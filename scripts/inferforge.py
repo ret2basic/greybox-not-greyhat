@@ -11119,6 +11119,7 @@ def build_verification_queue(
             cmd("source-peek-requests"),
             cmd("evidence-chain"),
             cmd("evidence-appendix"),
+            cmd("report"),
         ],
         evidence_refs=[
             "attack-strategy.json",
@@ -11126,6 +11127,8 @@ def build_verification_queue(
             "source-peek-requests.json",
             "evidence-chain.json",
             "evidence-appendix.json",
+            "report.md",
+            "index.html",
         ],
     )
     add_item(
@@ -13599,6 +13602,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("source-peek-requests", "run_source_peek_requests"),
         refresh_expectation("evidence-chain", "run_evidence_chain"),
         refresh_expectation("evidence-appendix", "run_evidence_appendix"),
+        refresh_expectation("report", "run_report"),
         refresh_expectation("verification-queue", "run_verification_queue"),
         refresh_expectation("adjudicate", "run_adjudicate"),
         refresh_expectation("capabilities", "run_capabilities"),
@@ -14893,6 +14897,53 @@ def build_capabilities(target: str, artifact_dir: Path, profile: dict[str, Any] 
         "artifacts": {
             "directory": str(artifact_dir),
         },
+    }
+
+
+def build_report_capabilities_placeholder(target: str, artifact_dir: Path) -> dict[str, Any]:
+    return {
+        "generated_at": utc_now(),
+        "status": "placeholder",
+        "target": {
+            "base_url": target,
+            "health_path": None,
+            "health_status": "unknown",
+            "reachable": None,
+            "service": None,
+            "m0_key_present": None,
+        },
+        "burp": {
+            "mcp_endpoint": "http://127.0.0.1:9876",
+            "mcp_port_open": "unknown",
+            "proxy_8080_open": "unknown",
+            "proxy_8081_open": "unknown",
+            "codex_mcp_get_burp_ok": "unknown",
+            "check_script_ok": "unknown",
+            "approval_sensitive_tools": {
+                "observed_get_proxy_http_history": "unknown",
+                "observed_send_http1_request": "unknown",
+                "observed_create_repeater_tab": "unknown",
+                "observed_set_proxy_intercept_state": "unknown",
+            },
+        },
+        "artifacts": {
+            "directory": str(artifact_dir),
+            "source": "placeholder-for-report-refresh",
+        },
+        "safety": "Placeholder used by report refresh only. No target, Burp, wallet, or upstream request was sent.",
+    }
+
+
+def build_report_transaction_intent_placeholder() -> dict[str, Any]:
+    return {
+        "generated_at": utc_now(),
+        "status": "not-run",
+        "candidates_seen": 0,
+        "decoded_transactions": 0,
+        "decoder": {"mode": "not-run"},
+        "intent_policy_checks": {"status": "not-run"},
+        "warnings": ["transaction-intent.json was not available when report was refreshed."],
+        "safety": "Placeholder used by report refresh only. No wallet signing or transaction submission was performed.",
     }
 
 
@@ -18965,6 +19016,85 @@ def run_evidence_appendix(args: argparse.Namespace) -> int:
     return 0 if evidence_appendix["status"] != "missing-evidence" else 1
 
 
+def run_report(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    clusters_path = artifact_dir / "endpoint-clusters.json"
+    clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
+    results = load_jsonl(artifact_dir / "probe-results.jsonl")
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
+    suspicions = suspicions_doc.get("suspicions", []) or []
+    attack_strategy = load_optional_json(artifact_dir / "attack-strategy.json") or build_attack_strategy(
+        clusters,
+        suspicions,
+        burp_history,
+    )
+    finding_gate = load_optional_json(artifact_dir / "finding-gate.json") or build_finding_gate(
+        suspicions,
+        burp_history,
+    )
+    hardening_notes_doc = load_optional_json(artifact_dir / "hardening-notes.json") or {}
+    hardening_notes = hardening_notes_doc.get("hardening_notes")
+    if hardening_notes is None:
+        hardening_notes = build_hardening_notes(suspicions, finding_gate)
+
+    capabilities = load_optional_json(artifact_dir / "burp-capabilities.json") or build_report_capabilities_placeholder(
+        target,
+        artifact_dir,
+    )
+    transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or build_report_transaction_intent_placeholder()
+    report = generate_report(
+        artifact_dir,
+        target,
+        results,
+        suspicions,
+        capabilities,
+        attack_strategy,
+        burp_history,
+        finding_gate,
+        transaction_intent,
+        load_optional_json(artifact_dir / "warmup-results.json"),
+        load_optional_json(artifact_dir / "evidence-gaps.json"),
+        load_optional_json(artifact_dir / "rpc-method-policy.json"),
+        load_optional_json(artifact_dir / "environment-readiness.json"),
+        load_optional_json(artifact_dir / "transaction-decoder-selftest.json"),
+        load_optional_json(artifact_dir / "blackbox-coverage.json"),
+        load_optional_json(artifact_dir / "evidence-chain.json"),
+        hardening_notes,
+        load_optional_json(artifact_dir / "adjudication.json"),
+        load_optional_json(artifact_dir / "evidence-appendix.json"),
+        load_optional_json(artifact_dir / "verification-queue.json"),
+        profile,
+    )
+    report_path = artifact_dir / "report.md"
+    index_path = artifact_dir / "index.html"
+    print("Report refresh: written")
+    print(
+        "Inputs: "
+        f"{len(results)} probe rows, "
+        f"{len(burp_history)} Burp observations, "
+        f"{len(suspicions)} suspicions"
+    )
+    print(f"Report bytes: {len(report.encode('utf-8'))}")
+    print(f"Wrote {report_path}")
+    print(f"Wrote {index_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="report",
+            output_paths=[
+                *target_profile_artifact_paths(artifact_dir),
+                report_path,
+                index_path,
+            ],
+        )
+    )
+    return 0
+
+
 def run_verification_queue(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -19497,6 +19627,24 @@ def run_regression_suite(args: argparse.Namespace) -> int:
                 extra=audit_args,
             )
             run_step("discovered-audit", command)
+
+    if not args.skip_audit and not suite_stopped:
+        command = inferforge_cli_command(
+            args,
+            profile_path=default_profile_path,
+            artifact_dir=default_artifact_dir,
+            subcommand="report",
+        )
+        run_step("default-report", command)
+
+        if not args.skip_discovered and not suite_stopped:
+            command = inferforge_cli_command(
+                args,
+                profile_path=discovered_profile_path,
+                artifact_dir=discovered_artifact_dir,
+                subcommand="report",
+            )
+            run_step("discovered-report", command)
 
     health_check_dirs = [default_artifact_dir]
     if not args.skip_discovered:
@@ -20667,6 +20815,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recompute compact request/response evidence appendix from current artifacts",
     )
     evidence_appendix.set_defaults(func=run_evidence_appendix)
+
+    report = sub.add_parser(
+        "report",
+        help="Refresh report.md and index.html from current artifacts without probing",
+    )
+    report.set_defaults(func=run_report)
 
     verification_queue = sub.add_parser(
         "verification-queue",
