@@ -4127,6 +4127,97 @@ def append_mcp_action_audit(
     )
 
 
+def call_mcp_tool_with_audit(
+    client: Any,
+    audit_artifact: dict[str, Any],
+    *,
+    tool: str,
+    arguments: dict[str, Any] | None,
+) -> tuple[dict[str, Any], str]:
+    try:
+        result = client.call_tool(tool, arguments or {})
+    except Exception as error:
+        append_mcp_action_audit(
+            audit_artifact,
+            tool=tool,
+            arguments=arguments,
+            status="failed",
+            error=error,
+        )
+        raise
+
+    raw_text = mcp_tool_text(result)
+    if result.get("isError"):
+        append_mcp_action_audit(
+            audit_artifact,
+            tool=tool,
+            arguments=arguments,
+            status="failed",
+            result_text=raw_text,
+        )
+        raise RuntimeError(raw_text)
+
+    append_mcp_action_audit(
+        audit_artifact,
+        tool=tool,
+        arguments=arguments,
+        status="succeeded",
+        result_text=raw_text,
+    )
+    return result, raw_text
+
+
+def call_mcp_tool_with_audit_or_fallback(
+    client: Any,
+    audit_artifact: dict[str, Any],
+    *,
+    primary_tool: str,
+    primary_arguments: dict[str, Any] | None,
+    fallback_tool: str,
+    fallback_arguments: dict[str, Any] | None,
+) -> dict[str, Any]:
+    primary_error_type = "unknown"
+    try:
+        result, raw_text = call_mcp_tool_with_audit(
+            client,
+            audit_artifact,
+            tool=primary_tool,
+            arguments=primary_arguments,
+        )
+        return {
+            "tool": primary_tool,
+            "arguments": primary_arguments or {},
+            "result": result,
+            "raw_text": raw_text,
+            "fallback_used": False,
+            "fallback_reason": None,
+        }
+    except Exception as primary_error:
+        primary_error_type = type(primary_error).__name__
+        fallback_reason = f"{primary_tool} failed ({primary_error_type}); using {fallback_tool} fallback"
+
+    try:
+        result, raw_text = call_mcp_tool_with_audit(
+            client,
+            audit_artifact,
+            tool=fallback_tool,
+            arguments=fallback_arguments,
+        )
+        return {
+            "tool": fallback_tool,
+            "arguments": fallback_arguments or {},
+            "result": result,
+            "raw_text": raw_text,
+            "fallback_used": True,
+            "fallback_reason": fallback_reason,
+        }
+    except Exception as fallback_error:
+        raise RuntimeError(
+            f"{primary_tool} failed ({primary_error_type}); "
+            f"{fallback_tool} fallback failed ({type(fallback_error).__name__})"
+        ) from fallback_error
+
+
 BURP_MCP_REQUIRED_CAPABILITY_TOOLS = {
     "proxy-http-history": ["get_proxy_http_history_regex", "get_proxy_http_history"],
     "proxy-websocket-history": ["get_proxy_websocket_history_regex", "get_proxy_websocket_history"],
@@ -15512,6 +15603,29 @@ def build_no_write_selftest() -> dict[str, Any]:
             "start_scan",
         ]
     )
+    class FallbackMcpClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+            self.calls.append((name, arguments or {}))
+            if name == "get_proxy_http_history_regex":
+                return {"isError": True, "content": [{"type": "text", "text": "regex tool unavailable"}]}
+            if name == "get_proxy_http_history":
+                return {"content": [{"type": "text", "text": "[]"}]}
+            raise RuntimeError(f"unexpected tool {name}")
+
+    fallback_client = FallbackMcpClient()
+    fallback_audit_artifact: dict[str, Any] = {"mcp_actions": []}
+    fallback_history_read = call_mcp_tool_with_audit_or_fallback(
+        fallback_client,
+        fallback_audit_artifact,
+        primary_tool="get_proxy_http_history_regex",
+        primary_arguments={"count": 10, "offset": 0, "regex": "Authorization: Bearer test"},
+        fallback_tool="get_proxy_http_history",
+        fallback_arguments={"count": 10, "offset": 0},
+    )
+    fallback_action_text = json.dumps(fallback_audit_artifact.get("mcp_actions", []), sort_keys=True)
     assertions = [
         {
             "id": "review-candidates-no-write-skips-artifacts",
@@ -15821,6 +15935,32 @@ def build_no_write_selftest() -> dict[str, Any]:
             ),
             "expected": "MCP tool inventory marks safe-loop dependencies available and scanner/intruder/state-editing tools disabled when present",
             "actual": mcp_tool_inventory,
+        },
+        {
+            "id": "mcp-history-read-falls-back-from-regex-tool",
+            "passed": (
+                fallback_history_read.get("tool") == "get_proxy_http_history"
+                and fallback_history_read.get("fallback_used") is True
+                and fallback_history_read.get("raw_text") == "[]"
+                and [name for name, _arguments in fallback_client.calls]
+                == ["get_proxy_http_history_regex", "get_proxy_http_history"]
+                and len(fallback_audit_artifact.get("mcp_actions", [])) == 2
+                and fallback_audit_artifact["mcp_actions"][0].get("status") == "failed"
+                and fallback_audit_artifact["mcp_actions"][1].get("status") == "succeeded"
+                and isinstance(fallback_audit_artifact["mcp_actions"][0].get("arguments", {}).get("regex"), dict)
+                and "Authorization: Bearer test" not in fallback_action_text
+                and "regex tool unavailable" not in fallback_action_text
+                and "regex tool unavailable" not in str(fallback_history_read.get("fallback_reason"))
+                and "RuntimeError" in str(fallback_history_read.get("fallback_reason"))
+                and "get_proxy_http_history fallback" in str(fallback_history_read.get("fallback_reason"))
+                and "regex" not in fallback_audit_artifact["mcp_actions"][1].get("arguments", {})
+            ),
+            "expected": "MCP history reads audit a failed regex call, fall back to non-regex history, and do not leak regex or MCP error response text in audit records or fallback reasons",
+            "actual": {
+                "read": fallback_history_read,
+                "calls": fallback_client.calls,
+                "actions": fallback_audit_artifact.get("mcp_actions", []),
+            },
         },
     ]
     failed = [item for item in assertions if not item["passed"]]
@@ -20639,9 +20779,14 @@ def run_burp_sync(args: argparse.Namespace) -> int:
         "mcp_url": args.mcp_url,
         "history_regex": history_regex,
         "http_history": {
+            "requested_tool": "get_proxy_http_history_regex",
+            "fallback_tool": "get_proxy_http_history",
             "tool": "get_proxy_http_history_regex",
             "count": args.count,
             "offset": args.offset,
+            "fallback_used": False,
+            "fallback_reason": None,
+            "filter_mode": "burp-mcp-regex",
             "raw_output": str(raw_path),
         },
         "websocket_history": None,
@@ -20684,74 +20829,47 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                     sync_artifact["intercept"]["error"] = str(error)
                     raise
 
-            http_arguments = {"count": args.count, "offset": args.offset, "regex": history_regex}
-            try:
-                http_result = client.call_tool("get_proxy_http_history_regex", http_arguments)
-            except Exception as error:
-                append_mcp_action_audit(
-                    sync_artifact,
-                    tool="get_proxy_http_history_regex",
-                    arguments=http_arguments,
-                    status="failed",
-                    error=error,
-                )
-                raise
-            raw_text = mcp_tool_text(http_result)
-            if http_result.get("isError"):
-                append_mcp_action_audit(
-                    sync_artifact,
-                    tool="get_proxy_http_history_regex",
-                    arguments=http_arguments,
-                    status="failed",
-                    result_text=raw_text,
-                )
-                raise RuntimeError(raw_text)
-            append_mcp_action_audit(
+            http_read = call_mcp_tool_with_audit_or_fallback(
+                client,
                 sync_artifact,
-                tool="get_proxy_http_history_regex",
-                arguments=http_arguments,
-                status="succeeded",
-                result_text=raw_text,
+                primary_tool="get_proxy_http_history_regex",
+                primary_arguments={"count": args.count, "offset": args.offset, "regex": history_regex},
+                fallback_tool="get_proxy_http_history",
+                fallback_arguments={"count": args.count, "offset": args.offset},
+            )
+            raw_text = str(http_read["raw_text"])
+            sync_artifact["http_history"].update(
+                {
+                    "tool": http_read["tool"],
+                    "fallback_used": http_read["fallback_used"],
+                    "fallback_reason": http_read["fallback_reason"],
+                    "filter_mode": "post-import-target-filter" if http_read["fallback_used"] else "burp-mcp-regex",
+                }
             )
             raw_path.parent.mkdir(parents=True, exist_ok=True)
             raw_path.write_text(raw_text, encoding="utf-8")
 
             if args.websocket_history:
-                ws_arguments = {"count": args.count, "offset": args.offset, "regex": history_regex}
-                try:
-                    ws_result = client.call_tool("get_proxy_websocket_history_regex", ws_arguments)
-                except Exception as error:
-                    append_mcp_action_audit(
-                        sync_artifact,
-                        tool="get_proxy_websocket_history_regex",
-                        arguments=ws_arguments,
-                        status="failed",
-                        error=error,
-                    )
-                    raise
-                ws_raw_text = mcp_tool_text(ws_result)
-                if ws_result.get("isError"):
-                    append_mcp_action_audit(
-                        sync_artifact,
-                        tool="get_proxy_websocket_history_regex",
-                        arguments=ws_arguments,
-                        status="failed",
-                        result_text=ws_raw_text,
-                    )
-                    raise RuntimeError(ws_raw_text)
-                append_mcp_action_audit(
+                ws_read = call_mcp_tool_with_audit_or_fallback(
+                    client,
                     sync_artifact,
-                    tool="get_proxy_websocket_history_regex",
-                    arguments=ws_arguments,
-                    status="succeeded",
-                    result_text=ws_raw_text,
+                    primary_tool="get_proxy_websocket_history_regex",
+                    primary_arguments={"count": args.count, "offset": args.offset, "regex": history_regex},
+                    fallback_tool="get_proxy_websocket_history",
+                    fallback_arguments={"count": args.count, "offset": args.offset},
                 )
+                ws_raw_text = str(ws_read["raw_text"])
                 ws_raw_path.parent.mkdir(parents=True, exist_ok=True)
                 ws_raw_path.write_text(ws_raw_text, encoding="utf-8")
                 sync_artifact["websocket_history"] = {
-                    "tool": "get_proxy_websocket_history_regex",
+                    "requested_tool": "get_proxy_websocket_history_regex",
+                    "fallback_tool": "get_proxy_websocket_history",
+                    "tool": ws_read["tool"],
                     "count": args.count,
                     "offset": args.offset,
+                    "fallback_used": ws_read["fallback_used"],
+                    "fallback_reason": ws_read["fallback_reason"],
+                    "filter_mode": "post-import-target-filter" if ws_read["fallback_used"] else "burp-mcp-regex",
                     "raw_output": str(ws_raw_path),
                     "bytes": len(ws_raw_text.encode("utf-8")),
                 }
