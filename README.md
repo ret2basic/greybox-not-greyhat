@@ -119,8 +119,9 @@ Profiles separate endpoint discovery from concrete probe paths:
   are not executed by `burp-sync --observe` until a concrete approved path is
   promoted into `burp_observation_plan`.
 - `review-candidates` lists these inert templates and writes
-  `.greybox/review-observation-candidates.json`. After reviewing one concrete
-  local read-only path, use `promote-observation-candidate` to write a separate
+  `.greybox/review-observation-candidates.json`; use `--no-write` to print the
+  same list without writing artifacts. After reviewing one concrete local
+  read-only path, use `promote-observation-candidate` to write a separate
   reviewed profile. Promotion is a profile edit only; it does not send HTTP
   traffic.
 - Generic `nextjs-api-routes` clusters with concrete probe paths receive only
@@ -259,6 +260,7 @@ python3 scripts/inferforge.py evidence-appendix
 python3 scripts/inferforge.py verification-queue
 python3 scripts/inferforge.py manifest
 python3 scripts/inferforge.py artifact-health --discover-child-runs
+python3 scripts/inferforge.py review-candidates --no-write
 python3 scripts/inferforge.py regression-suite --include-external --ws-resource-probes
 python3 scripts/inferforge.py adjudicate
 python3 scripts/inferforge.py audit --no-ws

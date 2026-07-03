@@ -14498,14 +14498,41 @@ def build_no_write_selftest() -> dict[str, Any]:
             "default_target": target,
             "default_source_root": str(root),
             "clusters": [],
+            "review_observation_candidates": [
+                {
+                    "id": "review_no_write_candidate",
+                    "type": "burp-http-observation",
+                    "status": "review-only",
+                    "method": "GET",
+                    "path_template": "/api/no-write/{path*}",
+                    "cluster": "no-write",
+                    "example_path": "/api/no-write/status",
+                    "safety": "Synthetic no-write candidate.",
+                }
+            ],
         }
         write_json(profile_path, profile)
+        review_candidates_output_dir = root / "review-candidates-output"
         capabilities_output_dir = root / "capabilities-output"
         readiness_output_dir = root / "readiness-output"
 
         original_build_capabilities = globals()["build_capabilities"]
         try:
             globals()["build_capabilities"] = stub_capabilities
+            review_candidates_return_code, review_candidates_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(review_candidates_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "review-candidates",
+                    "--no-write",
+                ]
+            )
             capabilities_return_code, capabilities_stdout = run_cli(
                 [
                     "--profile",
@@ -14538,6 +14565,10 @@ def build_no_write_selftest() -> dict[str, Any]:
             globals()["build_capabilities"] = original_build_capabilities
 
         output_paths = {
+            "review_candidates_dir": review_candidates_output_dir.exists(),
+            "review_candidates_json": (review_candidates_output_dir / "review-observation-candidates.json").exists(),
+            "review_candidates_profile_json": (review_candidates_output_dir / TARGET_PROFILE_ARTIFACT).exists(),
+            "review_candidates_manifest": (review_candidates_output_dir / MANIFEST_NAME).exists(),
             "capabilities_dir": capabilities_output_dir.exists(),
             "capabilities_json": (capabilities_output_dir / "burp-capabilities.json").exists(),
             "capabilities_manifest": (capabilities_output_dir / MANIFEST_NAME).exists(),
@@ -14548,6 +14579,31 @@ def build_no_write_selftest() -> dict[str, Any]:
         }
 
     assertions = [
+        {
+            "id": "review-candidates-no-write-skips-artifacts",
+            "passed": (
+                review_candidates_return_code == 0
+                and "Review observation candidates: 1" in review_candidates_stdout
+                and "review_no_write_candidate" in "\n".join(review_candidates_stdout)
+                and "No files written (--no-write)." in review_candidates_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "review_candidates_dir",
+                        "review_candidates_json",
+                        "review_candidates_profile_json",
+                        "review_candidates_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in review_candidates_stdout)
+            ),
+            "expected": "review-candidates --no-write prints candidates without writing artifacts or manifests",
+            "actual": {
+                "return_code": review_candidates_return_code,
+                "stdout": review_candidates_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
         {
             "id": "capabilities-no-write-skips-artifacts",
             "passed": (
@@ -14591,6 +14647,10 @@ def build_no_write_selftest() -> dict[str, Any]:
             "failed": len(failed),
         },
         "cases": {
+            "review_candidates": {
+                "return_code": review_candidates_return_code,
+                "stdout": review_candidates_stdout,
+            },
             "capabilities": {
                 "return_code": capabilities_return_code,
                 "stdout": capabilities_stdout,
@@ -20790,8 +20850,10 @@ def run_profile(args: argparse.Namespace) -> int:
 
 def run_review_candidates(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     candidates = collect_review_observation_candidates(profile)
     artifact = {
         "generated_at": utc_now(),
@@ -20803,7 +20865,6 @@ def run_review_candidates(args: argparse.Namespace) -> int:
         "safety": "Review candidates are inert templates. Listing them does not send HTTP traffic or modify the profile.",
     }
     output_path = artifact_dir / "review-observation-candidates.json"
-    write_json(output_path, artifact)
     print(f"Review observation candidates: {len(candidates)}")
     for candidate in candidates:
         print(
@@ -20814,20 +20875,24 @@ def run_review_candidates(args: argparse.Namespace) -> int:
         )
         if candidate.get("example_path"):
             print(f"  example_path={candidate.get('example_path')}")
-    print(f"Wrote {output_path}")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="review-candidates",
-            output_paths=[
-                artifact_dir / TARGET_PROFILE_ARTIFACT,
-                artifact_dir / STRATEGY_REGISTRY_ARTIFACT,
-                artifact_dir / PROFILE_VALIDATION_ARTIFACT,
-                output_path,
-            ],
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        write_json(output_path, artifact)
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="review-candidates",
+                output_paths=[
+                    artifact_dir / TARGET_PROFILE_ARTIFACT,
+                    artifact_dir / STRATEGY_REGISTRY_ARTIFACT,
+                    artifact_dir / PROFILE_VALIDATION_ARTIFACT,
+                    output_path,
+                ],
+            )
         )
-    )
     return 0
 
 
@@ -21599,6 +21664,11 @@ def build_parser() -> argparse.ArgumentParser:
     review_candidates = sub.add_parser(
         "review-candidates",
         help="List inert review-only observation candidates from the current profile",
+    )
+    review_candidates.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print candidates only; do not write review-observation-candidates.json or refreshed manifests.",
     )
     review_candidates.set_defaults(func=run_review_candidates)
 
