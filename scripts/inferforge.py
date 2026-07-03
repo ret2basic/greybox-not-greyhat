@@ -13594,13 +13594,14 @@ def discover_regression_suite_artifact_health_dirs(root_dir: Path) -> list[Path]
     seen: set[str] = set()
     for suite_key in ["suite", "default", "discovered"]:
         path = artifact_dir_from_suite_value(artifact_dirs.get(suite_key))
-        if path and (path / MANIFEST_NAME).exists():
-            resolved = path.resolve()
-            resolved_key = str(resolved)
-            if resolved_key in seen:
-                continue
-            seen.add(resolved_key)
-            dirs.append(resolved)
+        if not path:
+            continue
+        resolved = path.resolve()
+        resolved_key = str(resolved)
+        if resolved_key in seen:
+            continue
+        seen.add(resolved_key)
+        dirs.append(resolved)
     return dirs
 
 
@@ -13878,6 +13879,30 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         discovered_suite_dir_names = [path.name for path in discovered_suite_dirs]
         discovered_suite_health = build_artifact_health(discovered_suite_dirs)
 
+        missing_suite_root = root / "suite-missing"
+        missing_suite_default_dir = missing_suite_root / "regression-default"
+        missing_suite_discovered_dir = missing_suite_root / "regression-discovered"
+        for directory in [missing_suite_root, missing_suite_default_dir]:
+            directory.mkdir(parents=True)
+            write_json(directory / "ok.json", {"status": "ready"})
+        write_json(
+            missing_suite_root / "regression-suite.json",
+            {
+                "generated_at": utc_now(),
+                "status": "failed",
+                "artifact_dirs": {
+                    "suite": str(missing_suite_root),
+                    "default": str(missing_suite_default_dir),
+                    "discovered": str(missing_suite_discovered_dir),
+                },
+            },
+        )
+        write_minimal_manifest(missing_suite_root, ["ok.json", "regression-suite.json"])
+        write_minimal_manifest(missing_suite_default_dir, ["ok.json"])
+        missing_suite_dirs = discover_artifact_health_dirs(missing_suite_root)
+        missing_suite_dir_names = [path.name for path in missing_suite_dirs]
+        missing_suite_health = build_artifact_health(missing_suite_dirs)
+
     def stale_reasons(item: dict[str, Any]) -> set[str]:
         return {str(entry.get("reason")) for entry in item.get("stale_inputs", []) or []}
 
@@ -14012,6 +14037,21 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                 "status_counts": discovered_suite_health.get("summary", {}).get("status_counts"),
             },
         },
+        {
+            "id": "discover-child-runs-reports-missing-regression-suite-dirs",
+            "passed": (
+                missing_suite_dir_names
+                == ["suite-missing", "regression-default", "regression-discovered"]
+                and missing_suite_health.get("status") == "failed"
+                and str(missing_suite_discovered_dir) in missing_suite_health.get("summary", {}).get("failed_dirs", [])
+            ),
+            "expected": "regression-suite managed dirs are checked even when a child dir or manifest is missing",
+            "actual": {
+                "discovered_dirs": missing_suite_dir_names,
+                "health_status": missing_suite_health.get("status"),
+                "failed_dirs": missing_suite_health.get("summary", {}).get("failed_dirs"),
+            },
+        },
     ]
     failed = [item for item in assertions if not item["passed"]]
     return {
@@ -14051,6 +14091,10 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "regression_suite_discovery": {
                 "discovered_dirs": discovered_suite_dir_names,
                 "health": discovered_suite_health,
+            },
+            "missing_regression_suite_discovery": {
+                "discovered_dirs": missing_suite_dir_names,
+                "health": missing_suite_health,
             },
         },
         "assertions": assertions,

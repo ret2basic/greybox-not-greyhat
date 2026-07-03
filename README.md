@@ -570,7 +570,9 @@ python3 scripts/inferforge.py artifact-health --discover-child-runs --no-write
 
 When `regression-suite.json` is present, `--discover-child-runs` checks the
 suite, default, and discovered artifact directories recorded by that run before
-falling back to raw child-directory manifest discovery.
+falling back to raw child-directory manifest discovery. Recorded regression
+directories are still checked when their manifest or directory is missing, so a
+broken managed run fails health instead of being silently skipped.
 
 By default the command returns non-zero only for failed or missing artifact
 sets. Use `--strict` in CI when human-review or external-configuration blockers
