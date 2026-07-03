@@ -11112,14 +11112,16 @@ def build_verification_queue(
         "Refresh evidence indexes without probing",
         "ready",
         "medium",
-        "Rebuilds the machine-readable evidence chain and compact request/response appendix from current artifacts.",
+        "Rebuilds the strategy status, machine-readable evidence chain, and compact request/response appendix from current artifacts.",
         commands=[
+            cmd("attack-strategy"),
             cmd("response-deltas"),
             cmd("source-peek-requests"),
             cmd("evidence-chain"),
             cmd("evidence-appendix"),
         ],
         evidence_refs=[
+            "attack-strategy.json",
             "response-delta-analysis.json",
             "source-peek-requests.json",
             "evidence-chain.json",
@@ -11170,7 +11172,7 @@ def build_verification_queue(
                 "Attack strategy coverage is missing a specific strategy for: "
                 + (", ".join(uncovered_strategy_clusters) or "one or more clusters")
             ),
-            commands=[cmd("plan")],
+            commands=[cmd("attack-strategy")],
             evidence_refs=[
                 "attack-strategy.json",
                 "endpoint-clusters.json",
@@ -13588,6 +13590,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("burp-observe", "run_burp_observe", min_refreshes=3, min_prints=3),
         refresh_expectation("burp-sync", "run_burp_sync", min_refreshes=4, min_prints=4),
         refresh_expectation("import-burp-history", "run_import_burp_history", min_refreshes=2, min_prints=2),
+        refresh_expectation("attack-strategy", "run_attack_strategy"),
         refresh_expectation("gate", "run_gate", min_refreshes=2, min_prints=2),
         refresh_expectation("coverage", "run_coverage"),
         refresh_expectation("burp-observation-coverage", "run_burp_observation_coverage"),
@@ -18505,6 +18508,47 @@ def run_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_attack_strategy(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    clusters_path = artifact_dir / "endpoint-clusters.json"
+    clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
+    suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
+    attack_strategy = build_attack_strategy(
+        clusters,
+        suspicions_doc.get("suspicions", []) or [],
+        load_jsonl(artifact_dir / "burp-history-observations.jsonl"),
+    )
+    output_path = artifact_dir / "attack-strategy.json"
+    write_json(output_path, attack_strategy)
+    print(f"Attack strategy: {attack_strategy['status']}")
+    print(
+        "Coverage: "
+        f"{attack_strategy['summary']['clusters_with_specific_strategy']} specific / "
+        f"{attack_strategy['summary']['clusters']} clusters, "
+        f"waiting_actions={attack_strategy['summary']['waiting_action_count']}"
+    )
+    uncovered = attack_strategy["summary"].get("strategy_uncovered_clusters", [])
+    if uncovered:
+        print(f"Uncovered clusters: {', '.join(str(item) for item in uncovered)}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="attack-strategy",
+            output_paths=[
+                *target_profile_artifact_paths(artifact_dir),
+                output_path,
+            ],
+        )
+    )
+    if args.strict and attack_strategy["status"] != "ready-for-regression":
+        return 1
+    return 0
+
+
 def run_gate(args: argparse.Namespace) -> int:
     artifact_dir = Path(args.artifact_dir).resolve()
     profile = load_target_profile(args.profile)
@@ -20488,6 +20532,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Plan only for endpoint kinds seen in traffic-index.json",
     )
     plan.set_defaults(func=run_plan, ws=True)
+
+    attack_strategy = sub.add_parser(
+        "attack-strategy",
+        help="Recompute attack strategy coverage and next-action status from current artifacts",
+    )
+    attack_strategy.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless attack strategy status is ready-for-regression.",
+    )
+    attack_strategy.set_defaults(func=run_attack_strategy)
 
     audit = sub.add_parser("audit", help="Run safe probes, source peeks, clustering, and report generation")
     audit.add_argument("--include-external", action="store_true", help="Allow bounded M0 quote validation probes")
