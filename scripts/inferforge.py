@@ -14794,6 +14794,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         review_candidates_output_dir = root / "review-candidates-output"
         capabilities_output_dir = root / "capabilities-output"
         readiness_output_dir = root / "readiness-output"
+        attack_strategy_output_dir = root / "attack-strategy-output"
         verification_queue_output_dir = root / "verification-queue-output"
         promote_output_dir = root / "promote-output"
 
@@ -14839,6 +14840,20 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--source-root",
                     str(root),
                     "readiness",
+                    "--no-write",
+                ]
+            )
+            attack_strategy_return_code, attack_strategy_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(attack_strategy_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "attack-strategy",
                     "--no-write",
                 ]
             )
@@ -14889,6 +14904,10 @@ def build_no_write_selftest() -> dict[str, Any]:
             "readiness_capabilities_json": (readiness_output_dir / "burp-capabilities.json").exists(),
             "readiness_json": (readiness_output_dir / "environment-readiness.json").exists(),
             "readiness_manifest": (readiness_output_dir / MANIFEST_NAME).exists(),
+            "attack_strategy_dir": attack_strategy_output_dir.exists(),
+            "attack_strategy_target_profile_json": (attack_strategy_output_dir / TARGET_PROFILE_ARTIFACT).exists(),
+            "attack_strategy_json": (attack_strategy_output_dir / "attack-strategy.json").exists(),
+            "attack_strategy_manifest": (attack_strategy_output_dir / MANIFEST_NAME).exists(),
             "verification_queue_dir": verification_queue_output_dir.exists(),
             "verification_queue_target_profile_json": (verification_queue_output_dir / TARGET_PROFILE_ARTIFACT).exists(),
             "verification_queue_json": (verification_queue_output_dir / "verification-queue.json").exists(),
@@ -14906,6 +14925,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         }
 
     review_candidates_stdout_text = "\n".join(review_candidates_stdout)
+    attack_strategy_stdout_text = "\n".join(attack_strategy_stdout)
     verification_queue_stdout_text = "\n".join(verification_queue_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
     assertions = [
@@ -15006,6 +15026,31 @@ def build_no_write_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "attack-strategy-no-write-skips-artifacts",
+            "passed": (
+                attack_strategy_return_code == 0
+                and "Attack strategy: needs-burp-history" in attack_strategy_stdout
+                and "Coverage: 0 specific / 0 clusters" in attack_strategy_stdout_text
+                and "No files written (--no-write)." in attack_strategy_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "attack_strategy_dir",
+                        "attack_strategy_target_profile_json",
+                        "attack_strategy_json",
+                        "attack_strategy_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in attack_strategy_stdout)
+            ),
+            "expected": "attack-strategy --no-write prints strategy coverage without writing artifacts or manifests",
+            "actual": {
+                "return_code": attack_strategy_return_code,
+                "stdout": attack_strategy_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
             "id": "capabilities-no-write-skips-artifacts",
             "passed": (
                 capabilities_return_code == 0
@@ -15059,6 +15104,10 @@ def build_no_write_selftest() -> dict[str, Any]:
             "readiness": {
                 "return_code": readiness_return_code,
                 "stdout": readiness_stdout,
+            },
+            "attack_strategy": {
+                "return_code": attack_strategy_return_code,
+                "stdout": attack_strategy_stdout,
             },
             "outputs_exist": output_paths,
         },
@@ -20016,8 +20065,10 @@ def run_plan(args: argparse.Namespace) -> int:
 
 def run_attack_strategy(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     clusters_path = artifact_dir / "endpoint-clusters.json"
     clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
     suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
@@ -20027,7 +20078,8 @@ def run_attack_strategy(args: argparse.Namespace) -> int:
         load_jsonl(artifact_dir / "burp-history-observations.jsonl"),
     )
     output_path = artifact_dir / "attack-strategy.json"
-    write_json(output_path, attack_strategy)
+    if not no_write:
+        write_json(output_path, attack_strategy)
     print(f"Attack strategy: {attack_strategy['status']}")
     print(
         "Coverage: "
@@ -20043,18 +20095,21 @@ def run_attack_strategy(args: argparse.Namespace) -> int:
         print(f"Waiting action: {format_attack_strategy_waiting_action(action)}")
     if len(waiting_actions) > 3:
         print(f"Waiting action: {len(waiting_actions) - 3} more in attack-strategy.json")
-    print(f"Wrote {output_path}")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="attack-strategy",
-            output_paths=[
-                *target_profile_artifact_paths(artifact_dir),
-                output_path,
-            ],
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="attack-strategy",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    output_path,
+                ],
+            )
         )
-    )
     if args.strict and attack_strategy["status"] != "ready-for-regression":
         return 1
     return 0
@@ -22339,6 +22394,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict",
         action="store_true",
         help="Return non-zero unless attack strategy status is ready-for-regression.",
+    )
+    attack_strategy.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print strategy coverage only; do not write attack-strategy.json or refreshed manifests.",
     )
     attack_strategy.set_defaults(func=run_attack_strategy)
 

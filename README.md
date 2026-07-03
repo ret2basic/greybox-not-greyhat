@@ -268,6 +268,8 @@ python3 scripts/inferforge.py coverage
 python3 scripts/inferforge.py burp-observation-coverage
 python3 scripts/inferforge.py response-deltas
 python3 scripts/inferforge.py source-peek-requests
+python3 scripts/inferforge.py attack-strategy
+python3 scripts/inferforge.py attack-strategy --no-write
 python3 scripts/inferforge.py evidence-chain
 python3 scripts/inferforge.py evidence-appendix
 python3 scripts/inferforge.py verification-queue
@@ -456,7 +458,10 @@ black-box evidence refs, source refs, and answer artifact for review.
 records the active methodology, specific strategy coverage for each endpoint
 cluster, next-development-action status counts, and a top-level status such as
 `ready-for-regression`, `needs-external-evidence`, or `needs-strategy-review`.
-It is generated from local run context only; it does not execute probes.
+It is generated from local run context only; it does not execute probes. Use
+`attack-strategy --no-write` to preview the same coverage, uncovered clusters,
+and waiting actions without writing `attack-strategy.json`, target-profile
+artifacts, or refreshed manifests.
 
 `source-peek-results.json` also includes an `endpoint_resolver` section. The
 resolver statically maps observed HTTP endpoints back to matching Next.js App
