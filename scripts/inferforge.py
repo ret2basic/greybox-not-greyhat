@@ -6065,6 +6065,18 @@ def run_http_probes(
     return results
 
 
+def sanitize_probe_result_for_artifact(row: dict[str, Any]) -> dict[str, Any]:
+    sanitized = json_clone(row)
+    if "body_text" in sanitized:
+        sanitized.pop("body_text", None)
+        sanitized["body_text_redacted"] = True
+    return sanitized
+
+
+def sanitize_probe_results_for_artifact(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [sanitize_probe_result_for_artifact(row) for row in rows]
+
+
 def run_audit_warmup(
     target: str,
     artifact_dir: Path,
@@ -6084,7 +6096,7 @@ def run_audit_warmup(
         "note": "Local route warm-up before audit probes. Results are not counted as findings.",
         "selected_clusters": sorted(selected_clusters) if selected_clusters is not None else None,
         "ready": all(row["expected"] for row in warmup_results),
-        "results": warmup_results,
+        "results": sanitize_probe_results_for_artifact(warmup_results),
     }
     write_json(artifact_dir / "warmup-results.json", payload)
     return payload
@@ -14486,6 +14498,56 @@ def regression_suite_output_security_issues(doc: Any, *, file_name: str) -> list
     return issues
 
 
+def probe_result_body_text_security_issues_in_value(value: Any, *, file_name: str, path: str = "$") -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        if "body_text" in value:
+            issues.append(
+                {
+                    "file": file_name,
+                    "path": f"{path}.body_text",
+                    "reason": "probe-result-body-text-raw-field",
+                }
+            )
+        for key, child in value.items():
+            issues.extend(
+                probe_result_body_text_security_issues_in_value(
+                    child,
+                    file_name=file_name,
+                    path=f"{path}.{key}",
+                )
+            )
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            issues.extend(
+                probe_result_body_text_security_issues_in_value(
+                    child,
+                    file_name=file_name,
+                    path=f"{path}[{index}]",
+                )
+            )
+    return issues
+
+
+def probe_result_jsonl_security_issues(path: Path) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        issues.extend(
+            probe_result_body_text_security_issues_in_value(
+                row,
+                file_name=path.name,
+                path=f"$[{lineno}]",
+            )
+        )
+    return issues
+
+
 def redacted_error_field_security_issues(value: Any, *, file_name: str, path: str, reason_prefix: str) -> list[dict[str, Any]]:
     if value is None or value == "":
         return []
@@ -14511,6 +14573,8 @@ def mcp_action_audit_security_issues(parsed_json_by_name: dict[str, Any]) -> lis
             issues.extend(burp_sync_error_security_issues(doc, file_name=file_name))
         if file_name == "regression-suite.json":
             issues.extend(regression_suite_output_security_issues(doc, file_name=file_name))
+        if file_name == "warmup-results.json":
+            issues.extend(probe_result_body_text_security_issues_in_value(doc, file_name=file_name))
     return issues
 
 
@@ -14596,6 +14660,8 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
             rows, errors = parse_artifact_jsonl(path)
             jsonl_rows[path.name] = rows
             jsonl_errors.extend(errors)
+            if path.name == "probe-results.jsonl":
+                security_issues.extend(probe_result_jsonl_security_issues(path))
 
     if json_errors:
         checks.append(
@@ -14631,7 +14697,7 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
             }
         )
 
-    security_issues = mcp_action_audit_security_issues(parsed_json_by_name)
+    security_issues.extend(mcp_action_audit_security_issues(parsed_json_by_name))
     if security_issues:
         checks.append(
             {
@@ -14964,6 +15030,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         untracked_dir = root / "untracked"
         mcp_audit_leak_dir = root / "mcp-audit-leak"
         regression_output_leak_dir = root / "regression-output-leak"
+        probe_body_text_leak_dir = root / "probe-body-text-leak"
         refresh_dir = root / "refresh"
         derived_dir = root / "derived"
         for directory in [healthy_dir, modified_dir, missing_dir, untracked_dir]:
@@ -15048,6 +15115,34 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         )
         write_minimal_manifest(regression_output_leak_dir, ["regression-suite.json"])
 
+        probe_body_text_leak_dir.mkdir(parents=True)
+        (probe_body_text_leak_dir / "probe-results.jsonl").write_text(
+            json.dumps(
+                {
+                    "probe_id": "raw-body-text",
+                    "status": 200,
+                    "body_text": "Authorization: Bearer should-not-appear",
+                    "body_sample": "redacted-ish",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        write_json(
+            probe_body_text_leak_dir / "warmup-results.json",
+            {
+                "generated_at": utc_now(),
+                "status": "ready",
+                "results": [
+                    {
+                        "probe_id": "raw-warmup-body-text",
+                        "body_text": "warmup raw body should-not-appear",
+                    }
+                ],
+            },
+        )
+        write_minimal_manifest(probe_body_text_leak_dir, ["probe-results.jsonl", "warmup-results.json"])
+
         healthy = build_single_artifact_health(healthy_dir)
         modified = build_single_artifact_health(modified_dir)
         missing = build_single_artifact_health(missing_dir)
@@ -15057,6 +15152,8 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         mcp_audit_leak_text = json.dumps(mcp_audit_leak, sort_keys=True)
         regression_output_leak = build_single_artifact_health(regression_output_leak_dir)
         regression_output_leak_text = json.dumps(regression_output_leak, sort_keys=True)
+        probe_body_text_leak = build_single_artifact_health(probe_body_text_leak_dir)
+        probe_body_text_leak_text = json.dumps(probe_body_text_leak, sort_keys=True)
         aggregate = build_artifact_health([healthy_dir, modified_dir, missing_dir, untracked_dir])
         refresh_health = build_artifact_health([refresh_dir])
         refresh_output = refresh_dir / "artifact-health.json"
@@ -15263,6 +15360,23 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "artifact-health-detects-probe-body-text-leaks",
+            "passed": (
+                probe_body_text_leak.get("status") == "failed"
+                and {
+                    "probe-result-body-text-raw-field",
+                }.issubset({str(issue.get("reason")) for issue in probe_body_text_leak.get("security_issues", []) or []})
+                and "should-not-appear" not in probe_body_text_leak_text
+                and "Authorization: Bearer" not in probe_body_text_leak_text
+                and "warmup raw body" not in probe_body_text_leak_text
+            ),
+            "expected": "artifact-health fails when probe-results or warmup-results contain raw body_text without echoing leaked values",
+            "actual": {
+                "status": probe_body_text_leak.get("status"),
+                "security_issues": probe_body_text_leak.get("security_issues"),
+            },
+        },
+        {
             "id": "artifact-health-output-refreshes-manifest",
             "passed": (
                 refresh_stale_before.get("status") == "failed"
@@ -15403,6 +15517,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "mcp_audit_leak": mcp_audit_leak,
             "mcp_audit_leak_rollup": mcp_audit_leak_rollup,
             "regression_output_leak": regression_output_leak,
+            "probe_body_text_leak": probe_body_text_leak,
             "aggregate": aggregate,
             "refresh_stale_before": refresh_stale_before,
             "refreshed_health": refreshed_health,
@@ -19504,7 +19619,7 @@ def run_audit(args: argparse.Namespace) -> int:
         print(f"Wrote {artifact_dir / 'target-probe-lock.json'}")
         return 2
 
-    append_jsonl(artifact_dir / "probe-results.jsonl", results)
+    append_jsonl(artifact_dir / "probe-results.jsonl", sanitize_probe_results_for_artifact(results))
     response_delta_analysis = build_response_delta_analysis(clusters, results)
     write_json(artifact_dir / "response-delta-analysis.json", response_delta_analysis)
     traffic_index = build_traffic_index(results, burp_history)

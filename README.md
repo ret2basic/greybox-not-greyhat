@@ -663,10 +663,13 @@ grouped review blockers so unattended runs surface both health gates and next
 actions directly. `regression-suite.json` stores step output as byte, hash, and
 line-count summaries rather than raw command stdout; step and preparation
 failure errors use the same redacted type/length/hash shape as Burp MCP error
-artifacts. It clears only generated `probe-results.jsonl` files in the selected
-regression artifact directories before audit so reruns do not accumulate stale
-probe rows. It does not run Burp Scanner, fuzz broadly, invoke Server Actions,
-sign wallets, or submit transactions.
+artifacts. Probe and warm-up artifacts do not store full response `body_text`;
+they keep response hashes, lengths, truncation flags, and bounded redacted body
+samples for grouping and reproduction context. It clears only generated
+`probe-results.jsonl` files in the selected regression artifact directories
+before audit so reruns do not accumulate stale probe rows. It does not run Burp
+Scanner, fuzz broadly, invoke Server Actions, sign wallets, or submit
+transactions.
 
 ```bash
 python3 scripts/inferforge.py regression-suite --include-external --ws-resource-probes
