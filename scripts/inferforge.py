@@ -4100,6 +4100,16 @@ def mcp_audit_error(error: Any) -> dict[str, Any]:
     return redacted_error_summary(error)
 
 
+def target_probe_lock_blocked_payload(*, target: str, error: Any, safety: str) -> dict[str, Any]:
+    return {
+        "generated_at": utc_now(),
+        "status": "blocked",
+        "target": target,
+        "error": redacted_error_summary(error),
+        "safety": safety,
+    }
+
+
 def mcp_action_audit_record(
     *,
     tool: str,
@@ -14575,6 +14585,15 @@ def mcp_action_audit_security_issues(parsed_json_by_name: dict[str, Any]) -> lis
             issues.extend(regression_suite_output_security_issues(doc, file_name=file_name))
         if file_name == "warmup-results.json":
             issues.extend(probe_result_body_text_security_issues_in_value(doc, file_name=file_name))
+        if file_name == "target-probe-lock.json":
+            issues.extend(
+                redacted_error_field_security_issues(
+                    doc.get("error"),
+                    file_name=file_name,
+                    path="$.error",
+                    reason_prefix="target-probe-lock-error",
+                )
+            )
     return issues
 
 
@@ -15031,6 +15050,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         mcp_audit_leak_dir = root / "mcp-audit-leak"
         regression_output_leak_dir = root / "regression-output-leak"
         probe_body_text_leak_dir = root / "probe-body-text-leak"
+        target_lock_error_leak_dir = root / "target-lock-error-leak"
         refresh_dir = root / "refresh"
         derived_dir = root / "derived"
         for directory in [healthy_dir, modified_dir, missing_dir, untracked_dir]:
@@ -15143,6 +15163,19 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         )
         write_minimal_manifest(probe_body_text_leak_dir, ["probe-results.jsonl", "warmup-results.json"])
 
+        target_lock_error_leak_dir.mkdir(parents=True)
+        write_json(
+            target_lock_error_leak_dir / "target-probe-lock.json",
+            {
+                "generated_at": utc_now(),
+                "status": "blocked",
+                "target": "http://127.0.0.1:9997",
+                "error": "Active lock raw error should-not-appear",
+                "safety": "Synthetic lock artifact for artifact-health self-test.",
+            },
+        )
+        write_minimal_manifest(target_lock_error_leak_dir, ["target-probe-lock.json"])
+
         healthy = build_single_artifact_health(healthy_dir)
         modified = build_single_artifact_health(modified_dir)
         missing = build_single_artifact_health(missing_dir)
@@ -15154,6 +15187,8 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         regression_output_leak_text = json.dumps(regression_output_leak, sort_keys=True)
         probe_body_text_leak = build_single_artifact_health(probe_body_text_leak_dir)
         probe_body_text_leak_text = json.dumps(probe_body_text_leak, sort_keys=True)
+        target_lock_error_leak = build_single_artifact_health(target_lock_error_leak_dir)
+        target_lock_error_leak_text = json.dumps(target_lock_error_leak, sort_keys=True)
         aggregate = build_artifact_health([healthy_dir, modified_dir, missing_dir, untracked_dir])
         refresh_health = build_artifact_health([refresh_dir])
         refresh_output = refresh_dir / "artifact-health.json"
@@ -15377,6 +15412,22 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "artifact-health-detects-target-lock-error-leaks",
+            "passed": (
+                target_lock_error_leak.get("status") == "failed"
+                and {
+                    "target-probe-lock-error-raw-string",
+                }.issubset({str(issue.get("reason")) for issue in target_lock_error_leak.get("security_issues", []) or []})
+                and "should-not-appear" not in target_lock_error_leak_text
+                and "Active lock raw error" not in target_lock_error_leak_text
+            ),
+            "expected": "artifact-health fails when target-probe-lock artifacts contain raw error strings without echoing leaked values",
+            "actual": {
+                "status": target_lock_error_leak.get("status"),
+                "security_issues": target_lock_error_leak.get("security_issues"),
+            },
+        },
+        {
             "id": "artifact-health-output-refreshes-manifest",
             "passed": (
                 refresh_stale_before.get("status") == "failed"
@@ -15518,6 +15569,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "mcp_audit_leak_rollup": mcp_audit_leak_rollup,
             "regression_output_leak": regression_output_leak,
             "probe_body_text_leak": probe_body_text_leak,
+            "target_lock_error_leak": target_lock_error_leak,
             "aggregate": aggregate,
             "refresh_stale_before": refresh_stale_before,
             "refreshed_health": refreshed_health,
@@ -19607,13 +19659,11 @@ def run_audit(args: argparse.Namespace) -> int:
     except RuntimeError as error:
         write_json(
             artifact_dir / "target-probe-lock.json",
-            {
-                "generated_at": utc_now(),
-                "status": "blocked",
-                "target": target,
-                "error": str(error),
-                "safety": "Only one active probe run may target the same service at a time.",
-            },
+            target_probe_lock_blocked_payload(
+                target=target,
+                error=error,
+                safety="Only one active probe run may target the same service at a time.",
+            ),
         )
         print(f"Target probe lock blocked audit: {error}")
         print(f"Wrote {artifact_dir / 'target-probe-lock.json'}")
@@ -19992,13 +20042,11 @@ def run_burp_observe(args: argparse.Namespace) -> int:
         output_path = artifact_dir / "target-probe-lock.json"
         write_json(
             output_path,
-            {
-                "generated_at": utc_now(),
-                "status": "blocked",
-                "target": target,
-                "error": str(error),
-                "safety": "Only one active observation/probe run may target the same service at a time.",
-            },
+            target_probe_lock_blocked_payload(
+                target=target,
+                error=error,
+                safety="Only one active observation/probe run may target the same service at a time.",
+            ),
         )
         print(f"Target probe lock blocked burp-observe: {error}")
         print(f"Wrote {output_path}")
@@ -24174,13 +24222,11 @@ def run_collect_quote(args: argparse.Namespace) -> int:
         lock_path = artifact_dir / "target-probe-lock.json"
         write_json(
             lock_path,
-            {
-                "generated_at": utc_now(),
-                "status": "blocked",
-                "target": target,
-                "error": str(error),
-                "safety": "Only one active collection/probe run may target the same service at a time.",
-            },
+            target_probe_lock_blocked_payload(
+                target=target,
+                error=error,
+                safety="Only one active collection/probe run may target the same service at a time.",
+            ),
         )
         print(f"Target probe lock blocked collect-quote: {error}")
         print(f"Wrote {lock_path}")
@@ -24344,13 +24390,11 @@ def run_collect_orca_baseline(args: argparse.Namespace) -> int:
         lock_path = artifact_dir / "target-probe-lock.json"
         write_json(
             lock_path,
-            {
-                "generated_at": utc_now(),
-                "status": "blocked",
-                "target": target,
-                "error": str(error),
-                "safety": "Only one active collection/probe run may target the same service at a time.",
-            },
+            target_probe_lock_blocked_payload(
+                target=target,
+                error=error,
+                safety="Only one active collection/probe run may target the same service at a time.",
+            ),
         )
         print(f"Target probe lock blocked collect-orca-baseline: {error}")
         print(f"Wrote {lock_path}")
