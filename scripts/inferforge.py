@@ -12404,14 +12404,15 @@ def write_artifact_manifest(artifact_dir: Path, target: str, *, command: str) ->
     return manifest
 
 
-def refresh_artifact_health_output_manifests(
+def refresh_manifests_for_artifact_outputs(
     *,
-    output_path: Path,
+    output_paths: list[Path],
     artifact_dir: Path,
     check_dirs: list[Path],
     target: str,
+    command: str,
 ) -> list[dict[str, Any]]:
-    output_parent = output_path.resolve().parent
+    output_parents = {path.resolve().parent for path in output_paths}
     candidates = [artifact_dir.resolve(), *[path.resolve() for path in check_dirs]]
     refreshed = []
     seen: set[str] = set()
@@ -12420,9 +12421,9 @@ def refresh_artifact_health_output_manifests(
         if key in seen:
             continue
         seen.add(key)
-        if output_parent != candidate or not candidate.exists():
+        if candidate not in output_parents or not candidate.exists():
             continue
-        manifest = write_artifact_manifest(candidate, target, command="artifact-health")
+        manifest = write_artifact_manifest(candidate, target, command=command)
         refreshed.append(
             {
                 "artifact_dir": str(candidate),
@@ -12431,6 +12432,22 @@ def refresh_artifact_health_output_manifests(
             }
         )
     return refreshed
+
+
+def refresh_artifact_health_output_manifests(
+    *,
+    output_path: Path,
+    artifact_dir: Path,
+    check_dirs: list[Path],
+    target: str,
+) -> list[dict[str, Any]]:
+    return refresh_manifests_for_artifact_outputs(
+        output_paths=[output_path],
+        artifact_dir=artifact_dir,
+        check_dirs=check_dirs,
+        target=target,
+        command="artifact-health",
+    )
 
 
 def increment_count(counts: dict[str, int], key: str) -> None:
@@ -12957,6 +12974,19 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             target="http://127.0.0.1:9997",
         )
         refresh_after = build_single_artifact_health(refresh_dir)
+        review_blockers_json = refresh_dir / REVIEW_BLOCKERS_ARTIFACT
+        review_blockers_markdown = refresh_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT
+        write_json(review_blockers_json, {"generated_at": utc_now(), "status": "ready", "summary": {}})
+        review_blockers_markdown.write_text("# Review blockers\n\nready\n", encoding="utf-8")
+        review_blockers_stale_before = build_single_artifact_health(refresh_dir)
+        review_blockers_refreshed_manifests = refresh_manifests_for_artifact_outputs(
+            output_paths=[review_blockers_json, review_blockers_markdown],
+            artifact_dir=refresh_dir,
+            check_dirs=[],
+            target="http://127.0.0.1:9997",
+            command="review-blockers",
+        )
+        review_blockers_refresh_after = build_single_artifact_health(refresh_dir)
 
     def stale_reasons(item: dict[str, Any]) -> set[str]:
         return {str(entry.get("reason")) for entry in item.get("stale_inputs", []) or []}
@@ -13010,6 +13040,22 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                 "after_stale_inputs": refresh_after.get("stale_inputs"),
             },
         },
+        {
+            "id": "multi-output-refreshes-manifest",
+            "passed": (
+                review_blockers_stale_before.get("status") == "failed"
+                and review_blockers_refresh_after.get("status") == "healthy"
+                and len(review_blockers_refreshed_manifests) == 1
+                and not review_blockers_refresh_after.get("stale_inputs")
+            ),
+            "expected": "multiple generated outputs refresh one manifest",
+            "actual": {
+                "before_status": review_blockers_stale_before.get("status"),
+                "after_status": review_blockers_refresh_after.get("status"),
+                "refreshed_manifests": review_blockers_refreshed_manifests,
+                "after_stale_inputs": review_blockers_refresh_after.get("stale_inputs"),
+            },
+        },
     ]
     failed = [item for item in assertions if not item["passed"]]
     return {
@@ -13020,7 +13066,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "failed": len(failed),
             "aggregate_status": aggregate.get("status"),
             "stale_input_count": aggregate.get("summary", {}).get("stale_input_count"),
-            "manifest_refreshes": len(refreshed_manifests),
+            "manifest_refreshes": len(refreshed_manifests) + len(review_blockers_refreshed_manifests),
         },
         "cases": {
             "healthy": healthy,
@@ -13032,6 +13078,9 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "refreshed_health": refreshed_health,
             "refresh_after": refresh_after,
             "refreshed_manifests": refreshed_manifests,
+            "review_blockers_stale_before": review_blockers_stale_before,
+            "review_blockers_refresh_after": review_blockers_refresh_after,
+            "review_blockers_refreshed_manifests": review_blockers_refreshed_manifests,
         },
         "assertions": assertions,
         "safety": "Synthetic artifact-health self-test. It writes temporary local files only and sends no requests.",
@@ -17867,6 +17916,13 @@ def run_review_blockers(args: argparse.Namespace) -> int:
     )
     write_json(output_path, review_blockers)
     write_review_blockers_markdown(markdown_path, review_blockers)
+    refreshed_manifests = refresh_manifests_for_artifact_outputs(
+        output_paths=[output_path, markdown_path],
+        artifact_dir=artifact_dir,
+        check_dirs=deduped_dirs,
+        target=target,
+        command="review-blockers",
+    )
     print(f"Review blockers: {review_blockers['status']}")
     print(
         "Blockers: "
@@ -17886,6 +17942,8 @@ def run_review_blockers(args: argparse.Namespace) -> int:
         )
     print(f"Wrote {output_path}")
     print(f"Wrote {markdown_path}")
+    for item in refreshed_manifests:
+        print(f"Refreshed {item['manifest']}: {item['status']}")
     if review_blockers["status"] == "failed":
         return 1
     if args.strict and review_blockers["status"] != "ready":
