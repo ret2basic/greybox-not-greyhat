@@ -378,10 +378,12 @@ traffic clustering, write `.greybox/burp-mcp-sync.json`, and refresh the managed
 artifact manifest. The sync artifact includes `mcp_actions`, a compact audit log
 of Burp MCP tool calls with sensitive request bodies, regex values, tokens, and
 secrets hashed or redacted; MCP exception messages are summarized by type,
-length, and SHA-256 instead of stored as raw text. `burp-sync` prefers the regex
-history tools and falls back to the non-regex HTTP/WebSocket history tools when
-a Burp MCP version does not expose or cannot run the regex variant; fallback
-imports still apply the local target/profile filters before writing normalized
+length, and SHA-256 instead of stored as raw text. Top-level `burp-sync` failure
+metadata and Intercept-disable errors use the same redacted error shape.
+`burp-sync` prefers the regex history tools and falls back to the non-regex
+HTTP/WebSocket history tools when a Burp MCP version does not expose or cannot
+run the regex variant; fallback imports still apply the local target/profile
+filters before writing normalized
 observations:
 
 ```bash
@@ -610,7 +612,8 @@ SHA256/size entries still match current files and that no new top-level artifact
 is missing from the manifest, detects stale derived outputs such as
 `report.md`, `index.html`, `reproduction-steps.md`, and `review-blockers.md`,
 checks `mcp_actions` audit records for raw sensitive arguments, raw result text,
-or raw exception messages,
+or raw exception messages, checks `burp-mcp-sync.json` failure and Intercept
+error fields for redacted error summaries,
 carries forward key gate statuses such as black-box coverage, discovery
 coverage, verification queue, review blockers, response deltas,
 source-peek requests, and Burp observation coverage, and

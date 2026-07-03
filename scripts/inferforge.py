@@ -4082,7 +4082,7 @@ def mcp_audit_arguments(arguments: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def mcp_audit_error(error: Any) -> dict[str, Any]:
+def redacted_error_summary(error: Any) -> dict[str, Any]:
     message = str(error)
     encoded = message.encode("utf-8", errors="replace")
     return {
@@ -4091,6 +4091,10 @@ def mcp_audit_error(error: Any) -> dict[str, Any]:
         "message_sha256": hashlib.sha256(encoded).hexdigest(),
         "message_redacted": True,
     }
+
+
+def mcp_audit_error(error: Any) -> dict[str, Any]:
+    return redacted_error_summary(error)
 
 
 def mcp_action_audit_record(
@@ -14263,10 +14267,46 @@ def mcp_action_argument_security_issues(arguments: dict[str, Any], *, file_name:
     return issues
 
 
+def burp_sync_error_security_issues(doc: Any, *, file_name: str) -> list[dict[str, Any]]:
+    if not isinstance(doc, dict):
+        return []
+    issues: list[dict[str, Any]] = []
+    issues.extend(redacted_error_field_security_issues(doc.get("error"), file_name=file_name, path="$.error", reason_prefix="burp-sync-error"))
+    intercept = doc.get("intercept")
+    if isinstance(intercept, dict):
+        issues.extend(
+            redacted_error_field_security_issues(
+                intercept.get("error"),
+                file_name=file_name,
+                path="$.intercept.error",
+                reason_prefix="burp-sync-intercept-error",
+            )
+        )
+    return issues
+
+
+def redacted_error_field_security_issues(value: Any, *, file_name: str, path: str, reason_prefix: str) -> list[dict[str, Any]]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [{"file": file_name, "path": path, "reason": f"{reason_prefix}-raw-string"}]
+    if not isinstance(value, dict):
+        return [{"file": file_name, "path": path, "reason": f"{reason_prefix}-invalid-shape"}]
+    issues = []
+    for raw_key in ["message", "text", "body", "content", "raw", "raw_response"]:
+        if raw_key in value:
+            issues.append({"file": file_name, "path": f"{path}.{raw_key}", "reason": f"{reason_prefix}-raw-field"})
+    if value and value.get("message_redacted") is not True:
+        issues.append({"file": file_name, "path": path, "reason": f"{reason_prefix}-not-redacted"})
+    return issues
+
+
 def mcp_action_audit_security_issues(parsed_json_by_name: dict[str, Any]) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     for file_name, doc in sorted(parsed_json_by_name.items()):
         issues.extend(mcp_action_security_issues_in_value(doc, file_name=file_name))
+        if file_name == "burp-mcp-sync.json":
+            issues.extend(burp_sync_error_security_issues(doc, file_name=file_name))
     return issues
 
 
@@ -14746,6 +14786,8 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             mcp_audit_leak_dir / "burp-mcp-sync.json",
             {
                 "status": "failed",
+                "error": "top-level raw error should-not-appear",
+                "intercept": {"error": "intercept raw error should-not-appear"},
                 "mcp_actions": [
                     {
                         "tool": "get_proxy_http_history_regex",
@@ -14933,12 +14975,14 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "id": "artifact-health-detects-mcp-action-audit-leaks",
             "passed": (
                 mcp_audit_leak.get("status") == "failed"
-                and mcp_audit_leak_rollup.get("summary", {}).get("security_issue_count", 0) >= 4
+                and mcp_audit_leak_rollup.get("summary", {}).get("security_issue_count", 0) >= 6
                 and {
                     "mcp-action-sensitive-argument-not-hashed",
                     "mcp-action-secret-argument-not-redacted",
                     "mcp-action-result-raw-field",
                     "mcp-action-error-raw-string",
+                    "burp-sync-error-raw-string",
+                    "burp-sync-intercept-error-raw-string",
                 }.issubset({str(issue.get("reason")) for issue in mcp_audit_leak.get("security_issues", []) or []})
                 and "should-not-appear" not in mcp_audit_leak_text
                 and "Authorization: Bearer" not in mcp_audit_leak_text
@@ -20978,14 +21022,15 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                 },
                 "mcp_actions": [],
                 "observe_before_sync": bool(args.observe),
-                "error": str(error),
+                "error": redacted_error_summary(error),
+                "error_context": "profile-validation",
                 "safety": [
                     "No Burp MCP history was read because the active Burp observation plan is not a reviewed concrete local path set.",
                     "Does not run Burp Scanner, sign wallets, submit Solana transactions, or fuzz broadly.",
                 ],
             },
         )
-        print(f"Burp MCP sync blocked by profile validation: {error}")
+        print(f"Burp MCP sync blocked by profile validation: {type(error).__name__}")
         print(f"Wrote {sync_path}")
         print_refreshed_manifests(
             refresh_current_artifact_manifest(
@@ -21071,7 +21116,7 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                         error=error,
                     )
                     sync_artifact["intercept"]["ok"] = False
-                    sync_artifact["intercept"]["error"] = str(error)
+                    sync_artifact["intercept"]["error"] = redacted_error_summary(error)
                     raise
 
             http_read = call_mcp_tool_with_audit_or_fallback(
@@ -21121,10 +21166,11 @@ def run_burp_sync(args: argparse.Namespace) -> int:
 
     except Exception as error:
         sync_artifact["status"] = "failed"
-        sync_artifact["error"] = str(error)
+        sync_artifact["error"] = redacted_error_summary(error)
+        sync_artifact["error_context"] = "mcp-history-read"
         sync_path = artifact_dir / "burp-mcp-sync.json"
         write_json(sync_path, sync_artifact)
-        print(f"Burp MCP sync failed: {error}")
+        print(f"Burp MCP sync failed: {type(error).__name__}")
         print_refreshed_manifests(
             refresh_current_artifact_manifest(
                 artifact_dir=artifact_dir,
@@ -21153,11 +21199,12 @@ def run_burp_sync(args: argparse.Namespace) -> int:
         )
     except Exception as error:
         sync_artifact["status"] = "failed-import"
-        sync_artifact["error"] = str(error)
+        sync_artifact["error"] = redacted_error_summary(error)
+        sync_artifact["error_context"] = "history-import"
         sync_artifact["http_history"]["bytes"] = len(raw_text.encode("utf-8"))
         sync_path = artifact_dir / "burp-mcp-sync.json"
         write_json(sync_path, sync_artifact)
-        print(f"Burp MCP history import failed: {error}")
+        print(f"Burp MCP history import failed: {type(error).__name__}")
         print_refreshed_manifests(
             refresh_current_artifact_manifest(
                 artifact_dir=artifact_dir,
