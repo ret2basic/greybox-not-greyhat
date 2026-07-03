@@ -7774,6 +7774,23 @@ def format_attack_strategy_waiting_action(action: dict[str, Any]) -> str:
     return f"{action_id}: {status} - {title}"
 
 
+def format_attack_strategy_waiting_action_overflow(
+    total_count: int,
+    shown_count: int,
+    *,
+    no_write: bool,
+    output_path: Path,
+) -> str | None:
+    remaining = max(0, total_count - shown_count)
+    if remaining <= 0:
+        return None
+    noun = "waiting action" if remaining == 1 else "waiting actions"
+    output_label = repo_relative_or_absolute(output_path)
+    if no_write:
+        return f"Waiting action: {remaining} more {noun}; rerun without --no-write to write {output_label}"
+    return f"Waiting action: {remaining} more in {output_label}"
+
+
 def discovered_server_actions_from_source_peeks(source_peeks: dict[str, Any] | None) -> list[dict[str, Any]]:
     endpoint_resolver = (source_peeks or {}).get("endpoint_resolver") or {}
     actions = endpoint_resolver.get("discovered_server_actions") or []
@@ -15086,6 +15103,18 @@ def build_no_write_selftest() -> dict[str, Any]:
     verification_queue_stdout_text = "\n".join(verification_queue_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
     invalid_promote_stdout_text = "\n".join(invalid_promote_stdout)
+    attack_strategy_overflow_no_write = format_attack_strategy_waiting_action_overflow(
+        5,
+        3,
+        no_write=True,
+        output_path=attack_strategy_output_dir / "attack-strategy.json",
+    ) or ""
+    attack_strategy_overflow_write = format_attack_strategy_waiting_action_overflow(
+        5,
+        3,
+        no_write=False,
+        output_path=attack_strategy_output_dir / "attack-strategy.json",
+    ) or ""
     assertions = [
         {
             "id": "review-candidates-no-write-skips-artifacts",
@@ -15276,6 +15305,21 @@ def build_no_write_selftest() -> dict[str, Any]:
                 "return_code": attack_strategy_return_code,
                 "stdout": attack_strategy_stdout,
                 "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "attack-strategy-no-write-overflow-rerun-guidance",
+            "passed": (
+                "2 more waiting actions" in attack_strategy_overflow_no_write
+                and "rerun without --no-write" in attack_strategy_overflow_no_write
+                and "more in attack-strategy.json" not in attack_strategy_overflow_no_write
+                and "2 more in" in attack_strategy_overflow_write
+                and "rerun without --no-write" not in attack_strategy_overflow_write
+            ),
+            "expected": "attack-strategy --no-write overflow points to rerun instead of an unwritten artifact",
+            "actual": {
+                "no_write": attack_strategy_overflow_no_write,
+                "write": attack_strategy_overflow_write,
             },
         },
         {
@@ -20346,10 +20390,17 @@ def run_attack_strategy(args: argparse.Namespace) -> int:
     if uncovered:
         print(f"Uncovered clusters: {', '.join(str(item) for item in uncovered)}")
     waiting_actions = waiting_attack_strategy_actions(attack_strategy)
-    for action in waiting_actions[:3]:
+    waiting_action_preview_limit = 3
+    for action in waiting_actions[:waiting_action_preview_limit]:
         print(f"Waiting action: {format_attack_strategy_waiting_action(action)}")
-    if len(waiting_actions) > 3:
-        print(f"Waiting action: {len(waiting_actions) - 3} more in attack-strategy.json")
+    overflow_line = format_attack_strategy_waiting_action_overflow(
+        len(waiting_actions),
+        waiting_action_preview_limit,
+        no_write=no_write,
+        output_path=output_path,
+    )
+    if overflow_line:
+        print(overflow_line)
     if no_write:
         print("No files written (--no-write).")
     else:
