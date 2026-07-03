@@ -11709,6 +11709,19 @@ def review_blocker_group_command_safety(group: dict[str, Any]) -> dict[str, Any]
     return command_safety_summary(review_blocker_group_command_refs(group))
 
 
+def format_command_ref_label(ref: dict[str, Any]) -> str:
+    parts = [f"[{ref.get('classification') or 'unknown'}]"]
+    placeholders = ref.get("placeholders", []) or []
+    if placeholders:
+        parts.append("placeholders=" + ",".join(str(item) for item in placeholders))
+    issues = ref.get("issues", []) or []
+    if issues:
+        parts.append("issues=" + ",".join(str(item) for item in issues))
+    if ref.get("blocked_external"):
+        parts.append("external-blocker")
+    return " ".join(parts)
+
+
 def review_blocker_group_command_refs(group: dict[str, Any]) -> list[dict[str, Any]]:
     commands = review_blocker_group_command_templates(group)
     item_status = review_blocker_command_status(str(group.get("status") or ""))
@@ -11981,7 +11994,11 @@ def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str
                 ],
             ]
         )
-        group["command_safety"] = {"summary": review_blocker_group_command_safety(group)}
+        command_refs = review_blocker_group_command_refs(group)
+        group["command_safety"] = {
+            "summary": command_safety_summary(command_refs),
+            "commands": command_refs,
+        }
         group["blocker_ids"] = sorted_unique_strings(group["blocker_ids"])
         groups.append(group)
 
@@ -12698,6 +12715,7 @@ def build_review_blockers_selftest() -> dict[str, Any]:
     )
     rollup_route_group_summary = format_review_blocker_group_summary(rollup_route_group)
     rollup_route_group_command_safety = (rollup_route_group.get("command_safety", {}) or {}).get("summary", {}) or {}
+    rollup_route_group_command_refs = (rollup_route_group.get("command_safety", {}) or {}).get("commands", []) or []
     rollup_route_group_command_counts = rollup_route_group_command_safety.get("classification_counts", {}) or {}
     rollup_top_group_summaries = top_review_blocker_group_summaries(rollup, limit=2)
     assertions = [
@@ -12775,12 +12793,15 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             "id": "rollup-route-group-command-safety-rendered",
             "passed": (
                 rollup_route_group_command_safety.get("commands") == 2
+                and len(rollup_route_group_command_refs) == 2
                 and rollup_route_group_command_counts.get("manual-template") == 1
                 and rollup_route_group_command_counts.get("review-gated") == 1
                 and rollup_route_group_command_safety.get("unsafe_template_count") == 0
+                and rollup_route_group_command_refs[0].get("classification") == "manual-template"
+                and rollup_route_group_command_refs[1].get("classification") == "review-gated"
             ),
             "expected": "route group command safety summarizes manual-template and review-gated commands",
-            "actual": rollup_route_group_command_safety,
+            "actual": rollup_route_group.get("command_safety"),
         },
         {
             "id": "markdown-group-command-templates-rendered",
@@ -12788,6 +12809,8 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "Candidate details:" in markdown
                 and "Command safety:" in markdown
                 and "Command templates:" in markdown
+                and "# [manual-template]" in markdown
+                and "# [review-gated]" in markdown
                 and "promote-observation-candidate" in markdown
                 and "REPLACE_WITH_APPROVED_CONCRETE_LOCAL_PATH" in markdown
             ),
@@ -12796,6 +12819,8 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "candidate_details": "Candidate details:" in markdown,
                 "command_safety": "Command safety:" in markdown,
                 "command_templates": "Command templates:" in markdown,
+                "manual_template_label": "# [manual-template]" in markdown,
+                "review_gated_label": "# [review-gated]" in markdown,
                 "promote": "promote-observation-candidate" in markdown,
                 "placeholder": "REPLACE_WITH_APPROVED_CONCRETE_LOCAL_PATH" in markdown,
             },
@@ -12964,9 +12989,17 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
             command_safety = (item.get("command_safety", {}) or {}).get("summary", {}) or {}
             if command_safety:
                 lines.append(f"  - Command safety: `{format_command_safety_summary(command_safety)}`")
+            command_refs_by_command = {
+                str(ref.get("command") or ""): ref
+                for ref in (item.get("command_safety", {}) or {}).get("commands", []) or []
+            }
             lines.append("  - Command templates:")
             lines.append("    ```bash")
-            lines.extend(f"    {command}" for command in commands[:6])
+            for command in commands[:6]:
+                ref = command_refs_by_command.get(str(command))
+                if ref:
+                    lines.append(f"    # {format_command_ref_label(ref)}")
+                lines.append(f"    {command}")
             if len(commands) > 6:
                 lines.append(f"    # ... +{len(commands) - 6} more commands")
             lines.append("    ```")
@@ -20636,9 +20669,9 @@ def run_review_blockers(args: argparse.Namespace) -> int:
                         print(f"  command_safety={format_command_safety_summary(command_safety)}")
                     print("  command_templates:")
                     for ref in command_refs[:4]:
-                        classification = ref.get("classification") or "unknown"
+                        label = format_command_ref_label(ref)
                         command = inline_summary_text(ref.get("command"), max_chars=500)
-                        print(f"    - [{classification}] {command}")
+                        print(f"    - {label} {command}")
                     if len(command_refs) > 4:
                         print(f"    - ... +{len(command_refs) - 4} more commands")
         if len(groups) > 8:

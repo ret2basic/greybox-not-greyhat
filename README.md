@@ -534,7 +534,9 @@ including count, cluster, candidate ids, and next action. In `--no-write` mode,
 top groups with queued commands also print compact command safety totals and
 per-command classification labels such as `manual-template` and `review-gated`
 so the approval step can be previewed without writing artifacts. When
-`--check-dir` is repeated, it builds a root-level rollup across multiple
+artifacts are written, the JSON stores the same per-command classification refs
+and the Markdown playbook renders them as shell comments before each command.
+When `--check-dir` is repeated, it builds a root-level rollup across multiple
 artifact directories:
 
 ```bash
