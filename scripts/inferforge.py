@@ -3460,6 +3460,15 @@ def redact_text(value: str | None, *, max_chars: int = 500) -> str | None:
     return redacted
 
 
+def contains_unredacted_secret_text(value: str) -> bool:
+    for match in SECRET_TEXT_RE.finditer(value):
+        prefix = match.group(1) or match.group(2) or ""
+        secret = match.group(0)[len(prefix) :].strip()
+        if secret and secret.lower() not in {"[redacted]", "redacted"}:
+            return True
+    return False
+
+
 def redact_headers(headers: dict[str, str]) -> dict[str, str]:
     redacted = {}
     for key, value in headers.items():
@@ -6075,8 +6084,21 @@ def run_http_probes(
     return results
 
 
+def redact_probe_body_samples_for_artifact(value: Any) -> None:
+    if isinstance(value, dict):
+        for key, child in list(value.items()):
+            if key == "body_sample" and isinstance(child, str):
+                value[key] = redact_text(child, max_chars=MAX_BODY_SAMPLE_CHARS)
+            else:
+                redact_probe_body_samples_for_artifact(child)
+    elif isinstance(value, list):
+        for child in value:
+            redact_probe_body_samples_for_artifact(child)
+
+
 def sanitize_probe_result_for_artifact(row: dict[str, Any]) -> dict[str, Any]:
     sanitized = json_clone(row)
+    redact_probe_body_samples_for_artifact(sanitized)
     if "body_text" in sanitized:
         sanitized.pop("body_text", None)
         sanitized["body_text_redacted"] = True
@@ -14519,6 +14541,15 @@ def probe_result_body_text_security_issues_in_value(value: Any, *, file_name: st
                     "reason": "probe-result-body-text-raw-field",
                 }
             )
+        body_sample = value.get("body_sample")
+        if isinstance(body_sample, str) and contains_unredacted_secret_text(body_sample):
+            issues.append(
+                {
+                    "file": file_name,
+                    "path": f"{path}.body_sample",
+                    "reason": "probe-result-body-sample-sensitive-value",
+                }
+            )
         for key, child in value.items():
             issues.extend(
                 probe_result_body_text_security_issues_in_value(
@@ -15142,7 +15173,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                     "probe_id": "raw-body-text",
                     "status": 200,
                     "body_text": "Authorization: Bearer should-not-appear",
-                    "body_sample": "redacted-ish",
+                    "body_sample": "Authorization: Bearer should-not-appear",
                 }
             )
             + "\n",
@@ -15157,6 +15188,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                     {
                         "probe_id": "raw-warmup-body-text",
                         "body_text": "warmup raw body should-not-appear",
+                        "body_sample": "token=should-not-appear",
                     }
                 ],
             },
@@ -15189,6 +15221,19 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         probe_body_text_leak_text = json.dumps(probe_body_text_leak, sort_keys=True)
         target_lock_error_leak = build_single_artifact_health(target_lock_error_leak_dir)
         target_lock_error_leak_text = json.dumps(target_lock_error_leak, sort_keys=True)
+        sanitized_probe_artifact_sample = sanitize_probe_result_for_artifact(
+            {
+                "probe_id": "sanitize-sample",
+                "body_text": "full body should-not-appear",
+                "body_sample": "Authorization: Bearer should-not-appear",
+                "attempts": [
+                    {
+                        "body_sample": "token=should-not-appear",
+                    }
+                ],
+            }
+        )
+        sanitized_probe_artifact_sample_text = json.dumps(sanitized_probe_artifact_sample, sort_keys=True)
         aggregate = build_artifact_health([healthy_dir, modified_dir, missing_dir, untracked_dir])
         refresh_health = build_artifact_health([refresh_dir])
         refresh_output = refresh_dir / "artifact-health.json"
@@ -15400,16 +15445,29 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                 probe_body_text_leak.get("status") == "failed"
                 and {
                     "probe-result-body-text-raw-field",
+                    "probe-result-body-sample-sensitive-value",
                 }.issubset({str(issue.get("reason")) for issue in probe_body_text_leak.get("security_issues", []) or []})
                 and "should-not-appear" not in probe_body_text_leak_text
                 and "Authorization: Bearer" not in probe_body_text_leak_text
                 and "warmup raw body" not in probe_body_text_leak_text
             ),
-            "expected": "artifact-health fails when probe-results or warmup-results contain raw body_text without echoing leaked values",
+            "expected": "artifact-health fails when probe-results or warmup-results contain raw body_text or unredacted body_sample values without echoing leaked values",
             "actual": {
                 "status": probe_body_text_leak.get("status"),
                 "security_issues": probe_body_text_leak.get("security_issues"),
             },
+        },
+        {
+            "id": "probe-artifact-sanitizer-redacts-body-samples",
+            "passed": (
+                "body_text" not in sanitized_probe_artifact_sample
+                and sanitized_probe_artifact_sample.get("body_text_redacted") is True
+                and "should-not-appear" not in sanitized_probe_artifact_sample_text
+                and "Authorization: Bearer [redacted]" in sanitized_probe_artifact_sample_text
+                and "token=[redacted]" in sanitized_probe_artifact_sample_text
+            ),
+            "expected": "probe artifact sanitizer removes full body_text and redacts sensitive body_sample values recursively",
+            "actual": sanitized_probe_artifact_sample,
         },
         {
             "id": "artifact-health-detects-target-lock-error-leaks",
