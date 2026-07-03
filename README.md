@@ -476,7 +476,9 @@ as `ready`, `manual-template` when they still contain `REPLACE_WITH_*`,
 `review-gated` when they depend on an approved/manual-review step, or
 `unsafe-template` when shell-sensitive placeholder syntax such as `<...>` or
 control operators are present. `verification-queue` returns a non-zero status if
-unsafe command templates are generated.
+unsafe command templates are generated. Human-review and external-configuration
+states are encoded in the JSON artifacts; use `review-blockers --strict` when
+those states should fail a CI job.
 
 `review-blockers` writes `.greybox/review-blockers.json` plus
 `.greybox/review-blockers.md`, a read-only summary of the human-review,

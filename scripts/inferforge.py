@@ -10489,6 +10489,12 @@ def command_safety_summary(command_refs: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
+def verification_queue_exit_code(verification_queue: dict[str, Any]) -> int:
+    if verification_queue.get("status") == "invalid-command-templates":
+        return 2
+    return 0
+
+
 def build_command_safety_selftest() -> dict[str, Any]:
     cases = [
         {
@@ -10648,6 +10654,28 @@ def build_command_safety_selftest() -> dict[str, Any]:
     ]
     queue_summary = annotate_verification_queue_commands(queue_items)
     queue_counts = queue_summary.get("classification_counts", {})
+    exit_code_cases = [
+        {
+            "id": "exit-code-ready",
+            "status": "ready",
+            "expected": 0,
+        },
+        {
+            "id": "exit-code-needs-human-review",
+            "status": "needs-human-review",
+            "expected": 0,
+        },
+        {
+            "id": "exit-code-ready-with-external-blockers",
+            "status": "ready-with-external-blockers",
+            "expected": 0,
+        },
+        {
+            "id": "exit-code-invalid-command-templates",
+            "status": "invalid-command-templates",
+            "expected": 2,
+        },
+    ]
     queue_assertions = [
         {
             "id": "queue-ready-count",
@@ -10686,6 +10714,16 @@ def build_command_safety_selftest() -> dict[str, Any]:
             "actual": queue_summary.get("requires_manual_input"),
         },
     ]
+    for case in exit_code_cases:
+        actual = verification_queue_exit_code({"status": case["status"]})
+        queue_assertions.append(
+            {
+                "id": case["id"],
+                "passed": actual == case["expected"],
+                "expected": case["expected"],
+                "actual": actual,
+            }
+        )
     assertions.extend(queue_assertions)
     failed = [item for item in assertions if not item["passed"]]
     return {
@@ -10700,11 +10738,13 @@ def build_command_safety_selftest() -> dict[str, Any]:
             "issue_counts": summary.get("issue_counts", {}),
             "queue_classification_counts": queue_counts,
             "queue_unsafe_template_count": queue_summary.get("unsafe_template_count"),
+            "exit_code_cases": len(exit_code_cases),
         },
         "cases": results,
         "queue": {
             "summary": queue_summary,
             "items": queue_items,
+            "exit_code_cases": exit_code_cases,
         },
         "assertions": assertions,
         "safety": "Synthetic command-safety self-test. It classifies inert strings only and executes no generated commands.",
@@ -17480,9 +17520,7 @@ def run_verification_queue(args: argparse.Namespace) -> int:
     print(f"Wrote {artifact_dir / 'reproduction-steps.md'}")
     print(f"Wrote {artifact_dir / REVIEW_BLOCKERS_ARTIFACT}")
     print(f"Wrote {artifact_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT}")
-    if verification_queue["status"] == "invalid-command-templates":
-        return 2
-    return 0 if verification_queue["status"] != "needs-human-review" else 1
+    return verification_queue_exit_code(verification_queue)
 
 
 def run_review_blockers(args: argparse.Namespace) -> int:
