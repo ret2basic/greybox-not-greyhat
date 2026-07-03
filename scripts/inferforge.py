@@ -4025,6 +4025,12 @@ class McpSseClient:
         result = self.request("tools/call", {"name": name, "arguments": arguments or {}})
         return result if isinstance(result, dict) else {"raw": result}
 
+    def list_tools(self) -> list[dict[str, Any]]:
+        result = self.request("tools/list")
+        if isinstance(result, dict) and isinstance(result.get("tools"), list):
+            return [item for item in result["tools"] if isinstance(item, dict)]
+        return []
+
 
 def mcp_tool_text(result: dict[str, Any]) -> str:
     content = result.get("content", [])
@@ -4119,6 +4125,119 @@ def append_mcp_action_audit(
             error=error,
         )
     )
+
+
+BURP_MCP_REQUIRED_CAPABILITY_TOOLS = {
+    "proxy-http-history": ["get_proxy_http_history_regex", "get_proxy_http_history"],
+    "proxy-websocket-history": ["get_proxy_websocket_history_regex", "get_proxy_websocket_history"],
+    "proxy-intercept-state": ["set_proxy_intercept_state"],
+    "http-request-send": ["send_http1_request", "send_http2_request"],
+    "repeater-tab": ["create_repeater_tab", "create_repeater_tab_http2"],
+}
+
+
+BURP_MCP_DISABLED_CAPABILITY_MARKERS = {
+    "burp-scanner": ["scan", "scanner"],
+    "intruder": ["intruder"],
+    "burp-state-editing": [
+        "set_project_options",
+        "set_user_options",
+        "set_task_execution_engine_state",
+        "set_active_editor_contents",
+    ],
+}
+
+
+def summarize_burp_mcp_tool_inventory(tool_names: list[str]) -> dict[str, Any]:
+    names = sorted_unique_strings(tool_names)
+    name_set = set(names)
+    required: dict[str, dict[str, Any]] = {}
+    available_required = 0
+    for capability, required_tools in BURP_MCP_REQUIRED_CAPABILITY_TOOLS.items():
+        available_tools = [name for name in required_tools if name in name_set]
+        if available_tools:
+            available_required += 1
+        required[capability] = {
+            "status": "available" if available_tools else "missing",
+            "tools": required_tools,
+            "available_tools": available_tools,
+        }
+
+    disabled: dict[str, dict[str, Any]] = {}
+    lowered_names = {name: name.lower() for name in names}
+    for capability, markers in BURP_MCP_DISABLED_CAPABILITY_MARKERS.items():
+        matched_tools = [
+            name
+            for name, lowered in lowered_names.items()
+            if any(marker in lowered for marker in markers)
+        ]
+        disabled[capability] = {
+            "status": "available-but-disabled" if matched_tools else "not-present",
+            "tools": sorted(matched_tools),
+            "reason": "Not used by InferForge automation; high-volume or scanner-style tooling stays outside the safe loop.",
+        }
+
+    return {
+        "tool_count": len(names),
+        "tools": names,
+        "required_capabilities": required,
+        "required_summary": {
+            "available": available_required,
+            "missing": len(required) - available_required,
+            "total": len(required),
+        },
+        "disabled_capabilities": disabled,
+    }
+
+
+def build_burp_mcp_tool_inventory(mcp_url: str, *, timeout: int = 5) -> dict[str, Any]:
+    inventory: dict[str, Any] = {
+        "status": "not-checked",
+        "mcp_endpoint": mcp_url,
+        "tool_count": 0,
+        "tools": [],
+        "required_capabilities": {},
+        "required_summary": {
+            "available": 0,
+            "missing": len(BURP_MCP_REQUIRED_CAPABILITY_TOOLS),
+            "total": len(BURP_MCP_REQUIRED_CAPABILITY_TOOLS),
+        },
+        "disabled_capabilities": {},
+        "mcp_actions": [],
+        "safety": "Read-only MCP tools/list inventory. It does not call Burp Scanner, send HTTP requests, fuzz, sign wallets, or submit transactions.",
+    }
+    try:
+        with McpSseClient(mcp_url, timeout=timeout) as client:
+            tools = client.list_tools()
+    except Exception as error:
+        inventory["status"] = "unavailable"
+        inventory["error"] = str(error)[:500]
+        inventory["mcp_actions"].append(
+            mcp_action_audit_record(
+                tool="tools/list",
+                arguments={},
+                status="failed",
+                error=error,
+            )
+        )
+        return inventory
+
+    names = [
+        str(tool.get("name"))
+        for tool in tools
+        if tool.get("name") is not None
+    ]
+    inventory.update(summarize_burp_mcp_tool_inventory(names))
+    inventory["status"] = "listed"
+    inventory["mcp_actions"].append(
+        mcp_action_audit_record(
+            tool="tools/list",
+            arguments={},
+            status="succeeded",
+            result_text=json.dumps({"tools": inventory["tools"]}, sort_keys=True),
+        )
+    )
+    return inventory
 
 
 def http_request(
@@ -15381,6 +15500,18 @@ def build_no_write_selftest() -> dict[str, Any]:
         result_text="history item",
     )
     mcp_audit_record_text = json.dumps(mcp_audit_record, sort_keys=True)
+    mcp_tool_inventory = summarize_burp_mcp_tool_inventory(
+        [
+            "get_proxy_http_history_regex",
+            "get_proxy_websocket_history_regex",
+            "set_proxy_intercept_state",
+            "send_http1_request",
+            "create_repeater_tab",
+            "send_to_intruder",
+            "set_project_options",
+            "start_scan",
+        ]
+    )
     assertions = [
         {
             "id": "review-candidates-no-write-skips-artifacts",
@@ -15674,6 +15805,22 @@ def build_no_write_selftest() -> dict[str, Any]:
             ),
             "expected": "MCP action audit records keep tool/count/status while hashing or redacting sensitive arguments and response text",
             "actual": mcp_audit_record,
+        },
+        {
+            "id": "burp-mcp-tool-inventory-classifies-required-and-disabled-capabilities",
+            "passed": (
+                mcp_tool_inventory.get("required_summary", {}).get("missing") == 0
+                and mcp_tool_inventory.get("required_capabilities", {}).get("proxy-http-history", {}).get("status") == "available"
+                and mcp_tool_inventory.get("required_capabilities", {}).get("proxy-websocket-history", {}).get("status") == "available"
+                and mcp_tool_inventory.get("required_capabilities", {}).get("proxy-intercept-state", {}).get("status") == "available"
+                and mcp_tool_inventory.get("required_capabilities", {}).get("http-request-send", {}).get("status") == "available"
+                and mcp_tool_inventory.get("required_capabilities", {}).get("repeater-tab", {}).get("status") == "available"
+                and mcp_tool_inventory.get("disabled_capabilities", {}).get("burp-scanner", {}).get("status") == "available-but-disabled"
+                and mcp_tool_inventory.get("disabled_capabilities", {}).get("intruder", {}).get("status") == "available-but-disabled"
+                and mcp_tool_inventory.get("disabled_capabilities", {}).get("burp-state-editing", {}).get("status") == "available-but-disabled"
+            ),
+            "expected": "MCP tool inventory marks safe-loop dependencies available and scanner/intruder/state-editing tools disabled when present",
+            "actual": mcp_tool_inventory,
         },
     ]
     failed = [item for item in assertions if not item["passed"]]
@@ -16903,6 +17050,23 @@ def build_capabilities(target: str, artifact_dir: Path, profile: dict[str, Any] 
     codex = command_result(["codex", "mcp", "get", "burp"], timeout=10)
     script = ROOT / "scripts/check-burp-mcp.sh"
     script_check = command_result([str(script)], timeout=30) if script.exists() else {"ok": False, "output": "missing"}
+    mcp_endpoint = "http://127.0.0.1:9876"
+    mcp_port_open = socket_open("127.0.0.1", 9876)
+    mcp_tool_inventory = build_burp_mcp_tool_inventory(mcp_endpoint) if mcp_port_open else {
+        "status": "skipped-mcp-port-closed",
+        "mcp_endpoint": mcp_endpoint,
+        "tool_count": 0,
+        "tools": [],
+        "required_capabilities": {},
+        "required_summary": {
+            "available": 0,
+            "missing": len(BURP_MCP_REQUIRED_CAPABILITY_TOOLS),
+            "total": len(BURP_MCP_REQUIRED_CAPABILITY_TOOLS),
+        },
+        "disabled_capabilities": {},
+        "mcp_actions": [],
+        "safety": "Skipped tools/list because the Burp MCP port was closed.",
+    }
     health_path = probe_target_path(profile, "health", "path", "/health")
     health = http_request(target, "GET", health_path)
     health_json = parse_json_object(health.get("body_text") or "")
@@ -16924,12 +17088,13 @@ def build_capabilities(target: str, artifact_dir: Path, profile: dict[str, Any] 
             "m0_key_present": (health_json or {}).get("m0KeyPresent"),
         },
         "burp": {
-            "mcp_endpoint": "http://127.0.0.1:9876",
-            "mcp_port_open": socket_open("127.0.0.1", 9876),
+            "mcp_endpoint": mcp_endpoint,
+            "mcp_port_open": mcp_port_open,
             "proxy_8080_open": socket_open("127.0.0.1", 8080),
             "proxy_8081_open": socket_open("127.0.0.1", 8081),
             "codex_mcp_get_burp_ok": codex["ok"],
             "check_script_ok": script_check["ok"],
+            "mcp_tool_inventory": mcp_tool_inventory,
             "approval_sensitive_tools": {
                 "observed_get_proxy_http_history": history_status,
                 "observed_send_http1_request": "ok_after_127.0.0.1_3100_request_approval",
@@ -22338,7 +22503,16 @@ def run_capabilities(args: argparse.Namespace) -> int:
     mcp_ok = burp_info.get("mcp_port_open") is True
     proxy_ok = burp_info.get("proxy_8080_open") is True
     script_ok = burp_info.get("check_script_ok") is True
-    capability_status = "ready" if target_ok and mcp_ok and proxy_ok and script_ok else "limited"
+    tool_inventory = burp_info.get("mcp_tool_inventory", {}) or {}
+    required_summary = tool_inventory.get("required_summary", {}) or {}
+    inventory_ok = (
+        not tool_inventory
+        or (
+            tool_inventory.get("status") == "listed"
+            and int(required_summary.get("missing", 0) or 0) == 0
+        )
+    )
+    capability_status = "ready" if target_ok and mcp_ok and proxy_ok and script_ok and inventory_ok else "limited"
     print(f"Capabilities: {capability_status}")
     print(
         "Target: "
@@ -22361,6 +22535,21 @@ def run_capabilities(args: argparse.Namespace) -> int:
             f"http_request={approval_tools.get('observed_send_http1_request') or 'unknown'} "
             f"repeater={approval_tools.get('observed_create_repeater_tab') or 'unknown'} "
             f"intercept={approval_tools.get('observed_set_proxy_intercept_state') or 'unknown'}"
+        )
+    if tool_inventory:
+        disabled = tool_inventory.get("disabled_capabilities", {}) or {}
+        scanner_status = (disabled.get("burp-scanner", {}) or {}).get("status", "unknown")
+        intruder_status = (disabled.get("intruder", {}) or {}).get("status", "unknown")
+        state_editing_status = (disabled.get("burp-state-editing", {}) or {}).get("status", "unknown")
+        print(
+            "Burp MCP tool inventory: "
+            f"status={tool_inventory.get('status')} "
+            f"tools={tool_inventory.get('tool_count', 0)} "
+            f"required={required_summary.get('available', 0)}/{required_summary.get('total', 0)} "
+            f"missing={required_summary.get('missing', 0)} "
+            f"scanner={scanner_status} "
+            f"intruder={intruder_status} "
+            f"state_editing={state_editing_status}"
         )
     if no_write:
         print("No files written (--no-write).")
