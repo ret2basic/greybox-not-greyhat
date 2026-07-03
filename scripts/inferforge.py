@@ -7791,6 +7791,23 @@ def format_attack_strategy_waiting_action_overflow(
     return f"Waiting action: {remaining} more in {output_label}"
 
 
+def format_readiness_next_step_overflow(
+    total_count: int,
+    shown_count: int,
+    *,
+    no_write: bool,
+    output_path: Path,
+) -> str | None:
+    remaining = max(0, total_count - shown_count)
+    if remaining <= 0:
+        return None
+    noun = "step" if remaining == 1 else "steps"
+    output_label = repo_relative_or_absolute(output_path)
+    if no_write:
+        return f"- {remaining} more {noun}; rerun without --no-write to write {output_label}"
+    return f"- {remaining} more {noun} in {output_label}"
+
+
 def discovered_server_actions_from_source_peeks(source_peeks: dict[str, Any] | None) -> list[dict[str, Any]]:
     endpoint_resolver = (source_peeks or {}).get("endpoint_resolver") or {}
     actions = endpoint_resolver.get("discovered_server_actions") or []
@@ -15167,6 +15184,18 @@ def build_no_write_selftest() -> dict[str, Any]:
         no_write=False,
         output_path=attack_strategy_output_dir / "attack-strategy.json",
     ) or ""
+    readiness_overflow_no_write = format_readiness_next_step_overflow(
+        5,
+        3,
+        no_write=True,
+        output_path=readiness_output_dir / "environment-readiness.json",
+    ) or ""
+    readiness_overflow_write = format_readiness_next_step_overflow(
+        5,
+        3,
+        no_write=False,
+        output_path=readiness_output_dir / "environment-readiness.json",
+    ) or ""
     manual_followup_preview_lines = verification_queue_followup_preview_lines(
         {
             "id": "MANUAL-commandless",
@@ -15447,6 +15476,21 @@ def build_no_write_selftest() -> dict[str, Any]:
                 "return_code": readiness_return_code,
                 "stdout": readiness_stdout,
                 "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "readiness-no-write-overflow-rerun-guidance",
+            "passed": (
+                "2 more steps" in readiness_overflow_no_write
+                and "rerun without --no-write" in readiness_overflow_no_write
+                and "more steps in" not in readiness_overflow_no_write
+                and "2 more steps in" in readiness_overflow_write
+                and "rerun without --no-write" not in readiness_overflow_write
+            ),
+            "expected": "readiness --no-write overflow points to rerun instead of an unwritten artifact",
+            "actual": {
+                "no_write": readiness_overflow_no_write,
+                "write": readiness_overflow_write,
             },
         },
     ]
@@ -22125,11 +22169,18 @@ def run_readiness(args: argparse.Namespace) -> int:
     )
     next_steps = readiness.get("next_steps", []) or []
     if next_steps:
+        next_step_preview_limit = 3
         print("Next steps:")
-        for step in next_steps[:3]:
+        for step in next_steps[:next_step_preview_limit]:
             print(f"- {step}")
-        if len(next_steps) > 3:
-            print(f"- {len(next_steps) - 3} more step(s) in {readiness_path}")
+        overflow_line = format_readiness_next_step_overflow(
+            len(next_steps),
+            next_step_preview_limit,
+            no_write=no_write,
+            output_path=readiness_path,
+        )
+        if overflow_line:
+            print(overflow_line)
     else:
         print("Next steps: none")
     if no_write:
