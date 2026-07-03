@@ -463,8 +463,8 @@ cluster, next-development-action status counts, and a top-level status such as
 `ready-for-regression`, `needs-external-evidence`, or `needs-strategy-review`.
 It is generated from local run context only; it does not execute probes. Use
 `attack-strategy --no-write` to preview the same coverage, uncovered clusters,
-and waiting actions without writing `attack-strategy.json`, target-profile
-artifacts, or refreshed manifests.
+and cluster-relevant waiting actions without writing `attack-strategy.json`,
+target-profile artifacts, or refreshed manifests.
 
 `source-peek-results.json` also includes an `endpoint_resolver` section. The
 resolver statically maps observed HTTP endpoints back to matching Next.js App

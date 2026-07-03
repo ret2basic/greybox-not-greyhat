@@ -7655,6 +7655,12 @@ def build_attack_strategy(
         for action in next_actions
         if labels_apply_to_current_clusters(action.get("applies_to", ["all"]))
     ]
+    relevant_next_action_ids = {str(action.get("id") or "") for action in relevant_next_actions}
+    annotated_next_actions = []
+    for action in next_actions:
+        item = json_clone(action)
+        item["relevant"] = str(item.get("id") or "") in relevant_next_action_ids
+        annotated_next_actions.append(item)
     next_action_status_counts: dict[str, int] = {}
     for action in relevant_next_actions:
         increment_count(next_action_status_counts, str(action.get("status") or "unknown"))
@@ -7737,7 +7743,10 @@ def build_attack_strategy(
         "active_suspicions": [item["id"] for item in suspicions],
         "strategy_coverage": strategy_coverage,
         "strategies": strategies,
-        "next_development_actions": next_actions,
+        "next_development_actions": annotated_next_actions,
+        "relevant_next_development_actions": [
+            action for action in annotated_next_actions if action.get("relevant")
+        ],
         "safety": "Strategy artifact only. It does not send requests, fuzz, invoke Burp Scanner, sign wallets, or submit transactions.",
     }
 
@@ -7748,9 +7757,12 @@ def is_waiting_attack_strategy_action(action: dict[str, Any]) -> bool:
 
 
 def waiting_attack_strategy_actions(attack_strategy: dict[str, Any] | None) -> list[dict[str, Any]]:
+    action_source = (attack_strategy or {}).get("relevant_next_development_actions")
+    if action_source is None:
+        action_source = (attack_strategy or {}).get("next_development_actions", []) or []
     return [
         action
-        for action in (attack_strategy or {}).get("next_development_actions", []) or []
+        for action in action_source
         if isinstance(action, dict) and is_waiting_attack_strategy_action(action)
     ]
 
@@ -15198,6 +15210,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 attack_strategy_return_code == 0
                 and "Attack strategy: needs-burp-history" in attack_strategy_stdout
                 and "Coverage:" in attack_strategy_stdout_text
+                and "NEXT-transaction-intent-corpus" not in attack_strategy_stdout_text
                 and "No files written (--no-write)." in attack_strategy_stdout
                 and not any(
                     output_paths[key]
@@ -19656,6 +19669,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         [],
         [{"method": "POST", "path": "/bridge/quote", "status": 400, "source": "self-test"}],
     )
+    unknown_waiting_actions = waiting_attack_strategy_actions(unknown_attack_strategy)
     external_waiting_summaries = [
         format_attack_strategy_waiting_action(action)
         for action in waiting_attack_strategy_actions(external_attack_strategy)
@@ -19715,7 +19729,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and "strategy-fixed-upstream-rewrite" in rewrite_strategy_route_coverage.get("strategy_ids", [])
         and unknown_attack_strategy.get("status") == "needs-strategy-review"
         and unknown_attack_strategy.get("summary", {}).get("strategy_uncovered_clusters") == ["opaque-service"]
+        and unknown_waiting_actions == []
         and external_attack_strategy.get("status") == "needs-external-evidence"
+        and any(
+            action.get("id") == "NEXT-transaction-intent-corpus"
+            for action in external_attack_strategy.get("relevant_next_development_actions", [])
+        )
         and any(
             "NEXT-transaction-intent-corpus: waiting-for-real-quote-response - Feed real quote transaction payloads"
             in line
