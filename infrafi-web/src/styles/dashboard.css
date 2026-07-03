@@ -1,0 +1,559 @@
+/* ============================================================
+   Dashboard redesign (Figma "Broadband-backed stats")
+   Scoped under .dash so the new warm-black palette never leaks
+   into the rest of the app shell (which stays theme-midnight).
+   Palette + metrics mirror the Figma node set exactly.
+   ============================================================ */
+
+.dash {
+  --d-bg: #07080b;
+  --d-card: #13151a;
+  --d-elevated: #1b1d24;
+  --d-line: #26272b;
+  --d-line-soft: rgba(140, 138, 132, 0.2);
+  --d-text: #fbf7f3;
+  --d-ink-80: #c6c2bb;
+  --d-ink-60: #8c8a84;
+  --d-ink-40: rgba(140, 138, 132, 0.7);
+
+  --d-amber: #f3a24a;
+  --d-rose: #ed7c5b;
+  --d-coral: #e84066;
+  --d-pos: #7ed9a8;
+  --d-neg: #e23d32;
+  /* CTA / active gradient — matches Figma active chips, toggles, hero accent. */
+  --d-grad: linear-gradient(90deg, #f1994f 0%, #e84066 100%);
+
+  color: var(--d-text);
+  font-family: var(--font-sans);
+  /* Fill the available width so collapsed summaries keep the same size as
+     when a section is expanded (auto margins on .app-container would otherwise
+     shrink it to content when every section is collapsed). */
+  width: 100%;
+}
+
+/* ----- Hero ----- */
+.dash-hero {
+  position: relative;
+  text-align: center;
+  padding: 40px 0 28px;
+}
+.dash-hero > * {
+  position: relative;
+  z-index: 1;
+}
+.dash-hero h1 {
+  font-family: var(--font-sans);
+  font-weight: 500;
+  font-size: 36px;
+  letter-spacing: -0.025em;
+  line-height: 1.05;
+  margin: 0;
+  color: var(--d-text);
+}
+.dash-hero h1 .accent {
+  background: var(--d-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.dash-hero p {
+  margin: 6px 0 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--d-ink-80);
+}
+/* ----- Section header ----- */
+.dash-section {
+  margin-top: 38px;
+}
+.dash-section-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  cursor: pointer;
+  user-select: none;
+  width: max-content;
+}
+.dash-section-chevron {
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  color: var(--d-ink-60);
+  transition: transform 240ms cubic-bezier(0.2, 0.7, 0.2, 1);
+  flex-shrink: 0;
+}
+.dash-section-head.collapsed .dash-section-chevron {
+  transform: rotate(-90deg);
+}
+.dash-section-title {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 20px;
+  letter-spacing: -0.01em;
+  color: var(--d-text);
+  line-height: 1;
+}
+.dash-section-title .idx {
+  color: var(--accent, var(--d-amber));
+  margin-right: 8px;
+}
+.dash-section-sub {
+  font-size: 14px;
+  color: var(--d-ink-60);
+  margin-top: 9px;
+}
+
+/* Collapse animation — grid-rows 0fr→1fr keeps it height-agnostic. */
+.dash-collapse {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 300ms cubic-bezier(0.2, 0.7, 0.2, 1), opacity 240ms ease;
+  opacity: 1;
+}
+.dash-collapse.closed {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+.dash-collapse > .dash-collapse-inner {
+  overflow: hidden;
+  min-height: 0;
+}
+.dash-section-body {
+  padding-top: 16px;
+}
+
+/* ----- Collapsed summary row ----- */
+.dash-summary {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  padding: 18px 26px;
+  margin-top: 16px;
+  background: var(--d-card);
+  border: 1px solid var(--d-line);
+  border-radius: 16px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 160ms ease;
+}
+.dash-summary:hover {
+  border-color: #34353a;
+}
+.dash-summary::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--accent, var(--d-amber));
+}
+.dash-summary-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  flex: 0 0 320px;
+  min-width: 0;
+}
+.dash-summary-metrics {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  padding-left: 32px;
+}
+.dash-summary-metric {
+  flex: 1 1 0;
+  font-size: 14px;
+  color: var(--d-ink-60);
+}
+.dash-summary-metric b {
+  color: var(--d-text);
+  font-weight: 600;
+  margin-left: 8px;
+}
+
+/* ----- Card ----- */
+.dash-card {
+  position: relative;
+  background: var(--d-card);
+  border: 1px solid var(--d-line);
+  border-radius: 20px;
+  padding: 20px;
+  overflow: hidden;
+}
+/* Interactive cards: highlight + lift on hover, click to expand. */
+.dash-card.is-expandable {
+  cursor: pointer;
+  transition: border-color 220ms ease, transform 220ms ease, box-shadow 220ms ease;
+}
+.dash-card.is-expandable:hover {
+  transform: translateY(-3px);
+  border-color: rgba(243, 162, 74, 0.55);
+  box-shadow: 0 22px 60px -20px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(243, 162, 74, 0.32) inset,
+    0 0 36px -10px rgba(243, 162, 74, 0.22);
+}
+.dash-card.is-expandable:hover .dash-expand {
+  opacity: 1;
+  color: var(--d-amber);
+}
+.dash-card-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 16px;
+  color: var(--d-ink-60);
+  letter-spacing: -0.02em;
+}
+.dash-card-value {
+  font-family: var(--font-sans);
+  font-weight: 500;
+  font-size: 30px;
+  letter-spacing: -0.02em;
+  color: var(--d-text);
+  line-height: 1.15;
+}
+.dash-card-sub {
+  font-size: 14px;
+  color: var(--d-ink-40);
+}
+
+/* expand glyph */
+.dash-expand {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  width: 20px;
+  height: 20px;
+  color: var(--d-ink-60);
+  opacity: 0.7;
+  transition: opacity 220ms ease, color 220ms ease;
+}
+
+/* ----- Card expand modal (FLIP morph) ----- */
+.dash-modal-root {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+}
+.dash-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(7, 8, 11, 0.72);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  cursor: zoom-out;
+  opacity: 0;
+  /* Fade-in matches the card's 280ms morph; fade-out is overridden below so
+     close feels like a quick, uniform fade rather than a reverse morph. */
+  transition: opacity 280ms ease;
+}
+.dash-modal-root.is-open .dash-modal-backdrop {
+  opacity: 1;
+}
+.dash-modal-root.is-closing .dash-modal-backdrop {
+  opacity: 0;
+  transition: opacity 180ms ease;
+}
+.dash-modal-stage {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  pointer-events: none;
+}
+.dash-modal-card {
+  position: relative;
+  pointer-events: auto;
+  width: min(720px, calc(100% - 64px));
+  max-height: 90vh;
+  overflow: auto;
+  background: var(--d-card);
+  border: 1px solid var(--d-line);
+  border-radius: 20px;
+  padding: 28px;
+  transform-origin: center center;
+  box-shadow: 0 22px 60px -20px rgba(0, 0, 0, 0.45);
+}
+.dash-modal-root.is-open .dash-modal-card {
+  box-shadow: 0 40px 120px -20px rgba(0, 0, 0, 0.7);
+}
+/* The expand affordance is redundant inside the focused panel. */
+.dash-modal-card .dash-expand {
+  display: none;
+}
+.dash-modal-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  border: 1px solid var(--d-line);
+  background: var(--d-elevated);
+  color: var(--d-ink-60);
+  cursor: pointer;
+  z-index: 1;
+  transition: color 160ms ease, border-color 160ms ease;
+}
+.dash-modal-close:hover {
+  color: var(--d-text);
+  border-color: var(--d-ink-60);
+}
+
+/* info badge */
+.dash-info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  border: 1px solid var(--d-ink-60);
+  border-radius: 6px;
+  font: 500 9px/1 var(--font-mono);
+  color: var(--d-ink-60);
+  flex-shrink: 0;
+  cursor: help;
+}
+
+/* hover/focus tooltip for the info badge (portaled to body to escape card clipping) */
+.dash-info-tip {
+  position: fixed;
+  z-index: 1000;
+  transform: translate(-50%, calc(-100% - 10px));
+  max-width: 260px;
+  padding: 8px 11px;
+  border: 1px solid rgba(243, 162, 74, 0.55);
+  outline: 1px solid rgba(243, 162, 74, 0.18);
+  outline-offset: 2px;
+  border-radius: 10px;
+  background: #13151a;
+  box-shadow: 0 16px 40px -16px rgba(0, 0, 0, 0.8);
+  font: 400 12px/1.4 var(--font-sans);
+  color: #fbf7f3;
+  letter-spacing: -0.01em;
+  pointer-events: none;
+  white-space: normal;
+}
+
+/* delta pill */
+.dash-delta {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 8px;
+  font: 400 10px/1 var(--font-sans);
+}
+.dash-delta svg {
+  width: 9px;
+  height: 9px;
+}
+.dash-delta.pos {
+  background: rgba(126, 217, 168, 0.1);
+  border: 0.65px solid rgba(126, 217, 168, 0.2);
+  color: var(--d-pos);
+}
+.dash-delta.neg {
+  background: rgba(234, 97, 84, 0.13);
+  border: 0.65px solid rgba(234, 97, 84, 0.4);
+  color: var(--d-neg);
+}
+/* ----- Composition legend ----- */
+.dash-legend-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--d-ink-80);
+}
+.dash-legend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+/* ----- Donut legend bars ----- */
+.dash-bar-track {
+  position: relative;
+  height: 5px;
+  width: 100%;
+  border-radius: 3px;
+  background: var(--d-line-soft);
+  overflow: hidden;
+}
+.dash-bar-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: 3px;
+}
+
+/* ----- Table ----- */
+.dash-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.dash-table thead th {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--d-ink-60);
+  text-align: left;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--d-line);
+}
+.dash-table thead th.right {
+  text-align: right;
+}
+.dash-table tbody td {
+  padding: 16px;
+  border-bottom: 1px solid var(--d-line);
+  color: var(--d-ink-80);
+  vertical-align: middle;
+}
+.dash-table tbody td.right {
+  text-align: right;
+}
+.dash-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.dash-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+}
+.dash-status .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.dash-status.live {
+  background: rgba(126, 217, 168, 0.1);
+  border: 0.65px solid rgba(126, 217, 168, 0.22);
+  color: var(--d-pos);
+}
+.dash-status.soon {
+  background: rgba(140, 138, 132, 0.1);
+  border: 0.65px solid rgba(140, 138, 132, 0.22);
+  color: var(--d-ink-60);
+}
+
+/* skeleton shimmer for unsourced cards */
+.dash-skel {
+  position: relative;
+  overflow: hidden;
+  background: rgba(140, 138, 132, 0.08);
+  border-radius: 6px;
+}
+.dash-skel::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(140, 138, 132, 0.12),
+    transparent
+  );
+  animation: dash-shimmer 1.6s infinite;
+}
+@keyframes dash-shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* responsive grids */
+.dash-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
+}
+.dash-grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+}
+/* Slightly asymmetric 2-up (left a touch narrower than right). Replaces an
+   inline grid-template-columns that previously overrode the mobile collapse. */
+.dash-grid-2.is-asym {
+  grid-template-columns: 642fr 676fr;
+}
+@media (max-width: 1024px) {
+  .dash-grid-3,
+  .dash-grid-2,
+  .dash-grid-2.is-asym {
+    grid-template-columns: 1fr;
+  }
+  .dash-summary-metrics {
+    gap: 18px;
+  }
+}
+@media (max-width: 999px) {
+  .dash-summary-metric {
+    display: none;
+  }
+}
+@media (max-width: 640px) {
+  .dash-summary {
+    padding: 16px 18px;
+  }
+  .dash-summary-head {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .dash-section-head {
+    width: 100%;
+  }
+  .dash-section-head > div {
+    flex: 1;
+    min-width: 0;
+  }
+  .dash-section-title {
+    line-height: 1.2;
+    overflow-wrap: anywhere;
+  }
+  .dash-modal-stage {
+    padding: 12px;
+  }
+  .dash-modal-card {
+    width: calc(100% - 16px);
+    padding: 16px;
+    border-radius: 16px;
+  }
+  .dash-modal-close {
+    top: 10px;
+    right: 10px;
+  }
+  .dash-detail-footer-label {
+    flex: 0 0 60px !important;
+  }
+}
+@media (max-width: 900px) {
+  .dash-detail-stat-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .dash-detail-stat-tile {
+    text-align: center;
+  }
+  .dash-detail-stat-tile-legend {
+    justify-content: flex-start;
+  }
+}

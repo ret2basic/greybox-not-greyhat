@@ -1,0 +1,15892 @@
+#!/usr/bin/env python3
+"""InferForge local greybox runner.
+
+This intentionally stays small and dependency-free: Burp remains the security
+workbench, while this script records repeatable local probes and source peeks.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+from email.utils import parsedate_to_datetime
+import hashlib
+import html
+import http.client
+import ipaddress
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_TARGET = "http://127.0.0.1:3100"
+DEFAULT_ARTIFACT_DIR = ROOT / ".greybox"
+DEFAULT_SOURCE_ROOT = ROOT / "infrafi-web"
+DEFAULT_PROFILE_PATH = ROOT / "profiles/infrafi-web.json"
+DEFAULT_NODE = "/home/ret2basic/.npm/_npx/52027bd8fc0022aa/node_modules/node/bin/node"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDTEL_MINT = "dawn7ZUF7h7anFuEsDdAU1Y3HYwikwqNMAENZsQJdNL"
+DEFAULT_TEST_WALLET = "EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR"
+PLACEHOLDER_REAL_WALLET = "REPLACE_WITH_REAL_WALLET"
+PLACEHOLDER_APPROVED_POOL_ADDRESS = "REPLACE_WITH_APPROVED_POOL_ADDRESS"
+PLACEHOLDER_APPROVED_CONCRETE_PATH = "REPLACE_WITH_APPROVED_CONCRETE_LOCAL_PATH"
+MAX_RESPONSE_BYTES = 256 * 1024
+MAX_BODY_SAMPLE_CHARS = 1200
+MAX_REQUEST_CONTEXTS_PER_ENDPOINT = 6
+REDACTED_VALUE = "[redacted]"
+BASE64_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{80,}={0,2})(?![A-Za-z0-9+/=])")
+PLACEHOLDER_ENV_RE = re.compile(r"^YOUR_[A-Z0-9_]+_HERE$", re.IGNORECASE)
+MANIFEST_NAME = "artifact-manifest.json"
+TARGET_PROFILE_ARTIFACT = "target-profile.json"
+STRATEGY_REGISTRY_ARTIFACT = "strategy-registry.json"
+PROFILE_VALIDATION_ARTIFACT = "profile-validation.json"
+ROUTE_INVENTORY_ARTIFACT = "route-inventory.json"
+DISCOVERED_PROFILE_ARTIFACT = "discovered-profile.json"
+REQUIRED_ARTIFACTS = [
+    "index.html",
+    "report.md",
+    "reproduction-steps.md",
+    TARGET_PROFILE_ARTIFACT,
+    STRATEGY_REGISTRY_ARTIFACT,
+    PROFILE_VALIDATION_ARTIFACT,
+    "config.json",
+    "endpoint-clusters.json",
+    "probe-plan.json",
+    "probe-ranking.json",
+    "probe-results.jsonl",
+    "response-delta-analysis.json",
+    "warmup-results.json",
+    "traffic-index.json",
+    "source-peek-requests.json",
+    "source-peek-results.json",
+    "burp-capabilities.json",
+    "burp-history-observations.jsonl",
+    "burp-observation-run.json",
+    "burp-observation-coverage.json",
+    "blackbox-coverage.json",
+    "evidence-chain.json",
+    "evidence-appendix.json",
+    "verification-queue.json",
+    "adjudication.json",
+    "finding-gate.json",
+    "findings.json",
+    "hardening-notes.json",
+    "evidence-gaps.json",
+    "rpc-method-policy.json",
+    "transaction-intent.json",
+    "transaction-decoder-selftest.json",
+    "quote-collection.json",
+]
+REVIEW_ARTIFACTS = [
+    "review-observation-candidates.json",
+    "reviewed-profile.json",
+    "reviewed-profile-validation.json",
+    "reviewed-observation-promotion.json",
+]
+DISCOVERY_ARTIFACTS = [
+    ROUTE_INVENTORY_ARTIFACT,
+    DISCOVERED_PROFILE_ARTIFACT,
+    "discovered-profile-validation.json",
+]
+KNOWN_OPTIONAL_ARTIFACTS = [
+    *DISCOVERY_ARTIFACTS,
+    *REVIEW_ARTIFACTS,
+    "attack-strategy.json",
+    "burp-mcp-sync.json",
+    "burp-mcp-history-latest.txt",
+    "burp-mcp-websocket-history-latest.txt",
+    "burp-transaction-candidates.json",
+    "collection-summary.json",
+    "environment-readiness.json",
+    "orca-baseline.json",
+    "profile-routing-selftest.json",
+    "transaction-intent-policy.json",
+]
+INDEX_ARTIFACT_ORDER = [
+    "report.md",
+    MANIFEST_NAME,
+    TARGET_PROFILE_ARTIFACT,
+    STRATEGY_REGISTRY_ARTIFACT,
+    PROFILE_VALIDATION_ARTIFACT,
+    *DISCOVERY_ARTIFACTS,
+    *REVIEW_ARTIFACTS,
+    "config.json",
+    "collection-summary.json",
+    "endpoint-clusters.json",
+    "probe-plan.json",
+    "probe-ranking.json",
+    "probe-results.jsonl",
+    "response-delta-analysis.json",
+    "warmup-results.json",
+    "traffic-index.json",
+    "source-peek-requests.json",
+    "source-peek-results.json",
+    "attack-strategy.json",
+    "burp-capabilities.json",
+    "burp-history-observations.jsonl",
+    "burp-observation-run.json",
+    "burp-observation-coverage.json",
+    "burp-mcp-sync.json",
+    "burp-mcp-history-latest.txt",
+    "burp-mcp-websocket-history-latest.txt",
+    "burp-transaction-candidates.json",
+    "blackbox-coverage.json",
+    "evidence-chain.json",
+    "evidence-appendix.json",
+    "verification-queue.json",
+    "reproduction-steps.md",
+    "adjudication.json",
+    "finding-gate.json",
+    "findings.json",
+    "hardening-notes.json",
+    "suspicions.json",
+    "evidence-gaps.json",
+    "rpc-method-policy.json",
+    "transaction-intent.json",
+    "transaction-decoder-selftest.json",
+    "transaction-intent-policy.json",
+    "quote-collection.json",
+    "orca-baseline.json",
+]
+MANUAL_PLACEHOLDER_TOKENS = [
+    PLACEHOLDER_REAL_WALLET,
+    PLACEHOLDER_APPROVED_POOL_ADDRESS,
+    PLACEHOLDER_APPROVED_CONCRETE_PATH,
+    "REPLACE_WITH_",
+]
+SERVER_ACTION_REVIEW_KEYWORDS = {
+    "approve",
+    "burn",
+    "create",
+    "delete",
+    "insert",
+    "mint",
+    "mutate",
+    "pay",
+    "remove",
+    "send",
+    "sign",
+    "submit",
+    "swap",
+    "transfer",
+    "update",
+    "upsert",
+    "withdraw",
+}
+STRATEGY_REGISTRY: dict[str, dict[str, Any]] = {
+    "nextjs-api-routes": {
+        "title": "Next.js API route baseline",
+        "description": "Baseline local route availability, CORS preflight, and low-risk method handling for profile-defined Next.js routes.",
+        "cluster_ids": ["health"],
+        "probe_categories": ["health", "profile-defined-nextjs-api-routes"],
+        "safety": "Local health, HEAD/OPTIONS, and GET method-confusion checks only.",
+    },
+    "solana-json-rpc-proxy": {
+        "title": "Solana JSON-RPC proxy controls",
+        "description": "Origin, method, content-type, JSON shape, batch, transaction-method, and WebSocket policy probes.",
+        "cluster_ids": ["solana-rpc-http", "solana-rpc-ws"],
+        "probe_categories": ["solana-rpc-http", "solana-rpc-ws"],
+        "safety": "Uses invalid transaction payloads only; no signing or submission.",
+    },
+    "quote-transaction-decoder": {
+        "title": "Quote orchestration and transaction decoding",
+        "description": "Quote route validation, quote corpus collection hooks, and inspect-only Solana transaction decoding.",
+        "cluster_ids": ["quote"],
+        "probe_categories": ["quote"],
+        "safety": "Quote collection and decoding only; no wallet signing or transaction submission.",
+    },
+    "fixed-upstream-proxy": {
+        "title": "Fixed-upstream proxy boundary",
+        "description": "Path, method, query, and identifier-shape checks for bounded fixed-upstream proxy routes.",
+        "cluster_ids": ["orca-pools"],
+        "probe_categories": ["orca-pools"],
+        "safety": "Invalid-shape probes and optional single known-address baseline only; no upstream enumeration.",
+    },
+}
+SENSITIVE_HEADER_NAMES = {
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+    "set-cookie",
+    "x-api-key",
+    "x-m0-api-key",
+}
+SECRET_TEXT_RE = re.compile(
+    r"(?i)(authorization\s*[:=]\s*bearer\s+)[^,\s\"']+|"
+    r"((?:api[_-]?key|token|secret|password|cookie)\s*[:=]\s*)[^,\s\"';&]+"
+)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+
+
+def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("", encoding="utf-8")
+    with path.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=False) + "\n")
+
+
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        rows.append(json.loads(line))
+    return rows
+
+
+def load_optional_json(path: Path) -> dict[str, Any] | None:
+    return json.loads(read_text(path)) if path.exists() else None
+
+
+def json_clone(data: Any) -> Any:
+    return json.loads(json.dumps(data))
+
+
+def concrete_local_path_problem(path: Any) -> str | None:
+    if not isinstance(path, str):
+        return "path must be a string"
+    if not path:
+        return "path is empty"
+    if any(token and token in path for token in MANUAL_PLACEHOLDER_TOKENS):
+        return "path still contains a manual REPLACE_WITH_* placeholder"
+    parsed = urllib.parse.urlparse(path)
+    if parsed.scheme or parsed.netloc:
+        return "full URLs are not allowed; use a local path beginning with /"
+    if not path.startswith("/") or path.startswith("//"):
+        return "path must be a local absolute path beginning with a single /"
+    if "{" in path or "}" in path:
+        return "path contains template braces and is not concrete"
+    if "<" in path or ">" in path:
+        return "path contains angle-bracket placeholder text"
+    if re.search(r"\s", path):
+        return "path contains whitespace"
+    return None
+
+
+def is_active_observation_item(item: dict[str, Any]) -> bool:
+    return not (
+        item.get("enabled") is False
+        or item.get("review_only")
+        or item.get("status") == "review-only"
+    )
+
+
+def active_observation_label(item: dict[str, Any], index: int) -> str:
+    return str(item.get("id") or f"index-{index}")
+
+
+def default_target_profile() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "name": "infrafi-web",
+        "display_name": "InfraFi Web",
+        "description": "Default regression target used to develop InferForge as a reusable Burp-first greybox tool.",
+        "target_type": "nextjs-web3-defi-app",
+        "frameworks": ["Next.js App Router", "Solana", "M0 orchestration", "Orca"],
+        "default_target": DEFAULT_TARGET,
+        "default_source_root": "infrafi-web",
+        "strategy_sets": [
+            "nextjs-api-routes",
+            "solana-json-rpc-proxy",
+            "quote-transaction-decoder",
+            "fixed-upstream-proxy",
+        ],
+        "safety": {
+            "no_wallet_signing": True,
+            "no_transaction_submission": True,
+            "no_burp_scanner": True,
+            "no_broad_fuzzing": True,
+            "prefer_loopback_targets": True,
+        },
+        "probe_targets": {
+            "health": {
+                "path": "/health",
+            },
+            "quote": {
+                "path": "/api/quote",
+            },
+            "solana-rpc-http": {
+                "path": "/api/rpc/solana/devnet",
+                "root_path": "/api/rpc",
+                "unknown_cluster_path": "/api/rpc/solana/localnet",
+                "cluster": "devnet",
+                "unknown_cluster": "localnet",
+            },
+            "solana-rpc-ws": {
+                "path": "/api/rpc/solana/devnet",
+            },
+            "orca-pools": {
+                "path_template": "/api/orca/pools/{address}",
+                "invalid_address_path": "/api/orca/pools/not-an-address",
+                "invalid_base58_path": "/api/orca/pools/0OIlnotbase58",
+                "too_short_path": "/api/orca/pools/1111111111111111111111111111111",
+                "too_long_path": "/api/orca/pools/111111111111111111111111111111111111111111111",
+                "encoded_traversal_path": "/api/orca/pools/%2e%2e%2fhealth",
+                "extra_segment_path": "/api/orca/pools/not-an-address/extra",
+                "query_injection_path": "/api/orca/pools/not-an-address?url=https://evil.example",
+            },
+        },
+        "clusters": [
+            {
+                "id": "health",
+                "method": "GET",
+                "path": "/health",
+                "kind": "health",
+                "priority": "low",
+                "strategy_set": "nextjs-api-routes",
+                "match": {"methods": ["GET"], "paths": ["/health"]},
+                "source_refs": ["src/app/health/route.ts"],
+            },
+            {
+                "id": "solana-rpc-http",
+                "method": "POST",
+                "path": "/api/rpc/solana/{cluster}",
+                "kind": "json-rpc-proxy",
+                "priority": "high",
+                "strategy_set": "solana-json-rpc-proxy",
+                "match": {
+                    "path_prefixes": ["/api/rpc/solana/"],
+                    "paths": ["/api/rpc"],
+                    "exclude_methods": ["WS"],
+                },
+                "source_refs": [
+                    "src/app/api/rpc/_shared.ts",
+                    "src/app/api/rpc/route.ts",
+                    "src/app/api/rpc/solana/[cluster]/route.ts",
+                ],
+            },
+            {
+                "id": "solana-rpc-ws",
+                "method": "WS",
+                "path": "/api/rpc/solana/{cluster}",
+                "kind": "websocket-json-rpc-proxy",
+                "priority": "high",
+                "strategy_set": "solana-json-rpc-proxy",
+                "match": {
+                    "methods": ["WS"],
+                    "path_prefixes": ["/api/rpc/solana/"],
+                },
+                "source_refs": ["server.js"],
+            },
+            {
+                "id": "quote",
+                "method": "POST",
+                "path": "/api/quote",
+                "kind": "orchestration-proxy",
+                "priority": "high",
+                "strategy_set": "quote-transaction-decoder",
+                "match": {"paths": ["/api/quote"]},
+                "source_refs": ["src/app/api/quote/route.ts", "src/lib/m0.ts"],
+            },
+            {
+                "id": "orca-pools",
+                "method": "GET",
+                "path": "/api/orca/pools/{address}",
+                "kind": "fixed-upstream-proxy",
+                "priority": "medium",
+                "strategy_set": "fixed-upstream-proxy",
+                "match": {"path_prefixes": ["/api/orca/pools/"]},
+                "source_refs": ["src/app/api/orca/pools/[address]/route.ts"],
+            },
+        ],
+        "source_peeks": [
+            {
+                "endpoint": "POST /api/rpc and /api/rpc/solana/[cluster]",
+                "cluster_ids": ["solana-rpc-http"],
+                "files": [
+                    "src/app/api/rpc/_shared.ts",
+                    "src/app/api/rpc/route.ts",
+                ],
+                "line_patterns": {
+                    "root_route_default_cluster": {
+                        "file": "src/app/api/rpc/route.ts",
+                        "pattern": "handleSolanaRpc(req, 'mainnet')",
+                    },
+                    "allowed_methods": {
+                        "file": "src/app/api/rpc/_shared.ts",
+                        "pattern": "DEFAULT_ALLOWED_METHODS",
+                    },
+                    "transaction_method_gate": {
+                        "file": "src/app/api/rpc/_shared.ts",
+                        "pattern": "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS",
+                    },
+                    "blocked_methods": {
+                        "file": "src/app/api/rpc/_shared.ts",
+                        "pattern": "BLOCKED_METHODS",
+                    },
+                    "content_type_validation": {
+                        "file": "src/app/api/rpc/_shared.ts",
+                        "pattern": "Unsupported content type",
+                    },
+                    "duplicate_key_validation": {
+                        "file": "src/app/api/rpc/_shared.ts",
+                        "pattern": "function findDuplicateJsonKey",
+                    },
+                    "payload_validation": {
+                        "file": "src/app/api/rpc/_shared.ts",
+                        "pattern": "function validateRpcPayload",
+                    },
+                    "handler": {
+                        "file": "src/app/api/rpc/_shared.ts",
+                        "pattern": "export async function handleSolanaRpc",
+                    },
+                },
+                "conclusion": "RPC HTTP proxy has local source, content-type, duplicate-key, method, body, batch, and cluster controls before upstream forwarding.",
+            },
+            {
+                "endpoint": "WS /api/rpc/solana/[cluster]",
+                "cluster_ids": ["solana-rpc-ws"],
+                "files": ["server.js"],
+                "line_patterns": {
+                    "allowed_methods": {"file": "server.js", "pattern": "WS_ALLOWED_METHODS"},
+                    "batch_limit": {"file": "server.js", "pattern": "MAX_WS_BATCH_SIZE"},
+                    "duplicate_key_validation": {
+                        "file": "server.js",
+                        "pattern": "function findDuplicateJsonKey",
+                    },
+                    "message_validation": {
+                        "file": "server.js",
+                        "pattern": "function isAllowedWsRpcMessage",
+                    },
+                    "origin_check": {"file": "server.js", "pattern": "function handleSolanaWsProxy"},
+                    "policy_close": {
+                        "file": "server.js",
+                        "pattern": "Solana WS RPC method is not allowed",
+                    },
+                },
+                "conclusion": "WS proxy performs origin, binary-frame, duplicate-key, batch-size, and method allowlist checks before forwarding messages.",
+            },
+            {
+                "endpoint": "POST /api/quote",
+                "cluster_ids": ["quote"],
+                "files": ["src/app/api/quote/route.ts"],
+                "line_patterns": {
+                    "json_parse": {
+                        "file": "src/app/api/quote/route.ts",
+                        "pattern": "rawBody = await req.json()",
+                    },
+                    "local_validation": {
+                        "file": "src/app/api/quote/route.ts",
+                        "pattern": "function validateQuoteRequestBody",
+                    },
+                    "upstream_forward": {
+                        "file": "src/app/api/quote/route.ts",
+                        "pattern": "fetch(M0_QUOTE_API",
+                    },
+                    "upstream_error_sanitization": {
+                        "file": "src/app/api/quote/route.ts",
+                        "pattern": "M0 orchestration quote failed",
+                    },
+                    "generic_error_handler": {
+                        "file": "src/app/api/quote/route.ts",
+                        "pattern": "catch (err)",
+                    },
+                },
+                "conclusion": "Quote route performs strict local schema and policy validation, forwards only normalized allowlisted bodies to M0, and avoids reflecting upstream error bodies.",
+            },
+            {
+                "endpoint": "GET /api/orca/pools/[address]",
+                "cluster_ids": ["orca-pools"],
+                "files": ["src/app/api/orca/pools/[address]/route.ts"],
+                "line_patterns": {
+                    "address_guard": {
+                        "file": "src/app/api/orca/pools/[address]/route.ts",
+                        "pattern": "base58 Solana-style addresses",
+                    },
+                    "fixed_upstream": {
+                        "file": "src/app/api/orca/pools/[address]/route.ts",
+                        "pattern": "https://api.orca.so",
+                    },
+                },
+                "conclusion": "Orca route uses a fixed upstream and rejects non-base58 address shapes.",
+            },
+        ],
+        "burp_observation_plan": [
+            {
+                "id": "burp_observe_health",
+                "method": "GET",
+                "path": "/health",
+                "headers": {"User-Agent": "InferForge-Burp-Observe/0.1"},
+                "expected_statuses": [200],
+                "cluster": "health",
+            },
+            {
+                "id": "burp_observe_quote_invalid_body",
+                "method": "POST",
+                "path": "/api/quote",
+                "headers": {
+                    "User-Agent": "InferForge-Burp-Observe/0.1",
+                    "Origin": "{origin}",
+                    "Content-Type": "application/json",
+                },
+                "body": "{}",
+                "expected_statuses": [400],
+                "cluster": "quote",
+            },
+            {
+                "id": "burp_observe_rpc_get_health",
+                "method": "POST",
+                "path": "/api/rpc/solana/devnet",
+                "headers": {
+                    "User-Agent": "InferForge-Burp-Observe/0.1",
+                    "Origin": "{origin}",
+                    "Content-Type": "application/json",
+                },
+                "body_json": {"jsonrpc": "2.0", "id": 1, "method": "getHealth"},
+                "expected_statuses": [200],
+                "cluster": "solana-rpc-http",
+            },
+            {
+                "id": "burp_observe_orca_invalid_address",
+                "method": "GET",
+                "path": "/api/orca/pools/not-an-address",
+                "headers": {"User-Agent": "InferForge-Burp-Observe/0.1"},
+                "expected_statuses": [400],
+                "cluster": "orca-pools",
+            },
+        ],
+        "websocket_observation": {
+            "id": "burp_observe_ws_upgrade",
+            "path": "/api/rpc/solana/devnet",
+            "cluster": "solana-rpc-ws",
+            "expected_statuses": [101],
+            "subscribe_method": "slotSubscribe",
+        },
+    }
+
+
+def neutral_target_profile_defaults(
+    profile: dict[str, Any],
+    *,
+    profile_path: Path | None = None,
+) -> dict[str, Any]:
+    name = str(profile.get("name") or (profile_path.stem if profile_path else "custom-target"))
+    return {
+        "schema_version": 1,
+        "name": name,
+        "display_name": str(profile.get("display_name") or name),
+        "description": "",
+        "target_type": "custom-web-app",
+        "frameworks": [],
+        "default_target": DEFAULT_TARGET,
+        "default_source_root": ".",
+        "strategy_sets": [],
+        "safety": {
+            "no_wallet_signing": True,
+            "no_transaction_submission": True,
+            "no_burp_scanner": True,
+            "no_broad_fuzzing": True,
+            "prefer_loopback_targets": True,
+        },
+        "probe_targets": {},
+        "clusters": [],
+        "source_peeks": [],
+        "burp_observation_plan": [],
+        "review_observation_candidates": [],
+        "websocket_observation": None,
+    }
+
+
+def resolve_repo_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return (ROOT / path).resolve()
+
+
+def public_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: json_clone(value)
+        for key, value in profile.items()
+        if not str(key).startswith("_")
+    }
+
+
+def normalize_target_profile(profile: dict[str, Any], *, profile_path: Path | None = None) -> dict[str, Any]:
+    builtin_default = not (profile_path and profile_path.exists())
+    defaults = default_target_profile() if builtin_default else neutral_target_profile_defaults(profile, profile_path=profile_path)
+    normalized = json_clone(profile)
+    defaulted_keys: list[str] = []
+    for key in [
+        "schema_version",
+        "name",
+        "display_name",
+        "description",
+        "target_type",
+        "frameworks",
+        "default_target",
+        "default_source_root",
+        "strategy_sets",
+        "safety",
+        "probe_targets",
+        "clusters",
+        "source_peeks",
+        "burp_observation_plan",
+        "review_observation_candidates",
+        "websocket_observation",
+    ]:
+        if key not in normalized:
+            normalized[key] = json_clone(defaults[key])
+            defaulted_keys.append(key)
+    normalized["_profile_path"] = str(profile_path) if profile_path else "builtin-default"
+    normalized["_profile_loaded_from"] = "file" if profile_path and profile_path.exists() else "builtin-default"
+    normalized["_profile_defaulted_keys"] = defaulted_keys
+    return normalized
+
+
+def default_strategy_set_for_cluster(cluster_id: str) -> str | None:
+    for strategy_id, strategy in STRATEGY_REGISTRY.items():
+        if cluster_id in strategy.get("cluster_ids", []):
+            return strategy_id
+    return None
+
+
+def enabled_strategy_set_ids(profile: dict[str, Any] | None) -> set[str]:
+    if not profile:
+        return set(STRATEGY_REGISTRY)
+    raw = profile.get("strategy_sets")
+    if raw is None:
+        return set(STRATEGY_REGISTRY)
+    return {str(item) for item in raw}
+
+
+def strategy_set_enabled(profile: dict[str, Any] | None, strategy_set: str | None) -> bool:
+    if strategy_set is None:
+        return True
+    return strategy_set in enabled_strategy_set_ids(profile)
+
+
+def strategy_set_for_cluster(cluster: dict[str, Any]) -> str | None:
+    return cluster.get("strategy_set") or default_strategy_set_for_cluster(str(cluster.get("id")))
+
+
+def strategy_set_for_probe(probe: "Probe") -> str | None:
+    return probe.strategy_set or default_strategy_set_for_cluster(probe.category)
+
+
+def uses_builtin_target_defaults(profile: dict[str, Any] | None) -> bool:
+    return not profile or profile.get("_profile_loaded_from") == "builtin-default"
+
+
+def declared_cluster_by_id(profile: dict[str, Any] | None, cluster_id: str) -> dict[str, Any] | None:
+    for cluster in (profile or {}).get("clusters", []):
+        if str(cluster.get("id")) == cluster_id:
+            return cluster
+    if profile and profile.get("_profile_loaded_from") != "builtin-default":
+        return None
+    for cluster in default_target_profile().get("clusters", []):
+        if str(cluster.get("id")) == cluster_id:
+            return cluster
+    return None
+
+
+def render_path_template(path: str, replacements: dict[str, str] | None = None) -> str:
+    rendered = str(path)
+    for key, value in (replacements or {}).items():
+        rendered = rendered.replace("{" + key + "}", str(value))
+        rendered = rendered.replace("{" + key + "*}", str(value))
+    return rendered
+
+
+def cluster_default_path(
+    profile: dict[str, Any] | None,
+    cluster_id: str,
+    fallback: str,
+    replacements: dict[str, str] | None = None,
+) -> str:
+    cluster = declared_cluster_by_id(profile, cluster_id)
+    path = str((cluster or {}).get("path") or fallback)
+    return render_path_template(path, replacements)
+
+
+def probe_target_config(profile: dict[str, Any] | None, cluster_id: str) -> dict[str, Any]:
+    configured = (profile or {}).get("probe_targets", {}).get(cluster_id, {})
+    if not isinstance(configured, dict):
+        configured = {}
+    if not uses_builtin_target_defaults(profile):
+        return json_clone(configured)
+    defaults = default_target_profile().get("probe_targets", {}).get(cluster_id, {})
+    return {**json_clone(defaults), **json_clone(configured)}
+
+
+def explicit_probe_target_config(profile: dict[str, Any] | None, cluster_id: str) -> dict[str, Any]:
+    configured = (profile or {}).get("probe_targets", {}).get(cluster_id, {})
+    return json_clone(configured) if isinstance(configured, dict) else {}
+
+
+def websocket_observation_config(profile: dict[str, Any] | None) -> dict[str, Any] | None:
+    if profile and "websocket_observation" in profile:
+        configured = profile.get("websocket_observation")
+    else:
+        configured = default_target_profile().get("websocket_observation")
+
+    if configured is None or configured is False:
+        return None
+    config = json_clone(configured) if isinstance(configured, dict) else {}
+    if not config.get("path"):
+        ws_target = explicit_probe_target_config(profile, "solana-rpc-ws")
+        rpc_target = explicit_probe_target_config(profile, "solana-rpc-http")
+        target_path = (ws_target or rpc_target).get("path")
+        if target_path:
+            config["path"] = target_path
+        else:
+            cluster = declared_cluster_by_id(profile, "solana-rpc-ws") or declared_cluster_by_id(profile, "solana-rpc-http")
+            if cluster and cluster.get("path"):
+                config["path"] = render_path_template(str(cluster["path"]), {"cluster": "devnet"})
+            elif uses_builtin_target_defaults(profile):
+                config["path"] = "/api/rpc/solana/devnet"
+            else:
+                return None
+    return config
+
+
+def probe_target_path(
+    profile: dict[str, Any] | None,
+    cluster_id: str,
+    field: str,
+    fallback: str,
+    replacements: dict[str, str] | None = None,
+) -> str:
+    configured = explicit_probe_target_config(profile, cluster_id)
+    value = configured.get(field)
+    if value:
+        return render_path_template(str(value), replacements)
+    if field == "path":
+        return cluster_default_path(profile, cluster_id, fallback, replacements)
+    if uses_builtin_target_defaults(profile):
+        value = default_target_profile().get("probe_targets", {}).get(cluster_id, {}).get(field)
+        if value:
+            return render_path_template(str(value), replacements)
+    return render_path_template(fallback, replacements)
+
+
+def rpc_probe_paths(profile: dict[str, Any] | None) -> dict[str, str]:
+    config = explicit_probe_target_config(profile, "solana-rpc-http")
+    cluster = str(config.get("cluster") or "devnet")
+    unknown_cluster = str(config.get("unknown_cluster") or "localnet")
+    primary = probe_target_path(
+        profile,
+        "solana-rpc-http",
+        "path",
+        "/api/rpc/solana/{cluster}",
+        {"cluster": cluster},
+    )
+    root_candidates = [
+        str(path)
+        for path in (declared_cluster_by_id(profile, "solana-rpc-http") or {}).get("match", {}).get("paths", [])
+    ]
+    root = str(config.get("root_path") or (root_candidates[0] if root_candidates else "/api/rpc"))
+    unknown = (
+        render_path_template(str(config["unknown_cluster_path"]), {"cluster": unknown_cluster})
+        if config.get("unknown_cluster_path")
+        else cluster_default_path(profile, "solana-rpc-http", "/api/rpc/solana/{cluster}", {"cluster": unknown_cluster})
+    )
+    return {
+        "path": primary,
+        "root_path": root,
+        "unknown_cluster_path": unknown,
+        "cluster": cluster,
+        "unknown_cluster": unknown_cluster,
+    }
+
+
+def orca_probe_paths(profile: dict[str, Any] | None) -> dict[str, str]:
+    config = explicit_probe_target_config(profile, "orca-pools")
+    template = str(
+        config.get("path_template")
+        or cluster_default_path(profile, "orca-pools", "/api/orca/pools/{address}")
+    )
+
+    def from_address(address: str) -> str:
+        return render_path_template(template, {"address": address})
+
+    return {
+        "path_template": template,
+        "invalid_address_path": str(config.get("invalid_address_path") or from_address("not-an-address")),
+        "invalid_base58_path": str(config.get("invalid_base58_path") or from_address("0OIlnotbase58")),
+        "too_short_path": str(config.get("too_short_path") or from_address("1111111111111111111111111111111")),
+        "too_long_path": str(
+            config.get("too_long_path")
+            or from_address("111111111111111111111111111111111111111111111")
+        ),
+        "encoded_traversal_path": str(config.get("encoded_traversal_path") or from_address("%2e%2e%2fhealth")),
+        "extra_segment_path": str(config.get("extra_segment_path") or (from_address("not-an-address") + "/extra")),
+        "query_injection_path": str(
+            config.get("query_injection_path")
+            or (from_address("not-an-address") + "?url=https://evil.example")
+        ),
+    }
+
+
+def is_concrete_probe_path(path: str | None) -> bool:
+    return bool(path and str(path).startswith("/") and "{" not in str(path) and "}" not in str(path))
+
+
+def cluster_declared_methods(cluster: dict[str, Any]) -> set[str]:
+    methods = {str(cluster.get("method") or "").upper()}
+    match = cluster.get("match") or {}
+    methods.update(str(method).upper() for method in match.get("methods", []))
+    methods.discard("")
+    methods.discard("WS")
+    return {method for method in methods if method in HTTP_METHODS}
+
+
+def generic_nextjs_route_targets(profile: dict[str, Any] | None) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    for cluster in (profile or {}).get("clusters", []):
+        cluster_id = str(cluster.get("id") or "")
+        if not cluster_id or cluster_id == "health":
+            continue
+        if strategy_set_for_cluster(cluster) != "nextjs-api-routes":
+            continue
+        path = probe_target_path(profile, cluster_id, "path", str(cluster.get("path") or ""))
+        if not is_concrete_probe_path(path):
+            continue
+        targets.append(
+            {
+                "id": cluster_id,
+                "path": path,
+                "methods": sorted(cluster_declared_methods(cluster)),
+                "kind": cluster.get("kind") or "api-route",
+                "priority": cluster.get("priority") or "low",
+            }
+        )
+    return targets
+
+
+def safe_probe_id(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").lower() or "route"
+
+
+def build_strategy_registry_artifact(
+    profile: dict[str, Any],
+    clusters: dict[str, Any],
+) -> dict[str, Any]:
+    enabled = enabled_strategy_set_ids(profile)
+    unknown_enabled = sorted(strategy_id for strategy_id in enabled if strategy_id not in STRATEGY_REGISTRY)
+    registry = {}
+    for strategy_id, strategy in STRATEGY_REGISTRY.items():
+        registry[strategy_id] = {
+            **json_clone(strategy),
+            "enabled": strategy_id in enabled,
+        }
+    return {
+        "generated_at": utc_now(),
+        "status": "loaded",
+        "profile": profile_summary(profile),
+        "enabled_strategy_sets": sorted(enabled),
+        "unknown_enabled_strategy_sets": unknown_enabled,
+        "registry": registry,
+        "effective_clusters": [
+            {
+                "id": cluster.get("id"),
+                "kind": cluster.get("kind"),
+                "strategy_set": cluster.get("strategy_set"),
+                "priority": cluster.get("priority"),
+            }
+            for cluster in clusters.get("clusters", [])
+        ],
+        "safety": "Strategy registry controls bounded probe selection only; it does not enable signing, transaction submission, Burp Scanner, or broad fuzzing.",
+    }
+
+
+def build_profile_validation_artifact(
+    profile: dict[str, Any],
+    clusters: dict[str, Any],
+    source_root: Path,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    enabled = enabled_strategy_set_ids(profile)
+    defaulted_keys = [str(key) for key in profile.get("_profile_defaulted_keys", [])]
+    unknown_strategy_sets = sorted(strategy_id for strategy_id in enabled if strategy_id not in STRATEGY_REGISTRY)
+    for strategy_id in unknown_strategy_sets:
+        issues.append(
+            {
+                "id": f"unknown-strategy-set:{strategy_id}",
+                "severity": "error",
+                "message": f"Profile enables strategy set `{strategy_id}`, but it is not in the InferForge registry.",
+            }
+        )
+
+    if profile.get("_profile_loaded_from") == "file":
+        for key in sorted(set(defaulted_keys) & {
+            "clusters",
+            "probe_targets",
+            "source_peeks",
+            "burp_observation_plan",
+            "websocket_observation",
+        }):
+            warnings.append(
+                {
+                    "id": f"profile:defaulted-{key}",
+                    "severity": "warning",
+                    "message": (
+                        f"Profile did not declare `{key}`; InferForge used a neutral empty default "
+                        "instead of the regression target defaults."
+                    ),
+                }
+            )
+
+    seen_cluster_ids: set[str] = set()
+    declared_clusters = profile.get("clusters", [])
+    active_burp_observation_count = 0
+    for index, cluster in enumerate(declared_clusters):
+        cluster_id = str(cluster.get("id") or "")
+        if not cluster_id:
+            issues.append(
+                {
+                    "id": f"cluster-{index}-missing-id",
+                    "severity": "error",
+                    "message": "Cluster is missing required `id`.",
+                }
+            )
+            continue
+        if cluster_id in seen_cluster_ids:
+            issues.append(
+                {
+                    "id": f"duplicate-cluster:{cluster_id}",
+                    "severity": "error",
+                    "message": f"Cluster id `{cluster_id}` is declared more than once.",
+                }
+            )
+        seen_cluster_ids.add(cluster_id)
+
+        for field in ["method", "path", "kind", "priority"]:
+            if not cluster.get(field):
+                issues.append(
+                    {
+                        "id": f"cluster:{cluster_id}:missing-{field}",
+                        "severity": "error",
+                        "message": f"Cluster `{cluster_id}` is missing required `{field}`.",
+                    }
+                )
+        strategy_set = strategy_set_for_cluster(cluster)
+        if strategy_set and strategy_set not in STRATEGY_REGISTRY:
+            issues.append(
+                {
+                    "id": f"cluster:{cluster_id}:unknown-strategy-set",
+                    "severity": "error",
+                    "message": f"Cluster `{cluster_id}` references unknown strategy set `{strategy_set}`.",
+                }
+            )
+        if strategy_set and strategy_set not in enabled:
+            warnings.append(
+                {
+                    "id": f"cluster:{cluster_id}:strategy-disabled",
+                    "severity": "warning",
+                    "message": f"Cluster `{cluster_id}` belongs to disabled strategy set `{strategy_set}` and will not be active.",
+                }
+            )
+        if strategy_set and strategy_set in enabled and cluster_id in {
+            "health",
+            "quote",
+            "solana-rpc-http",
+            "solana-rpc-ws",
+            "orca-pools",
+        }:
+            probe_target = explicit_probe_target_config(profile, cluster_id)
+            if not probe_target and cluster_id != "solana-rpc-ws":
+                warnings.append(
+                    {
+                        "id": f"cluster:{cluster_id}:missing-probe-target",
+                        "severity": "warning",
+                        "message": (
+                            f"Cluster `{cluster_id}` has no explicit `probe_targets.{cluster_id}` entry. "
+                            "InferForge will derive bounded probe paths from the cluster path when possible."
+                        ),
+                    }
+                )
+            if cluster_id == "solana-rpc-ws" and websocket_observation_config(profile) is None:
+                warnings.append(
+                    {
+                        "id": "cluster:solana-rpc-ws:missing-websocket-observation",
+                        "severity": "warning",
+                        "message": (
+                            "Cluster `solana-rpc-ws` is active, but no WebSocket observation/probe path "
+                            "can be resolved from `websocket_observation`, `probe_targets`, or cluster path."
+                        ),
+                    }
+                )
+        if strategy_set == "nextjs-api-routes" and cluster_id != "health":
+            generic_path = probe_target_path(profile, cluster_id, "path", str(cluster.get("path") or ""))
+            if not is_concrete_probe_path(generic_path):
+                warnings.append(
+                    {
+                        "id": f"cluster:{cluster_id}:generic-route-missing-concrete-probe-path",
+                        "severity": "warning",
+                        "message": (
+                            f"Cluster `{cluster_id}` is a generic Next.js route, but its probe path "
+                            "is not concrete. Add `probe_targets.{cluster_id}.path` to enable bounded "
+                            "HEAD/OPTIONS/GET method probes."
+                        ),
+                    }
+                )
+
+        match = cluster.get("match") or {}
+        if not (match.get("paths") or match.get("path_prefixes") or match.get("path_patterns")):
+            warnings.append(
+                {
+                    "id": f"cluster:{cluster_id}:missing-match",
+                    "severity": "warning",
+                    "message": f"Cluster `{cluster_id}` has no explicit match rules; endpoint classification will fall back to its path pattern.",
+                }
+                )
+
+        for ref in cluster.get("source_refs", []):
+            ref_path = source_ref_to_path(source_root, str(ref))
+            if not ref_path.exists():
+                warnings.append(
+                    {
+                        "id": f"cluster:{cluster_id}:missing-source-ref",
+                        "severity": "warning",
+                        "message": f"Source reference `{ref}` does not exist under the effective source root.",
+                    }
+                )
+
+    observation_plan = profile.get("burp_observation_plan", [])
+    if not isinstance(observation_plan, list):
+        issues.append(
+            {
+                "id": "burp-observation-plan:not-list",
+                "severity": "error",
+                "message": "`burp_observation_plan` must be a list.",
+            }
+        )
+    else:
+        for index, item in enumerate(observation_plan):
+            if not isinstance(item, dict):
+                issues.append(
+                    {
+                        "id": f"burp-observation-plan:index-{index}:not-object",
+                        "severity": "error",
+                        "message": "Each `burp_observation_plan` entry must be an object.",
+                    }
+                )
+                continue
+            if not is_active_observation_item(item):
+                continue
+            active_burp_observation_count += 1
+            label = active_observation_label(item, index)
+            method = str(item.get("method") or "").upper()
+            if method not in HTTP_METHODS:
+                issues.append(
+                    {
+                        "id": f"burp-observation-plan:{label}:invalid-method",
+                        "severity": "error",
+                        "message": (
+                            f"Active Burp observation `{label}` has invalid method `{method or '(missing)'}`."
+                        ),
+                    }
+                )
+            path_problem = concrete_local_path_problem(item.get("path"))
+            if path_problem:
+                issues.append(
+                    {
+                        "id": f"burp-observation-plan:{label}:unsafe-path",
+                        "severity": "error",
+                        "message": (
+                            f"Active Burp observation `{label}` path is unsafe: {path_problem}. "
+                            "Move placeholders to `review_observation_candidates` or promote one reviewed concrete path."
+                        ),
+                    }
+                )
+            cluster_id = item.get("cluster")
+            if declared_clusters and cluster_id and str(cluster_id) not in seen_cluster_ids:
+                warnings.append(
+                    {
+                        "id": f"burp-observation-plan:{label}:unknown-cluster",
+                        "severity": "warning",
+                        "message": (
+                            f"Active Burp observation `{label}` references cluster `{cluster_id}`, "
+                            "which is not declared by the profile."
+                        ),
+                    }
+                )
+
+    websocket_raw = profile.get("websocket_observation")
+    if websocket_raw not in (None, False):
+        if not isinstance(websocket_raw, dict):
+            issues.append(
+                {
+                    "id": "websocket-observation:not-object",
+                    "severity": "error",
+                    "message": "`websocket_observation` must be an object, null, or false.",
+                }
+            )
+        else:
+            ws_config = websocket_observation_config(profile)
+            if ws_config is not None:
+                path_problem = concrete_local_path_problem(ws_config.get("path"))
+                if path_problem:
+                    issues.append(
+                        {
+                            "id": "websocket-observation:unsafe-path",
+                            "severity": "error",
+                            "message": (
+                                f"Active WebSocket observation path is unsafe: {path_problem}. "
+                                "Set a reviewed concrete local path or disable WebSocket observation."
+                            ),
+                        }
+                    )
+
+    if declared_clusters and not clusters.get("clusters"):
+        issues.append(
+            {
+                "id": "no-effective-clusters",
+                "severity": "error",
+                "message": "Profile declares clusters, but none are active after strategy-set filtering.",
+            }
+        )
+    elif not declared_clusters:
+        warnings.append(
+            {
+                "id": "no-declared-clusters",
+                "severity": "warning",
+                "message": "Profile has no clusters. Run discover-profile or add clusters before auditing.",
+            }
+        )
+
+    status = "failed" if issues else ("warnings" if warnings else "passed")
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "profile": profile_summary(profile),
+        "source_root": str(source_root),
+        "summary": {
+            "declared_clusters": len(declared_clusters),
+            "effective_clusters": len(clusters.get("clusters", [])),
+            "enabled_strategy_sets": sorted(enabled),
+            "unknown_strategy_sets": unknown_strategy_sets,
+            "defaulted_keys": defaulted_keys,
+            "active_burp_observations": active_burp_observation_count,
+            "review_observation_candidates": len(profile.get("review_observation_candidates", []) or []),
+            "issue_count": len(issues),
+            "warning_count": len(warnings),
+        },
+        "issues": issues,
+        "warnings": warnings,
+        "safety": "Profile validation is static and read-only except for writing this artifact.",
+    }
+
+
+HTTP_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+ROUTE_FILE_NAMES = {"route.js", "route.jsx", "route.ts", "route.tsx"}
+PAGES_API_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx"}
+NEXT_CONFIG_FILE_NAMES = {
+    "next.config.js",
+    "next.config.mjs",
+    "next.config.cjs",
+    "next.config.ts",
+}
+
+
+def repo_relative_or_absolute(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path.resolve())
+
+
+def source_root_relative_or_repo(path: Path, source_root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(source_root.resolve()))
+    except ValueError:
+        return repo_relative_or_absolute(path)
+
+
+def route_segment_to_path_segment(segment: str) -> str | None:
+    if not segment or segment.startswith("(") and segment.endswith(")"):
+        return None
+    if segment.startswith("@"):
+        return None
+    if segment.startswith("[[...") and segment.endswith("]]"):
+        return "{" + segment[5:-2] + "*}"
+    if segment.startswith("[...") and segment.endswith("]"):
+        return "{" + segment[4:-1] + "*}"
+    if segment.startswith("[") and segment.endswith("]"):
+        return "{" + segment[1:-1] + "}"
+    return segment
+
+
+def app_roots(source_root: Path) -> list[Path]:
+    return [source_root / "src/app", source_root / "app"]
+
+
+def nextjs_route_path(route_file: Path, source_root: Path) -> str | None:
+    relative = None
+    for app_root in app_roots(source_root):
+        try:
+            relative = route_file.relative_to(app_root)
+            break
+        except ValueError:
+            continue
+    if relative is None:
+        return None
+    if relative.name not in ROUTE_FILE_NAMES:
+        return None
+    segments = []
+    for segment in relative.parent.parts:
+        path_segment = route_segment_to_path_segment(segment)
+        if path_segment:
+            segments.append(path_segment)
+    return "/" + "/".join(segments) if segments else "/"
+
+
+def pages_api_roots(source_root: Path) -> list[Path]:
+    return [source_root / "src/pages/api", source_root / "pages/api"]
+
+
+def nextjs_pages_api_path(api_file: Path, source_root: Path) -> str | None:
+    if api_file.suffix not in PAGES_API_EXTENSIONS or api_file.name.endswith(".d.ts"):
+        return None
+    if api_file.name.startswith("_"):
+        return None
+    for api_root in pages_api_roots(source_root):
+        try:
+            relative = api_file.relative_to(api_root)
+        except ValueError:
+            continue
+        stemmed = relative.with_suffix("")
+        if stemmed.name.endswith((".test", ".spec")):
+            return None
+        segments = []
+        parts = list(stemmed.parts)
+        for index, segment in enumerate(parts):
+            if index == len(parts) - 1 and segment == "index":
+                continue
+            path_segment = route_segment_to_path_segment(segment)
+            if path_segment:
+                segments.append(path_segment)
+        return "/api" + ("/" + "/".join(segments) if segments else "")
+    return None
+
+
+def extract_route_methods(source: str) -> list[str]:
+    methods = set(re.findall(r"export\s+(?:async\s+)?function\s+([A-Z]+)\b", source))
+    methods.update(re.findall(r"export\s+const\s+([A-Z]+)\s*=", source))
+    return sorted(method for method in methods if method in HTTP_METHODS)
+
+
+def extract_pages_api_methods(source: str) -> list[str]:
+    methods = set(extract_route_methods(source))
+    methods.update(
+        re.findall(
+            r"\b(?:req|request)\.method\s*(?:={2,3}|!={1,2})\s*['\"]([A-Z]+)['\"]",
+            source,
+        )
+    )
+    methods.update(re.findall(r"\bcase\s+['\"]([A-Z]+)['\"]\s*:", source))
+    return sorted(method for method in methods if method in HTTP_METHODS)
+
+
+def extract_fixed_upstreams(source: str) -> list[str]:
+    urls = []
+    for match in re.finditer(r"https?://[A-Za-z0-9._~:/?#\[\]@!&*+,;=%-]+", source):
+        url = match.group(0).rstrip("'),\"`};]")
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            if origin not in urls:
+                urls.append(origin)
+    return urls[:20]
+
+
+def js_string_literal_value(expr: str) -> str | None:
+    expr = expr.strip()
+    if len(expr) < 2:
+        return None
+    quote = expr[0]
+    if quote not in {"'", '"', "`"}:
+        return None
+    if quote == "`":
+        if not expr.endswith("`"):
+            return None
+        return expr[1:-1]
+    try:
+        value = json.loads(expr) if quote == '"' else None
+    except json.JSONDecodeError:
+        value = None
+    if value is not None:
+        return str(value)
+    if not expr.endswith(quote):
+        return None
+    return bytes(expr[1:-1], "utf-8").decode("unicode_escape")
+
+
+def extract_next_config_env_defaults(source: str) -> dict[str, dict[str, str]]:
+    defaults: dict[str, dict[str, str]] = {}
+    pattern = re.compile(
+        r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+        r"process\.env\.([A-Za-z_][A-Za-z0-9_]*)\s*(?:\?\?|\|\|)\s*"
+        r"((?:'[^']*')|(?:\"[^\"]*\")|(?:`[^`]*`))",
+        re.S,
+    )
+    for match in pattern.finditer(source):
+        value = js_string_literal_value(match.group(3))
+        if value is None:
+            continue
+        defaults[match.group(1)] = {
+            "env": match.group(2),
+            "default": value,
+        }
+    return defaults
+
+
+def extract_js_string_constants(source: str) -> dict[str, str]:
+    constants: dict[str, str] = {}
+    pattern = re.compile(
+        r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+        r"((?:'[^']*')|(?:\"[^\"]*\")|(?:`[^`]*`))",
+        re.S,
+    )
+    for match in pattern.finditer(source):
+        value = js_string_literal_value(match.group(2))
+        if value is not None:
+            constants[match.group(1)] = value
+    return constants
+
+
+def render_static_template_literal(
+    value: str,
+    env_defaults: dict[str, dict[str, str]],
+) -> tuple[str, list[str]]:
+    variables: list[str] = []
+
+    def replace_var(match: re.Match[str]) -> str:
+        expression = match.group(1).strip()
+        if re.fullmatch(r"[A-Za-z_$][\w$]*", expression):
+            variables.append(expression)
+            if expression in env_defaults:
+                return env_defaults[expression]["default"]
+        return "${" + expression + "}"
+
+    return re.sub(r"\$\{([^{}]+)\}", replace_var, value), variables
+
+
+def rewrite_source_to_profile_path(source: str) -> str:
+    path = re.sub(r":([A-Za-z_][A-Za-z0-9_]*)\*", r"{\1*}", source)
+    path = re.sub(r":([A-Za-z_][A-Za-z0-9_]*)", r"{\1}", path)
+    return path
+
+
+def normalize_next_path(path: str) -> str:
+    if not path:
+        return "/"
+    normalized = "/" + path.strip("/")
+    return "/" if normalized == "//" else normalized
+
+
+def join_next_paths(prefix: str | None, path: str) -> str:
+    normalized_path = normalize_next_path(path)
+    if not prefix:
+        return normalized_path
+    normalized_prefix = normalize_next_path(prefix)
+    if normalized_prefix == "/":
+        return normalized_path
+    if normalized_path == "/":
+        return normalized_prefix
+    if normalized_path == normalized_prefix or normalized_path.startswith(normalized_prefix + "/"):
+        return normalized_path
+    return normalized_prefix.rstrip("/") + normalized_path
+
+
+def apply_trailing_slash(path: str, trailing_slash: bool | None) -> str:
+    if trailing_slash is None:
+        return path
+    if path == "/":
+        return path
+    if trailing_slash:
+        if path.endswith("/") or re.search(r"\{[^{}]+\*\}$", path):
+            return path
+        return path + "/"
+    return path.rstrip("/") or "/"
+
+
+def alternate_trailing_path(path: str, trailing_slash: bool | None) -> str | None:
+    if trailing_slash is None or path == "/" or re.search(r"\{[^{}]+\*\}$", path):
+        return None
+    alternate = path.rstrip("/") if trailing_slash else path + "/"
+    return alternate if alternate and alternate != path else None
+
+
+def extract_js_array_string_literals(expression: str | None) -> list[str]:
+    if not expression or not expression.strip().startswith("["):
+        return []
+    values = []
+    for item in split_js_array_items(expression.strip()):
+        value = js_string_literal_value(item)
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def next_config_root_body(source: str) -> str | None:
+    candidates: list[tuple[int, str]] = []
+    patterns = [
+        r"\b(?:const|let|var)\s+[A-Za-z_$][\w$]*(?:\s*:\s*[^=]+)?\s*=\s*\{",
+        r"\bmodule\.exports\s*=\s*\{",
+        r"\bexport\s+default\s+\{",
+    ]
+    config_props = {"basePath", "trailingSlash", "i18n", "rewrites", "redirects", "headers"}
+    for pattern in patterns:
+        for match in re.finditer(pattern, source):
+            start = source.find("{", match.start(), match.end())
+            if start < 0:
+                continue
+            end = find_js_object_end(source, start)
+            if end is None:
+                continue
+            body = source[start + 1 : end]
+            direct_props = js_object_direct_property_names(body)
+            score = len(direct_props & config_props)
+            if score:
+                candidates.append((score, body))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def discover_next_config_runtime(source_root: Path) -> dict[str, Any]:
+    configs = []
+    for config_file in next_config_files(source_root):
+        try:
+            source = read_text(config_file)
+        except UnicodeDecodeError:
+            continue
+        config_body = next_config_root_body(source) or source
+        base_path = js_string_literal_value(extract_js_direct_property_expression(config_body, "basePath") or "")
+        trailing_slash = js_boolean_literal_value(extract_js_direct_property_expression(config_body, "trailingSlash"))
+        i18n_expression = extract_js_direct_property_expression(config_body, "i18n")
+        i18n = {
+            "locales": [],
+            "default_locale": None,
+            "locale_prefixes": [],
+            "configured": False,
+        }
+        if i18n_expression and i18n_expression.startswith("{"):
+            locales = extract_js_array_string_literals(extract_js_property_expression(i18n_expression, "locales"))
+            default_locale = js_string_literal_value(extract_js_property_expression(i18n_expression, "defaultLocale") or "")
+            i18n = {
+                "locales": locales,
+                "default_locale": default_locale,
+                "locale_prefixes": [locale for locale in locales if locale != default_locale],
+                "configured": bool(locales),
+            }
+        config_doc = {
+            "file": source_root_relative_or_repo(config_file, source_root),
+            "repo_file": repo_relative_or_absolute(config_file),
+            "base_path": normalize_next_path(base_path) if base_path else None,
+            "trailing_slash": trailing_slash,
+            "i18n": i18n,
+            "line_patterns": {
+                "base_path": "basePath",
+                "trailing_slash": "trailingSlash",
+                "i18n": "i18n",
+                "locales": "locales",
+                "default_locale": "defaultLocale",
+            },
+        }
+        configs.append(config_doc)
+
+    base_path = next((item.get("base_path") for item in configs if item.get("base_path")), None)
+    trailing_slash = next(
+        (item.get("trailing_slash") for item in configs if item.get("trailing_slash") is not None),
+        None,
+    )
+    i18n = next(
+        (item.get("i18n") for item in configs if (item.get("i18n") or {}).get("configured")),
+        {"locales": [], "default_locale": None, "locale_prefixes": [], "configured": False},
+    )
+    reasons = []
+    if base_path:
+        reasons.append("next-config-basePath")
+    if trailing_slash is not None:
+        reasons.append("next-config-trailingSlash")
+    if i18n.get("configured"):
+        reasons.append("next-config-i18n")
+    return {
+        "status": "configured" if reasons else ("next-config-found" if configs else "not-found"),
+        "files": configs,
+        "base_path": base_path,
+        "trailing_slash": trailing_slash,
+        "i18n": i18n,
+        "inference_reasons": reasons,
+    }
+
+
+def next_config_entry_base_path_enabled(body: str) -> bool:
+    value = js_boolean_literal_value(extract_js_property_expression(body, "basePath"))
+    return value is not False
+
+
+def next_config_entry_locale_enabled(body: str) -> bool:
+    value = js_boolean_literal_value(extract_js_property_expression(body, "locale"))
+    return value is not False
+
+
+def next_runtime_path_variants(
+    source_path: str,
+    runtime_config: dict[str, Any] | None,
+    *,
+    apply_base_path: bool = True,
+    locale_aware: bool = True,
+) -> dict[str, Any]:
+    runtime_config = runtime_config or {}
+    base_path = runtime_config.get("base_path") if apply_base_path else None
+    trailing_slash = runtime_config.get("trailing_slash")
+    i18n = runtime_config.get("i18n") or {}
+    locale_prefixes = list(i18n.get("locale_prefixes") or []) if locale_aware else []
+
+    framework_path = normalize_next_path(source_path)
+    default_path = apply_trailing_slash(join_next_paths(base_path, framework_path), trailing_slash)
+    variants = [default_path]
+    alternate = alternate_trailing_path(default_path, trailing_slash)
+    if alternate:
+        variants.append(alternate)
+
+    locale_variants: dict[str, list[str]] = {}
+    for locale in locale_prefixes:
+        locale_path = apply_trailing_slash(join_next_paths(join_next_paths(base_path, f"/{locale}"), framework_path), trailing_slash)
+        locale_items = [locale_path]
+        locale_alternate = alternate_trailing_path(locale_path, trailing_slash)
+        if locale_alternate:
+            locale_items.append(locale_alternate)
+        locale_variants[locale] = locale_items
+        variants.extend(locale_items)
+
+    deduped = list(dict.fromkeys(variants))
+    return {
+        "source_path": framework_path,
+        "path": default_path,
+        "variants": deduped,
+        "locale_variants": locale_variants,
+        "base_path": base_path,
+        "base_path_applied": bool(base_path),
+        "trailing_slash": trailing_slash,
+        "i18n": {
+            "configured": bool(i18n.get("configured")),
+            "locales": list(i18n.get("locales") or []),
+            "default_locale": i18n.get("default_locale"),
+            "locale_prefixes": locale_prefixes,
+            "locale_aware": bool(locale_prefixes),
+        },
+    }
+
+
+def match_for_path_variants(paths: list[str], methods: list[str] | None = None) -> dict[str, Any]:
+    match: dict[str, Any] = {}
+    if methods:
+        match["methods"] = methods
+    for path in dict.fromkeys(paths):
+        if "{" in path:
+            match.setdefault("path_patterns", []).append(path)
+            prefix = catchall_prefix_for_path(path)
+            if prefix:
+                match.setdefault("path_prefixes", []).append(prefix)
+        else:
+            match.setdefault("paths", []).append(path)
+    return match
+
+
+def next_runtime_match_for_path(source_path: str, methods: list[str] | None, runtime_config: dict[str, Any] | None) -> dict[str, Any]:
+    runtime = next_runtime_path_variants(source_path, runtime_config)
+    return match_for_path_variants(runtime["variants"], methods or [])
+
+
+def next_runtime_reasons(runtime: dict[str, Any]) -> list[str]:
+    reasons = []
+    if runtime.get("base_path_applied"):
+        reasons.append("next-config-basePath")
+    if runtime.get("trailing_slash") is not None:
+        reasons.append("next-config-trailingSlash")
+    if (runtime.get("i18n") or {}).get("locale_aware"):
+        reasons.append("next-config-i18n")
+    return reasons
+
+
+def catchall_prefix_for_path(path: str) -> str | None:
+    match = re.search(r"\{[^{}]+\*\}", path)
+    if not match:
+        return None
+    prefix = path[: match.start()]
+    if not prefix or prefix == "/":
+        return None
+    return prefix if prefix.endswith("/") else prefix + "/"
+
+
+def extract_rewrite_prop(body: str, name: str) -> str | None:
+    match = re.search(
+        rf"\b{name}\s*:\s*((?:'[^']*')|(?:\"[^\"]*\")|(?:`[^`]*`)|[^,\n}}]+)",
+        body,
+        re.S,
+    )
+    return match.group(1).strip() if match else None
+
+
+def looks_like_next_redirect_body(body: str) -> bool:
+    return bool(re.search(r"\b(?:permanent|statusCode)\s*:", body))
+
+
+def find_js_object_end(source: str, start: int) -> int | None:
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    index = start
+    while index < len(source):
+        char = source[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            index += 1
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def js_object_direct_property_names(body: str) -> set[str]:
+    names: set[str] = set()
+    index = 0
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    while index < len(body):
+        char = body[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            index += 1
+            continue
+        if char in "{[(":
+            depth += 1
+            index += 1
+            continue
+        if char in "}])":
+            depth = max(0, depth - 1)
+            index += 1
+            continue
+        if depth == 0:
+            match = re.match(r"\s*([A-Za-z_$][\w$]*)\s*:", body[index:])
+            if match:
+                names.add(match.group(1))
+                index += match.end()
+                continue
+        index += 1
+    return names
+
+
+def js_object_bodies_with_props(source: str, props: set[str]) -> list[str]:
+    bodies: list[str] = []
+    for index, char in enumerate(source):
+        if char != "{":
+            continue
+        end = find_js_object_end(source, index)
+        if end is None:
+            continue
+        body = source[index + 1 : end]
+        direct_props = js_object_direct_property_names(body)
+        if props.issubset(direct_props):
+            bodies.append(body)
+    return bodies
+
+
+def js_object_bodies_with_props_and_locations(source: str, props: set[str]) -> list[tuple[str, int, int]]:
+    bodies: list[tuple[str, int, int]] = []
+    for index, char in enumerate(source):
+        if char != "{":
+            continue
+        end = find_js_object_end(source, index)
+        if end is None:
+            continue
+        body = source[index + 1 : end]
+        direct_props = js_object_direct_property_names(body)
+        if props.issubset(direct_props):
+            bodies.append((body, index, end))
+    return bodies
+
+
+def next_config_files(source_root: Path) -> list[Path]:
+    return [
+        source_root / name
+        for name in sorted(NEXT_CONFIG_FILE_NAMES)
+        if (source_root / name).is_file()
+    ]
+
+
+def nearest_next_config_rewrite_phase(source: str, object_start: int) -> str:
+    prefix = source[:object_start]
+    phase_positions = {
+        phase: prefix.rfind(f"{phase}:")
+        for phase in ["beforeFiles", "afterFiles", "fallback"]
+    }
+    phase, position = max(phase_positions.items(), key=lambda item: item[1])
+    return phase if position >= 0 else "array"
+
+
+def extract_next_config_conditions(body: str) -> dict[str, list[dict[str, Any]]]:
+    conditions: dict[str, list[dict[str, Any]]] = {"has": [], "missing": []}
+    for key in ["has", "missing"]:
+        expression = extract_js_property_expression(body, key)
+        if not expression or not expression.startswith("["):
+            continue
+        for item in split_js_array_items(expression):
+            if not item.strip().startswith("{"):
+                continue
+            condition_type = js_string_literal_value(extract_js_property_expression(item, "type") or "")
+            condition_key = js_string_literal_value(extract_js_property_expression(item, "key") or "")
+            condition_value = js_string_literal_value(extract_js_property_expression(item, "value") or "")
+            if not condition_type and not condition_key:
+                continue
+            conditions[key].append(
+                {
+                    "type": condition_type,
+                    "key": condition_key,
+                    "value": condition_value,
+                }
+            )
+    return conditions
+
+
+def next_config_conditions_present(conditions: dict[str, list[dict[str, Any]]] | None) -> bool:
+    return bool((conditions or {}).get("has") or (conditions or {}).get("missing"))
+
+
+def discover_nextjs_rewrites(source_root: Path, runtime_config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    rewrites: list[dict[str, Any]] = []
+    for config_file in next_config_files(source_root):
+        try:
+            source = read_text(config_file)
+        except UnicodeDecodeError:
+            continue
+        env_defaults = extract_next_config_env_defaults(source)
+        for index, (body, start, _end) in enumerate(js_object_bodies_with_props_and_locations(source, {"source", "destination"}), start=1):
+            if looks_like_next_redirect_body(body):
+                continue
+            source_expr = extract_rewrite_prop(body, "source")
+            destination_expr = extract_rewrite_prop(body, "destination")
+            source_value = js_string_literal_value(source_expr or "")
+            destination_template = js_string_literal_value(destination_expr or "")
+            if not source_value or not destination_template or not source_value.startswith("/"):
+                continue
+            destination_resolved, variables = render_static_template_literal(destination_template, env_defaults)
+            source_path = rewrite_source_to_profile_path(source_value)
+            runtime = next_runtime_path_variants(
+                source_path,
+                runtime_config,
+                apply_base_path=next_config_entry_base_path_enabled(body),
+                locale_aware=next_config_entry_locale_enabled(body),
+            )
+            path = runtime["path"]
+            upstreams = extract_fixed_upstreams(destination_resolved)
+            reasons = ["next-config-rewrite"]
+            if upstreams:
+                reasons.append("rewrite-destination-fixed-upstream")
+            if variables:
+                reasons.append("rewrite-destination-template-env")
+            reasons.extend(reason for reason in next_runtime_reasons(runtime) if reason not in reasons)
+            phase = nearest_next_config_rewrite_phase(source, start)
+            conditions = extract_next_config_conditions(body)
+            if next_config_conditions_present(conditions):
+                reasons.append("rewrite-conditions")
+            rewrite_doc = {
+                "cluster_id": cluster_id_from_route_path(source_path),
+                "path": path,
+                "source_path": source_path,
+                "methods": [],
+                "file": source_root_relative_or_repo(config_file, source_root),
+                "repo_file": repo_relative_or_absolute(config_file),
+                "dynamic_segments": route_dynamic_segments(source_path),
+                "fixed_upstreams": upstreams,
+                "strategy_set": "fixed-upstream-proxy",
+                "kind": "rewrite-proxy",
+                "priority": "medium",
+                "inference_reasons": reasons,
+                "next_config": runtime,
+                "match": match_for_path_variants(runtime["variants"], []),
+                "rewrite": {
+                    "source": source_value,
+                    "source_pattern": path,
+                    "source_framework_pattern": source_path,
+                    "destination_template": destination_template,
+                    "destination_resolved": destination_resolved,
+                    "destination_expression": destination_expr,
+                    "template_variables": variables,
+                    "env_defaults_used": {
+                        variable: env_defaults[variable]
+                        for variable in variables
+                        if variable in env_defaults
+                    },
+                    "phase": phase,
+                    "conditions": conditions,
+                    "conditional": next_config_conditions_present(conditions),
+                    "index": index,
+                },
+            }
+            rewrites.append(rewrite_doc)
+    return rewrites
+
+
+def custom_server_files(source_root: Path) -> list[Path]:
+    names = [
+        "server.js",
+        "server.mjs",
+        "server.cjs",
+        "server.ts",
+        "src/server.js",
+        "src/server.ts",
+    ]
+    return [source_root / name for name in names if (source_root / name).is_file()]
+
+
+def custom_ws_cluster_id_for_prefix(prefix: str) -> str:
+    if prefix.startswith("/api/rpc/solana/"):
+        return "solana-rpc-ws"
+    return f"custom-ws-{safe_probe_id(prefix.strip('/') or 'root')}"
+
+
+def custom_ws_path_for_prefix(prefix: str) -> str:
+    normalized = prefix if prefix.endswith("/") else prefix + "/"
+    if normalized.startswith("/api/rpc/solana/"):
+        return normalized + "{cluster}"
+    return normalized + "{path*}"
+
+
+def discover_custom_server_entrypoints(source_root: Path) -> list[dict[str, Any]]:
+    entrypoints: list[dict[str, Any]] = []
+    for server_file in custom_server_files(source_root):
+        try:
+            source = read_text(server_file)
+        except UnicodeDecodeError:
+            continue
+        if "server.on(" not in source or "upgrade" not in source:
+            continue
+        if "WebSocketServer" not in source and ".getUpgradeHandler(" not in source:
+            continue
+
+        constants = extract_js_string_constants(source)
+        fixed_upstreams = [
+            url
+            for url in extract_fixed_upstreams(source)
+            if urllib.parse.urlparse(url).hostname not in {"localhost", "127.0.0.1", "::1"}
+        ]
+        for const_name, value in sorted(constants.items()):
+            if not value.startswith("/") or not value.endswith("/"):
+                continue
+            if f"startsWith({const_name})" not in source:
+                continue
+            path = custom_ws_path_for_prefix(value)
+            cluster_id = custom_ws_cluster_id_for_prefix(value)
+            line_patterns = {
+                "path_prefix_const": const_name,
+                "upgrade_handler": ["server.on('upgrade'", 'server.on("upgrade"'],
+                "websocket_server": "new WebSocketServer",
+            }
+            if "getSolanaClusterFromPathname" in source:
+                line_patterns["route_extractor"] = "function getSolanaClusterFromPathname"
+            if "handleSolanaWsProxy" in source:
+                line_patterns["proxy_handler"] = "function handleSolanaWsProxy"
+            if "isAllowedOrigin" in source:
+                line_patterns["origin_check"] = "function isAllowedOrigin"
+
+            entrypoints.append(
+                {
+                    "cluster_id": cluster_id,
+                    "path": path,
+                    "methods": ["WS"],
+                    "file": source_root_relative_or_repo(server_file, source_root),
+                    "repo_file": repo_relative_or_absolute(server_file),
+                    "dynamic_segments": route_dynamic_segments(path),
+                    "fixed_upstreams": fixed_upstreams,
+                    "strategy_set": "solana-json-rpc-proxy" if cluster_id == "solana-rpc-ws" else "custom-server-upgrade",
+                    "kind": "websocket-json-rpc-proxy" if cluster_id == "solana-rpc-ws" else "custom-websocket-upgrade",
+                    "priority": "high" if cluster_id == "solana-rpc-ws" else "medium",
+                    "inference_reasons": [
+                        "custom-server-upgrade-handler",
+                        "custom-server-path-prefix",
+                        "custom-server-websocket",
+                    ],
+                    "match": {
+                        "methods": ["WS"],
+                        "path_patterns": [path],
+                        "path_prefixes": [value],
+                    },
+                    "custom_server": {
+                        "path_prefix_constant": const_name,
+                        "path_prefix": value,
+                        "upgrade_handler": "server.on('upgrade')",
+                    },
+                    "line_patterns": line_patterns,
+                }
+            )
+    return entrypoints
+
+
+def middleware_files(source_root: Path) -> list[Path]:
+    candidates = []
+    for base in [source_root, source_root / "src"]:
+        for stem in ["middleware", "proxy"]:
+            for suffix in PAGES_API_EXTENSIONS:
+                path = base / f"{stem}{suffix}"
+                if path.is_file() and not path.name.endswith(".d.ts"):
+                    candidates.append(path)
+    return sorted(dict.fromkeys(candidates))
+
+
+def extract_js_property_expression(source: str, property_name: str) -> str | None:
+    match = re.search(rf"\b{re.escape(property_name)}\s*:", source)
+    if not match:
+        return None
+    index = match.end()
+    while index < len(source) and source[index].isspace():
+        index += 1
+    if index >= len(source):
+        return None
+
+    opening = source[index]
+    if opening in {"'", '"', "`"}:
+        quote = opening
+        escaped = False
+        index += 1
+        while index < len(source):
+            char = source[index]
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                return source[match.end(): index + 1].strip()
+            index += 1
+        return None
+
+    closing_by_opening = {"[": "]", "{": "}", "(": ")"}
+    if opening in closing_by_opening:
+        stack = [closing_by_opening[opening]]
+        quote: str | None = None
+        escaped = False
+        index += 1
+        while index < len(source):
+            char = source[index]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char in {"'", '"', "`"}:
+                quote = char
+                index += 1
+                continue
+            if char in closing_by_opening:
+                stack.append(closing_by_opening[char])
+            elif stack and char == stack[-1]:
+                stack.pop()
+                if not stack:
+                    return source[match.end(): index + 1].strip()
+            index += 1
+        return None
+
+    end = index
+    while end < len(source) and source[end] not in {",", "\n", "}"}:
+        end += 1
+    return source[index:end].strip()
+
+
+def extract_js_direct_property_expression(body: str, property_name: str) -> str | None:
+    index = 0
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    while index < len(body):
+        char = body[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            index += 1
+            continue
+        if char in "{[(":
+            depth += 1
+            index += 1
+            continue
+        if char in "}])":
+            depth = max(0, depth - 1)
+            index += 1
+            continue
+        if depth == 0:
+            match = re.match(rf"\s*{re.escape(property_name)}\s*:", body[index:])
+            if match:
+                return extract_js_property_expression(body[index:], property_name)
+        index += 1
+    return None
+
+
+def split_js_array_items(expression: str) -> list[str]:
+    expression = expression.strip()
+    if not expression.startswith("[") or not expression.endswith("]"):
+        return []
+    body = expression[1:-1]
+    items: list[str] = []
+    start = 0
+    index = 0
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    while index < len(body):
+        char = body[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+        elif char in "[{(":
+            depth += 1
+        elif char in "]})" and depth > 0:
+            depth -= 1
+        elif char == "," and depth == 0:
+            item = body[start:index].strip()
+            if item:
+                items.append(item)
+            start = index + 1
+        index += 1
+    tail = body[start:].strip()
+    if tail:
+        items.append(tail)
+    return items
+
+
+def extract_middleware_matchers(source: str, runtime_config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    expression = extract_js_property_expression(source, "matcher")
+    if not expression:
+        return []
+    matcher_docs: list[dict[str, Any]] = []
+
+    def add_literal(value: str, *, source_kind: str) -> None:
+        if not value.startswith("/"):
+            return
+        source_pattern = rewrite_source_to_profile_path(value)
+        runtime = next_runtime_path_variants(source_pattern, runtime_config)
+        matcher_docs.append(
+            {
+                "source": value,
+                "source_path_pattern": source_pattern,
+                "path_pattern": runtime["path"],
+                "path_patterns": runtime["variants"],
+                "source_kind": source_kind,
+                "simple": all(middleware_matcher_is_simple(pattern) for pattern in runtime["variants"]),
+                "next_config": runtime,
+            }
+        )
+
+    if expression[0] in {"'", '"', "`"}:
+        value = js_string_literal_value(expression)
+        if value is not None:
+            add_literal(value, source_kind="literal")
+        return matcher_docs
+
+    if expression.startswith("["):
+        for item in split_js_array_items(expression):
+            if item and item[0] in {"'", '"', "`"}:
+                value = js_string_literal_value(item)
+                if value is not None:
+                    add_literal(value, source_kind="array-literal")
+                continue
+            source_expression = extract_js_property_expression(item, "source")
+            if source_expression:
+                value = js_string_literal_value(source_expression)
+                if value is not None:
+                    add_literal(value, source_kind="object-source")
+        return matcher_docs
+
+    source_expression = extract_js_property_expression(expression, "source")
+    if source_expression:
+        value = js_string_literal_value(source_expression)
+        if value is not None:
+            add_literal(value, source_kind="object-source")
+    return matcher_docs
+
+
+def middleware_matcher_is_simple(pattern: str) -> bool:
+    return not any(marker in pattern for marker in ["(", ")", "[", "]", "|", "?=", "?!", "+"])
+
+
+def discover_nextjs_middleware(source_root: Path, runtime_config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    middleware_entries: list[dict[str, Any]] = []
+    for path in middleware_files(source_root):
+        try:
+            source = read_text(path)
+        except UnicodeDecodeError:
+            continue
+        stem = path.stem
+        matchers = extract_middleware_matchers(source, runtime_config)
+        reasons = [f"nextjs-{stem}-file"]
+        if matchers:
+            reasons.append("static-matcher-config")
+        else:
+            reasons.append("default-all-paths")
+        if runtime_config:
+            for reason in runtime_config.get("inference_reasons", []):
+                if reason not in reasons:
+                    reasons.append(reason)
+        middleware_entries.append(
+            {
+                "id": f"{stem}-{safe_probe_id(source_root_relative_or_repo(path, source_root))}",
+                "kind": f"nextjs-{stem}",
+                "file": source_root_relative_or_repo(path, source_root),
+                "repo_file": repo_relative_or_absolute(path),
+                "matchers": matchers,
+                "match_strategy": "static-matchers" if matchers else "default-all-paths",
+                "inference_reasons": reasons,
+                "line_patterns": {
+                    "handler": [
+                        "export function middleware",
+                        "export async function middleware",
+                        "export default function middleware",
+                        "export function proxy",
+                        "export async function proxy",
+                        "export default function proxy",
+                    ],
+                    "config": "export const config",
+                    "matcher": "matcher",
+                },
+                "safety": "Static middleware/proxy source context only. Does not execute middleware or send HTTP requests.",
+            }
+        )
+    return middleware_entries
+
+
+def server_action_scan_roots(source_root: Path) -> list[Path]:
+    candidates = [
+        *app_roots(source_root),
+        source_root / "src/actions",
+        source_root / "actions",
+    ]
+    return sorted(dict.fromkeys(path for path in candidates if path.is_dir()))
+
+
+def server_action_candidate_files(source_root: Path) -> list[Path]:
+    excluded_parts = {"node_modules", ".next", "dist", "build", "coverage"}
+    files: list[Path] = []
+    for root in server_action_scan_roots(source_root):
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix not in PAGES_API_EXTENSIONS or path.name.endswith(".d.ts"):
+                continue
+            if any(part in excluded_parts for part in path.parts):
+                continue
+            files.append(path)
+    return sorted(dict.fromkeys(files))
+
+
+def has_file_level_use_server(source: str) -> bool:
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        return stripped in {"'use server'", '"use server"', "'use server';", '"use server";'}
+    return False
+
+
+def use_server_directive_count(source: str) -> int:
+    return len(re.findall(r"(?m)^\s*['\"]use server['\"]\s*;?\s*$", source))
+
+
+def extract_server_action_exports(source: str) -> list[str]:
+    names: set[str] = set()
+    patterns = [
+        r"\bexport\s+async\s+function\s+([A-Za-z_$][\w$]*)\b",
+        r"\bexport\s+function\s+([A-Za-z_$][\w$]*)\b",
+        r"\bexport\s+const\s+([A-Za-z_$][\w$]*)\s*=\s*async\b",
+        r"\bexport\s+const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(",
+    ]
+    for pattern in patterns:
+        names.update(re.findall(pattern, source))
+    return sorted(names)
+
+
+def discover_nextjs_server_actions(source_root: Path) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    for path in server_action_candidate_files(source_root):
+        try:
+            source = read_text(path)
+        except UnicodeDecodeError:
+            continue
+        directive_count = use_server_directive_count(source)
+        if directive_count == 0:
+            continue
+        file_level = has_file_level_use_server(source)
+        action_names = extract_server_action_exports(source)
+        source_ref = source_root_relative_or_repo(path, source_root)
+        line_patterns: dict[str, Any] = {"use_server": "use server"}
+        for name in action_names[:12]:
+            line_patterns[f"action:{name}"] = name
+        actions.append(
+            {
+                "id": f"server_action_{safe_probe_id(source_ref)}",
+                "kind": "nextjs-server-action",
+                "file": source_ref,
+                "repo_file": repo_relative_or_absolute(path),
+                "scope": "file-level-use-server" if file_level else "inline-use-server",
+                "action_names": action_names,
+                "action_count": len(action_names),
+                "use_server_directive_count": directive_count,
+                "inference_reasons": [
+                    "nextjs-use-server-directive",
+                    "server-action-source-context",
+                    "file-level-use-server" if file_level else "inline-use-server",
+                ],
+                "line_patterns": line_patterns,
+                "safety": "Static Server Actions source context only. Does not execute actions, submit forms, send HTTP requests, sign wallets, or mutate state.",
+            }
+        )
+    return actions
+
+
+def js_boolean_literal_value(expr: str | None) -> bool | None:
+    if expr is None:
+        return None
+    value = str(expr).strip().rstrip(",")
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    return None
+
+
+def js_integer_literal_value(expr: str | None) -> int | None:
+    if expr is None:
+        return None
+    value = str(expr).strip().rstrip(",")
+    return int(value) if re.fullmatch(r"\d{3}", value) else None
+
+
+def next_config_route_policy_match(path: str) -> dict[str, Any]:
+    if "{" in path:
+        match = {"path_patterns": [path]}
+        prefix = catchall_prefix_for_path(path)
+        if prefix:
+            match["path_prefixes"] = [prefix]
+        return match
+    return {"paths": [path]}
+
+
+def extract_next_config_headers(body: str) -> list[dict[str, Any]]:
+    expression = extract_js_property_expression(body, "headers")
+    if not expression or not expression.startswith("["):
+        return []
+    headers = []
+    for item in split_js_array_items(expression):
+        key_expr = extract_js_property_expression(item, "key")
+        value_expr = extract_js_property_expression(item, "value")
+        key = js_string_literal_value(key_expr or "")
+        value = js_string_literal_value(value_expr or "")
+        if not key:
+            continue
+        headers.append(
+            {
+                "key": key,
+                "value": value,
+                "key_expression": key_expr,
+                "value_expression": value_expr,
+            }
+        )
+    return headers
+
+
+def discover_next_config_route_policies(source_root: Path, runtime_config: dict[str, Any] | None = None) -> dict[str, list[dict[str, Any]]]:
+    redirects: list[dict[str, Any]] = []
+    headers: list[dict[str, Any]] = []
+    for config_file in next_config_files(source_root):
+        try:
+            source = read_text(config_file)
+        except UnicodeDecodeError:
+            continue
+        env_defaults = extract_next_config_env_defaults(source)
+
+        for index, (body, _start, _end) in enumerate(js_object_bodies_with_props_and_locations(source, {"source", "destination"}), start=1):
+            if not looks_like_next_redirect_body(body):
+                continue
+            source_expr = extract_rewrite_prop(body, "source")
+            destination_expr = extract_rewrite_prop(body, "destination")
+            source_value = js_string_literal_value(source_expr or "")
+            destination_template = js_string_literal_value(destination_expr or "")
+            if not source_value or not destination_template or not source_value.startswith("/"):
+                continue
+            destination_resolved, variables = render_static_template_literal(destination_template, env_defaults)
+            source_path = rewrite_source_to_profile_path(source_value)
+            runtime = next_runtime_path_variants(
+                source_path,
+                runtime_config,
+                apply_base_path=next_config_entry_base_path_enabled(body),
+                locale_aware=next_config_entry_locale_enabled(body),
+            )
+            path = runtime["path"]
+            permanent_expr = extract_rewrite_prop(body, "permanent")
+            status_expr = extract_rewrite_prop(body, "statusCode")
+            permanent = js_boolean_literal_value(permanent_expr)
+            status_code = js_integer_literal_value(status_expr)
+            if status_code is None and permanent is not None:
+                status_code = 308 if permanent else 307
+            conditions = extract_next_config_conditions(body)
+            redirects.append(
+                {
+                    "id": f"redirect_{safe_probe_id(source_root_relative_or_repo(config_file, source_root))}_{index}",
+                    "kind": "next-config-redirect",
+                    "path": path,
+                    "source_path": source_path,
+                    "file": source_root_relative_or_repo(config_file, source_root),
+                    "repo_file": repo_relative_or_absolute(config_file),
+                    "dynamic_segments": route_dynamic_segments(source_path),
+                    "match": match_for_path_variants(runtime["variants"], []),
+                    "inference_reasons": ["next-config-redirect", *next_runtime_reasons(runtime)],
+                    "next_config": runtime,
+                    "route_policy": {
+                        "type": "redirect",
+                        "source": source_value,
+                        "source_pattern": path,
+                        "source_framework_pattern": source_path,
+                        "destination_template": destination_template,
+                        "destination_resolved": destination_resolved,
+                        "destination_expression": destination_expr,
+                        "permanent": permanent,
+                        "status_code": status_code,
+                        "conditions": conditions,
+                        "conditional": next_config_conditions_present(conditions),
+                        "template_variables": variables,
+                        "env_defaults_used": {
+                            variable: env_defaults[variable]
+                            for variable in variables
+                            if variable in env_defaults
+                        },
+                        "index": index,
+                    },
+                    "line_patterns": {
+                        "source": source_value,
+                        "destination": [str(destination_expr or ""), destination_template, destination_resolved],
+                        "permanent": "permanent",
+                        "status_code": "statusCode",
+                        "has_conditions": "has",
+                        "missing_conditions": "missing",
+                    },
+                }
+            )
+
+        for index, (body, _start, _end) in enumerate(js_object_bodies_with_props_and_locations(source, {"source", "headers"}), start=1):
+            source_expr = extract_rewrite_prop(body, "source")
+            source_value = js_string_literal_value(source_expr or "")
+            if not source_value or not source_value.startswith("/"):
+                continue
+            header_entries = extract_next_config_headers(body)
+            conditions = extract_next_config_conditions(body)
+            source_path = rewrite_source_to_profile_path(source_value)
+            runtime = next_runtime_path_variants(
+                source_path,
+                runtime_config,
+                apply_base_path=next_config_entry_base_path_enabled(body),
+                locale_aware=next_config_entry_locale_enabled(body),
+            )
+            path = runtime["path"]
+            headers.append(
+                {
+                    "id": f"headers_{safe_probe_id(source_root_relative_or_repo(config_file, source_root))}_{index}",
+                    "kind": "next-config-headers",
+                    "path": path,
+                    "source_path": source_path,
+                    "file": source_root_relative_or_repo(config_file, source_root),
+                    "repo_file": repo_relative_or_absolute(config_file),
+                    "dynamic_segments": route_dynamic_segments(source_path),
+                    "match": match_for_path_variants(runtime["variants"], []),
+                    "inference_reasons": ["next-config-headers", *next_runtime_reasons(runtime)],
+                    "next_config": runtime,
+                    "route_policy": {
+                        "type": "headers",
+                        "source": source_value,
+                        "source_pattern": path,
+                        "source_framework_pattern": source_path,
+                        "headers": [
+                            {"key": item["key"], "value": item.get("value")}
+                            for item in header_entries
+                        ],
+                        "header_keys": [item["key"] for item in header_entries],
+                        "conditions": conditions,
+                        "conditional": next_config_conditions_present(conditions),
+                        "index": index,
+                    },
+                    "line_patterns": {
+                        "source": source_value,
+                        "headers": "headers",
+                        "has_conditions": "has",
+                        "missing_conditions": "missing",
+                        **{
+                            f"header:{item['key']}": str(item.get("key_expression") or item["key"])
+                            for item in header_entries
+                        },
+                    },
+                }
+            )
+    return {"redirects": redirects, "headers": headers}
+
+
+def route_dynamic_segments(path: str) -> list[str]:
+    return re.findall(r"\{([^{}]+)\}", path)
+
+
+def cluster_id_from_route_path(path: str) -> str:
+    if path == "/health":
+        return "health"
+    if path == "/api/quote":
+        return "quote"
+    if path == "/api/rpc" or path.startswith("/api/rpc/solana/"):
+        return "solana-rpc-http"
+    if path.startswith("/api/orca/pools/"):
+        return "orca-pools"
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", path.strip("/")).strip("-").lower()
+    return f"route-{slug or 'root'}"
+
+
+def infer_route_strategy(path: str, methods: list[str], source: str, upstreams: list[str]) -> dict[str, Any]:
+    lowered = source.lower()
+    reasons = []
+    if path == "/health":
+        return {
+            "strategy_set": "nextjs-api-routes",
+            "kind": "health",
+            "priority": "low",
+            "reasons": ["path:/health"],
+        }
+    if path == "/api/quote" or "quote" in path.lower() or "m0" in lowered:
+        if "quote" in path.lower():
+            reasons.append("path-contains-quote")
+        if "m0" in lowered:
+            reasons.append("source-mentions-m0")
+        return {
+            "strategy_set": "quote-transaction-decoder",
+            "kind": "orchestration-proxy",
+            "priority": "high",
+            "reasons": reasons or ["quote-like-route"],
+        }
+    if path == "/api/rpc" or "/rpc/" in path or "jsonrpc" in lowered:
+        if "jsonrpc" in lowered:
+            reasons.append("source-mentions-jsonrpc")
+        if "solana" in lowered:
+            reasons.append("source-mentions-solana")
+        if "/rpc" in path:
+            reasons.append("path-contains-rpc")
+        return {
+            "strategy_set": "solana-json-rpc-proxy",
+            "kind": "json-rpc-proxy",
+            "priority": "high",
+            "reasons": reasons or ["rpc-like-route"],
+        }
+    if upstreams:
+        if "solana" in lowered:
+            reasons.append("source-mentions-solana")
+        return {
+            "strategy_set": "fixed-upstream-proxy",
+            "kind": "fixed-upstream-proxy",
+            "priority": "medium",
+            "reasons": ["source-contains-fixed-http-upstream", *reasons],
+        }
+    return {
+        "strategy_set": "nextjs-api-routes",
+        "kind": "api-route",
+        "priority": "medium" if any(method in {"POST", "PUT", "PATCH", "DELETE"} for method in methods) else "low",
+        "reasons": ["generic-nextjs-route"],
+    }
+
+
+def discover_nextjs_routes(source_root: Path) -> dict[str, Any]:
+    discovered_app_roots = app_roots(source_root)
+    api_roots = pages_api_roots(source_root)
+    routes = []
+    runtime_config = discover_next_config_runtime(source_root)
+    rewrites = discover_nextjs_rewrites(source_root, runtime_config)
+    custom_server_entrypoints = discover_custom_server_entrypoints(source_root)
+    middleware_entries = discover_nextjs_middleware(source_root, runtime_config)
+    server_actions = discover_nextjs_server_actions(source_root)
+    route_policies = discover_next_config_route_policies(source_root, runtime_config)
+    redirects = route_policies["redirects"]
+    header_routes = route_policies["headers"]
+
+    for app_root in discovered_app_roots:
+        if not app_root.is_dir():
+            continue
+        for route_file in sorted(app_root.rglob("route.*")):
+            if route_file.name not in ROUTE_FILE_NAMES or not route_file.is_file():
+                continue
+            source_path = nextjs_route_path(route_file, source_root)
+            if not source_path:
+                continue
+            runtime = next_runtime_path_variants(source_path, runtime_config)
+            route_path = runtime["path"]
+            try:
+                source = read_text(route_file)
+            except UnicodeDecodeError:
+                continue
+            methods = extract_route_methods(source)
+            upstreams = extract_fixed_upstreams(source)
+            inference = infer_route_strategy(source_path, methods, source, upstreams)
+            routes.append(
+                {
+                    "cluster_id": cluster_id_from_route_path(source_path),
+                    "path": route_path,
+                    "source_path": source_path,
+                    "methods": methods,
+                    "file": source_root_relative_or_repo(route_file, source_root),
+                    "repo_file": repo_relative_or_absolute(route_file),
+                    "router": "app",
+                    "dynamic_segments": route_dynamic_segments(source_path),
+                    "fixed_upstreams": upstreams,
+                    "strategy_set": inference["strategy_set"],
+                    "kind": inference["kind"],
+                    "priority": inference["priority"],
+                    "inference_reasons": [*inference["reasons"], *next_runtime_reasons(runtime)],
+                    "match": match_for_path_variants(runtime["variants"], methods),
+                    "next_config": runtime,
+                }
+            )
+
+    for api_root in api_roots:
+        if not api_root.is_dir():
+            continue
+        for route_file in sorted(api_root.rglob("*")):
+            if not route_file.is_file():
+                continue
+            source_path = nextjs_pages_api_path(route_file, source_root)
+            if not source_path:
+                continue
+            runtime = next_runtime_path_variants(source_path, runtime_config)
+            route_path = runtime["path"]
+            try:
+                source = read_text(route_file)
+            except UnicodeDecodeError:
+                continue
+            methods = extract_pages_api_methods(source)
+            upstreams = extract_fixed_upstreams(source)
+            inference = infer_route_strategy(source_path, methods, source, upstreams)
+            routes.append(
+                {
+                    "cluster_id": cluster_id_from_route_path(source_path),
+                    "path": route_path,
+                    "source_path": source_path,
+                    "methods": methods,
+                    "file": source_root_relative_or_repo(route_file, source_root),
+                    "repo_file": repo_relative_or_absolute(route_file),
+                    "router": "pages",
+                    "dynamic_segments": route_dynamic_segments(source_path),
+                    "fixed_upstreams": upstreams,
+                    "strategy_set": inference["strategy_set"],
+                    "kind": inference["kind"],
+                    "priority": inference["priority"],
+                    "inference_reasons": ["pages-router-api-route", *inference["reasons"], *next_runtime_reasons(runtime)],
+                    "match": match_for_path_variants(runtime["variants"], methods),
+                    "next_config": runtime,
+                }
+            )
+
+    if routes:
+        status = "discovered"
+    elif rewrites or custom_server_entrypoints or middleware_entries or server_actions or redirects or header_routes:
+        status = "discovered-without-route-handlers"
+    else:
+        status = "source-root-missing-nextjs-routes"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "source_root": str(source_root),
+        "app_root": str(discovered_app_roots[0]),
+        "app_roots": [str(path) for path in discovered_app_roots],
+        "pages_api_roots": [str(path) for path in api_roots],
+        "summary": {
+            "route_count": len(routes),
+            "app_router_route_count": sum(1 for route in routes if route.get("router") == "app"),
+            "pages_router_api_route_count": sum(1 for route in routes if route.get("router") == "pages"),
+            "rewrite_count": len(rewrites),
+            "custom_server_entrypoint_count": len(custom_server_entrypoints),
+            "middleware_count": len(middleware_entries),
+            "server_action_file_count": len(server_actions),
+            "server_action_export_count": sum(int(item.get("action_count", 0) or 0) for item in server_actions),
+            "redirect_count": len(redirects),
+            "header_route_count": len(header_routes),
+            "route_policy_count": len(redirects) + len(header_routes),
+            "next_config_runtime": {
+                "base_path": runtime_config.get("base_path"),
+                "trailing_slash": runtime_config.get("trailing_slash"),
+                "i18n_configured": bool((runtime_config.get("i18n") or {}).get("configured")),
+                "locale_count": len((runtime_config.get("i18n") or {}).get("locales") or []),
+            },
+            "entrypoint_count": len(routes) + len(rewrites) + len(custom_server_entrypoints),
+            "surface_count": (
+                len(routes)
+                + len(rewrites)
+                + len(custom_server_entrypoints)
+                + len(middleware_entries)
+                + len(server_actions)
+                + len(redirects)
+                + len(header_routes)
+            ),
+            "api_route_count": sum(1 for route in routes if str(route.get("source_path") or route["path"]).startswith("/api/")),
+            "strategy_sets": sorted({route["strategy_set"] for route in [*routes, *rewrites, *custom_server_entrypoints]}),
+        },
+        "next_config": runtime_config,
+        "routes": routes,
+        "rewrites": rewrites,
+        "custom_server_entrypoints": custom_server_entrypoints,
+        "middleware": middleware_entries,
+        "server_actions": server_actions,
+        "redirects": redirects,
+        "headers": header_routes,
+        "safety": "Discovery is static source inspection only; no HTTP requests, signing, transaction submission, or upstream enumeration are performed.",
+    }
+
+
+def route_match_for_path(path: str, methods: list[str]) -> dict[str, Any]:
+    match: dict[str, Any] = {}
+    if methods:
+        match["methods"] = methods
+    if "{" in path:
+        match["path_patterns"] = [path]
+        prefix = catchall_prefix_for_path(path)
+        if prefix:
+            match["path_prefixes"] = [prefix]
+    else:
+        match["paths"] = [path]
+    return match
+
+
+def merge_discovered_clusters(routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    for route in routes:
+        cluster_id = str(route.get("cluster_id") or cluster_id_from_route_path(str(route["path"])))
+        route_methods = list(route.get("methods", []))
+        route_match = json_clone(route.get("match") or route_match_for_path(str(route["path"]), route_methods))
+        default_method = str(route.get("method") or (route_methods[0] if route_methods else "ANY"))
+        cluster = by_id.setdefault(
+            cluster_id,
+            {
+                "id": cluster_id,
+                "method": default_method,
+                "path": route["path"],
+                "kind": route["kind"],
+                "priority": route["priority"],
+                "strategy_set": route["strategy_set"],
+                "match": {"paths": [], "path_patterns": [], "path_prefixes": [], "methods": []},
+                "source_refs": [],
+                "discovery": {
+                    "routes": [],
+                    "rewrites": [],
+                    "inference_reasons": [],
+                    "fixed_upstreams": [],
+                },
+            },
+        )
+        if priority_rank(str(route["priority"])) > priority_rank(str(cluster["priority"])):
+            cluster["priority"] = route["priority"]
+        if route["path"] == "/api/rpc/solana/{cluster}":
+            cluster["path"] = route["path"]
+        elif "{" not in str(cluster["path"]) and "{" in str(route["path"]):
+            cluster["path"] = route["path"]
+        methods = cluster["match"].setdefault("methods", [])
+        for method in route_match.get("methods", []):
+            if method not in methods:
+                methods.append(method)
+        for match_key in ["paths", "path_patterns", "path_prefixes"]:
+            target_items = cluster["match"].setdefault(match_key, [])
+            for item in route_match.get(match_key, []):
+                if item not in target_items:
+                    target_items.append(item)
+        if route["file"] not in cluster["source_refs"]:
+            cluster["source_refs"].append(route["file"])
+        if route.get("kind") == "rewrite-proxy":
+            cluster["discovery"]["rewrites"].append(
+                {
+                    "source": route.get("rewrite", {}).get("source"),
+                    "source_pattern": route.get("rewrite", {}).get("source_pattern"),
+                    "source_framework_pattern": route.get("rewrite", {}).get("source_framework_pattern"),
+                    "destination_resolved": route.get("rewrite", {}).get("destination_resolved"),
+                    "destination_template": route.get("rewrite", {}).get("destination_template"),
+                    "phase": route.get("rewrite", {}).get("phase"),
+                    "conditions": route.get("rewrite", {}).get("conditions"),
+                    "conditional": route.get("rewrite", {}).get("conditional"),
+                    "next_config": route.get("next_config"),
+                }
+            )
+        else:
+            cluster["discovery"]["routes"].append(
+                {
+                    "path": route["path"],
+                    "source_path": route.get("source_path"),
+                    "methods": route.get("methods", []),
+                    "router": route.get("router"),
+                    "next_config": route.get("next_config"),
+                }
+            )
+        for reason in route.get("inference_reasons", []):
+            if reason not in cluster["discovery"]["inference_reasons"]:
+                cluster["discovery"]["inference_reasons"].append(reason)
+        for upstream in route.get("fixed_upstreams", []):
+            if upstream not in cluster["discovery"]["fixed_upstreams"]:
+                cluster["discovery"]["fixed_upstreams"].append(upstream)
+
+    clusters = []
+    for cluster in by_id.values():
+        match = cluster["match"]
+        if not match.get("methods"):
+            match.pop("methods", None)
+        for key in ["paths", "path_patterns", "path_prefixes"]:
+            if not match.get(key):
+                match.pop(key, None)
+        if not cluster["discovery"].get("routes"):
+            cluster["discovery"].pop("routes", None)
+        if not cluster["discovery"].get("rewrites"):
+            cluster["discovery"].pop("rewrites", None)
+        clusters.append(cluster)
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+    clusters.sort(key=lambda item: (priority_order.get(str(item.get("priority")), 9), str(item.get("id"))))
+    return clusters
+
+
+def build_probe_targets_from_clusters(clusters: list[dict[str, Any]]) -> dict[str, Any]:
+    targets: dict[str, Any] = {}
+    for cluster in clusters:
+        cluster_id = str(cluster.get("id"))
+        path = str(cluster.get("path") or "")
+        if not path:
+            continue
+        if cluster_id == "health":
+            targets["health"] = {"path": path}
+        elif cluster_id == "quote":
+            targets["quote"] = {"path": path}
+        elif cluster_id == "solana-rpc-http":
+            root_paths = [
+                path_item
+                for path_item in (cluster.get("match") or {}).get("paths", [])
+                if str(path_item) == "/api/rpc" or str(path_item).endswith("/rpc")
+            ]
+            cluster_value = "devnet"
+            dynamic_match = re.search(r"\{([^{}]+)\}", path)
+            concrete_path = render_path_template(path, {dynamic_match.group(1): cluster_value}) if dynamic_match else path
+            unknown_path = render_path_template(path, {dynamic_match.group(1): "localnet"}) if dynamic_match else path
+            targets["solana-rpc-http"] = {
+                "path": concrete_path,
+                "root_path": root_paths[0] if root_paths else "/api/rpc",
+                "unknown_cluster_path": unknown_path,
+                "cluster": cluster_value,
+                "unknown_cluster": "localnet",
+            }
+            targets.setdefault("solana-rpc-ws", {"path": concrete_path})
+        elif cluster_id == "solana-rpc-ws":
+            targets["solana-rpc-ws"] = {"path": render_path_template(path, {"cluster": "devnet"})}
+        elif cluster_id == "orca-pools":
+            template = path
+            targets["orca-pools"] = {
+                "path_template": template,
+                "invalid_address_path": render_path_template(template, {"address": "not-an-address"}),
+                "invalid_base58_path": render_path_template(template, {"address": "0OIlnotbase58"}),
+                "too_short_path": render_path_template(template, {"address": "1111111111111111111111111111111"}),
+                "too_long_path": render_path_template(
+                    template,
+                    {"address": "111111111111111111111111111111111111111111111"},
+                ),
+                "encoded_traversal_path": render_path_template(template, {"address": "%2e%2e%2fhealth"}),
+                "extra_segment_path": render_path_template(template, {"address": "not-an-address"}) + "/extra",
+                "query_injection_path": render_path_template(template, {"address": "not-an-address"}) + "?url=https://evil.example",
+            }
+        else:
+            targets[cluster_id] = {"path": path}
+    return targets
+
+
+def build_discovered_burp_observation_plan(
+    clusters: list[dict[str, Any]],
+    probe_targets: dict[str, Any],
+) -> list[dict[str, Any]]:
+    plan: list[dict[str, Any]] = []
+    cluster_ids = {str(cluster.get("id")) for cluster in clusters}
+
+    def add_once(item: dict[str, Any]) -> None:
+        if any(existing.get("id") == item.get("id") for existing in plan):
+            return
+        plan.append(item)
+
+    if "health" in cluster_ids and (probe_targets.get("health") or {}).get("path"):
+        add_once(
+            {
+                "id": "burp_observe_health",
+                "method": "GET",
+                "path": probe_targets["health"]["path"],
+                "headers": {"User-Agent": "InferForge-Burp-Observe/0.1"},
+                "expected_statuses": [200],
+                "cluster": "health",
+            }
+        )
+
+    if "quote" in cluster_ids and (probe_targets.get("quote") or {}).get("path"):
+        add_once(
+            {
+                "id": "burp_observe_quote_invalid_body",
+                "method": "POST",
+                "path": probe_targets["quote"]["path"],
+                "headers": {
+                    "User-Agent": "InferForge-Burp-Observe/0.1",
+                    "Origin": "{origin}",
+                    "Content-Type": "application/json",
+                },
+                "body": "{}",
+                "expected_statuses": [400, 422],
+                "cluster": "quote",
+            }
+        )
+
+    rpc_target = probe_targets.get("solana-rpc-http") or {}
+    if "solana-rpc-http" in cluster_ids and rpc_target.get("path"):
+        add_once(
+            {
+                "id": "burp_observe_rpc_get_health",
+                "method": "POST",
+                "path": rpc_target["path"],
+                "headers": {
+                    "User-Agent": "InferForge-Burp-Observe/0.1",
+                    "Origin": "{origin}",
+                    "Content-Type": "application/json",
+                },
+                "body_json": {"jsonrpc": "2.0", "id": 1, "method": "getHealth"},
+                "expected_statuses": [200, 400, 403, 502],
+                "cluster": "solana-rpc-http",
+            }
+        )
+
+    orca_target = probe_targets.get("orca-pools") or {}
+    if "orca-pools" in cluster_ids and orca_target.get("invalid_address_path"):
+        add_once(
+            {
+                "id": "burp_observe_orca_invalid_address",
+                "method": "GET",
+                "path": orca_target["invalid_address_path"],
+                "headers": {"User-Agent": "InferForge-Burp-Observe/0.1"},
+                "expected_statuses": [400, 404],
+                "cluster": "orca-pools",
+            }
+        )
+
+    for cluster in clusters:
+        cluster_id = str(cluster.get("id") or "")
+        if cluster_id in {"health", "quote", "solana-rpc-http", "solana-rpc-ws", "orca-pools"}:
+            continue
+        if cluster.get("kind") == "rewrite-proxy":
+            continue
+        target = probe_targets.get(cluster_id) or {}
+        path = target.get("path")
+        if not is_concrete_probe_path(path):
+            continue
+        add_once(
+            {
+                "id": f"burp_observe_{safe_probe_id(cluster_id)}",
+                "method": "HEAD",
+                "path": path,
+                "headers": {"User-Agent": "InferForge-Burp-Observe/0.1"},
+                "expected_statuses": [200, 204, 400, 403, 404, 405],
+                "cluster": cluster_id,
+            }
+        )
+
+    return plan
+
+
+def build_rewrite_review_observation_candidate(cluster: dict[str, Any]) -> dict[str, Any] | None:
+    if cluster.get("kind") != "rewrite-proxy":
+        return None
+    cluster_id = str(cluster.get("id") or "")
+    path_template = str(cluster.get("path") or "")
+    if not cluster_id or not path_template:
+        return None
+
+    discovery = cluster.get("discovery") or {}
+    rewrites = discovery.get("rewrites") or []
+    fixed_upstreams = list(discovery.get("fixed_upstreams") or [])
+    example_path = render_path_template(path_template, {"path": "<approved-read-only-path>"})
+    if example_path == path_template and "{" not in path_template:
+        example_path = path_template
+
+    return {
+        "id": f"review_observe_{safe_probe_id(cluster_id)}_approved_path",
+        "cluster": cluster_id,
+        "type": "burp-http-observation",
+        "status": "review-only",
+        "method": "GET",
+        "path_template": path_template,
+        "example_path": example_path,
+        "source_refs": list(cluster.get("source_refs") or []),
+        "rewrites": rewrites,
+        "fixed_upstreams": fixed_upstreams,
+        "approval_required": [
+            "Choose exactly one known safe read-only concrete path under this rewrite source.",
+            "Confirm the upstream request is non-mutating and does not require secrets in the URL.",
+            f"Add the concrete path to `burp_observation_plan` for cluster `{cluster_id}` before automated Burp observation.",
+        ],
+        "promote_to_burp_observation_plan": {
+            "id": f"burp_observe_{safe_probe_id(cluster_id)}_reviewed_path",
+            "method": "GET",
+            "path": PLACEHOLDER_APPROVED_CONCRETE_PATH,
+            "headers": {"User-Agent": "InferForge-Burp-Observe/0.1"},
+            "expected_statuses": [200, 204, 400, 403, 404, 405, 502],
+            "cluster": cluster_id,
+        },
+        "safety": "Review-only candidate. InferForge will not execute this until the profile contains a concrete approved observation path.",
+    }
+
+
+def review_observation_candidates_for_cluster(cluster: dict[str, Any]) -> list[dict[str, Any]]:
+    discovery = cluster.get("discovery") or {}
+    candidates = [
+        json_clone(item)
+        for item in discovery.get("review_observation_candidates", [])
+        if isinstance(item, dict)
+    ]
+    if candidates:
+        return candidates
+    rewrite_candidate = build_rewrite_review_observation_candidate(cluster)
+    return [rewrite_candidate] if rewrite_candidate else []
+
+
+def build_discovered_review_observation_candidates(clusters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for cluster in clusters:
+        cluster_candidates = review_observation_candidates_for_cluster(cluster)
+        if not cluster_candidates:
+            continue
+        discovery = cluster.setdefault("discovery", {})
+        discovery["review_observation_candidates"] = cluster_candidates
+        for candidate in cluster_candidates:
+            candidate_id = str(candidate.get("id") or "")
+            if not candidate_id or candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            candidates.append(json_clone(candidate))
+    return candidates
+
+
+def build_orca_baseline_review_candidate() -> dict[str, Any]:
+    return {
+        "id": "review_orca_single_pool_baseline",
+        "cluster": "orca-pools",
+        "type": "single-address-baseline",
+        "status": "review-only",
+        "command_templates": [
+            f"python3 scripts/inferforge.py collect-orca-baseline --address {PLACEHOLDER_APPROVED_POOL_ADDRESS}",
+            "python3 scripts/inferforge.py audit --include-external --ws-resource-probes",
+        ],
+        "approval_required": [
+            "Use one approved known pool address only, or rely on a source-known pool list reviewed for the target.",
+            "Do not enumerate pool addresses or run repeated upstream baseline requests.",
+            "Review cache headers and response shape only; do not store full upstream bodies.",
+        ],
+        "safety": "Single approved/source-known address baseline only. No pool enumeration is performed.",
+    }
+
+
+def collect_review_observation_candidates(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(item: dict[str, Any]) -> None:
+        candidate_id = str(item.get("id") or "")
+        if not candidate_id or candidate_id in seen:
+            return
+        seen.add(candidate_id)
+        candidates.append(json_clone(item))
+
+    for item in profile.get("review_observation_candidates", []) or []:
+        if isinstance(item, dict):
+            add(item)
+    for cluster in profile.get("clusters", []) or []:
+        if not isinstance(cluster, dict):
+            continue
+        for item in review_observation_candidates_for_cluster(cluster):
+            add(item)
+    return candidates
+
+
+def find_review_observation_candidate(profile: dict[str, Any], candidate_id: str) -> dict[str, Any] | None:
+    for candidate in collect_review_observation_candidates(profile):
+        if str(candidate.get("id") or "") == candidate_id:
+            return candidate
+    return None
+
+
+def is_safe_concrete_local_path(path: str) -> bool:
+    return concrete_local_path_problem(path) is None
+
+
+def validate_candidate_promotion_path(candidate: dict[str, Any], path: str) -> None:
+    if not is_safe_concrete_local_path(path):
+        raise ValueError("Approved path must be a concrete local path such as /api/proxy/status; URLs, placeholders, braces, angle brackets, and whitespace are not allowed.")
+    path_template = str(candidate.get("path_template") or "")
+    if path_template and not path_pattern_matches(path_template, path.split("?", 1)[0]):
+        raise ValueError(f"Approved path `{path}` does not match candidate template `{path_template}`.")
+
+
+def promote_review_observation_candidate(
+    profile: dict[str, Any],
+    *,
+    candidate_id: str,
+    approved_path: str,
+    observation_id: str | None = None,
+    method: str | None = None,
+    expected_statuses: list[int] | None = None,
+    note: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    candidate = find_review_observation_candidate(profile, candidate_id)
+    if candidate is None:
+        raise ValueError(f"Review observation candidate not found: {candidate_id}")
+    if candidate.get("type") != "burp-http-observation":
+        raise ValueError(f"Candidate `{candidate_id}` is type `{candidate.get('type')}`, not a Burp HTTP observation candidate.")
+    validate_candidate_promotion_path(candidate, approved_path)
+
+    template = json_clone(candidate.get("promote_to_burp_observation_plan") or {})
+    observation = {
+        "id": observation_id or template.get("id") or f"burp_observe_{safe_probe_id(candidate_id)}",
+        "method": str(method or template.get("method") or candidate.get("method") or "GET").upper(),
+        "path": approved_path,
+        "headers": template.get("headers") or {"User-Agent": "InferForge-Burp-Observe/0.1"},
+        "expected_statuses": expected_statuses or template.get("expected_statuses") or [200, 204, 400, 403, 404, 405, 502],
+        "cluster": template.get("cluster") or candidate.get("cluster") or "unknown",
+        "source_candidate_id": candidate_id,
+        "reviewed": True,
+    }
+    if note:
+        observation["review_note"] = note
+
+    promoted_profile = public_profile(profile)
+    promoted_profile.setdefault("review_observation_candidates", collect_review_observation_candidates(profile))
+    plan = [json_clone(item) for item in promoted_profile.get("burp_observation_plan", []) or []]
+    for item in plan:
+        if item.get("id") != observation["id"]:
+            continue
+        if item.get("method") == observation["method"] and item.get("path") == observation["path"] and item.get("cluster") == observation["cluster"]:
+            promoted_profile["burp_observation_plan"] = plan
+            return promoted_profile, observation
+        raise ValueError(f"Observation id `{observation['id']}` already exists with a different path or method.")
+    plan.append(observation)
+    promoted_profile["burp_observation_plan"] = plan
+    promotions = promoted_profile.setdefault("review_promotions", [])
+    promotions.append(
+        {
+            "generated_at": utc_now(),
+            "candidate_id": candidate_id,
+            "observation_id": observation["id"],
+            "path": approved_path,
+            "cluster": observation["cluster"],
+            "method": observation["method"],
+            "note": note,
+            "safety": "Profile edit only. Promotion does not send HTTP traffic; run burp-sync --observe separately to collect evidence.",
+        }
+    )
+    return promoted_profile, observation
+
+
+def priority_rank(priority: str) -> int:
+    return {"low": 1, "medium": 2, "high": 3}.get(priority, 0)
+
+
+def build_discovered_profile(
+    route_inventory: dict[str, Any],
+    *,
+    name: str,
+    display_name: str,
+    target: str,
+    source_root: Path,
+) -> dict[str, Any]:
+    routes = route_inventory.get("routes", [])
+    rewrites = route_inventory.get("rewrites", [])
+    custom_server_entrypoints = route_inventory.get("custom_server_entrypoints", [])
+    middleware_entries = route_inventory.get("middleware", [])
+    server_action_entries = route_inventory.get("server_actions", [])
+    entrypoints = [*routes, *rewrites, *custom_server_entrypoints]
+    clusters = merge_discovered_clusters(entrypoints)
+    enabled_strategy_sets = sorted({cluster["strategy_set"] for cluster in clusters if cluster.get("strategy_set")})
+    source_peeks = [
+        {
+            "endpoint": f"{cluster.get('method')} {cluster.get('path')}",
+            "cluster_ids": [cluster["id"]],
+            "files": cluster.get("source_refs", []),
+            "line_patterns": {},
+            "conclusion": "Discovered route source context; add profile-specific line patterns before relying on source claims.",
+        }
+        for cluster in clusters
+    ]
+    probe_targets = build_probe_targets_from_clusters(clusters)
+    burp_observation_plan = build_discovered_burp_observation_plan(clusters, probe_targets)
+    review_observation_candidates = build_discovered_review_observation_candidates(clusters)
+    websocket_observation = None
+    if "solana-rpc-ws" in {cluster.get("id") for cluster in clusters} or "solana-rpc-http" in {cluster.get("id") for cluster in clusters}:
+        websocket_observation = {
+            "id": "burp_observe_ws_upgrade",
+            "path": (probe_targets.get("solana-rpc-ws") or probe_targets.get("solana-rpc-http") or {}).get("path", "/api/rpc/solana/devnet"),
+            "cluster": "solana-rpc-ws",
+            "expected_statuses": [101],
+            "subscribe_method": "slotSubscribe",
+        }
+
+    try:
+        source_root_value = str(source_root.resolve().relative_to(ROOT))
+    except ValueError:
+        source_root_value = str(source_root.resolve())
+
+    frameworks = ["Next.js"]
+    if route_inventory.get("summary", {}).get("app_router_route_count"):
+        frameworks.append("Next.js App Router")
+    if route_inventory.get("summary", {}).get("pages_router_api_route_count"):
+        frameworks.append("Next.js Pages Router")
+    if middleware_entries:
+        frameworks.append("Next.js Middleware")
+    if server_action_entries:
+        frameworks.append("Next.js Server Actions")
+    next_config_runtime = (route_inventory.get("summary", {}) or {}).get("next_config_runtime") or {}
+    if next_config_runtime.get("base_path"):
+        frameworks.append("Next.js basePath")
+    if next_config_runtime.get("trailing_slash") is not None:
+        frameworks.append("Next.js trailingSlash")
+    if next_config_runtime.get("i18n_configured"):
+        frameworks.append("Next.js i18n")
+
+    return {
+        "schema_version": 1,
+        "name": name,
+        "display_name": display_name,
+        "description": "Starter target profile generated from static Next.js route, rewrite, middleware, and custom-server discovery. Review and edit before a full audit.",
+        "target_type": "discovered-nextjs-app",
+        "frameworks": frameworks,
+        "default_target": target,
+        "default_source_root": source_root_value,
+        "strategy_sets": enabled_strategy_sets,
+        "safety": {
+            "no_wallet_signing": True,
+            "no_transaction_submission": True,
+            "no_burp_scanner": True,
+            "no_broad_fuzzing": True,
+            "prefer_loopback_targets": True,
+        },
+        "probe_targets": probe_targets,
+        "clusters": clusters,
+        "source_peeks": source_peeks,
+        "burp_observation_plan": burp_observation_plan,
+        "review_observation_candidates": review_observation_candidates,
+        "websocket_observation": websocket_observation,
+        "discovery": {
+            "generated_at": route_inventory.get("generated_at"),
+            "route_inventory": ROUTE_INVENTORY_ARTIFACT,
+            "route_count": route_inventory.get("summary", {}).get("route_count", 0),
+            "rewrite_count": route_inventory.get("summary", {}).get("rewrite_count", 0),
+            "custom_server_entrypoint_count": route_inventory.get("summary", {}).get("custom_server_entrypoint_count", 0),
+            "middleware_count": route_inventory.get("summary", {}).get("middleware_count", 0),
+            "server_action_file_count": route_inventory.get("summary", {}).get("server_action_file_count", 0),
+            "server_action_export_count": route_inventory.get("summary", {}).get("server_action_export_count", 0),
+            "redirect_count": route_inventory.get("summary", {}).get("redirect_count", 0),
+            "header_route_count": route_inventory.get("summary", {}).get("header_route_count", 0),
+            "route_policy_count": route_inventory.get("summary", {}).get("route_policy_count", 0),
+            "entrypoint_count": route_inventory.get("summary", {}).get("entrypoint_count", len(entrypoints)),
+            "surface_count": route_inventory.get("summary", {}).get("surface_count", len(entrypoints) + len(middleware_entries)),
+            "next_config": route_inventory.get("next_config"),
+            "review_required": True,
+            "notes": [
+                "Static discovery can identify likely routes and strategy sets, but probe templates may still need profile-specific tuning.",
+                "Unknown or generic routes are included as nextjs-api-routes clusters and should be reviewed before active probing.",
+                "Next.js rewrites are included as fixed-upstream rewrite-proxy clusters for classification/source context; review before adding active probes.",
+                "Next.js middleware/proxy files are included as cross-cutting source context only; they do not generate active probes.",
+                "Next.js redirects and headers are included as route-policy source context only; they do not generate active probes.",
+                "Custom server WebSocket upgrade handlers are included when static path prefixes can be resolved; review generated WS probes before active testing.",
+            ],
+        },
+    }
+
+
+def load_target_profile(profile_path: str | None) -> dict[str, Any]:
+    path = resolve_repo_path(profile_path or DEFAULT_PROFILE_PATH)
+    if path.exists():
+        return normalize_target_profile(json.loads(read_text(path)), profile_path=path)
+    return normalize_target_profile(default_target_profile(), profile_path=path)
+
+
+def profile_display_name(profile: dict[str, Any] | None) -> str:
+    if not profile:
+        return "Target"
+    return str(profile.get("display_name") or profile.get("name") or "Target")
+
+
+def profile_summary(profile: dict[str, Any] | None) -> dict[str, Any]:
+    if not profile:
+        return {}
+    return {
+        "schema_version": profile.get("schema_version"),
+        "name": profile.get("name"),
+        "display_name": profile.get("display_name"),
+        "target_type": profile.get("target_type"),
+        "frameworks": profile.get("frameworks", []),
+        "strategy_sets": profile.get("strategy_sets", []),
+        "profile_path": profile.get("_profile_path"),
+        "loaded_from": profile.get("_profile_loaded_from"),
+    }
+
+
+def resolve_target(args: argparse.Namespace, profile: dict[str, Any]) -> str:
+    return str(args.target or profile.get("default_target") or DEFAULT_TARGET).rstrip("/")
+
+
+def resolve_source_root(args: argparse.Namespace, profile: dict[str, Any]) -> Path:
+    source_root = args.source_root or profile.get("default_source_root") or str(DEFAULT_SOURCE_ROOT)
+    return resolve_repo_path(source_root)
+
+
+def resolve_run_context(args: argparse.Namespace) -> tuple[dict[str, Any], Path, str, Path]:
+    profile = load_target_profile(args.profile)
+    artifact_dir = Path(args.artifact_dir).resolve()
+    target = resolve_target(args, profile)
+    source_root = resolve_source_root(args, profile)
+    return profile, artifact_dir, target, source_root
+
+
+def source_ref_to_path(source_root: Path, ref: str) -> Path:
+    raw = str(ref)
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    if raw == source_root.name or raw.startswith(f"{source_root.name}/"):
+        return (ROOT / raw).resolve()
+    return (source_root / raw).resolve()
+
+
+def source_ref_for_artifact(source_root: Path, ref: str) -> str:
+    path = source_ref_to_path(source_root, ref)
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def write_target_profile_artifact(
+    artifact_dir: Path,
+    profile: dict[str, Any],
+    target: str,
+    source_root: Path,
+) -> dict[str, Any]:
+    doc = public_profile(profile)
+    declared_clusters = json_clone(doc.get("clusters", []))
+    clusters = build_clusters(profile, source_root)
+    doc["generated_at"] = utc_now()
+    doc["status"] = "loaded"
+    doc["profile_path"] = profile.get("_profile_path")
+    doc["loaded_from"] = profile.get("_profile_loaded_from")
+    doc["declared_clusters"] = declared_clusters
+    doc["effective"] = {
+        "target": target,
+        "source_root": str(source_root),
+        "artifact_dir": str(artifact_dir),
+        "enabled_strategy_sets": sorted(enabled_strategy_set_ids(profile)),
+        "strategy_registry": STRATEGY_REGISTRY_ARTIFACT,
+    }
+    doc["clusters"] = clusters["clusters"]
+    write_json(artifact_dir / TARGET_PROFILE_ARTIFACT, doc)
+    write_json(artifact_dir / STRATEGY_REGISTRY_ARTIFACT, build_strategy_registry_artifact(profile, clusters))
+    write_json(artifact_dir / PROFILE_VALIDATION_ARTIFACT, build_profile_validation_artifact(profile, clusters, source_root))
+    return doc
+
+
+def redact_text(value: str | None, *, max_chars: int = 500) -> str | None:
+    if value is None:
+        return None
+    redacted = SECRET_TEXT_RE.sub(lambda match: f"{match.group(1) or match.group(2)}[redacted]", value)
+    if len(redacted) > max_chars:
+        return redacted[:max_chars] + "...[truncated]"
+    return redacted
+
+
+def redact_headers(headers: dict[str, str]) -> dict[str, str]:
+    redacted = {}
+    for key, value in headers.items():
+        if key.lower() in SENSITIVE_HEADER_NAMES:
+            redacted[key] = REDACTED_VALUE
+        else:
+            redacted[key] = value
+    return redacted
+
+
+def sensitive_param_name(name: str) -> bool:
+    lowered = name.lower()
+    return any(token in lowered for token in ["token", "secret", "password", "api_key", "apikey", "key", "auth", "cookie"])
+
+
+def redact_observed_value(key: str, value: str, *, sensitive: bool = False) -> str:
+    if sensitive or sensitive_param_name(key):
+        return REDACTED_VALUE
+    redacted = redact_text(value, max_chars=500)
+    return REDACTED_VALUE if redacted is None else redacted
+
+
+def parse_cookie_header(value: str) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    for part in value.split(";"):
+        item = part.strip()
+        if not item:
+            continue
+        if "=" in item:
+            key, cookie_value = item.split("=", 1)
+        else:
+            key, cookie_value = item, ""
+        key = key.strip()
+        if key:
+            cookies[key] = cookie_value.strip()
+    return cookies
+
+
+def parse_query_context(path: str) -> dict[str, list[str]]:
+    parsed = urllib.parse.urlparse(path)
+    query: dict[str, list[str]] = {}
+    for key, values in urllib.parse.parse_qs(parsed.query, keep_blank_values=True).items():
+        query[key] = [redact_observed_value(key, str(value)) for value in values]
+    return query
+
+
+def build_request_context(method: str, path: str, headers: dict[str, str] | None = None, host: str | None = None) -> dict[str, Any]:
+    raw_headers = headers or {}
+    normalized_headers = {str(key).lower(): str(value) for key, value in raw_headers.items()}
+    observed_host = host or normalized_headers.get("host", "")
+    redacted_headers = {
+        key: redact_observed_value(key, value, sensitive=key in SENSITIVE_HEADER_NAMES)
+        for key, value in normalized_headers.items()
+    }
+    cookie_header = normalized_headers.get("cookie", "")
+    raw_cookies = {} if cookie_header == REDACTED_VALUE else parse_cookie_header(cookie_header)
+    cookies = {name: REDACTED_VALUE for name in raw_cookies}
+    query = parse_query_context(path)
+    return {
+        "method": str(method).upper(),
+        "path": path,
+        "path_without_query": path.split("?", 1)[0],
+        "host": observed_host,
+        "headers": redacted_headers,
+        "header_names": sorted(redacted_headers),
+        "query": query,
+        "query_keys": sorted(query),
+        "cookies": cookies,
+        "cookie_names": sorted(cookies),
+        "redaction": {
+            "sensitive_headers": sorted(key for key in normalized_headers if key in SENSITIVE_HEADER_NAMES),
+            "cookie_values": "redacted" if cookies else "absent",
+        },
+    }
+
+
+def request_context_signature(context: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "method": context.get("method"),
+            "path": context.get("path"),
+            "host": context.get("host"),
+            "headers": context.get("headers", {}),
+            "query": context.get("query", {}),
+            "cookie_names": context.get("cookie_names", []),
+        },
+        sort_keys=True,
+    )
+
+
+def parse_http_headers(lines: list[str]) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for line in lines:
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        headers[key.strip().lower()] = value.strip()
+    return headers
+
+
+def split_http_message(raw: str) -> tuple[str, list[str], str]:
+    head, sep, body = raw.partition("\r\n\r\n")
+    if not sep:
+        head, _, body = raw.partition("\n\n")
+    lines = head.replace("\r\n", "\n").splitlines()
+    start_line = lines[0] if lines else ""
+    return start_line, lines[1:], body
+
+
+def normalize_request_path(target: str) -> str:
+    parsed = urllib.parse.urlparse(target)
+    if parsed.scheme and parsed.netloc:
+        path = parsed.path or "/"
+        return urllib.parse.urlunparse(("", "", path, "", parsed.query, ""))
+    return target or "/"
+
+
+def parse_raw_http_request(raw: str) -> dict[str, Any]:
+    start_line, header_lines, _ = split_http_message(raw)
+    parts = start_line.split()
+    method = parts[0].upper() if parts else ""
+    path = normalize_request_path(parts[1]) if len(parts) > 1 else "/"
+    headers = parse_http_headers(header_lines)
+    return {
+        "method": method,
+        "path": path,
+        "headers": headers,
+        "host": headers.get("host", ""),
+        "user_agent": headers.get("user-agent", ""),
+    }
+
+
+def parse_raw_http_response(raw: str) -> dict[str, Any]:
+    if not raw:
+        return {"status": None, "headers": {}, "body": ""}
+
+    start_line, header_lines, body = split_http_message(raw)
+    parts = start_line.split()
+    status = None
+    if len(parts) > 1:
+        try:
+            status = int(parts[1])
+        except ValueError:
+            status = None
+    headers = parse_http_headers(header_lines)
+    return {"status": status, "headers": headers, "body": body}
+
+
+def parse_http_date(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_json_object(text: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def is_placeholder_env_value(value: str | None) -> bool:
+    return bool(value and PLACEHOLDER_ENV_RE.fullmatch(value.strip()))
+
+
+def parse_dotenv_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def classify_env_value(value: str | None, *, secret: bool) -> dict[str, Any]:
+    if value is None:
+        return {"status": "missing"}
+    if value == "":
+        return {"status": "empty"}
+    if is_placeholder_env_value(value):
+        return {"status": "placeholder"}
+    result: dict[str, Any] = {"status": "configured"}
+    if not secret:
+        result["value"] = value
+    return result
+
+
+def is_websocket_upgrade_observation(request: dict[str, Any], response: dict[str, Any]) -> bool:
+    request_headers = request.get("headers", {})
+    response_headers = response.get("headers", {})
+    request_upgrade = request_headers.get("upgrade", "").lower() == "websocket"
+    response_upgrade = response_headers.get("upgrade", "").lower() == "websocket"
+    request_connection = request_headers.get("connection", "").lower()
+    response_connection = response_headers.get("connection", "").lower()
+    return (
+        response.get("status") == 101
+        and request_upgrade
+        and response_upgrade
+        and "upgrade" in request_connection
+        and "upgrade" in response_connection
+    )
+
+
+def decode_mcp_text_payload(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return ""
+
+    try:
+        parsed = json.loads(stripped, strict=False)
+    except json.JSONDecodeError:
+        return text
+
+    if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
+        chunks = [
+            item.get("text", "")
+            for item in parsed
+            if item.get("type") == "text" and isinstance(item.get("text"), str)
+        ]
+        if chunks:
+            return "\n\n".join(chunks)
+
+    if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
+        return parsed["text"]
+
+    return text
+
+
+def parse_burp_mcp_history_items(text: str) -> list[dict[str, Any]]:
+    payload = decode_mcp_text_payload(text)
+    stripped = payload.strip()
+    if not stripped:
+        return []
+
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, dict)]
+    if isinstance(parsed, dict):
+        return [parsed]
+
+    decoder = json.JSONDecoder(strict=False)
+    index = 0
+    items: list[dict[str, Any]] = []
+    while index < len(payload):
+        while index < len(payload) and payload[index].isspace():
+            index += 1
+        if index >= len(payload):
+            break
+        try:
+            item, next_index = decoder.raw_decode(payload, index)
+        except json.JSONDecodeError as error:
+            snippet = payload[index:index + 120].replace("\n", "\\n")
+            raise ValueError(f"Could not parse Burp MCP history item near offset {index}: {snippet}") from error
+        if isinstance(item, dict):
+            items.append(item)
+        index = next_index
+
+    return items
+
+
+def normalize_burp_history_items(
+    items: list[dict[str, Any]],
+    *,
+    target_netloc: str | None,
+    source: str,
+) -> list[dict[str, Any]]:
+    observations: list[dict[str, Any]] = []
+
+    for item in items:
+        request = parse_raw_http_request(str(item.get("request") or ""))
+        response = parse_raw_http_response(str(item.get("response") or ""))
+        host = request["host"]
+        if target_netloc and host != target_netloc:
+            continue
+
+        response_headers = response["headers"]
+        response_body = response["body"]
+        method = "WS" if is_websocket_upgrade_observation(request, response) else request["method"]
+        request_context = build_request_context(method, request["path"], request.get("headers", {}), host)
+        observations.append(
+            {
+                "ts": parse_http_date(response_headers.get("date")) or utc_now(),
+                "source": source,
+                "method": method,
+                "path": request["path"],
+                "host": host,
+                "status": response["status"],
+                "content_type": response_headers.get("content-type"),
+                "request_user_agent": request["user_agent"],
+                "request_context": request_context,
+                "response_sample": response_body[:500],
+                "notes": item.get("notes", ""),
+            }
+        )
+
+    return observations
+
+
+def dedupe_observations(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[Any, ...]] = set()
+    deduped: list[dict[str, Any]] = []
+    for row in rows:
+        key = (
+            row.get("method"),
+            row.get("path"),
+            row.get("host"),
+            row.get("status"),
+            row.get("request_user_agent"),
+            row.get("response_sample"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
+def origin_for(target: str) -> str:
+    parsed = urllib.parse.urlparse(target)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def target_to_ws(target: str) -> str:
+    parsed = urllib.parse.urlparse(target)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    return urllib.parse.urlunparse((scheme, parsed.netloc, "", "", "", ""))
+
+
+def socket_open(host: str, port: int, timeout: float = 1.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def target_lock_key(target: str) -> str:
+    parsed = urllib.parse.urlparse(target)
+    key = f"{parsed.scheme or 'http'}://{parsed.netloc or parsed.path}".rstrip("/")
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    return f"target-{digest}"
+
+
+def process_is_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def read_lock_metadata(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(read_text(path))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+class TargetProbeLock:
+    def __init__(self, target: str, *, purpose: str, stale_after_seconds: int = 3600) -> None:
+        self.target = target.rstrip("/")
+        self.purpose = purpose
+        self.stale_after_seconds = stale_after_seconds
+        self.path = DEFAULT_ARTIFACT_DIR / "locks" / f"{target_lock_key(self.target)}.json"
+        self.acquired = False
+
+    def __enter__(self) -> "TargetProbeLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            try:
+                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                existing = read_lock_metadata(self.path)
+                pid = existing.get("pid")
+                age = time.time() - self.path.stat().st_mtime if self.path.exists() else 0
+                stale = age > self.stale_after_seconds or not process_is_alive(int(pid) if isinstance(pid, int) else None)
+                if stale:
+                    try:
+                        self.path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+                raise RuntimeError(
+                    "Active probes are already running for this target: "
+                    f"target={existing.get('target', self.target)} "
+                    f"purpose={existing.get('purpose', 'unknown')} "
+                    f"pid={existing.get('pid', 'unknown')} "
+                    f"lock={self.path}"
+                )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "created_at": utc_now(),
+                        "pid": os.getpid(),
+                        "target": self.target,
+                        "purpose": self.purpose,
+                        "safety": "Prevents concurrent active probes from creating resource-control false positives.",
+                    },
+                    handle,
+                    indent=2,
+                    sort_keys=True,
+                )
+                handle.write("\n")
+            self.acquired = True
+            return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if not self.acquired:
+            return
+        try:
+            existing = read_lock_metadata(self.path)
+            if existing.get("pid") == os.getpid():
+                self.path.unlink()
+        except FileNotFoundError:
+            pass
+        finally:
+            self.acquired = False
+
+
+def command_result(cmd: list[str], cwd: Path = ROOT, timeout: int = 10) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "output": proc.stdout[-4000:],
+        }
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"ok": False, "returncode": None, "output": str(error)}
+
+
+class McpSseClient:
+    def __init__(self, url: str, *, timeout: int = 10) -> None:
+        self.url = url.rstrip("/") + "/"
+        self.timeout = timeout
+        self.response: Any = None
+        self.message_url: str | None = None
+        self.next_id = 1
+
+    def __enter__(self) -> "McpSseClient":
+        request = urllib.request.Request(
+            self.url,
+            headers={"Accept": "text/event-stream"},
+        )
+        self.response = urllib.request.urlopen(request, timeout=self.timeout)
+        endpoint = self._read_sse_data(expected_event="endpoint")
+        if not endpoint:
+            raise RuntimeError("Burp MCP SSE endpoint did not provide a session endpoint")
+        self.message_url = urllib.parse.urljoin(self.url, endpoint)
+        self._initialize()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.response:
+            self.response.close()
+
+    def _readline(self) -> str:
+        if not self.response:
+            raise RuntimeError("MCP SSE connection is not open")
+        return self.response.readline().decode("utf-8", errors="replace").rstrip("\r\n")
+
+    def _read_sse_data(self, *, expected_event: str | None = None, request_id: int | None = None) -> Any:
+        event: str | None = None
+        data_lines: list[str] = []
+        while True:
+            line = self._readline()
+            if line == "":
+                if not data_lines:
+                    continue
+                data = "\n".join(data_lines)
+                if expected_event and event != expected_event:
+                    event = None
+                    data_lines = []
+                    continue
+                if request_id is None:
+                    return data
+                try:
+                    payload = json.loads(data)
+                except json.JSONDecodeError:
+                    event = None
+                    data_lines = []
+                    continue
+                if payload.get("id") == request_id:
+                    if payload.get("error"):
+                        raise RuntimeError(json.dumps(payload["error"], sort_keys=True))
+                    return payload.get("result")
+                event = None
+                data_lines = []
+                continue
+            if line.startswith("event:"):
+                event = line.split(":", 1)[1].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line.split(":", 1)[1].strip())
+
+    def _post(self, payload: dict[str, Any]) -> None:
+        if not self.message_url:
+            raise RuntimeError("MCP message endpoint is not ready")
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            self.message_url,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            response.read()
+
+    def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        request_id = self.next_id
+        self.next_id += 1
+        self._post(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params or {},
+            }
+        )
+        return self._read_sse_data(request_id=request_id)
+
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        self._post({"jsonrpc": "2.0", "method": method, "params": params or {}})
+
+    def _initialize(self) -> None:
+        self.request(
+            "initialize",
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "inferforge", "version": "0.1"},
+            },
+        )
+        self.notify("notifications/initialized", {})
+
+    def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+        result = self.request("tools/call", {"name": name, "arguments": arguments or {}})
+        return result if isinstance(result, dict) else {"raw": result}
+
+
+def mcp_tool_text(result: dict[str, Any]) -> str:
+    content = result.get("content", [])
+    chunks = [
+        item.get("text", "")
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
+    ]
+    if chunks:
+        return "\n\n".join(chunks)
+    if "raw" in result:
+        return str(result["raw"])
+    return json.dumps(result, sort_keys=False)
+
+
+def http_request(
+    target: str,
+    method: str,
+    path: str,
+    body: str | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: int = 20,
+) -> dict[str, Any]:
+    url = urllib.parse.urljoin(target.rstrip("/") + "/", path.lstrip("/"))
+    raw_body = None if body is None else body.encode("utf-8")
+    req = urllib.request.Request(url, method=method, data=raw_body, headers=headers or {})
+    started = time.monotonic()
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp_body = resp.read(MAX_RESPONSE_BYTES + 1)
+            response_headers = dict(resp.headers.items())
+            status = resp.status
+    except urllib.error.HTTPError as error:
+        resp_body = error.read(MAX_RESPONSE_BYTES + 1)
+        response_headers = dict(error.headers.items())
+        status = error.code
+    except urllib.error.URLError as error:
+        return {
+            "ok": False,
+            "status": None,
+            "duration_ms": round((time.monotonic() - started) * 1000),
+            "error": str(error.reason),
+            "body_sample": "",
+            "body_text": "",
+            "body_sha256": None,
+            "body_truncated": False,
+            "body_length": 0,
+            "headers": {},
+        }
+    except (TimeoutError, socket.timeout) as error:
+        return {
+            "ok": False,
+            "status": None,
+            "duration_ms": round((time.monotonic() - started) * 1000),
+            "error": str(error),
+            "body_sample": "",
+            "body_text": "",
+            "body_sha256": None,
+            "body_truncated": False,
+            "body_length": 0,
+            "headers": {},
+        }
+
+    body_truncated = len(resp_body) > MAX_RESPONSE_BYTES
+    if body_truncated:
+        resp_body = resp_body[:MAX_RESPONSE_BYTES]
+    body_text = resp_body.decode("utf-8", errors="replace")
+
+    return {
+        "ok": True,
+        "status": status,
+        "duration_ms": round((time.monotonic() - started) * 1000),
+        "error": None,
+        "body_sample": body_text[:MAX_BODY_SAMPLE_CHARS],
+        "body_text": body_text,
+        "body_sha256": hashlib.sha256(resp_body).hexdigest(),
+        "body_truncated": body_truncated,
+        "body_length": len(resp_body),
+        "headers": response_headers,
+    }
+
+
+def http_request_through_proxy(
+    target: str,
+    proxy: str,
+    method: str,
+    path: str,
+    body: str | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: int = 20,
+) -> dict[str, Any]:
+    target_url = urllib.parse.urljoin(target.rstrip("/") + "/", path.lstrip("/"))
+    parsed_target = urllib.parse.urlparse(target_url)
+    parsed_proxy = urllib.parse.urlparse(proxy)
+    if parsed_target.scheme != "http":
+        return {
+            "ok": False,
+            "status": None,
+            "duration_ms": 0,
+            "error": "burp-observe currently supports HTTP targets only",
+            "body_sample": "",
+            "body_text": "",
+            "body_sha256": None,
+            "body_truncated": False,
+            "body_length": 0,
+            "headers": {},
+        }
+    if parsed_proxy.scheme != "http" or not parsed_proxy.hostname:
+        return {
+            "ok": False,
+            "status": None,
+            "duration_ms": 0,
+            "error": "proxy must be an http://host:port URL",
+            "body_sample": "",
+            "body_text": "",
+            "body_sha256": None,
+            "body_truncated": False,
+            "body_length": 0,
+            "headers": {},
+        }
+
+    request_headers = dict(headers or {})
+    request_headers.setdefault("Host", parsed_target.netloc)
+    request_headers.setdefault("Connection", "close")
+    raw_body = None if body is None else body.encode("utf-8")
+    if raw_body is not None:
+        request_headers.setdefault("Content-Length", str(len(raw_body)))
+
+    started = time.monotonic()
+    conn = http.client.HTTPConnection(
+        parsed_proxy.hostname,
+        parsed_proxy.port or 8080,
+        timeout=timeout,
+    )
+    try:
+        conn.request(method, target_url, body=raw_body, headers=request_headers)
+        resp = conn.getresponse()
+        resp_body = resp.read(MAX_RESPONSE_BYTES + 1)
+        response_headers = {key: value for key, value in resp.getheaders()}
+        status = resp.status
+    except (OSError, http.client.HTTPException) as error:
+        return {
+            "ok": False,
+            "status": None,
+            "duration_ms": round((time.monotonic() - started) * 1000),
+            "error": str(error),
+            "body_sample": "",
+            "body_text": "",
+            "body_sha256": None,
+            "body_truncated": False,
+            "body_length": 0,
+            "headers": {},
+        }
+    finally:
+        conn.close()
+
+    body_truncated = len(resp_body) > MAX_RESPONSE_BYTES
+    if body_truncated:
+        resp_body = resp_body[:MAX_RESPONSE_BYTES]
+    body_text = resp_body.decode("utf-8", errors="replace")
+
+    return {
+        "ok": True,
+        "status": status,
+        "duration_ms": round((time.monotonic() - started) * 1000),
+        "error": None,
+        "body_sample": body_text[:MAX_BODY_SAMPLE_CHARS],
+        "body_text": body_text,
+        "body_sha256": hashlib.sha256(resp_body).hexdigest(),
+        "body_truncated": body_truncated,
+        "body_length": len(resp_body),
+        "headers": response_headers,
+    }
+
+
+def is_loopback_target(target: str) -> bool:
+    hostname = urllib.parse.urlparse(target).hostname
+    if not hostname:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def render_profile_headers(headers: dict[str, Any], target: str) -> dict[str, str]:
+    origin = origin_for(target)
+    rendered = {}
+    for key, value in headers.items():
+        rendered[str(key)] = str(value).replace("{origin}", origin)
+    return rendered
+
+
+def build_burp_observation_plan(target: str, profile: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    if profile and "burp_observation_plan" in profile:
+        plan = []
+        for index, item in enumerate(profile.get("burp_observation_plan") or []):
+            if not isinstance(item, dict):
+                raise ValueError(f"Invalid Burp observation entry at index {index}: expected object.")
+            if not is_active_observation_item(item):
+                continue
+            label = active_observation_label(item, index)
+            method = str(item.get("method") or "").upper()
+            if method not in HTTP_METHODS:
+                raise ValueError(f"Invalid active Burp observation `{label}`: unsupported method `{method or '(missing)'}`.")
+            path_problem = concrete_local_path_problem(item.get("path"))
+            if path_problem:
+                raise ValueError(f"Invalid active Burp observation `{label}`: {path_problem}.")
+            body = item.get("body")
+            if "body_json" in item:
+                body = json.dumps(item["body_json"])
+            plan.append(
+                {
+                    "id": item.get("id") or f"burp_observe_{index}",
+                    "method": method,
+                    "path": item["path"],
+                    "headers": render_profile_headers(item.get("headers", {}), target),
+                    "body": body,
+                    "expected_statuses": item.get("expected_statuses", []),
+                    "cluster": item.get("cluster", "unknown"),
+                }
+            )
+        return plan
+
+    origin = origin_for(target)
+    return [
+        {
+            "id": "burp_observe_health",
+            "method": "GET",
+            "path": "/health",
+            "headers": {"User-Agent": "InferForge-Burp-Observe/0.1"},
+            "body": None,
+            "expected_statuses": [200],
+            "cluster": "health",
+        },
+        {
+            "id": "burp_observe_quote_invalid_body",
+            "method": "POST",
+            "path": "/api/quote",
+            "headers": {
+                "User-Agent": "InferForge-Burp-Observe/0.1",
+                "Origin": origin,
+                "Content-Type": "application/json",
+            },
+            "body": "{}",
+            "expected_statuses": [400],
+            "cluster": "quote",
+        },
+        {
+            "id": "burp_observe_rpc_get_health",
+            "method": "POST",
+            "path": "/api/rpc/solana/devnet",
+            "headers": {
+                "User-Agent": "InferForge-Burp-Observe/0.1",
+                "Origin": origin,
+                "Content-Type": "application/json",
+            },
+            "body": json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getHealth"}),
+            "expected_statuses": [200],
+            "cluster": "solana-rpc-http",
+        },
+        {
+            "id": "burp_observe_orca_invalid_address",
+            "method": "GET",
+            "path": "/api/orca/pools/not-an-address",
+            "headers": {"User-Agent": "InferForge-Burp-Observe/0.1"},
+            "body": None,
+            "expected_statuses": [400],
+            "cluster": "orca-pools",
+        },
+    ]
+
+
+def build_burp_history_regex(
+    target: str,
+    observation_plan: list[dict[str, Any]],
+    *,
+    include_ws_upgrade: bool = False,
+) -> str:
+    history_regex_terms = []
+    for item in observation_plan:
+        user_agent = (item.get("headers") or {}).get("User-Agent")
+        if user_agent:
+            history_regex_terms.append(re.escape(f"User-Agent: {user_agent}"))
+    if not history_regex_terms:
+        history_regex_terms.extend(
+            re.escape(f"{item['method']} {item['path']}")
+            for item in observation_plan
+        )
+    if include_ws_upgrade:
+        history_regex_terms.append(r"Upgrade: websocket")
+    return "|".join(dict.fromkeys(history_regex_terms))
+
+
+def run_ws_upgrade_observation_through_proxy(
+    target: str,
+    proxy: str,
+    node: str,
+    source_root: Path,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    ws_profile = websocket_observation_config(profile)
+    if ws_profile is None:
+        return {
+            "id": "burp_observe_ws_upgrade",
+            "ok": True,
+            "skipped": True,
+            "status": None,
+            "path": None,
+            "cluster": "solana-rpc-ws",
+            "expected_statuses": [],
+            "error": "WebSocket observation disabled by target profile.",
+        }
+    ws_path = str(ws_profile.get("path") or "/api/rpc/solana/devnet")
+    ws_cluster = str(ws_profile.get("cluster") or "solana-rpc-ws")
+    ws_expected_statuses = list(ws_profile.get("expected_statuses") or [101])
+    subscribe_method = str(ws_profile.get("subscribe_method") or "slotSubscribe")
+    path_problem = concrete_local_path_problem(ws_path)
+    if path_problem:
+        return {
+            "id": "burp_observe_ws_upgrade",
+            "ok": False,
+            "status": None,
+            "path": ws_path,
+            "cluster": ws_cluster,
+            "expected_statuses": ws_expected_statuses,
+            "error": f"WebSocket observation path is unsafe: {path_problem}",
+        }
+    node_path = Path(node)
+    if not node_path.exists():
+        fallback = command_result(["node", "-v"])
+        if not fallback["ok"]:
+            return {
+                "id": "burp_observe_ws_upgrade",
+                "ok": False,
+                "status": None,
+                "error": f"Node not found at {node}",
+            }
+        node = "node"
+
+    parsed = urllib.parse.urlparse(target)
+    if parsed.scheme != "http":
+        return {
+            "id": "burp_observe_ws_upgrade",
+            "ok": False,
+            "status": None,
+            "error": "WebSocket upgrade observation currently supports HTTP targets only",
+        }
+    ws_url = urllib.parse.urlunparse(("ws", parsed.netloc, ws_path, "", "", ""))
+    script = """
+import { WebSocket } from 'ws'
+import proxyAgentPkg from 'https-proxy-agent'
+
+const { HttpsProxyAgent } = proxyAgentPkg
+const input = JSON.parse(process.argv[2])
+const agent = new HttpsProxyAgent(input.proxy)
+const started = Date.now()
+let opened = false
+let messageSeen = false
+
+const ws = new WebSocket(input.url, {
+  agent,
+  headers: { Origin: input.origin },
+  handshakeTimeout: 5000,
+  perMessageDeflate: false,
+})
+
+const finish = (status, error = null) => {
+  console.log(JSON.stringify({
+    id: 'burp_observe_ws_upgrade',
+    ok: opened,
+    status,
+    duration_ms: Date.now() - started,
+    opened,
+    message_seen: messageSeen,
+    error,
+  }))
+  process.exit(opened ? 0 : 1)
+}
+
+const timer = setTimeout(() => {
+  ws.terminate()
+  finish(opened ? 101 : null, opened ? null : 'timeout')
+}, 10000)
+
+ws.on('open', () => {
+  opened = true
+  ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: input.subscribeMethod }))
+  setTimeout(() => ws.close(1000, 'done'), 500)
+})
+ws.on('message', () => {
+  messageSeen = true
+  clearTimeout(timer)
+  ws.close(1000, 'done')
+})
+ws.on('close', (code, reason) => {
+  clearTimeout(timer)
+  finish(opened ? 101 : null, opened ? null : `closed ${code} ${reason.toString()}`)
+})
+ws.on('error', (error) => {
+  clearTimeout(timer)
+  finish(opened ? 101 : null, error.message)
+})
+"""
+    if not source_root.is_dir():
+        return {
+            "id": "burp_observe_ws_upgrade",
+            "ok": False,
+            "status": None,
+            "error": f"Source root not found: {source_root}",
+        }
+    with tempfile.NamedTemporaryFile(
+        "w",
+        suffix=".mjs",
+        prefix=".inferforge-burp-ws-observe-",
+        dir=str(source_root),
+        delete=False,
+        encoding="utf-8",
+    ) as script_handle:
+        script_handle.write(script)
+        script_path = script_handle.name
+
+    try:
+        proc = subprocess.run(
+            [
+                node,
+                script_path,
+                json.dumps(
+                    {
+                        "url": ws_url,
+                        "proxy": proxy,
+                        "origin": origin_for(target),
+                        "subscribeMethod": subscribe_method,
+                    }
+                ),
+            ],
+            cwd=str(source_root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=15,
+            check=False,
+        )
+    finally:
+        Path(script_path).unlink(missing_ok=True)
+
+    parsed_output = parse_json_object(proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "")
+    if parsed_output:
+        parsed_output["path"] = ws_path
+        parsed_output["method"] = "WS"
+        parsed_output["cluster"] = ws_cluster
+        parsed_output["expected_statuses"] = ws_expected_statuses
+        return parsed_output
+    return {
+        "id": "burp_observe_ws_upgrade",
+        "ok": False,
+        "status": None,
+        "path": ws_path,
+        "method": "WS",
+        "cluster": ws_cluster,
+        "expected_statuses": ws_expected_statuses,
+        "error": proc.stdout[-1000:],
+    }
+
+
+def compact_response_attempt(response: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": response.get("status"),
+        "duration_ms": response.get("duration_ms"),
+        "error": response.get("error"),
+        "body_sha256": response.get("body_sha256"),
+        "body_sample": response.get("body_sample", "")[:240],
+    }
+
+
+@dataclass(frozen=True)
+class Probe:
+    id: str
+    label: str
+    method: str
+    path: str
+    body: str | None = None
+    origin: str | None = None
+    content_type: str | None = None
+    expected_statuses: tuple[int, ...] = ()
+    category: str = "http"
+    external: bool = False
+    policy_field: str | None = None
+    risk: str = "safe"
+    referer: str | None = None
+    expectation: str = "status"
+    strategy_set: str | None = None
+
+
+def build_probe_headers(probe: Probe) -> dict[str, str]:
+    headers: dict[str, str] = {"User-Agent": "InferForge-Local/0.1"}
+    if probe.origin:
+        headers["Origin"] = probe.origin
+    if probe.referer:
+        headers["Referer"] = probe.referer
+    if probe.content_type:
+        headers["Content-Type"] = probe.content_type
+    if probe.method == "OPTIONS":
+        headers["Access-Control-Request-Method"] = "POST"
+        headers["Access-Control-Request-Headers"] = "content-type"
+    return headers
+
+
+def is_next_dev_manifest_error(response: dict[str, Any]) -> bool:
+    if response.get("status") != 500:
+        return False
+    body = response.get("body_text") or response.get("body_sample") or ""
+    return (
+        "loadManifest" in body
+        and "Unexpected end of JSON input" in body
+        and ("next-dev-server" in body or "/_error" in body)
+    )
+
+
+def retry_reason_for_probe_response(probe: Probe, response: dict[str, Any]) -> str | None:
+    if probe.external:
+        return None
+    is_generic_nextjs_route = str(probe.risk).startswith("safe-generic-route-")
+    if probe.category not in {"quote", "solana-rpc-http", "orca-pools"} and not is_generic_nextjs_route:
+        return None
+    if response.get("status") is None:
+        return "local-request-timeout-or-transport-error"
+    if is_next_dev_manifest_error(response):
+        return "next-dev-manifest-transient-500"
+    return None
+
+
+def run_probe_request(
+    target: str,
+    probe: Probe,
+    *,
+    timeout: int = 20,
+    max_attempts: int = 1,
+) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
+    attempts = []
+    retry_reason = None
+    response: dict[str, Any] | None = None
+    headers = build_probe_headers(probe)
+
+    for attempt_number in range(1, max_attempts + 1):
+        response = http_request(
+            target=target,
+            method=probe.method,
+            path=probe.path,
+            body=probe.body,
+            headers=headers,
+            timeout=timeout,
+        )
+        attempts.append({"attempt": attempt_number, **compact_response_attempt(response)})
+        retry_reason = retry_reason_for_probe_response(probe, response)
+        if retry_reason is None or attempt_number == max_attempts:
+            break
+        time.sleep(0.4)
+
+    if response is None:
+        raise RuntimeError("probe request produced no response")
+    return response, attempts, retry_reason if len(attempts) > 1 else None
+
+
+def jsonrpc_response_is_error_only(value: Any) -> bool:
+    responses = value if isinstance(value, list) else [value]
+    if not responses:
+        return False
+
+    for item in responses:
+        if not isinstance(item, dict):
+            return False
+        if "result" in item:
+            return False
+        if "error" not in item:
+            return False
+    return True
+
+
+def response_has_internal_error_leak(response: dict[str, Any]) -> bool:
+    body = response.get("body_text") or response.get("body_sample") or ""
+    lowered = body.lower()
+    return any(
+        marker in lowered
+        for marker in [
+            "traceback",
+            "syntaxerror:",
+            "typeerror:",
+            "referenceerror:",
+            "at async",
+            "node_modules",
+            "webpack-internal",
+        ]
+    )
+
+
+def evaluate_probe_response(
+    probe: Probe,
+    status: int | None,
+    response: dict[str, Any],
+) -> tuple[bool, str]:
+    if probe.expectation == "jsonrpc-error-or-local-reject":
+        if status in {400, 403, 413, 415}:
+            return True, "local-reject"
+        if status != 200:
+            return False, "expected local rejection or JSON-RPC error"
+        if response_has_internal_error_leak(response):
+            return False, "internal-error-leak"
+        try:
+            payload = json.loads(response.get("body_text") or "")
+        except json.JSONDecodeError:
+            return False, "invalid-json-rpc-response-body"
+        if jsonrpc_response_is_error_only(payload):
+            return True, "jsonrpc-error"
+        return False, "jsonrpc-result-for-invalid-transaction-payload"
+
+    if not probe.expected_statuses:
+        return True, "status-unconstrained"
+    if status in probe.expected_statuses:
+        return True, "status"
+    return False, "unexpected-status"
+
+
+def build_probe_plan(
+    target: str,
+    include_external: bool,
+    selected_clusters: set[str] | None = None,
+    profile: dict[str, Any] | None = None,
+) -> list[Probe]:
+    allowed_origin = origin_for(target)
+    evil_origin = "https://evil.example"
+    allowed_referer = f"{allowed_origin}/swap"
+    evil_referer = "https://evil.example/swap"
+    valid_rpc = '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+    blocked_rpc = '{"jsonrpc":"2.0","id":2,"method":"getProgramAccounts","params":[]}'
+    unknown_rpc = '{"jsonrpc":"2.0","id":3,"method":"requestAirdrop","params":[]}'
+    wrong_method_type_rpc = '{"jsonrpc":"2.0","id":4,"method":123,"params":[]}'
+    invalid_transaction_payload = "inferforge-not-a-valid-solana-transaction"
+    duplicate_method_blocked_then_allowed_rpc = (
+        '{"jsonrpc":"2.0","id":5,"method":"getProgramAccounts","method":"getHealth","params":[]}'
+    )
+    duplicate_method_allowed_then_blocked_rpc = (
+        '{"jsonrpc":"2.0","id":6,"method":"getHealth","method":"getProgramAccounts","params":[]}'
+    )
+    batch_11 = json.dumps(
+        [{"jsonrpc": "2.0", "id": i, "method": "getHealth"} for i in range(1, 12)]
+    )
+    mixed_blocked_batch = json.dumps(
+        [
+            {"jsonrpc": "2.0", "id": 7, "method": "getHealth"},
+            {"jsonrpc": "2.0", "id": 8, "method": "getProgramAccounts", "params": []},
+        ]
+    )
+    valid_wallet = DEFAULT_TEST_WALLET
+    alternate_wallet = "11111111111111111111111111111111"
+    health_path = probe_target_path(profile, "health", "path", "/health")
+    quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
+    rpc_paths = rpc_probe_paths(profile)
+    rpc_path = rpc_paths["path"]
+    rpc_root_path = rpc_paths["root_path"]
+    rpc_unknown_cluster_path = rpc_paths["unknown_cluster_path"]
+    orca_paths = orca_probe_paths(profile)
+
+    def quote_body(
+        *,
+        amount_in: Any = "1000000",
+        sender: Any = valid_wallet,
+        recipient: Any = valid_wallet,
+        source_chain: Any = "Solana",
+        source_address: Any = USDC_MINT,
+        destination_chain: Any = "Solana",
+        destination_address: Any = USDTEL_MINT,
+        max_num_quotes: Any = 1,
+        include_route: bool = True,
+        include_source: bool = True,
+        include_destination: bool = True,
+        include_amount: bool = True,
+        include_sender: bool = True,
+        include_recipient: bool = True,
+        include_max_num_quotes: bool = True,
+        extra: dict[str, Any] | None = None,
+    ) -> str:
+        body: dict[str, Any] = {}
+        if include_route:
+            route: dict[str, Any] = {}
+            if include_source:
+                route["source"] = {"chain": source_chain, "address": source_address}
+            if include_destination:
+                route["destination"] = {
+                    "chain": destination_chain,
+                    "address": destination_address,
+                }
+            body["route"] = route
+        if include_amount:
+            body["amountIn"] = amount_in
+        if include_sender:
+            body["sender"] = sender
+        if include_recipient:
+            body["recipient"] = recipient
+        if include_max_num_quotes:
+            body["maxNumQuotes"] = max_num_quotes
+        if extra:
+            body.update(extra)
+        return json.dumps(body)
+
+    def quote_probe(
+        probe_id: str,
+        label: str,
+        body: str,
+        *,
+        external: bool = False,
+        policy_field: str | None = None,
+        risk: str = "safe-local-validation",
+    ) -> Probe:
+        return Probe(
+            probe_id,
+            label,
+            "POST",
+            "/api/quote",
+            body,
+            allowed_origin,
+            "application/json",
+            (400,),
+            category="quote",
+            external=external,
+            policy_field=policy_field,
+            risk=risk,
+        )
+
+    def generic_route_probes() -> list[Probe]:
+        generated: list[Probe] = []
+        for route in generic_nextjs_route_targets(profile):
+            cluster_id = route["id"]
+            path = route["path"]
+            methods = set(route.get("methods", []))
+            prefix = safe_probe_id(cluster_id)
+            generated.append(
+                Probe(
+                    f"nextjs_{prefix}_head",
+                    f"Next.js route HEAD baseline {cluster_id}",
+                    "HEAD",
+                    path,
+                    expected_statuses=(200, 204, 400, 403, 404, 405),
+                    category=cluster_id,
+                    policy_field="method",
+                    risk="safe-generic-route-method-probe",
+                    strategy_set="nextjs-api-routes",
+                )
+            )
+            generated.append(
+                Probe(
+                    f"nextjs_{prefix}_options_preflight",
+                    f"Next.js route OPTIONS preflight {cluster_id}",
+                    "OPTIONS",
+                    path,
+                    origin=allowed_origin,
+                    expected_statuses=(200, 204, 400, 403, 404, 405),
+                    category=cluster_id,
+                    policy_field="cors-preflight",
+                    risk="safe-generic-route-preflight-probe",
+                    strategy_set="nextjs-api-routes",
+                )
+            )
+            if not methods:
+                continue
+            if "GET" in methods:
+                generated.append(
+                    Probe(
+                        f"nextjs_{prefix}_get_availability",
+                        f"Next.js route GET availability {cluster_id}",
+                        "GET",
+                        path,
+                        expected_statuses=(200, 204, 304, 400, 403, 404),
+                        category=cluster_id,
+                        policy_field="availability",
+                        risk="safe-generic-route-availability-probe",
+                        strategy_set="nextjs-api-routes",
+                    )
+                )
+            else:
+                generated.append(
+                    Probe(
+                        f"nextjs_{prefix}_get_method_confusion",
+                        f"Next.js route GET method confusion {cluster_id}",
+                        "GET",
+                        path,
+                        expected_statuses=(400, 403, 404, 405),
+                        category=cluster_id,
+                        policy_field="method",
+                        risk="safe-generic-route-method-probe",
+                        strategy_set="nextjs-api-routes",
+                    )
+                )
+        return generated
+
+    probes = [
+        Probe("health", "GET /health", "GET", "/health", expected_statuses=(200,), category="health"),
+        Probe(
+            "rpc_options_allowed",
+            "RPC OPTIONS allowed Origin",
+            "OPTIONS",
+            "/api/rpc/solana/devnet",
+            origin=allowed_origin,
+            expected_statuses=(204,),
+            category="solana-rpc-http",
+        ),
+        Probe(
+            "rpc_options_disallowed",
+            "RPC OPTIONS disallowed Origin",
+            "OPTIONS",
+            "/api/rpc/solana/devnet",
+            origin=evil_origin,
+            expected_statuses=(403,),
+            category="solana-rpc-http",
+        ),
+        Probe(
+            "rpc_root_options_allowed",
+            "RPC root OPTIONS allowed Origin",
+            "OPTIONS",
+            "/api/rpc",
+            origin=allowed_origin,
+            expected_statuses=(204,),
+            category="solana-rpc-http",
+            policy_field="root-route-source",
+        ),
+        Probe(
+            "rpc_root_options_disallowed",
+            "RPC root OPTIONS disallowed Origin",
+            "OPTIONS",
+            "/api/rpc",
+            origin=evil_origin,
+            expected_statuses=(403,),
+            category="solana-rpc-http",
+            policy_field="root-route-source",
+        ),
+        Probe(
+            "rpc_get_health",
+            "RPC getHealth",
+            "POST",
+            "/api/rpc/solana/devnet",
+            valid_rpc,
+            allowed_origin,
+            "application/json",
+            (200,),
+            category="solana-rpc-http",
+        ),
+        Probe(
+            "rpc_no_origin_dev",
+            "RPC no Origin in dev",
+            "POST",
+            "/api/rpc/solana/devnet",
+            valid_rpc,
+            None,
+            "application/json",
+            (200,),
+            category="solana-rpc-http",
+        ),
+        Probe(
+            "rpc_referer_allowed",
+            "RPC Referer-only allowed source",
+            "POST",
+            "/api/rpc/solana/devnet",
+            body=valid_rpc,
+            referer=allowed_referer,
+            content_type="application/json",
+            expected_statuses=(200,),
+            category="solana-rpc-http",
+            policy_field="source",
+        ),
+        Probe(
+            "rpc_referer_disallowed",
+            "RPC Referer-only disallowed source",
+            "POST",
+            "/api/rpc/solana/devnet",
+            body=valid_rpc,
+            referer=evil_referer,
+            content_type="application/json",
+            expected_statuses=(403,),
+            category="solana-rpc-http",
+            policy_field="source",
+        ),
+        Probe(
+            "rpc_disallowed_origin",
+            "RPC POST disallowed Origin",
+            "POST",
+            "/api/rpc/solana/devnet",
+            valid_rpc,
+            evil_origin,
+            "application/json",
+            (403,),
+            category="solana-rpc-http",
+        ),
+        Probe(
+            "rpc_get_method_confusion",
+            "RPC GET method confusion",
+            "GET",
+            "/api/rpc/solana/devnet",
+            expected_statuses=(405,),
+            category="solana-rpc-http",
+            policy_field="method",
+        ),
+        Probe(
+            "rpc_root_get_method_confusion",
+            "RPC root GET method confusion",
+            "GET",
+            "/api/rpc",
+            expected_statuses=(405,),
+            category="solana-rpc-http",
+            policy_field="root-route-method",
+        ),
+        Probe(
+            "rpc_text_plain_valid_json",
+            "RPC text/plain valid JSON",
+            "POST",
+            "/api/rpc/solana/devnet",
+            valid_rpc,
+            allowed_origin,
+            "text/plain",
+            (415,),
+            category="solana-rpc-http",
+            policy_field="content-type",
+        ),
+        Probe(
+            "rpc_root_text_plain_valid_json",
+            "RPC root text/plain valid JSON",
+            "POST",
+            "/api/rpc",
+            valid_rpc,
+            allowed_origin,
+            "text/plain",
+            (415,),
+            category="solana-rpc-http",
+            policy_field="root-route-content-type",
+        ),
+        Probe(
+            "rpc_blocked_method",
+            "RPC blocked method",
+            "POST",
+            "/api/rpc/solana/devnet",
+            blocked_rpc,
+            allowed_origin,
+            "application/json",
+            (403,),
+            category="solana-rpc-http",
+        ),
+        Probe(
+            "rpc_root_blocked_method",
+            "RPC root blocked method",
+            "POST",
+            "/api/rpc",
+            blocked_rpc,
+            allowed_origin,
+            "application/json",
+            (403,),
+            category="solana-rpc-http",
+            policy_field="root-route-method",
+        ),
+        Probe(
+            "rpc_method_wrong_type",
+            "RPC method wrong type",
+            "POST",
+            "/api/rpc/solana/devnet",
+            wrong_method_type_rpc,
+            allowed_origin,
+            "application/json",
+            (400,),
+            category="solana-rpc-http",
+            policy_field="method",
+        ),
+        Probe(
+            "rpc_duplicate_method_blocked_then_allowed",
+            "RPC duplicate method blocked then allowed",
+            "POST",
+            "/api/rpc/solana/devnet",
+            duplicate_method_blocked_then_allowed_rpc,
+            allowed_origin,
+            "application/json",
+            (400,),
+            category="solana-rpc-http",
+            policy_field="json-duplicate-keys",
+        ),
+        Probe(
+            "rpc_duplicate_method_allowed_then_blocked",
+            "RPC duplicate method allowed then blocked",
+            "POST",
+            "/api/rpc/solana/devnet",
+            duplicate_method_allowed_then_blocked_rpc,
+            allowed_origin,
+            "application/json",
+            (400,),
+            category="solana-rpc-http",
+            policy_field="json-duplicate-keys",
+        ),
+        Probe(
+            "rpc_allowlist_miss",
+            "RPC allowlist miss",
+            "POST",
+            "/api/rpc/solana/devnet",
+            unknown_rpc,
+            allowed_origin,
+            "application/json",
+            (403,),
+            category="solana-rpc-http",
+        ),
+        Probe(
+            "rpc_malformed_json",
+            "RPC malformed JSON",
+            "POST",
+            "/api/rpc/solana/devnet",
+            "{bad json",
+            allowed_origin,
+            "application/json",
+            (400,),
+            category="solana-rpc-http",
+        ),
+        Probe(
+            "rpc_empty_batch",
+            "RPC empty batch",
+            "POST",
+            "/api/rpc/solana/devnet",
+            "[]",
+            allowed_origin,
+            "application/json",
+            (400,),
+            category="solana-rpc-http",
+        ),
+        Probe(
+            "rpc_mixed_batch_blocked_method",
+            "RPC mixed batch blocked method",
+            "POST",
+            "/api/rpc/solana/devnet",
+            mixed_blocked_batch,
+            allowed_origin,
+            "application/json",
+            (403,),
+            category="solana-rpc-http",
+            policy_field="batch-method",
+        ),
+        Probe(
+            "rpc_batch_over_limit",
+            "RPC batch over limit",
+            "POST",
+            "/api/rpc/solana/devnet",
+            batch_11,
+            allowed_origin,
+            "application/json",
+            (413,),
+            category="solana-rpc-http",
+        ),
+        Probe(
+            "rpc_unknown_cluster",
+            "RPC unknown cluster",
+            "POST",
+            "/api/rpc/solana/localnet",
+            valid_rpc,
+            allowed_origin,
+            "application/json",
+            (404,),
+            category="solana-rpc-http",
+        ),
+        Probe(
+            "rpc_simulate_transaction_invalid_payload",
+            "RPC simulateTransaction invalid transaction payload",
+            "POST",
+            "/api/rpc/solana/devnet",
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 42,
+                    "method": "simulateTransaction",
+                    "params": [
+                        invalid_transaction_payload,
+                        {"encoding": "base64", "sigVerify": True},
+                    ],
+                }
+            ),
+            allowed_origin,
+            "application/json",
+            (200, 400, 403, 413, 415),
+            category="solana-rpc-http",
+            policy_field="transaction-method",
+            risk="safe-invalid-transaction-rpc-probe",
+            expectation="jsonrpc-error-or-local-reject",
+        ),
+        Probe(
+            "rpc_send_transaction_invalid_payload",
+            "RPC sendTransaction invalid transaction payload",
+            "POST",
+            "/api/rpc/solana/devnet",
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 43,
+                    "method": "sendTransaction",
+                    "params": [
+                        invalid_transaction_payload,
+                        {"encoding": "base64", "skipPreflight": False},
+                    ],
+                }
+            ),
+            allowed_origin,
+            "application/json",
+            (200, 400, 403, 413, 415),
+            category="solana-rpc-http",
+            policy_field="transaction-method",
+            risk="safe-invalid-transaction-rpc-probe",
+            expectation="jsonrpc-error-or-local-reject",
+        ),
+        Probe(
+            "rpc_root_send_transaction_invalid_payload",
+            "RPC root sendTransaction invalid transaction payload",
+            "POST",
+            "/api/rpc",
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 44,
+                    "method": "sendTransaction",
+                    "params": [
+                        invalid_transaction_payload,
+                        {"encoding": "base64", "skipPreflight": False},
+                    ],
+                }
+            ),
+            allowed_origin,
+            "application/json",
+            (200, 400, 403, 413, 415),
+            category="solana-rpc-http",
+            policy_field="root-route-transaction-method",
+            risk="safe-invalid-transaction-rpc-probe",
+            expectation="jsonrpc-error-or-local-reject",
+        ),
+        quote_probe("quote_invalid_body", "Quote invalid body", "{}", policy_field="body"),
+        quote_probe(
+            "quote_missing_route",
+            "Quote missing route",
+            quote_body(include_route=False),
+            policy_field="route",
+        ),
+        quote_probe(
+            "quote_missing_source",
+            "Quote missing source route",
+            quote_body(include_source=False),
+            policy_field="route.source",
+        ),
+        quote_probe(
+            "quote_missing_destination",
+            "Quote missing destination route",
+            quote_body(include_destination=False),
+            policy_field="route.destination",
+        ),
+        quote_probe(
+            "quote_missing_amount",
+            "Quote missing amountIn",
+            quote_body(include_amount=False),
+            policy_field="amountIn",
+        ),
+        quote_probe(
+            "quote_missing_sender",
+            "Quote missing sender",
+            quote_body(include_sender=False),
+            policy_field="sender",
+        ),
+        Probe(
+            "quote_malformed_json",
+            "Quote malformed JSON",
+            "POST",
+            "/api/quote",
+            "{bad json",
+            allowed_origin,
+            "application/json",
+            (400,),
+            category="quote",
+            policy_field="json",
+            risk="safe-local-validation",
+        ),
+        Probe(
+            "quote_text_plain_invalid_json",
+            "Quote text/plain invalid JSON",
+            "POST",
+            "/api/quote",
+            "not-json",
+            allowed_origin,
+            "text/plain",
+            (415,),
+            category="quote",
+            policy_field="json",
+            risk="safe-local-validation",
+        ),
+        quote_probe(
+            "quote_wrong_amount_type",
+            "Quote wrong amountIn type",
+            quote_body(amount_in=1),
+            policy_field="amountIn",
+        ),
+        quote_probe(
+            "quote_wrong_sender_type",
+            "Quote wrong sender type",
+            quote_body(sender=1),
+            policy_field="sender",
+        ),
+        quote_probe(
+            "quote_route_wrong_type",
+            "Quote wrong route type",
+            json.dumps(
+                {
+                    "route": "not-an-object",
+                    "amountIn": "1000000",
+                    "sender": valid_wallet,
+                    "recipient": valid_wallet,
+                    "maxNumQuotes": 1,
+                }
+            ),
+            policy_field="route",
+        ),
+        Probe(
+            "orca_invalid_address",
+            "Orca invalid address",
+            "GET",
+            "/api/orca/pools/not-an-address",
+            expected_statuses=(400,),
+            category="orca-pools",
+            policy_field="address-shape",
+        ),
+        Probe(
+            "orca_invalid_base58_character",
+            "Orca invalid base58 character",
+            "GET",
+            "/api/orca/pools/0OIlnotbase58",
+            expected_statuses=(400,),
+            category="orca-pools",
+            policy_field="address-base58",
+        ),
+        Probe(
+            "orca_address_too_short",
+            "Orca address too short",
+            "GET",
+            "/api/orca/pools/1111111111111111111111111111111",
+            expected_statuses=(400,),
+            category="orca-pools",
+            policy_field="address-length",
+        ),
+        Probe(
+            "orca_address_too_long",
+            "Orca address too long",
+            "GET",
+            "/api/orca/pools/111111111111111111111111111111111111111111111",
+            expected_statuses=(400,),
+            category="orca-pools",
+            policy_field="address-length",
+        ),
+        Probe(
+            "orca_encoded_path_traversal",
+            "Orca encoded path traversal",
+            "GET",
+            "/api/orca/pools/%2e%2e%2fhealth",
+            expected_statuses=(400, 404),
+            category="orca-pools",
+            policy_field="path-traversal",
+        ),
+        Probe(
+            "orca_extra_path_segment",
+            "Orca extra path segment",
+            "GET",
+            "/api/orca/pools/not-an-address/extra",
+            expected_statuses=(404,),
+            category="orca-pools",
+            policy_field="path-segment",
+        ),
+        Probe(
+            "orca_query_injection_invalid_address",
+            "Orca query injection invalid address",
+            "GET",
+            "/api/orca/pools/not-an-address?url=https://evil.example",
+            expected_statuses=(400,),
+            category="orca-pools",
+            policy_field="query-ignored",
+        ),
+        Probe(
+            "orca_head_method_confusion",
+            "Orca HEAD method confusion",
+            "HEAD",
+            "/api/orca/pools/not-an-address",
+            expected_statuses=(400, 405),
+            category="orca-pools",
+            policy_field="method",
+        ),
+        Probe(
+            "orca_method_confusion",
+            "Orca method confusion",
+            "POST",
+            "/api/orca/pools/not-an-address",
+            "{}",
+            allowed_origin,
+            "application/json",
+            (405,),
+            category="orca-pools",
+        ),
+    ]
+    probes.extend(generic_route_probes())
+
+    if include_external:
+        external_quote_risk = "bounded-m0-validation-probe"
+        probes.extend(
+            [
+                quote_probe(
+                    "quote_shape_valid_invalid_business_values",
+                    "Quote shape-valid invalid business values",
+                    quote_body(
+                        source_chain="NotSolana",
+                        source_address="not-a-mint",
+                        destination_chain="AlsoNotSolana",
+                        destination_address="not-a-destination",
+                        amount_in="1",
+                        sender="not-a-wallet",
+                        recipient="also-not-a-wallet",
+                        max_num_quotes=999,
+                    ),
+                    external=True,
+                    policy_field="combined",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_invalid_source_chain",
+                    "Quote invalid source chain",
+                    quote_body(source_chain="Ethereum"),
+                    external=True,
+                    policy_field="route.source.chain",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_invalid_destination_chain",
+                    "Quote invalid destination chain",
+                    quote_body(destination_chain="Ethereum"),
+                    external=True,
+                    policy_field="route.destination.chain",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_invalid_source_mint",
+                    "Quote invalid source mint",
+                    quote_body(source_address="not-a-mint"),
+                    external=True,
+                    policy_field="route.source.address",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_invalid_destination_mint",
+                    "Quote invalid destination mint",
+                    quote_body(destination_address="not-a-mint"),
+                    external=True,
+                    policy_field="route.destination.address",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_source_mint_wrong_type",
+                    "Quote source mint wrong type",
+                    quote_body(source_address=123),
+                    external=True,
+                    policy_field="route.source.address",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_destination_mint_wrong_type",
+                    "Quote destination mint wrong type",
+                    quote_body(destination_address=123),
+                    external=True,
+                    policy_field="route.destination.address",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_sender_invalid_public_key",
+                    "Quote sender invalid public key",
+                    quote_body(sender="not-a-wallet"),
+                    external=True,
+                    policy_field="sender",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_recipient_invalid_public_key",
+                    "Quote recipient invalid public key",
+                    quote_body(recipient="not-a-wallet"),
+                    external=True,
+                    policy_field="recipient",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_missing_recipient",
+                    "Quote missing recipient",
+                    quote_body(include_recipient=False),
+                    external=True,
+                    policy_field="recipient",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_sender_recipient_mismatch",
+                    "Quote sender recipient mismatch",
+                    quote_body(recipient=alternate_wallet),
+                    external=True,
+                    policy_field="recipient",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_amount_zero",
+                    "Quote amountIn zero",
+                    quote_body(amount_in="0"),
+                    external=True,
+                    policy_field="amountIn",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_amount_negative",
+                    "Quote amountIn negative",
+                    quote_body(amount_in="-1"),
+                    external=True,
+                    policy_field="amountIn",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_amount_decimal",
+                    "Quote amountIn decimal",
+                    quote_body(amount_in="1.5"),
+                    external=True,
+                    policy_field="amountIn",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_amount_scientific",
+                    "Quote amountIn scientific notation",
+                    quote_body(amount_in="1e9"),
+                    external=True,
+                    policy_field="amountIn",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_amount_huge",
+                    "Quote amountIn huge integer",
+                    quote_body(amount_in="9" * 80),
+                    external=True,
+                    policy_field="amountIn",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_amount_non_numeric",
+                    "Quote amountIn non-numeric",
+                    quote_body(amount_in="not-a-number"),
+                    external=True,
+                    policy_field="amountIn",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_max_num_quotes_wrong_type",
+                    "Quote maxNumQuotes wrong type",
+                    quote_body(max_num_quotes="1"),
+                    external=True,
+                    policy_field="maxNumQuotes",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_max_num_quotes_zero",
+                    "Quote maxNumQuotes zero",
+                    quote_body(max_num_quotes=0),
+                    external=True,
+                    policy_field="maxNumQuotes",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_max_num_quotes_high",
+                    "Quote maxNumQuotes high",
+                    quote_body(max_num_quotes=999),
+                    external=True,
+                    policy_field="maxNumQuotes",
+                    risk=external_quote_risk,
+                ),
+                quote_probe(
+                    "quote_unknown_extra_fields",
+                    "Quote unknown extra fields",
+                    quote_body(extra={"unexpectedField": "inferforge", "debug": True}),
+                    external=True,
+                    policy_field="unknown-fields",
+                    risk=external_quote_risk,
+                ),
+            ]
+        )
+
+    path_rewrites = {
+        "/health": health_path,
+        "/api/quote": quote_path,
+        "/api/rpc/solana/devnet": rpc_path,
+        "/api/rpc": rpc_root_path,
+        "/api/rpc/solana/localnet": rpc_unknown_cluster_path,
+        "/api/orca/pools/not-an-address": orca_paths["invalid_address_path"],
+        "/api/orca/pools/0OIlnotbase58": orca_paths["invalid_base58_path"],
+        "/api/orca/pools/1111111111111111111111111111111": orca_paths["too_short_path"],
+        "/api/orca/pools/111111111111111111111111111111111111111111111": orca_paths["too_long_path"],
+        "/api/orca/pools/%2e%2e%2fhealth": orca_paths["encoded_traversal_path"],
+        "/api/orca/pools/not-an-address/extra": orca_paths["extra_segment_path"],
+        "/api/orca/pools/not-an-address?url=https://evil.example": orca_paths["query_injection_path"],
+    }
+    probes = [replace(probe, path=path_rewrites.get(probe.path, probe.path)) for probe in probes]
+
+    filtered = [
+        probe
+        for probe in probes
+        if strategy_set_enabled(profile, strategy_set_for_probe(probe))
+    ]
+
+    if selected_clusters is None:
+        return filtered
+
+    return [probe for probe in filtered if probe.category in selected_clusters]
+
+
+def build_warmup_probes(
+    target: str,
+    profile: dict[str, Any] | None = None,
+    selected_clusters: set[str] | None = None,
+) -> list[Probe]:
+    allowed_origin = origin_for(target)
+    evil_referer = "https://evil.example/swap"
+    valid_rpc = '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+    health_path = probe_target_path(profile, "health", "path", "/health")
+    quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
+    rpc_path = rpc_probe_paths(profile)["path"]
+    orca_paths = orca_probe_paths(profile)
+    probes = [
+        Probe("warmup_health", "Warm up /health", "GET", health_path, expected_statuses=(200,), category="health"),
+        Probe(
+            "warmup_quote_invalid_body",
+            "Warm up quote validation route",
+            "POST",
+            quote_path,
+            "{}",
+            allowed_origin,
+            "application/json",
+            (400,),
+            category="quote",
+            risk="warmup-local-route",
+        ),
+        Probe(
+            "warmup_rpc_get_health",
+            "Warm up RPC route module",
+            "POST",
+            rpc_path,
+            valid_rpc,
+            allowed_origin,
+            "application/json",
+            (200,),
+            category="solana-rpc-http",
+            risk="warmup-local-route",
+        ),
+        Probe(
+            "warmup_rpc_referer_disallowed",
+            "Warm up RPC referer policy",
+            "POST",
+            rpc_path,
+            valid_rpc,
+            referer=evil_referer,
+            content_type="application/json",
+            expected_statuses=(403,),
+            category="solana-rpc-http",
+            policy_field="source",
+            risk="warmup-local-route",
+        ),
+        Probe(
+            "warmup_orca_invalid_address",
+            "Warm up Orca route module",
+            "GET",
+            orca_paths["invalid_address_path"],
+            expected_statuses=(400,),
+            category="orca-pools",
+            risk="warmup-local-route",
+        ),
+        Probe(
+            "warmup_orca_extra_path_segment",
+            "Warm up Orca not-found route",
+            "GET",
+            orca_paths["extra_segment_path"],
+            expected_statuses=(404,),
+            category="orca-pools",
+            risk="warmup-local-route",
+        ),
+    ]
+    probes = [
+        probe
+        for probe in probes
+        if strategy_set_enabled(profile, strategy_set_for_probe(probe))
+    ]
+    if selected_clusters is not None:
+        probes = [probe for probe in probes if probe.category in selected_clusters]
+    return probes
+
+
+def run_http_probes(
+    target: str,
+    probes: list[Probe],
+    *,
+    phase: str = "probe",
+    timeout: int = 20,
+    max_attempts: int = 1,
+) -> list[dict[str, Any]]:
+    results = []
+    for probe in probes:
+        request_headers = build_probe_headers(probe)
+        raw_request_body = (probe.body or "").encode("utf-8")
+        request_body_truncated = bool(probe.body is not None and len(probe.body) > 500)
+        response, attempts, retry_reason = run_probe_request(
+            target,
+            probe,
+            timeout=timeout,
+            max_attempts=max_attempts,
+        )
+        status = response["status"]
+        expected, expectation_result = evaluate_probe_response(probe, status, response)
+        result = {
+            "ts": utc_now(),
+            "phase": phase,
+            "probe_id": probe.id,
+            "label": probe.label,
+            "target": target,
+            "method": probe.method,
+            "path": probe.path,
+            "origin": probe.origin,
+            "referer": probe.referer,
+            "request": {
+                "method": probe.method,
+                "path": probe.path,
+                "headers": redact_headers(request_headers),
+                "body_sha256": hashlib.sha256(raw_request_body).hexdigest() if probe.body is not None else None,
+                "body_length": len(raw_request_body),
+                "body_sample": redact_text(probe.body, max_chars=500),
+                "body_truncated": request_body_truncated,
+            },
+            "category": probe.category,
+            "external": probe.external,
+            "policy_field": probe.policy_field,
+            "risk": probe.risk,
+            "expectation": probe.expectation,
+            "expectation_result": expectation_result,
+            "expected_statuses": list(probe.expected_statuses),
+            "status": status,
+            "expected": expected,
+            "duration_ms": response["duration_ms"],
+            "error": response["error"],
+            "body_sample": response["body_sample"],
+            "body_text": response["body_text"],
+            "body_sha256": response["body_sha256"],
+            "body_truncated": response["body_truncated"],
+            "body_length": response["body_length"],
+            "interesting": (not expected) or is_interesting(probe, status, response["body_sample"]),
+            "attempt_count": len(attempts),
+        }
+        if len(attempts) > 1:
+            result["attempts"] = attempts
+            result["retry_reason"] = retry_reason
+            result["first_attempt"] = attempts[0]
+        results.append(result)
+    return results
+
+
+def run_audit_warmup(
+    target: str,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None = None,
+    selected_clusters: set[str] | None = None,
+) -> dict[str, Any]:
+    warmup_results = run_http_probes(
+        target,
+        build_warmup_probes(target, profile, selected_clusters),
+        phase="warmup",
+        timeout=35,
+        max_attempts=3,
+    )
+    payload = {
+        "generated_at": utc_now(),
+        "target": target,
+        "note": "Local route warm-up before audit probes. Results are not counted as findings.",
+        "selected_clusters": sorted(selected_clusters) if selected_clusters is not None else None,
+        "ready": all(row["expected"] for row in warmup_results),
+        "results": warmup_results,
+    }
+    write_json(artifact_dir / "warmup-results.json", payload)
+    return payload
+
+
+def run_ws_probes(
+    target: str,
+    node: str,
+    source_root: Path | None = None,
+    profile: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    source_root = source_root or DEFAULT_SOURCE_ROOT
+    ws_profile = websocket_observation_config(profile)
+    if ws_profile is None:
+        return [
+            {
+                "ts": utc_now(),
+                "probe_id": "ws_profile_disabled",
+                "label": "WebSocket probes disabled by profile",
+                "target": target_to_ws(target),
+                "method": "WS",
+                "path": None,
+                "category": "solana-rpc-ws",
+                "external": False,
+                "policy_field": "profile",
+                "risk": "profile-disabled",
+                "expected_statuses": [],
+                "status": None,
+                "expected": True,
+                "duration_ms": None,
+                "error": None,
+                "body_sample": "",
+                "body_text": "",
+                "body_sha256": None,
+                "body_truncated": False,
+                "body_length": 0,
+                "interesting": False,
+                "skipped": True,
+            }
+        ]
+    ws_path = str(ws_profile.get("path") or "/api/rpc/solana/devnet")
+    ws_cluster = str(ws_profile.get("cluster") or "solana-rpc-ws")
+    subscribe_method = str(ws_profile.get("subscribe_method") or "slotSubscribe")
+    node_path = Path(node)
+    if not node_path.exists():
+        fallback = command_result(["node", "-v"])
+        if not fallback["ok"]:
+            return [
+                {
+                    "ts": utc_now(),
+                    "probe_id": "ws_runtime_unavailable",
+                    "label": "WebSocket runtime unavailable",
+                    "status": None,
+                    "expected": False,
+                    "error": f"Node not found at {node}",
+                    "body_sample": "",
+                    "interesting": True,
+                }
+            ]
+        node = "node"
+
+    script_root = source_root if source_root.is_dir() else DEFAULT_SOURCE_ROOT
+    ws_base = target_to_ws(target)
+    allowed_origin = origin_for(target)
+    script = f"""
+import {{ WebSocket }} from 'ws'
+
+async function one(name, origin, payload, options = {{}}) {{
+  return new Promise((resolve) => {{
+    const ws = new WebSocket('{ws_base}{ws_path}', {{
+      headers: {{ Origin: origin }},
+      perMessageDeflate: false,
+    }})
+    const timeout = setTimeout(() => {{
+      try {{ ws.close() }} catch {{}}
+      resolve({{ name, status: null, error: 'timeout', body_sample: '' }})
+    }}, 10000)
+    ws.on('open', () => {{
+      if (options.binary) {{
+        ws.send(Buffer.from(payload))
+      }} else if (options.raw) {{
+        ws.send(payload)
+      }} else if (payload !== null && payload !== undefined) {{
+        ws.send(JSON.stringify(payload))
+      }}
+    }})
+    ws.on('message', (data) => {{
+      console.log(`${{name}} message ${{data.toString().slice(0, 180)}}`)
+    }})
+    ws.on('close', (code, reason) => {{
+      clearTimeout(timeout)
+      resolve({{ name, status: code, error: null, body_sample: reason.toString() }})
+    }})
+    ws.on('error', (error) => {{
+      clearTimeout(timeout)
+      resolve({{ name, status: error.message.includes('403') ? 403 : null, error: error.message, body_sample: '' }})
+    }})
+  }})
+}}
+
+const results = []
+const overLimitBatch = Array.from({{ length: 11 }}, (_, index) => ({{
+  jsonrpc: '2.0',
+  id: index + 20,
+  method: '{subscribe_method}',
+}}))
+results.push(await one('ws_blocked_method', '{allowed_origin}', {{ jsonrpc: '2.0', id: 1, method: 'getProgramAccounts', params: [] }}))
+results.push(await one('ws_malformed_json', '{allowed_origin}', '{{"jsonrpc":"2.0","id":2,"method":', {{ raw: true }}))
+results.push(await one('ws_binary_message', '{allowed_origin}', JSON.stringify({{ jsonrpc: '2.0', id: 3, method: '{subscribe_method}' }}), {{ binary: true }}))
+results.push(await one('ws_method_wrong_type', '{allowed_origin}', {{ jsonrpc: '2.0', id: 4, method: 123, params: [] }}))
+results.push(await one('ws_duplicate_method_blocked_then_allowed', '{allowed_origin}', '{{"jsonrpc":"2.0","id":5,"method":"getProgramAccounts","method":"{subscribe_method}"}}', {{ raw: true }}))
+results.push(await one('ws_duplicate_method_allowed_then_blocked', '{allowed_origin}', '{{"jsonrpc":"2.0","id":6,"method":"{subscribe_method}","method":"getProgramAccounts"}}', {{ raw: true }}))
+results.push(await one('ws_empty_batch', '{allowed_origin}', []))
+results.push(await one('ws_batch_over_limit', '{allowed_origin}', overLimitBatch))
+results.push(await one('ws_mixed_batch_blocked_method', '{allowed_origin}', [
+  {{ jsonrpc: '2.0', id: 31, method: '{subscribe_method}' }},
+  {{ jsonrpc: '2.0', id: 32, method: 'getProgramAccounts', params: [] }},
+]))
+results.push(await one('ws_disallowed_origin', 'https://evil.example', null))
+console.log(JSON.stringify(results))
+"""
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        suffix=".mjs",
+        prefix=".inferforge-ws-",
+        dir=str(script_root),
+        delete=False,
+        encoding="utf-8",
+    ) as handle:
+        handle.write(script)
+        script_path = handle.name
+
+    try:
+        proc = subprocess.run(
+            [node, script_path],
+            cwd=str(script_root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=15,
+            check=False,
+        )
+    finally:
+        Path(script_path).unlink(missing_ok=True)
+
+    output = proc.stdout.strip().splitlines()
+    raw_json = output[-1] if output else "[]"
+    try:
+        raw_results = json.loads(raw_json)
+    except json.JSONDecodeError:
+        raw_results = [{"name": "ws_probe_parse_error", "status": None, "error": proc.stdout, "body_sample": ""}]
+
+    results = []
+    policy_fields = {
+        "ws_blocked_method": "method",
+        "ws_malformed_json": "json",
+        "ws_binary_message": "frame-type",
+        "ws_method_wrong_type": "method",
+        "ws_duplicate_method_blocked_then_allowed": "json-duplicate-keys",
+        "ws_duplicate_method_allowed_then_blocked": "json-duplicate-keys",
+        "ws_empty_batch": "batch",
+        "ws_batch_over_limit": "batch",
+        "ws_mixed_batch_blocked_method": "batch-method",
+        "ws_disallowed_origin": "origin",
+    }
+    for item in raw_results:
+        probe_id = item["name"]
+        status = item.get("status")
+        expected_statuses = [403] if probe_id == "ws_disallowed_origin" else [1008]
+        results.append(
+            {
+                "ts": utc_now(),
+                "probe_id": probe_id,
+                "label": probe_id.replace("_", " "),
+                "target": ws_base,
+                "method": "WS",
+                "path": ws_path,
+                "origin": "https://evil.example" if probe_id == "ws_disallowed_origin" else allowed_origin,
+                "category": ws_cluster,
+                "external": False,
+                "policy_field": policy_fields.get(probe_id, "message"),
+                "risk": "safe-websocket-validation",
+                "expected_statuses": expected_statuses,
+                "status": status,
+                "expected": status in expected_statuses,
+                "duration_ms": None,
+                "error": item.get("error"),
+                "body_sample": item.get("body_sample", ""),
+                "body_text": item.get("body_sample", ""),
+                "body_sha256": None,
+                "body_truncated": False,
+                "body_length": len(item.get("body_sample", "")),
+                "interesting": status not in expected_statuses,
+            }
+        )
+    return results
+
+
+def run_ws_resource_probes(
+    target: str,
+    node: str,
+    source_root: Path | None = None,
+    profile: dict[str, Any] | None = None,
+    *,
+    connection_attempts: int = 11,
+) -> list[dict[str, Any]]:
+    connection_attempts = max(2, min(connection_attempts, 12))
+    source_root = source_root or DEFAULT_SOURCE_ROOT
+    ws_profile = websocket_observation_config(profile)
+    if ws_profile is None:
+        return [
+            {
+                "ts": utc_now(),
+                "probe_id": "ws_resource_profile_disabled",
+                "label": "WebSocket resource probes disabled by profile",
+                "target": target_to_ws(target),
+                "method": "WS",
+                "path": None,
+                "category": "solana-rpc-ws",
+                "external": False,
+                "policy_field": "profile",
+                "risk": "profile-disabled",
+                "expected_statuses": [],
+                "status": None,
+                "expected": True,
+                "duration_ms": None,
+                "error": None,
+                "body_sample": "",
+                "body_text": "",
+                "body_sha256": None,
+                "body_truncated": False,
+                "body_length": 0,
+                "interesting": False,
+                "skipped": True,
+            }
+        ]
+    ws_path = str(ws_profile.get("path") or "/api/rpc/solana/devnet")
+    ws_cluster = str(ws_profile.get("cluster") or "solana-rpc-ws")
+    node_path = Path(node)
+    if not node_path.exists():
+        fallback = command_result(["node", "-v"])
+        if not fallback["ok"]:
+            return [
+                {
+                    "ts": utc_now(),
+                    "probe_id": "ws_resource_runtime_unavailable",
+                    "label": "WebSocket resource runtime unavailable",
+                    "target": target_to_ws(target),
+                    "method": "WS",
+                    "path": ws_path,
+                    "category": ws_cluster,
+                    "external": False,
+                    "policy_field": "resource-runtime",
+                    "risk": "approval-gated-low-volume-websocket-resource-probe",
+                    "expected_statuses": [429],
+                    "status": None,
+                    "expected": False,
+                    "duration_ms": None,
+                    "error": f"Node not found at {node}",
+                    "body_sample": "",
+                    "body_text": "",
+                    "body_sha256": None,
+                    "body_truncated": False,
+                    "body_length": 0,
+                    "interesting": True,
+                }
+            ]
+        node = "node"
+
+    script_root = source_root if source_root.is_dir() else DEFAULT_SOURCE_ROOT
+    ws_base = target_to_ws(target)
+    allowed_origin = origin_for(target)
+    script = f"""
+import {{ WebSocket }} from 'ws'
+
+const sockets = []
+
+function one(index) {{
+  return new Promise((resolve) => {{
+    const ws = new WebSocket('{ws_base}{ws_path}', {{
+      headers: {{ Origin: '{allowed_origin}' }},
+      perMessageDeflate: false,
+    }})
+    sockets.push(ws)
+    const timeout = setTimeout(() => {{
+      resolve({{ index, state: 'timeout', status: null, error: 'timeout' }})
+    }}, 5000)
+    ws.on('open', () => {{
+      clearTimeout(timeout)
+      resolve({{ index, state: 'open', status: 101, error: null }})
+    }})
+    ws.on('error', (error) => {{
+      clearTimeout(timeout)
+      const match = /Unexpected server response: (\\d+)/.exec(error.message)
+      resolve({{
+        index,
+        state: 'error',
+        status: match ? Number(match[1]) : null,
+        error: error.message,
+      }})
+    }})
+  }})
+}}
+
+const started = Date.now()
+const results = await Promise.all(Array.from({{ length: {connection_attempts} }}, (_, index) => one(index)))
+for (const ws of sockets) {{
+  try {{ ws.close(1000, 'InferForge resource probe complete') }} catch {{}}
+}}
+await new Promise((resolve) => setTimeout(resolve, 250))
+console.log(JSON.stringify({{
+  duration_ms: Date.now() - started,
+  connection_attempts: {connection_attempts},
+  results,
+}}))
+"""
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        suffix=".mjs",
+        prefix=".inferforge-ws-resource-",
+        dir=str(script_root),
+        delete=False,
+        encoding="utf-8",
+    ) as handle:
+        handle.write(script)
+        script_path = handle.name
+
+    try:
+        proc = subprocess.run(
+            [node, script_path],
+            cwd=str(script_root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+            check=False,
+        )
+    finally:
+        Path(script_path).unlink(missing_ok=True)
+
+    output = proc.stdout.strip().splitlines()
+    raw_json = output[-1] if output else "{}"
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError:
+        payload = {
+            "duration_ms": None,
+            "connection_attempts": connection_attempts,
+            "results": [],
+            "parse_error": proc.stdout[-1000:],
+        }
+
+    attempts = payload.get("results", [])
+    statuses = [item.get("status") for item in attempts if isinstance(item, dict)]
+    rejected_429 = sum(1 for status in statuses if status == 429)
+    opened = sum(1 for status in statuses if status == 101)
+    timed_out = sum(1 for item in attempts if isinstance(item, dict) and item.get("state") == "timeout")
+    status = 429 if rejected_429 > 0 else (101 if opened > 0 else None)
+    expected_statuses = [429]
+    expected = status in expected_statuses and timed_out == 0
+    body = {
+        "connection_attempts": payload.get("connection_attempts", connection_attempts),
+        "opened": opened,
+        "rejected_429": rejected_429,
+        "timed_out": timed_out,
+        "attempts": attempts,
+    }
+    if payload.get("parse_error"):
+        body["parse_error"] = payload["parse_error"]
+    body_text = json.dumps(body, sort_keys=False)
+
+    return [
+        {
+            "ts": utc_now(),
+            "probe_id": "ws_resource_connection_limit",
+            "label": "WS connection limit low-volume probe",
+            "target": ws_base,
+            "method": "WS",
+            "path": ws_path,
+            "origin": allowed_origin,
+            "category": ws_cluster,
+            "external": False,
+            "policy_field": "connection-limit",
+            "risk": "approval-gated-low-volume-websocket-resource-probe",
+            "expected_statuses": expected_statuses,
+            "status": status,
+            "expected": expected,
+            "duration_ms": payload.get("duration_ms"),
+            "error": None if expected else payload.get("parse_error"),
+            "body_sample": body_text[:MAX_BODY_SAMPLE_CHARS],
+            "body_text": body_text,
+            "body_sha256": hashlib.sha256(body_text.encode("utf-8")).hexdigest(),
+            "body_truncated": False,
+            "body_length": len(body_text),
+            "interesting": not expected,
+        }
+    ]
+
+
+def is_interesting(probe: Probe, status: int | None, body: str) -> bool:
+    if probe.id in {"quote_malformed_json", "quote_text_plain_invalid_json"} and status == 500:
+        return True
+    if str(probe.risk).startswith("safe-generic-route-") and probe.policy_field and status not in set(probe.expected_statuses):
+        return True
+    if probe.category == "quote" and probe.external and probe.policy_field and status not in {400, None}:
+        return True
+    if probe.category == "quote" and probe.policy_field and not probe.external and status not in set(probe.expected_statuses):
+        return True
+    if probe.category == "solana-rpc-http" and probe.policy_field and status not in set(probe.expected_statuses):
+        return True
+    if probe.category == "orca-pools" and probe.policy_field and status not in set(probe.expected_statuses):
+        return True
+    return False
+
+
+def line_of(path: Path, pattern: str, base: Path) -> str:
+    try:
+        for index, line in enumerate(read_text(path).splitlines(), start=1):
+            if pattern in line:
+                return f"{path.relative_to(base)}:{index}"
+    except FileNotFoundError:
+        return f"{path.relative_to(base)}:missing"
+    return f"{path.relative_to(base)}:not-found"
+
+
+def line_of_any(path: Path, patterns: list[str], base: Path) -> str:
+    for pattern in patterns:
+        if not pattern:
+            continue
+        location = line_of(path, pattern, base)
+        if not location.endswith(":not-found") and not location.endswith(":missing"):
+            return location
+    return line_of(path, patterns[0] if patterns else "", base)
+
+
+def entrypoint_source_ref(source_root: Path, entrypoint: dict[str, Any]) -> str:
+    if entrypoint.get("repo_file"):
+        return str(entrypoint["repo_file"])
+    return source_ref_for_artifact(source_root, str(entrypoint.get("file") or ""))
+
+
+def entrypoint_line_refs(source_root: Path, entrypoint: dict[str, Any], method: str) -> dict[str, str]:
+    source_file = source_ref_to_path(source_root, str(entrypoint.get("file") or ""))
+    if entrypoint.get("line_patterns"):
+        refs: dict[str, str] = {}
+        for key, pattern_spec in (entrypoint.get("line_patterns") or {}).items():
+            patterns = pattern_spec if isinstance(pattern_spec, list) else [str(pattern_spec)]
+            refs[str(key)] = line_of_any(source_file, [str(pattern) for pattern in patterns], source_root)
+        return refs
+
+    if entrypoint.get("kind") == "rewrite-proxy":
+        rewrite = entrypoint.get("rewrite") or {}
+        refs = {
+            "rewrite_source": line_of(source_file, str(rewrite.get("source") or entrypoint.get("path") or ""), source_root),
+            "rewrite_destination": line_of_any(
+                source_file,
+                [
+                    str(rewrite.get("destination_expression") or ""),
+                    str(rewrite.get("destination_template") or ""),
+                    str(rewrite.get("destination_resolved") or ""),
+                ],
+                source_root,
+            ),
+        }
+        for variable, env_doc in (rewrite.get("env_defaults_used") or {}).items():
+            refs[f"env_default:{variable}"] = line_of(source_file, str(env_doc.get("env") or variable), source_root)
+        if next_config_conditions_present(rewrite.get("conditions")):
+            refs["has_conditions"] = line_of(source_file, "has", source_root)
+            refs["missing_conditions"] = line_of(source_file, "missing", source_root)
+        return refs
+
+    normalized_method = method.upper()
+    refs: dict[str, str] = {}
+    if normalized_method in HTTP_METHODS:
+        refs["handler"] = line_of_any(
+            source_file,
+            [
+                f"export async function {normalized_method}",
+                f"export function {normalized_method}",
+                f"export const {normalized_method}",
+                f"function {normalized_method}",
+            ],
+            source_root,
+        )
+    return refs
+
+
+def request_contexts_for_condition_evaluation(request_context: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not request_context:
+        return []
+    contexts = request_context.get("contexts")
+    if isinstance(contexts, list):
+        return [item for item in contexts if isinstance(item, dict)]
+    return [request_context]
+
+
+def observed_condition_values(condition: dict[str, Any], request_context: dict[str, Any]) -> dict[str, Any]:
+    condition_type = str(condition.get("type") or "").lower()
+    key = str(condition.get("key") or "")
+    if condition_type == "header":
+        if not key:
+            return {"status": "unknown", "reason": "header-condition-missing-key", "values": []}
+        headers = request_context.get("headers") or {}
+        normalized_key = key.lower()
+        if normalized_key not in headers:
+            return {"status": "absent", "values": []}
+        return {"status": "present", "values": [str(headers[normalized_key])]}
+    if condition_type == "query":
+        if not key:
+            return {"status": "unknown", "reason": "query-condition-missing-key", "values": []}
+        query = request_context.get("query") or {}
+        if key not in query:
+            return {"status": "absent", "values": []}
+        return {"status": "present", "values": [str(value) for value in query.get(key, [])]}
+    if condition_type == "cookie":
+        if not key:
+            return {"status": "unknown", "reason": "cookie-condition-missing-key", "values": []}
+        cookies = request_context.get("cookies") or {}
+        if key not in cookies:
+            return {"status": "absent", "values": []}
+        return {"status": "present", "values": [str(cookies[key])]}
+    if condition_type == "host":
+        host = str(request_context.get("host") or "")
+        if not host:
+            return {"status": "unknown", "reason": "request-host-unavailable", "values": []}
+        return {"status": "present", "values": [host]}
+    return {"status": "unknown", "reason": f"unsupported-condition-type:{condition_type or 'missing'}", "values": []}
+
+
+def next_config_condition_value_status(expected_value: str, observed_values: list[str]) -> str:
+    if not expected_value:
+        return "satisfied" if observed_values else "not-satisfied"
+    if not observed_values:
+        return "not-satisfied"
+    if any(value == REDACTED_VALUE for value in observed_values):
+        return "unknown"
+    if any(value == expected_value for value in observed_values):
+        return "satisfied"
+    try:
+        pattern = re.compile(expected_value)
+    except re.error:
+        return "unknown"
+    return "satisfied" if any(pattern.fullmatch(value) for value in observed_values) else "not-satisfied"
+
+
+def evaluate_next_config_condition(scope: str, condition: dict[str, Any], request_context: dict[str, Any]) -> dict[str, Any]:
+    observed = observed_condition_values(condition, request_context)
+    observed_status = str(observed.get("status") or "unknown")
+    observed_values = [str(value) for value in observed.get("values", [])]
+    expected_value = str(condition.get("value") or "")
+    result = {
+        "scope": scope,
+        "type": condition.get("type"),
+        "key": condition.get("key"),
+        "value": expected_value,
+        "observed": observed_status,
+        "observed_values": observed_values,
+    }
+    if observed.get("reason"):
+        result["reason"] = observed.get("reason")
+
+    if observed_status == "unknown":
+        result["status"] = "unknown"
+        return result
+
+    has_match_status = next_config_condition_value_status(expected_value, observed_values)
+    if scope == "has":
+        result["status"] = has_match_status
+        return result
+
+    if scope == "missing":
+        if has_match_status == "unknown":
+            result["status"] = "unknown"
+        elif has_match_status == "satisfied":
+            result["status"] = "not-satisfied"
+        else:
+            result["status"] = "satisfied"
+        return result
+
+    result["status"] = "unknown"
+    result["reason"] = f"unsupported-condition-scope:{scope}"
+    return result
+
+
+def evaluate_next_config_conditions_for_context(
+    conditions: dict[str, list[dict[str, Any]]] | None,
+    request_context: dict[str, Any],
+) -> dict[str, Any]:
+    results = []
+    for scope in ["has", "missing"]:
+        for condition in (conditions or {}).get(scope, []) or []:
+            results.append(evaluate_next_config_condition(scope, condition, request_context))
+    if not results:
+        return {"status": "no-condition", "results": []}
+    statuses = {str(item.get("status")) for item in results}
+    if "not-satisfied" in statuses:
+        status = "condition-not-satisfied"
+    elif "unknown" in statuses:
+        status = "condition-unknown"
+    else:
+        status = "condition-satisfied"
+    return {
+        "status": status,
+        "results": results,
+        "request_context_source": request_context.get("observed_sources", []),
+    }
+
+
+def evaluate_next_config_conditions(
+    conditions: dict[str, list[dict[str, Any]]] | None,
+    request_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not next_config_conditions_present(conditions):
+        return {"status": "no-condition", "results": [], "evaluated_context_count": 0}
+    contexts = request_contexts_for_condition_evaluation(request_context)
+    if not contexts:
+        return {
+            "status": "condition-unknown",
+            "reason": "request-context-unavailable",
+            "results": [],
+            "evaluated_context_count": 0,
+        }
+
+    context_evaluations = [
+        evaluate_next_config_conditions_for_context(conditions, context)
+        for context in contexts
+    ]
+    counts: dict[str, int] = {}
+    for evaluation in context_evaluations:
+        status = str(evaluation.get("status") or "condition-unknown")
+        counts[status] = counts.get(status, 0) + 1
+
+    selected = None
+    for preferred_status in ["condition-satisfied", "condition-unknown", "condition-not-satisfied"]:
+        selected = next(
+            (item for item in context_evaluations if item.get("status") == preferred_status),
+            None,
+        )
+        if selected is not None:
+            break
+    selected = selected or context_evaluations[0]
+    if counts.get("condition-satisfied"):
+        status = "condition-satisfied"
+    elif counts.get("condition-unknown"):
+        status = "condition-unknown"
+    else:
+        status = "condition-not-satisfied"
+
+    return {
+        "status": status,
+        "results": selected.get("results", []),
+        "evaluated_context_count": len(context_evaluations),
+        "context_status_counts": counts,
+        "selected_context_source": selected.get("request_context_source", []),
+    }
+
+
+def rewrite_condition_evaluation(entrypoint: dict[str, Any], request_context: dict[str, Any] | None) -> dict[str, Any] | None:
+    rewrite = entrypoint.get("rewrite") or {}
+    if not rewrite.get("conditional"):
+        return None
+    return evaluate_next_config_conditions(rewrite.get("conditions"), request_context)
+
+
+def entrypoint_applicability(entrypoint: dict[str, Any], condition_evaluation: dict[str, Any] | None) -> str:
+    if not condition_evaluation:
+        return "path-and-method-match"
+    status = condition_evaluation.get("status")
+    if status == "condition-satisfied":
+        return "path-match-condition-satisfied"
+    if status == "condition-not-satisfied":
+        return "path-match-condition-not-satisfied"
+    return "path-match-condition-unknown"
+
+
+def runtime_variant_matches(pattern: str, normalized_path: str) -> bool:
+    return path_pattern_matches(pattern, normalized_path) if "{" in pattern else pattern == normalized_path
+
+
+def next_runtime_match_reasons(runtime: dict[str, Any] | None, path: str) -> list[str]:
+    if not runtime:
+        return []
+    normalized_path = path.split("?", 1)[0]
+    reasons = []
+    base_path = runtime.get("base_path")
+    if base_path and (normalized_path == base_path or normalized_path.startswith(str(base_path).rstrip("/") + "/")):
+        reasons.append(f"basePath:{base_path}")
+    trailing_slash = runtime.get("trailing_slash")
+    if trailing_slash is not None:
+        canonical_patterns = [runtime.get("path")]
+        for variants in (runtime.get("locale_variants") or {}).values():
+            if variants:
+                canonical_patterns.append(variants[0])
+        canonical_patterns = [str(pattern) for pattern in canonical_patterns if pattern]
+        alternate_patterns = [
+            str(pattern)
+            for pattern in runtime.get("variants", [])
+            if pattern and str(pattern) not in set(canonical_patterns)
+        ]
+        canonical = any(runtime_variant_matches(pattern, normalized_path) for pattern in canonical_patterns)
+        alternate = any(runtime_variant_matches(pattern, normalized_path) for pattern in alternate_patterns)
+        if canonical:
+            reasons.append("trailingSlash:canonical")
+        elif alternate:
+            reasons.append("trailingSlash:alternate")
+        else:
+            reasons.append("trailingSlash:configured")
+    for locale, variants in (runtime.get("locale_variants") or {}).items():
+        if any(runtime_variant_matches(str(pattern), normalized_path) for pattern in variants):
+            reasons.append(f"locale-prefix:{locale}")
+            break
+    return reasons
+
+
+def entrypoint_match_reasons(
+    entrypoint: dict[str, Any],
+    method: str,
+    path: str,
+    condition_evaluation: dict[str, Any] | None = None,
+) -> list[str]:
+    normalized_method = method.upper()
+    normalized_path = path.split("?", 1)[0]
+    methods = {str(item).upper() for item in entrypoint.get("methods", [])}
+    match = entrypoint.get("match") or route_match_for_path(str(entrypoint.get("path") or ""), list(methods))
+    reasons = []
+    if methods:
+        reasons.append("method-match" if normalized_method in methods else "method-mismatch")
+    else:
+        reasons.append("method-unconstrained")
+    if normalized_path in {str(item) for item in match.get("paths", [])}:
+        reasons.append("path-exact")
+    if any(normalized_path.startswith(str(prefix)) for prefix in match.get("path_prefixes", [])):
+        reasons.append("path-prefix")
+    if any(path_pattern_matches(str(pattern), normalized_path) for pattern in match.get("path_patterns", [])):
+        reasons.append("path-pattern")
+    reasons.extend(reason for reason in next_runtime_match_reasons(entrypoint.get("next_config"), path) if reason not in reasons)
+    rewrite = entrypoint.get("rewrite") or {}
+    if rewrite.get("phase"):
+        reasons.append(f"rewrite-phase:{rewrite.get('phase')}")
+    if rewrite.get("conditional"):
+        reasons.append("conditional-route")
+        if condition_evaluation:
+            reasons.append(str(condition_evaluation.get("status") or "condition-unknown"))
+    return reasons
+
+
+def entrypoint_matches_endpoint(
+    entrypoint: dict[str, Any],
+    method: str,
+    path: str,
+    *,
+    path_only: bool = False,
+) -> bool:
+    methods = list(entrypoint.get("methods", []))
+    match = json_clone(entrypoint.get("match") or route_match_for_path(str(entrypoint.get("path") or ""), methods))
+    if path_only:
+        match.pop("methods", None)
+        match.pop("exclude_methods", None)
+    cluster = {
+        "id": cluster_id_from_route_path(str(entrypoint.get("path") or "")),
+        "path": entrypoint.get("path"),
+        "match": match,
+    }
+    return cluster_matches_endpoint(cluster, method, path)
+
+
+def middleware_line_refs(source_root: Path, middleware: dict[str, Any]) -> dict[str, str]:
+    source_file = source_ref_to_path(source_root, str(middleware.get("file") or ""))
+    refs: dict[str, str] = {}
+    for key, pattern_spec in (middleware.get("line_patterns") or {}).items():
+        patterns = pattern_spec if isinstance(pattern_spec, list) else [str(pattern_spec)]
+        refs[str(key)] = line_of_any(source_file, [str(pattern) for pattern in patterns], source_root)
+    return refs
+
+
+def middleware_match_status(middleware: dict[str, Any], path: str) -> str:
+    normalized_path = path.split("?", 1)[0]
+    matchers = middleware.get("matchers") or []
+    if not matchers:
+        return "matched-default-all-paths"
+    unresolved = False
+    for matcher in matchers:
+        patterns = [
+            str(pattern)
+            for pattern in (matcher.get("path_patterns") or [matcher.get("path_pattern") or matcher.get("source") or ""])
+            if str(pattern)
+        ]
+        if not patterns:
+            continue
+        if not matcher.get("simple"):
+            unresolved = True
+            continue
+        if any(path_pattern_matches(pattern, normalized_path) for pattern in patterns):
+            return "matched-static-matcher"
+    return "possible-unresolved-matcher" if unresolved else "not-matched"
+
+
+def middleware_context_for_endpoint(
+    source_root: Path,
+    middleware_entries: list[dict[str, Any]],
+    method: str,
+    path: str,
+) -> list[dict[str, Any]]:
+    if str(method).upper() not in HTTP_METHODS:
+        return []
+    context = []
+    for middleware in middleware_entries:
+        status = middleware_match_status(middleware, path)
+        if status == "not-matched":
+            continue
+        context.append(
+            {
+                "id": middleware.get("id"),
+                "kind": middleware.get("kind"),
+                "source_ref": entrypoint_source_ref(source_root, middleware),
+                "match_status": status,
+                "match_strategy": middleware.get("match_strategy"),
+                "matchers": middleware.get("matchers", []),
+                "line_refs": middleware_line_refs(source_root, middleware),
+                "inference_reasons": middleware.get("inference_reasons", []),
+            }
+        )
+    return context
+
+
+def route_policy_line_refs(source_root: Path, policy: dict[str, Any]) -> dict[str, str]:
+    source_file = source_ref_to_path(source_root, str(policy.get("file") or ""))
+    refs: dict[str, str] = {}
+    conditions = (policy.get("route_policy") or {}).get("conditions")
+    for key, pattern_spec in (policy.get("line_patterns") or {}).items():
+        if key == "has_conditions" and not (conditions or {}).get("has"):
+            continue
+        if key == "missing_conditions" and not (conditions or {}).get("missing"):
+            continue
+        patterns = pattern_spec if isinstance(pattern_spec, list) else [str(pattern_spec)]
+        refs[str(key)] = line_of_any(source_file, [str(pattern) for pattern in patterns if str(pattern)], source_root)
+    return refs
+
+
+def route_policy_match_status(policy: dict[str, Any], path: str) -> str:
+    normalized_path = path.split("?", 1)[0]
+    match = policy.get("match") or next_config_route_policy_match(str(policy.get("path") or ""))
+    route_policy = policy.get("route_policy") or {}
+    matched_status = "matched-conditional-policy" if route_policy.get("conditional") else "matched-static-policy"
+    if normalized_path in {str(item) for item in match.get("paths", [])}:
+        return matched_status
+    if any(normalized_path.startswith(str(prefix)) for prefix in match.get("path_prefixes", [])):
+        return matched_status
+    for pattern in match.get("path_patterns", []):
+        pattern_text = str(pattern)
+        if middleware_matcher_is_simple(pattern_text):
+            if path_pattern_matches(pattern_text, normalized_path):
+                return matched_status
+        else:
+            return "possible-unresolved-policy"
+    return "not-matched"
+
+
+def route_policy_context_for_endpoint(
+    source_root: Path,
+    policies: list[dict[str, Any]],
+    method: str,
+    path: str,
+    request_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if str(method).upper() not in HTTP_METHODS:
+        return []
+    context = []
+    for policy in policies:
+        status = route_policy_match_status(policy, path)
+        if status == "not-matched":
+            continue
+        route_policy = policy.get("route_policy") or {}
+        condition_evaluation = None
+        if route_policy.get("conditional"):
+            condition_evaluation = evaluate_next_config_conditions(route_policy.get("conditions"), request_context)
+        context_item = {
+            "id": policy.get("id"),
+            "kind": policy.get("kind"),
+            "source_ref": entrypoint_source_ref(source_root, policy),
+            "match_status": status,
+            "path": policy.get("path"),
+            "route_policy": route_policy,
+            "line_refs": route_policy_line_refs(source_root, policy),
+            "inference_reasons": policy.get("inference_reasons", []),
+            "applicability": entrypoint_applicability(policy, condition_evaluation),
+        }
+        if condition_evaluation:
+            context_item["condition_status"] = condition_evaluation.get("status")
+            context_item["condition_results"] = condition_evaluation.get("results", [])
+            context_item["condition_context_status_counts"] = condition_evaluation.get("context_status_counts", {})
+            context_item["condition_evaluated_context_count"] = condition_evaluation.get("evaluated_context_count", 0)
+        context.append(
+            context_item
+        )
+    return context
+
+
+def resolve_endpoint_sources(
+    source_root: Path,
+    method: str,
+    path: str,
+    route_inventory: dict[str, Any] | None = None,
+    request_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    route_inventory = route_inventory or discover_nextjs_routes(source_root)
+    entrypoints = [
+        *(route_inventory.get("routes") or []),
+        *(route_inventory.get("rewrites") or []),
+        *(route_inventory.get("custom_server_entrypoints") or []),
+    ]
+    middleware_entries = route_inventory.get("middleware") or []
+    server_actions = route_inventory.get("server_actions") or []
+    route_policies = [
+        *(route_inventory.get("redirects") or []),
+        *(route_inventory.get("headers") or []),
+    ]
+    matches = []
+    for entrypoint in entrypoints:
+        if not entrypoint_matches_endpoint(
+            entrypoint,
+            method,
+            path,
+            path_only=str(method).upper() in HTTP_METHODS,
+        ):
+            continue
+        condition_evaluation = rewrite_condition_evaluation(entrypoint, request_context)
+        match_item = {
+            "cluster_id": str(entrypoint.get("cluster_id") or cluster_id_from_route_path(str(entrypoint.get("path") or ""))),
+            "kind": entrypoint.get("kind"),
+            "strategy_set": entrypoint.get("strategy_set"),
+            "entrypoint_path": entrypoint.get("path"),
+            "source_path": entrypoint.get("source_path"),
+            "source_ref": entrypoint_source_ref(source_root, entrypoint),
+            "line_refs": entrypoint_line_refs(source_root, entrypoint, method),
+            "fixed_upstreams": entrypoint.get("fixed_upstreams", []),
+            "rewrite": entrypoint.get("rewrite"),
+            "custom_server": entrypoint.get("custom_server"),
+            "match_reasons": entrypoint_match_reasons(entrypoint, method, path, condition_evaluation),
+            "applicability": entrypoint_applicability(entrypoint, condition_evaluation),
+        }
+        if condition_evaluation:
+            match_item["condition_status"] = condition_evaluation.get("status")
+            match_item["condition_results"] = condition_evaluation.get("results", [])
+            match_item["condition_context_status_counts"] = condition_evaluation.get("context_status_counts", {})
+            match_item["condition_evaluated_context_count"] = condition_evaluation.get("evaluated_context_count", 0)
+        matches.append(
+            match_item
+        )
+    middleware_context = middleware_context_for_endpoint(source_root, middleware_entries, method, path)
+    route_policy_context = route_policy_context_for_endpoint(source_root, route_policies, method, path, request_context)
+    return {
+        "method": method,
+        "path": path,
+        "request_context_available": bool(request_contexts_for_condition_evaluation(request_context)),
+        "match_count": len(matches),
+        "matches": matches,
+        "middleware_count": len(middleware_context),
+        "middleware_context": middleware_context,
+        "route_policy_count": len(route_policy_context),
+        "route_policy_context": route_policy_context,
+    }
+
+
+def request_context_for_observed_endpoint(endpoint: dict[str, Any]) -> dict[str, Any] | None:
+    context = endpoint.get("request_context")
+    if isinstance(context, dict):
+        return context
+    contexts = endpoint.get("request_contexts")
+    if isinstance(contexts, list) and contexts:
+        return {"contexts": [item for item in contexts if isinstance(item, dict)], "context_count": len(contexts)}
+    return None
+
+
+def build_endpoint_source_resolver(
+    source_root: Path,
+    observed_endpoints: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    route_inventory = discover_nextjs_routes(source_root)
+    entrypoints = [
+        *(route_inventory.get("routes") or []),
+        *(route_inventory.get("rewrites") or []),
+        *(route_inventory.get("custom_server_entrypoints") or []),
+    ]
+    middleware_entries = route_inventory.get("middleware") or []
+    server_actions = route_inventory.get("server_actions") or []
+    route_policies = [
+        *(route_inventory.get("redirects") or []),
+        *(route_inventory.get("headers") or []),
+    ]
+    discovered_entrypoints = [
+        {
+            "cluster_id": str(entrypoint.get("cluster_id") or cluster_id_from_route_path(str(entrypoint.get("path") or ""))),
+            "kind": entrypoint.get("kind"),
+            "strategy_set": entrypoint.get("strategy_set"),
+            "path": entrypoint.get("path"),
+            "source_path": entrypoint.get("source_path"),
+            "match": entrypoint.get("match"),
+            "source_ref": entrypoint_source_ref(source_root, entrypoint),
+            "fixed_upstreams": entrypoint.get("fixed_upstreams", []),
+            "rewrite": entrypoint.get("rewrite"),
+            "custom_server": entrypoint.get("custom_server"),
+            "next_config": entrypoint.get("next_config"),
+        }
+        for entrypoint in entrypoints
+    ]
+    discovered_middleware = [
+        {
+            "id": middleware.get("id"),
+            "kind": middleware.get("kind"),
+            "source_ref": entrypoint_source_ref(source_root, middleware),
+            "match_strategy": middleware.get("match_strategy"),
+            "matchers": middleware.get("matchers", []),
+            "inference_reasons": middleware.get("inference_reasons", []),
+        }
+        for middleware in middleware_entries
+    ]
+    discovered_server_actions = [
+        {
+            "id": action.get("id"),
+            "kind": action.get("kind"),
+            "source_ref": entrypoint_source_ref(source_root, action),
+            "scope": action.get("scope"),
+            "action_names": action.get("action_names", []),
+            "action_count": action.get("action_count", 0),
+            "use_server_directive_count": action.get("use_server_directive_count", 0),
+            "line_refs": route_policy_line_refs(source_root, action),
+            "inference_reasons": action.get("inference_reasons", []),
+            "safety": action.get("safety"),
+        }
+        for action in server_actions
+    ]
+    discovered_route_policies = [
+        {
+            "id": policy.get("id"),
+            "kind": policy.get("kind"),
+            "source_ref": entrypoint_source_ref(source_root, policy),
+            "path": policy.get("path"),
+            "source_path": policy.get("source_path"),
+            "match": policy.get("match"),
+            "route_policy": policy.get("route_policy"),
+            "next_config": policy.get("next_config"),
+            "inference_reasons": policy.get("inference_reasons", []),
+        }
+        for policy in route_policies
+    ]
+    observed_resolution = [
+        resolve_endpoint_sources(
+            source_root,
+            str(endpoint.get("method") or ""),
+            str(endpoint.get("path") or ""),
+            route_inventory,
+            request_context_for_observed_endpoint(endpoint),
+        )
+        for endpoint in (observed_endpoints or [])
+        if endpoint.get("method") and endpoint.get("path")
+    ]
+    return {
+        "status": "resolved" if entrypoints or middleware_entries or server_actions or route_policies else "no-static-entrypoints",
+        "methodology": "Static Next.js route, rewrite, custom-server, middleware, Server Actions, redirect, and header-policy resolver. Reads local source only; does not send HTTP requests.",
+        "inventory_summary": route_inventory.get("summary", {}),
+        "next_config": route_inventory.get("next_config"),
+        "discovered_entrypoints": discovered_entrypoints,
+        "discovered_middleware": discovered_middleware,
+        "discovered_server_actions": discovered_server_actions,
+        "discovered_route_policies": discovered_route_policies,
+        "observed_endpoint_resolution": observed_resolution,
+    }
+
+
+def build_source_peeks(
+    source_root: Path,
+    profile: dict[str, Any] | None = None,
+    observed_endpoints: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    profile = profile or default_target_profile()
+
+    def display_path(path: Path) -> str:
+        try:
+            return str(path.relative_to(ROOT))
+        except ValueError:
+            return str(path)
+
+    def resolve_line(pattern_spec: Any, default_files: list[Path]) -> str:
+        if isinstance(pattern_spec, dict):
+            pattern = str(pattern_spec.get("pattern", ""))
+            candidate_files = [source_ref_to_path(source_root, str(pattern_spec["file"]))] if pattern_spec.get("file") else default_files
+        else:
+            pattern = str(pattern_spec)
+            candidate_files = default_files
+
+        if not pattern:
+            return "missing-pattern"
+
+        for candidate in candidate_files:
+            location = line_of(candidate, pattern, source_root)
+            if not location.endswith(":not-found") and not location.endswith(":missing"):
+                return location
+        first = candidate_files[0] if candidate_files else source_root
+        return line_of(first, pattern, source_root)
+
+    source_peeks = []
+    for item in profile.get("source_peeks", []):
+        files = [source_ref_to_path(source_root, str(ref)) for ref in item.get("files", [])]
+        source_peeks.append(
+            {
+                "endpoint": item.get("endpoint"),
+                "cluster_ids": item.get("cluster_ids", []),
+                "files": [display_path(path) for path in files],
+                "relevant_lines": {
+                    key: resolve_line(value, files)
+                    for key, value in (item.get("line_patterns") or {}).items()
+                },
+                "conclusion": item.get("conclusion"),
+            }
+        )
+
+    return {
+        "generated_at": utc_now(),
+        "target": profile.get("name"),
+        "profile": profile_summary(profile),
+        "source_root": str(source_root),
+        "source_peeks": source_peeks,
+        "endpoint_resolver": build_endpoint_source_resolver(source_root, observed_endpoints),
+    }
+
+
+def parse_typescript_string_set(source: str, const_name: str) -> list[str]:
+    match = re.search(rf"const\s+{re.escape(const_name)}\s*=\s*new Set\(\[(.*?)\]\)", source, re.S)
+    if not match:
+        return []
+    return re.findall(r"['\"]([^'\"]+)['\"]", match.group(1))
+
+
+def source_references(source_root: Path, patterns: list[str]) -> list[dict[str, Any]]:
+    refs = []
+    extensions = {".js", ".jsx", ".ts", ".tsx"}
+    for path in sorted((source_root / "src").rglob("*")):
+        if path.suffix not in extensions or not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except UnicodeDecodeError:
+            continue
+        for index, line in enumerate(lines, start=1):
+            if any(pattern in line for pattern in patterns):
+                refs.append(
+                    {
+                        "file": str(path.relative_to(ROOT)),
+                        "line": index,
+                        "sample": line.strip()[:180],
+                    }
+                )
+    return refs
+
+
+def parse_source_orca_whirlpools(source_root: Path) -> list[dict[str, str]]:
+    path = source_root / "src/lib/partners/orca.ts"
+    if not path.exists():
+        return []
+
+    source = read_text(path)
+    match = re.search(r"ORCA_WHIRLPOOLS\s*=\s*\{(.*?)\}\s+as const", source, re.S)
+    if not match:
+        return []
+
+    pools = []
+    for item in re.finditer(r"['\"]([^'\"]+)['\"]\s*:\s*['\"]([^'\"]+)['\"]", match.group(1)):
+        pools.append({"strategy_id": item.group(1), "address": item.group(2)})
+    return pools
+
+
+def is_base58_solana_address(value: str) -> bool:
+    return re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", value) is not None
+
+
+def compact_json_shape(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        shape: dict[str, Any] = {
+            "type": "object",
+            "keys": sorted(str(key) for key in value.keys())[:40],
+        }
+        data = value.get("data")
+        if isinstance(data, dict):
+            shape["data_keys"] = sorted(str(key) for key in data.keys())[:80]
+            shape["data_present"] = True
+        else:
+            shape["data_present"] = data is not None
+        return shape
+    if isinstance(value, list):
+        return {"type": "array", "length": len(value)}
+    return {"type": type(value).__name__}
+
+
+def build_orca_baseline(
+    target: str,
+    source_root: Path,
+    *,
+    address: str | None = None,
+    strategy_id: str | None = None,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    source_pools = parse_source_orca_whirlpools(source_root)
+    selected = None
+    if address:
+        selected = {"strategy_id": strategy_id or "manual-address", "address": address}
+    elif strategy_id:
+        selected = next((pool for pool in source_pools if pool["strategy_id"] == strategy_id), None)
+    elif source_pools:
+        selected = source_pools[0]
+
+    if not selected:
+        return {
+            "generated_at": utc_now(),
+            "target": target,
+            "success": False,
+            "error": "No Orca pool address provided and no ORCA_WHIRLPOOLS source addresses found.",
+            "source_pools": source_pools,
+            "safety": "Single-address baseline only. No pool enumeration is performed.",
+        }
+
+    selected_address = selected["address"]
+    if not is_base58_solana_address(selected_address):
+        return {
+            "generated_at": utc_now(),
+            "target": target,
+            "success": False,
+            "error": "Selected Orca pool address is not a base58 Solana-style address.",
+            "request": selected,
+            "source_pools": source_pools,
+            "safety": "Single-address baseline only. No pool enumeration is performed.",
+        }
+
+    path = render_path_template(orca_probe_paths(profile)["path_template"], {"address": selected_address})
+    response = http_request(
+        target,
+        "GET",
+        path,
+        headers={"User-Agent": "InferForge-Orca-Baseline/0.1"},
+        timeout=25,
+    )
+    parsed_body: Any = None
+    body_json_ok = False
+    if response.get("body_text"):
+        try:
+            parsed_body = json.loads(response["body_text"])
+            body_json_ok = True
+        except json.JSONDecodeError:
+            parsed_body = None
+
+    body_shape = compact_json_shape(parsed_body) if body_json_ok else {"type": "non-json"}
+    data_present = bool(isinstance(parsed_body, dict) and parsed_body.get("data"))
+    success = response.get("status") == 200 and body_json_ok and data_present
+
+    return {
+        "generated_at": utc_now(),
+        "target": target,
+        "success": success,
+        "request": {
+            "strategy_id": selected["strategy_id"],
+            "address": selected_address,
+            "path": path,
+            "source": "cli" if address else f"source:{repo_relative_or_absolute(source_root / 'src/lib/partners/orca.ts')}",
+        },
+        "response": {
+            "status": response["status"],
+            "duration_ms": response["duration_ms"],
+            "error": response["error"],
+            "content_type": response["headers"].get("Content-Type") or response["headers"].get("content-type"),
+            "cache_control": response["headers"].get("Cache-Control") or response["headers"].get("cache-control"),
+            "body_sha256": response["body_sha256"],
+            "body_length": response["body_length"],
+            "body_truncated": response["body_truncated"],
+            "body_sample": response["body_sample"][:500],
+            "body_json": body_json_ok,
+            "body_shape": body_shape,
+        },
+        "source_pools": source_pools,
+        "safety": "Single approved/source-known address baseline only. No pool enumeration is performed.",
+    }
+
+
+def build_rpc_method_policy(source_root: Path, results: list[dict[str, Any]]) -> dict[str, Any]:
+    rpc_path = source_root / "src/app/api/rpc/_shared.ts"
+    rpc_source = read_text(rpc_path)
+    default_methods = parse_typescript_string_set(rpc_source, "DEFAULT_ALLOWED_METHODS")
+    transaction_methods = parse_typescript_string_set(rpc_source, "TRANSACTION_METHODS")
+    high_impact_methods = ["sendTransaction", "simulateTransaction"]
+    transaction_probe_ids = {
+        "rpc_send_transaction_invalid_payload",
+        "rpc_simulate_transaction_invalid_payload",
+    }
+    transaction_probe_results = [
+        {
+            "probe_id": row["probe_id"],
+            "status": row.get("status"),
+            "expected": row.get("expected"),
+            "expectation_result": row.get("expectation_result"),
+            "body_sample": row.get("body_sample", "")[:240],
+        }
+        for row in results
+        if row.get("probe_id") in transaction_probe_ids
+    ]
+    default_high_impact = sorted(set(default_methods) & set(high_impact_methods))
+    env_configured_methods = os.environ.get("SOLANA_RPC_PROXY_ALLOWED_METHODS")
+    env_allow_transaction_methods = os.environ.get("SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS")
+    explicit_gate_present = "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS" in rpc_source
+    frontend_transaction_refs = source_references(
+        source_root,
+        ["walletProvider.sendTransaction", "sendRawTransaction", "sendTransaction("],
+    )
+    proxy_connection_refs = source_references(
+        source_root,
+        ["/api/rpc/solana/", "getSolanaRpcProxyUrl", "getSolanaRpcProxyEndpoint"],
+    )
+
+    if default_high_impact:
+        posture = "high-impact-methods-default-allowed"
+    elif env_allow_transaction_methods == "true" or (
+        env_configured_methods
+        and any(method in {item.strip() for item in env_configured_methods.split(",")} for method in high_impact_methods)
+    ):
+        posture = "high-impact-methods-explicitly-enabled-in-runner-env"
+    elif explicit_gate_present and transaction_methods:
+        posture = "high-impact-methods-explicit-opt-in"
+    else:
+        posture = "high-impact-method-policy-unclear"
+
+    return {
+        "generated_at": utc_now(),
+        "source": str(rpc_path.relative_to(ROOT)),
+        "default_allowed_methods": default_methods,
+        "transaction_methods": transaction_methods,
+        "high_impact_methods": high_impact_methods,
+        "default_high_impact_methods": default_high_impact,
+        "explicit_transaction_method_gate_present": explicit_gate_present,
+        "runner_environment": {
+            "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS": env_allow_transaction_methods,
+            "SOLANA_RPC_PROXY_ALLOWED_METHODS_set": env_configured_methods is not None,
+        },
+        "frontend_transaction_dependency_refs": frontend_transaction_refs,
+        "proxy_connection_refs": proxy_connection_refs,
+        "transaction_probe_results": transaction_probe_results,
+        "policy_posture": posture,
+        "recommendation": (
+            "Keep transaction methods out of DEFAULT_ALLOWED_METHODS. Enable them only with an explicit deployment decision "
+            "and continue to require origin/rate-limit controls and transaction-intent review for returned quote payloads."
+        ),
+    }
+
+
+def build_clusters(
+    profile: dict[str, Any] | None = None,
+    source_root: Path | None = None,
+) -> dict[str, Any]:
+    profile = profile or default_target_profile()
+    source_root = source_root or resolve_repo_path(profile.get("default_source_root") or DEFAULT_SOURCE_ROOT)
+    clusters = []
+    for cluster in profile.get("clusters", []):
+        normalized = json_clone(cluster)
+        strategy_set = strategy_set_for_cluster(normalized)
+        normalized["strategy_set"] = strategy_set
+        if not strategy_set_enabled(profile, strategy_set):
+            continue
+        normalized["source_refs"] = [
+            source_ref_for_artifact(source_root, str(ref))
+            for ref in cluster.get("source_refs", [])
+        ]
+        clusters.append(normalized)
+    return {
+        "generated_at": utc_now(),
+        "source": "InferForge profile-assisted clustering with optional Burp browser history observations.",
+        "profile": profile_summary(profile),
+        "clusters": clusters,
+    }
+
+
+def path_pattern_matches(pattern: str, path: str) -> bool:
+    escaped = re.escape(pattern)
+    escaped = re.sub(r"\\\{[^/{}]+\\\*\\\}", r".*", escaped)
+    regex = re.sub(r"\\\{[^/{}]+\\\}", r"[^/]+", escaped)
+    return re.fullmatch(regex, path) is not None
+
+
+def cluster_matches_endpoint(cluster: dict[str, Any], method: str, path: str) -> bool:
+    normalized_method = method.upper()
+    normalized_path = path.split("?", 1)[0]
+    match = cluster.get("match") or {}
+
+    methods = {str(item).upper() for item in match.get("methods", [])}
+    exclude_methods = {str(item).upper() for item in match.get("exclude_methods", [])}
+    if methods and normalized_method not in methods:
+        return False
+    if exclude_methods and normalized_method in exclude_methods:
+        return False
+
+    paths = [str(item) for item in match.get("paths", [])]
+    path_prefixes = [str(item) for item in match.get("path_prefixes", [])]
+    path_patterns = [str(item) for item in match.get("path_patterns", [])]
+    if not (paths or path_prefixes or path_patterns):
+        path_patterns = [str(cluster.get("path", ""))]
+
+    if normalized_path in paths:
+        return True
+    if any(normalized_path.startswith(prefix) for prefix in path_prefixes):
+        return True
+    return any(path_pattern_matches(pattern, normalized_path) for pattern in path_patterns if pattern)
+
+
+def classify_endpoint(method: str, path: str, cluster_doc: dict[str, Any] | None = None) -> set[str]:
+    cluster_doc = cluster_doc or build_clusters()
+    clusters: set[str] = set()
+
+    for cluster in cluster_doc.get("clusters", []):
+        if cluster_matches_endpoint(cluster, method, path):
+            clusters.add(str(cluster["id"]))
+
+    return clusters
+
+
+def source_cluster_ids(clusters: dict[str, Any]) -> set[str]:
+    return {cluster["id"] for cluster in clusters["clusters"]}
+
+
+def observed_cluster_ids(traffic_index: dict[str, Any], clusters: dict[str, Any]) -> set[str]:
+    observed: set[str] = set()
+    for endpoint in traffic_index.get("endpoints", []):
+        observed.update(str(cluster_id) for cluster_id in endpoint.get("cluster_ids", []) or [])
+        observed.update(classify_endpoint(endpoint["method"], endpoint["path"], clusters))
+    return observed
+
+
+def select_cluster_ids(
+    traffic_index: dict[str, Any],
+    clusters: dict[str, Any],
+    *,
+    source_assisted: bool,
+) -> dict[str, Any]:
+    observed = observed_cluster_ids(traffic_index, clusters)
+    source_known = source_cluster_ids(clusters) if source_assisted else set()
+    selected = observed | source_known
+
+    return {
+        "generated_at": utc_now(),
+        "mode": "source-assisted" if source_assisted else "observed-only",
+        "observed_cluster_ids": sorted(observed),
+        "source_cluster_ids": sorted(source_known),
+        "selected_cluster_ids": sorted(selected),
+        "reasoning": [
+            "Observed clusters come from Burp browser history and prior safe probe traffic.",
+            "Source-assisted mode adds known source-defined attack surfaces even if the browser has not visited them yet.",
+            "Observed-only mode is stricter and only schedules probes for currently observed endpoint kinds.",
+        ],
+    }
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def cluster_priority_scores(clusters: dict[str, Any]) -> dict[str, int]:
+    scores = {"high": 90, "medium": 60, "low": 30}
+    return {
+        cluster["id"]: scores.get(cluster.get("priority", "low"), 30)
+        for cluster in clusters.get("clusters", [])
+    }
+
+
+def build_probe_ranking(
+    probes: list[Probe],
+    selection: dict[str, Any],
+    clusters: dict[str, Any],
+    *,
+    max_probes: int | None,
+) -> dict[str, Any]:
+    priority_by_cluster = cluster_priority_scores(clusters)
+    observed = set(selection.get("observed_cluster_ids", []))
+    source_known = set(selection.get("source_cluster_ids", []))
+    ranked: list[dict[str, Any]] = []
+
+    for original_index, probe in enumerate(probes):
+        score = priority_by_cluster.get(probe.category, 30)
+        reasons = [f"cluster-priority:{score}"]
+        strategy_set = strategy_set_for_probe(probe)
+        if strategy_set:
+            reasons.append(f"strategy-set:{strategy_set}")
+
+        if probe.category in observed:
+            score += 50
+            reasons.append("observed-in-burp-or-traffic")
+        elif probe.category in source_known:
+            score += 15
+            reasons.append("source-defined-surface")
+
+        if probe.category in {"solana-rpc-http", "solana-rpc-ws", "quote"}:
+            score += 10
+            reasons.append("asset-or-transaction-boundary")
+
+        if probe.policy_field:
+            score += 6
+            reasons.append(f"policy-field:{probe.policy_field}")
+
+        if probe.external:
+            score -= 25
+            reasons.append("external-upstream-cost")
+
+        if probe.risk.startswith("safe"):
+            score += 5
+            reasons.append(probe.risk)
+
+        ranked.append(
+            {
+                "probe_id": probe.id,
+                "cluster_id": probe.category,
+                "strategy_set": strategy_set,
+                "score": score,
+                "original_index": original_index,
+                "external": probe.external,
+                "policy_field": probe.policy_field,
+                "risk": probe.risk,
+                "expectation": probe.expectation,
+                "reasons": reasons,
+            }
+        )
+
+    ranked.sort(
+        key=lambda item: (
+            -item["score"],
+            item["external"],
+            item["cluster_id"],
+            item["original_index"],
+        )
+    )
+    selected_count = len(ranked) if max_probes is None else min(max_probes, len(ranked))
+    for rank, item in enumerate(ranked, start=1):
+        item["rank"] = rank
+        item["rank_status"] = "selected" if rank <= selected_count else "deferred-by-budget"
+
+    return {
+        "generated_at": utc_now(),
+        "selection_mode": selection["mode"],
+        "max_probes": max_probes,
+        "selected_probe_count": selected_count,
+        "total_probe_count": len(ranked),
+        "scoring": [
+            "Base score comes from endpoint cluster priority.",
+            "Observed Burp/traffic surfaces receive the largest bonus.",
+            "Source-defined but unobserved surfaces remain eligible in source-assisted mode.",
+            "Asset, transaction, and explicit policy-boundary probes receive smaller bonuses.",
+            "External upstream probes are penalized so local evidence is gathered first.",
+        ],
+        "ranked_probes": ranked,
+    }
+
+
+def apply_probe_ranking(probes: list[Probe], ranking: dict[str, Any]) -> list[Probe]:
+    by_id = {probe.id: probe for probe in probes}
+    selected_ids = [
+        item["probe_id"]
+        for item in ranking["ranked_probes"]
+        if item["rank_status"] == "selected"
+    ]
+    return [by_id[probe_id] for probe_id in selected_ids if probe_id in by_id]
+
+
+def request_context_from_probe_result(row: dict[str, Any]) -> dict[str, Any]:
+    request = row.get("request") or {}
+    target = urllib.parse.urlparse(str(row.get("target") or ""))
+    return build_request_context(
+        str(request.get("method") or row.get("method") or ""),
+        str(request.get("path") or row.get("path") or ""),
+        request.get("headers") or {},
+        target.netloc,
+    )
+
+
+def request_context_from_burp_history(row: dict[str, Any]) -> dict[str, Any]:
+    context = row.get("request_context")
+    if isinstance(context, dict) and context.get("path"):
+        return context
+    return build_request_context(
+        str(row.get("method") or ""),
+        str(row.get("path") or ""),
+        {},
+        str(row.get("host") or ""),
+    )
+
+
+def add_endpoint_request_context(item: dict[str, Any], context: dict[str, Any], source: str) -> None:
+    if not context.get("method") or not context.get("path"):
+        return
+    context = json_clone(context)
+    sources = context.setdefault("observed_sources", [])
+    if source not in sources:
+        sources.append(source)
+    contexts = item.setdefault("request_contexts", [])
+    signature = request_context_signature(context)
+    for existing in contexts:
+        if request_context_signature(existing) == signature:
+            existing_sources = existing.setdefault("observed_sources", [])
+            for source_item in sources:
+                if source_item not in existing_sources:
+                    existing_sources.append(source_item)
+            return
+    if len(contexts) < MAX_REQUEST_CONTEXTS_PER_ENDPOINT:
+        contexts.append(context)
+    else:
+        item["request_contexts_truncated"] = True
+
+
+def finalize_endpoint_request_contexts(item: dict[str, Any]) -> None:
+    contexts = item.get("request_contexts") or []
+    if not contexts:
+        return
+    item["request_context_count"] = len(contexts)
+    item["request_context"] = contexts[0] if len(contexts) == 1 else {"contexts": contexts, "context_count": len(contexts)}
+
+
+def build_traffic_index(
+    results: list[dict[str, Any]],
+    burp_history: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    endpoints: dict[str, dict[str, Any]] = {}
+    for row in results:
+        key = f"{row['method']} {row['path']}"
+        item = endpoints.setdefault(
+            key,
+            {
+                "method": row["method"],
+                "path": row["path"],
+                "statuses": [],
+                "probe_ids": [],
+                "cluster_ids": [],
+                "observed_via": "safe-local-probe",
+            },
+        )
+        if row["status"] not in item["statuses"]:
+            item["statuses"].append(row["status"])
+        item["probe_ids"].append(row["probe_id"])
+        category = str(row.get("category") or "")
+        if category and category != "unknown" and category not in item["cluster_ids"]:
+            item["cluster_ids"].append(category)
+        add_endpoint_request_context(item, request_context_from_probe_result(row), "safe-local-probe")
+
+    for row in burp_history or []:
+        key = f"{row['method']} {row['path']}"
+        item = endpoints.setdefault(
+            key,
+            {
+                "method": row["method"],
+                "path": row["path"],
+                "statuses": [],
+                "probe_ids": [],
+                "cluster_ids": [],
+                "observed_via": "burp-built-in-browser",
+            },
+        )
+        if row.get("status") not in item["statuses"]:
+            item["statuses"].append(row.get("status"))
+        item["probe_ids"].append("burp-history")
+        if item["observed_via"] != "burp-built-in-browser":
+            item["observed_via"] = "safe-local-probe-and-burp-history"
+        add_endpoint_request_context(item, request_context_from_burp_history(row), "burp-built-in-browser")
+
+    for item in endpoints.values():
+        item["cluster_ids"] = sorted(item.get("cluster_ids", []))
+        finalize_endpoint_request_contexts(item)
+
+    return {
+        "generated_at": utc_now(),
+        "note": "Combines safe local probes with any available Burp built-in-browser history observations.",
+        "endpoints": list(endpoints.values()),
+    }
+
+
+def build_attack_strategy(
+    clusters: dict[str, Any],
+    suspicions: list[dict[str, Any]],
+    burp_history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    strategies = [
+        {
+            "id": "strategy-scope-and-evidence",
+            "title": "Evidence-first loop",
+            "applies_to": ["all"],
+            "phase_order": ["observe", "probe", "compare", "source-peek", "gate"],
+            "rules": [
+                "Prefer Burp built-in-browser history as black-box evidence when present.",
+                "Use MCP direct requests for controlled, repeatable probes.",
+                "Use source reads only to answer a concrete black-box question.",
+                "Do not mark a finding valid without request/response evidence and an explicit attacker model.",
+            ],
+            "automation_state": "implemented-as-artifact-contract",
+        },
+        {
+            "id": "strategy-rpc-http",
+            "title": "Solana HTTP JSON-RPC proxy strategy",
+            "applies_to": ["solana-rpc-http"],
+            "attacker_model": "Unauthenticated browser or script that can send same-origin or cross-origin POSTs to the RPC proxy.",
+            "primary_questions": [
+                "Can blocked methods be reached through aliases, casing, batching, duplicate keys, or content-type variation?",
+                "Are allowed methods safe for unauthenticated exposure, especially simulateTransaction and sendTransaction?",
+                "Are body size, batch size, origin, and rate-limit controls enforced consistently?",
+            ],
+            "safe_probe_queue": [
+                "implemented: origin matrix with allowed, disallowed, missing Origin, and Referer-only",
+                "implemented: method matrix with blocked, unknown, allowed, wrong type, and duplicate JSON keys",
+                "implemented: batch matrix with empty, over limit, and mixed allowed/blocked methods",
+                "implemented: method/content-type confusion with GET, OPTIONS, text/plain, and malformed JSON",
+                "implemented: invalid-payload negative probes for simulateTransaction and sendTransaction",
+                "implemented: /api/rpc root compatibility route policy probes that stop before upstream forwarding",
+                "bounded body-size tests below destructive thresholds",
+            ],
+            "source_peek_triggers": [
+                "Any blocked method returns upstream-looking data.",
+                "Any disallowed Origin receives CORS allow headers.",
+                "Any batch with one blocked method partially succeeds.",
+                "Any request reaches upstream before local validation.",
+            ],
+            "finding_gate": [
+                "Show the exact JSON-RPC body.",
+                "Show baseline versus mutated response.",
+                "Identify whether the effect is local validation bypass or upstream behavior.",
+            ],
+            "safety": "No high-volume rate-limit testing by default; no real wallet transaction submission.",
+        },
+        {
+            "id": "strategy-rpc-websocket",
+            "title": "Solana WebSocket RPC proxy strategy",
+            "applies_to": ["solana-rpc-ws"],
+            "attacker_model": "Browser or script that can open a WebSocket to the local app's Solana RPC proxy.",
+            "primary_questions": [
+                "Does Origin enforcement happen before upgrade?",
+                "Are binary, malformed, oversized, and blocked method messages rejected before upstream send?",
+                "Can pending-message queues or connection limits be abused?",
+            ],
+            "safe_probe_queue": [
+                "implemented: disallowed Origin handshake",
+                "implemented: blocked and wrong-type method messages",
+                "implemented: binary message close behavior",
+                "implemented: malformed JSON close behavior",
+                "implemented: duplicate JSON key and mixed batch rejection",
+                "small over-limit pending queue simulation only after manual approval",
+            ],
+            "source_peek_triggers": [
+                "Any disallowed Origin reaches upstream.",
+                "Any non-allowlisted method receives an upstream response.",
+                "Any client message is forwarded before validation.",
+            ],
+            "finding_gate": [
+                "Capture close code/reason.",
+                "Map the close behavior to server.js validation path.",
+            ],
+            "safety": "Do not run connection-exhaustion tests automatically.",
+        },
+        {
+            "id": "strategy-quote",
+            "title": "M0 quote orchestration proxy strategy",
+            "applies_to": ["quote"],
+            "attacker_model": "Unauthenticated client that can POST quote requests to the same-origin quote proxy.",
+            "primary_questions": [
+                "Does the server enforce chain, mint, wallet, amount, recipient, and maxNumQuotes policy before forwarding?",
+                "Does malformed input produce server errors or internal/upstream detail leakage?",
+                "Can executable transaction payloads be tied back to the user's intended swap?",
+            ],
+            "safe_probe_queue": [
+                "implemented: malformed JSON and wrong content type",
+                "implemented: missing local shape fields and wrong primitive types",
+                "implemented behind --include-external: invalid chain, mint, wallet, amount, recipient, maxNumQuotes, and unknown fields",
+                "implemented: transaction payload decoding artifact only; no signing",
+            ],
+            "source_peek_triggers": [
+                "Any shape-valid invalid business request is forwarded upstream.",
+                "Any parser/upstream detail is reflected to the client.",
+                "Any returned transaction cannot be decoded or matched to UI intent.",
+            ],
+            "finding_gate": [
+                "Separate hardening notes from exploitable validation bypass.",
+                "Require proof of impact before escalating beyond informational.",
+                "Never submit or sign returned transactions automatically.",
+            ],
+            "safety": "One low-risk upstream validation probe only when --include-external is set.",
+        },
+        {
+            "id": "strategy-orca",
+            "title": "Orca fixed-upstream proxy strategy",
+            "applies_to": ["orca-pools"],
+            "attacker_model": "Client that controls the pool address path segment.",
+            "primary_questions": [
+                "Can the path segment escape the fixed upstream route?",
+                "Can invalid address shapes cause SSRF/open-proxy behavior or noisy upstream errors?",
+                "Does caching expose stale or cross-address data?",
+            ],
+            "safe_probe_queue": [
+                "implemented: invalid base58 characters",
+                "implemented: too-short and too-long address shapes",
+                "implemented: encoded path traversal markers and extra path segments",
+                "implemented: query injection on invalid address shapes",
+                "implemented: method confusion with HEAD and POST",
+            ],
+            "source_peek_triggers": [
+                "Any invalid address reaches upstream.",
+                "Any response includes upstream URL or internal fetch details.",
+            ],
+            "finding_gate": [
+                "Show fixed upstream cannot be attacker-controlled before closing SSRF concern.",
+            ],
+            "safety": "No broad address enumeration.",
+        },
+    ]
+
+    next_actions = [
+        {
+            "id": "NEXT-burp-history-ingest",
+            "title": "Make Burp history collection first-class",
+            "reason": "Burp MCP history works; the CLI can now normalize raw MCP HTTP history output into reusable observations.",
+            "status": "implemented-via-import-burp-history-command",
+        },
+        {
+            "id": "NEXT-quote-validator",
+            "title": "Implement quote-specific validator and transaction intent decoder",
+            "reason": "The strongest current signal is thin local quote validation and executable payload trust boundary.",
+            "status": "implemented-in-local-runner",
+        },
+        {
+            "id": "NEXT-transaction-intent-corpus",
+            "title": "Feed real quote transaction payloads into the decoder",
+            "reason": "The decoder is implemented; it needs a successful quote payload corpus to compare transaction instructions against user intent.",
+            "status": "waiting-for-real-quote-response",
+        },
+        {
+            "id": "NEXT-transaction-intent-policy",
+            "title": "Compare decoded transactions against swap intent",
+            "reason": "A decoded transaction is only useful if it can be compared against the intended wallet, direction, and token mints without signing or submitting it.",
+            "status": "implemented-via-intent-policy-checks",
+        },
+        {
+            "id": "NEXT-probe-selection",
+            "title": "Rank probes by endpoint kind and evidence gaps",
+            "reason": "The runner should choose probes from observed attack surface, not only a fixed list.",
+            "status": "implemented-via-probe-ranking-artifact-and-max-probes",
+        },
+        {
+            "id": "NEXT-ws-message-shape",
+            "title": "Implement safe WebSocket message-shape probes",
+            "reason": "The WS proxy should reject malformed JSON, binary frames, duplicate keys, empty or oversized batches, and blocked methods before upstream forwarding.",
+            "status": "implemented-via-ws-probes-and-server-validation",
+        },
+        {
+            "id": "NEXT-rpc-high-impact-negative-probes",
+            "title": "Exercise high-impact Solana RPC methods with invalid transaction payloads",
+            "reason": "sendTransaction and simulateTransaction are high-impact allowlisted methods; safe negative probes should prove invalid, unsigned payloads do not succeed or leak internals.",
+            "status": "implemented-via-invalid-transaction-rpc-probes",
+        },
+    ]
+
+    return {
+        "generated_at": utc_now(),
+        "methodology": "black-box-first greybox: Burp observations -> safe probes -> source peek -> finding gate",
+        "clusters_seen": [cluster["id"] for cluster in clusters["clusters"]],
+        "burp_history_items": len(burp_history),
+        "active_suspicions": [item["id"] for item in suspicions],
+        "strategies": strategies,
+        "next_development_actions": next_actions,
+    }
+
+
+def discovered_server_actions_from_source_peeks(source_peeks: dict[str, Any] | None) -> list[dict[str, Any]]:
+    endpoint_resolver = (source_peeks or {}).get("endpoint_resolver") or {}
+    actions = endpoint_resolver.get("discovered_server_actions") or []
+    return [item for item in actions if isinstance(item, dict)]
+
+
+def identifier_words(value: str) -> set[str]:
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
+    return {
+        token.lower()
+        for token in re.split(r"[^A-Za-z0-9]+", spaced)
+        if token
+    }
+
+
+def server_action_names(action: dict[str, Any]) -> list[str]:
+    names = []
+    for name in action.get("action_names", []) or []:
+        text = str(name).strip()
+        if text:
+            names.append(text)
+    return names
+
+
+def risky_server_action_names(action_names: list[str]) -> list[str]:
+    risky = []
+    for name in action_names:
+        words = identifier_words(name)
+        if words & SERVER_ACTION_REVIEW_KEYWORDS:
+            risky.append(name)
+    return risky
+
+
+def server_action_review_candidate(action: dict[str, Any]) -> dict[str, Any]:
+    source_ref = str(action.get("source_ref") or action.get("file") or action.get("id") or "unknown")
+    action_names = server_action_names(action)
+    return {
+        "id": f"review_server_action_{safe_probe_id(source_ref)}",
+        "type": "server-action-source-review",
+        "status": "manual-review",
+        "source_ref": source_ref,
+        "scope": action.get("scope"),
+        "action_names": action_names,
+        "action_count": int(action.get("action_count", len(action_names)) or len(action_names)),
+        "line_refs": action.get("line_refs", {}),
+        "review_questions": [
+            "Authentication and authorization are checked before side effects.",
+            "Input validation or schema checks happen before persistence, upstream calls, wallet, or transaction work.",
+            "CSRF, origin, or same-site assumptions are explicit for browser-reachable mutations.",
+            "Returned transaction payloads are decoded/reviewed only and are not signed or submitted automatically.",
+            "External side effects are idempotent or guarded against replay where applicable.",
+        ],
+        "approval_required": [
+            "Record the source-review conclusion before closing this evidence gap.",
+            "Do not invoke the action or submit a form as part of automated verification.",
+        ],
+        "safety": "Source review only. No HTTP request, form submission, wallet signing, or mutation is generated.",
+    }
+
+
+def build_evidence_gaps(
+    clusters: dict[str, Any],
+    results: list[dict[str, Any]],
+    burp_history: list[dict[str, Any]],
+    transaction_intent: dict[str, Any],
+    rpc_method_policy: dict[str, Any] | None = None,
+    orca_baseline: dict[str, Any] | None = None,
+    quote_collection: dict[str, Any] | None = None,
+    source_peeks: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    burp_cluster_ids = observed_cluster_ids(build_traffic_index([], burp_history), clusters)
+    results_by_cluster: dict[str, list[dict[str, Any]]] = {}
+    for row in results:
+        results_by_cluster.setdefault(row.get("category", "unknown"), []).append(row)
+
+    gaps: list[dict[str, Any]] = []
+    next_probe_candidates: list[dict[str, Any]] = []
+    coverage_by_cluster = []
+    cluster_ids = {str(cluster.get("id")) for cluster in clusters.get("clusters", []) if cluster.get("id")}
+
+    def add_gap(
+        gap_id: str,
+        cluster_id: str,
+        title: str,
+        priority: str,
+        reason: str,
+        safe_next_step: str,
+        safety_gate: str,
+        *,
+        review_candidates: list[dict[str, Any]] | None = None,
+    ) -> None:
+        gap = {
+            "id": gap_id,
+            "cluster_id": cluster_id,
+            "title": title,
+            "priority": priority,
+            "reason": reason,
+            "safe_next_step": safe_next_step,
+            "safety_gate": safety_gate,
+        }
+        if review_candidates:
+            gap["review_candidates"] = review_candidates
+        gaps.append(gap)
+
+    for cluster in clusters.get("clusters", []):
+        cluster_id = cluster["id"]
+        rows = results_by_cluster.get(cluster_id, [])
+        unexpected = [row for row in rows if not row.get("expected")]
+        policy_fields = sorted(
+            {
+                str(row["policy_field"])
+                for row in rows
+                if row.get("policy_field") is not None
+            }
+        )
+        burp_observed = cluster_id in burp_cluster_ids
+        if unexpected:
+            coverage_status = "probe-review-needed"
+        elif rows:
+            coverage_status = "covered-by-safe-probes"
+        else:
+            coverage_status = "not-probed"
+
+        coverage_by_cluster.append(
+            {
+                "cluster_id": cluster_id,
+                "kind": cluster.get("kind"),
+                "priority": cluster.get("priority"),
+                "probe_count": len(rows),
+                "unexpected_count": len(unexpected),
+                "policy_fields_covered": policy_fields,
+                "burp_browser_observed": burp_observed,
+                "coverage_status": coverage_status,
+            }
+        )
+
+        if not burp_observed and cluster_id != "health":
+            review_candidates = review_observation_candidates_for_cluster(cluster)
+            observation_reason = (
+                "Safe probes cover this source-defined surface, but Burp built-in-browser history has not observed a normal user flow for it yet."
+                if rows
+                else "This source-defined surface is discovery-only until a Burp built-in-browser flow or reviewed profile probe target provides concrete black-box evidence."
+            )
+            observation_next_step = (
+                "Review the generated observation candidate, choose one known safe concrete path, add it to the profile's `burp_observation_plan`, then rerun Burp observation."
+                if review_candidates
+                else "Use the Burp built-in browser to exercise the relevant UI flow, then import or read the matching Proxy history before comparing mutations."
+            )
+            add_gap(
+                f"GAP-{cluster_id}-burp-observation",
+                cluster_id,
+                "Browser-flow observation missing",
+                "medium" if cluster.get("priority") == "high" else "low",
+                observation_reason,
+                observation_next_step,
+                "Keep Proxy Intercept off for automation; turn it on only for a human-edited request.",
+                review_candidates=review_candidates,
+            )
+
+    seen_server_action_refs: set[str] = set()
+    for action in discovered_server_actions_from_source_peeks(source_peeks):
+        source_ref = str(action.get("source_ref") or action.get("file") or action.get("id") or "unknown")
+        if source_ref in seen_server_action_refs:
+            continue
+        seen_server_action_refs.add(source_ref)
+        action_names = server_action_names(action)
+        risky_names = risky_server_action_names(action_names)
+        name_summary = ", ".join(action_names[:8]) if action_names else "no exported action names statically extracted"
+        risky_summary = (
+            f" Mutation-sensitive action names: {', '.join(risky_names[:8])}."
+            if risky_names
+            else ""
+        )
+        add_gap(
+            f"GAP-server-action-{safe_probe_id(source_ref)}-manual-review",
+            "server-actions",
+            "Server Action mutation boundary needs manual source review",
+            "high" if risky_names else "medium",
+            (
+                f"Static discovery found Next.js Server Action source `{source_ref}` with actions: "
+                f"{name_summary}. Server Actions are not invoked by this tool, so mutation boundaries "
+                f"must be confirmed from source.{risky_summary}"
+            ),
+            (
+                "Review authentication, authorization, CSRF/origin assumptions, input validation, "
+                "wallet/transaction boundaries, idempotency, and external side effects in the Server Action source."
+            ),
+            "Source review only; do not invoke Server Actions, submit forms, sign wallets, or mutate state automatically.",
+            review_candidates=[server_action_review_candidate(action)],
+        )
+
+    quote_rows = results_by_cluster.get("quote", [])
+    quote_cluster_present = "quote" in cluster_ids or bool(quote_rows)
+    if quote_cluster_present and transaction_intent.get("candidates_seen", 0) == 0:
+        quote_diagnosis = (quote_collection or {}).get("diagnosis", {})
+        quote_classification = quote_diagnosis.get("classification")
+        quote_reason = "The transaction decoder is implemented, but this run did not receive a successful quote response containing a transaction candidate."
+        quote_next_step = "Run collect-quote with a test wallet and amount once M0 returns a 200 quote, then compare decoded account keys, signer, mints, and program IDs against intent."
+        if quote_classification == "m0-config-missing-or-placeholder":
+            quote_reason = (
+                "The transaction decoder is implemented, but the last quote collection did not reach M0 with real credentials: "
+                "the local M0 orchestration key is missing or still set to a template placeholder."
+            )
+            quote_next_step = (
+                "Configure a real M0_ORCHESTRATION_API_KEY, restart the target server, then rerun collect-quote. "
+                "Only decode returned transactions; do not sign or submit them automatically."
+            )
+        elif quote_classification == "m0-upstream-auth-or-policy-rejected":
+            quote_reason = (
+                "The transaction decoder is implemented, but the last quote collection was rejected by upstream M0 authorization or business policy."
+            )
+            quote_next_step = (
+                "Confirm the M0 key, account permissions, route, wallet, and amount are eligible, then rerun collect-quote. "
+                "Only decode returned transactions; do not sign or submit them automatically."
+            )
+        add_gap(
+            "GAP-quote-transaction-corpus",
+            "quote",
+            "No real quote transaction payload corpus",
+            "high",
+            quote_reason,
+            quote_next_step,
+            "Never sign or submit returned transactions automatically.",
+        )
+        next_probe_candidates.append(
+            {
+                "id": "NEXT-quote-collect-real-payload",
+                "cluster_id": "quote",
+                "priority": "high",
+                "command": (
+                    "python3 scripts/inferforge.py collect-quote --direction buy "
+                    f"--wallet {DEFAULT_TEST_WALLET} --amount-in 1000000"
+                ),
+                "expected_evidence": ".greybox/transaction-payloads.json and .greybox/transaction-intent.json",
+                "safety_gate": "Decode only; no signing or Solana submission.",
+            }
+        )
+
+    if quote_cluster_present and not any(row.get("external") for row in quote_rows):
+        add_gap(
+            "GAP-quote-business-policy-probes",
+            "quote",
+            "Business-policy quote probes not executed",
+            "medium",
+            "The current run did not include chain, mint, wallet, recipient, amount, maxNumQuotes, and unknown-field policy probes.",
+            "Rerun audit with --include-external when bounded M0-facing validation probes are acceptable.",
+            "Stop if any probe would require a real signature, broad enumeration, or repeated upstream traffic.",
+        )
+
+    rpc_rows = results_by_cluster.get("solana-rpc-http", [])
+    if rpc_rows:
+        high_impact_rows = [
+            row
+            for row in rpc_rows
+            if row.get("probe_id")
+            in {
+                "rpc_simulate_transaction_invalid_payload",
+                "rpc_send_transaction_invalid_payload",
+            }
+        ]
+        high_impact_passed = high_impact_rows and all(row.get("expected") for row in high_impact_rows)
+        rpc_posture = (rpc_method_policy or {}).get("policy_posture")
+        if rpc_posture == "high-impact-methods-explicit-opt-in" and high_impact_rows:
+            pass
+        elif high_impact_passed:
+            add_gap(
+                "GAP-rpc-high-impact-policy-decision",
+                "solana-rpc-http",
+                "High-impact allowed RPC methods need an explicit exposure decision",
+                "medium",
+                "Invalid-payload negative probes for sendTransaction and simulateTransaction passed, but the default unauthenticated allowlist still exposes high-impact transaction methods to browser clients.",
+                "Decide whether sendTransaction and simulateTransaction should remain in the default allowlist, require authentication, or move behind transaction-intent policy checks.",
+                "Any future positive-path test must use explicit approval and must not submit a real signed transaction automatically.",
+            )
+        else:
+            add_gap(
+                "GAP-rpc-high-impact-allowed-methods",
+                "solana-rpc-http",
+                "High-impact allowed RPC methods need safe negative probes",
+                "high",
+                "Source policy allows sendTransaction and simulateTransaction, but this run does not yet prove invalid, unsigned payloads fail safely.",
+                "Add bounded negative probes using invalid transaction payloads, then decide whether these methods should require authentication, be removed from the default allowlist, or be constrained by transaction intent checks.",
+                "Use invalid, unsigned payloads only; never submit a valid signed transaction.",
+            )
+            next_probe_candidates.append(
+                {
+                    "id": "NEXT-rpc-high-impact-negative-probes",
+                    "cluster_id": "solana-rpc-http",
+                    "priority": "high",
+                    "probe_shapes": [
+                        "simulateTransaction with syntactically invalid transaction data",
+                        "sendTransaction with syntactically invalid transaction data",
+                        "oversized-but-bounded request body below configured MAX_BODY_BYTES",
+                    ],
+                    "expected_evidence": "Local rejection or sanitized upstream JSON-RPC error without transaction submission.",
+                    "safety_gate": "Invalid payloads only; no valid signatures; one request per method.",
+                }
+            )
+
+    ws_resource_rows = [
+        row
+        for row in results_by_cluster.get("solana-rpc-ws", [])
+        if row.get("probe_id") == "ws_resource_connection_limit"
+    ]
+    if results_by_cluster.get("solana-rpc-ws") and not (
+        ws_resource_rows and all(row.get("expected") for row in ws_resource_rows)
+    ):
+        add_gap(
+            "GAP-ws-resource-controls",
+            "solana-rpc-ws",
+            "WebSocket resource-control behavior remains manual",
+            "medium",
+            "Message-shape policy is covered, but connection-count and pending-queue pressure tests are intentionally not automated by default.",
+            "Add an approval-gated low-volume resource probe that opens a small fixed number of sockets and records close/error behavior.",
+            "Require explicit operator approval and hard limits before resource-pressure tests.",
+        )
+
+    if results_by_cluster.get("orca-pools") and not (orca_baseline or {}).get("success"):
+        add_gap(
+            "GAP-orca-real-address-cache-baseline",
+            "orca-pools",
+            "Real pool address cache behavior not baselined",
+            "low",
+            "Invalid address and route-escape probes pass, but this run does not compare behavior for a known real pool address or cache headers.",
+            "With one approved known pool address, collect a single positive baseline and compare cache headers and response shape against invalid-address probes.",
+            "No address enumeration or broad upstream Orca requests.",
+            review_candidates=[build_orca_baseline_review_candidate()],
+        )
+
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+    gaps.sort(key=lambda item: (priority_order.get(item["priority"], 9), item["cluster_id"], item["id"]))
+    next_probe_candidates.sort(key=lambda item: (priority_order.get(item["priority"], 9), item["id"]))
+
+    return {
+        "generated_at": utc_now(),
+        "methodology": "Evidence gaps are not findings; they are the next safe questions to answer before escalating risk.",
+        "coverage_by_cluster": coverage_by_cluster,
+        "gaps": gaps,
+        "next_probe_candidates": next_probe_candidates,
+    }
+
+
+def compact_source_refs(values: list[Any]) -> list[str]:
+    refs = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        refs.append(text)
+    return refs
+
+
+def endpoint_request_key(method: str, path: str) -> str:
+    return f"{str(method or '').upper()} {str(path or '').split('?', 1)[0]}"
+
+
+def observed_cluster_ids_from_traffic_index(
+    traffic_index: dict[str, Any] | None,
+    clusters: dict[str, Any],
+) -> set[str]:
+    observed: set[str] = set()
+    for endpoint in (traffic_index or {}).get("endpoints", []) or []:
+        observed.update(str(cluster_id) for cluster_id in endpoint.get("cluster_ids", []) or [])
+        observed.update(
+            classify_endpoint(
+                str(endpoint.get("method") or ""),
+                str(endpoint.get("path") or ""),
+                clusters,
+            )
+        )
+    return observed
+
+
+def source_resolver_observed_resolution_map(source_peeks: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    endpoint_resolver = (source_peeks or {}).get("endpoint_resolver") or {}
+    by_endpoint: dict[str, dict[str, Any]] = {}
+    for resolution in endpoint_resolver.get("observed_endpoint_resolution", []) or []:
+        key = endpoint_request_key(str(resolution.get("method") or ""), str(resolution.get("path") or ""))
+        by_endpoint[key] = resolution
+    return by_endpoint
+
+
+def source_refs_from_observed_resolution(resolution: dict[str, Any] | None) -> list[str]:
+    if not resolution:
+        return []
+    refs: list[Any] = []
+    for match in resolution.get("matches", []) or []:
+        refs.append(match.get("source_ref"))
+    for item in resolution.get("middleware_context", []) or []:
+        refs.append(item.get("source_ref"))
+    for item in resolution.get("route_policy_context", []) or []:
+        refs.append(item.get("source_ref"))
+    return compact_source_refs(refs)
+
+
+def cluster_source_refs_by_id(clusters: dict[str, Any]) -> dict[str, list[str]]:
+    return {
+        str(cluster.get("id")): compact_source_refs(cluster.get("source_refs", []) or [])
+        for cluster in clusters.get("clusters", []) or []
+        if cluster.get("id")
+    }
+
+
+def configured_source_peek_requests(
+    source_peeks: dict[str, Any] | None,
+    observed_cluster_ids: set[str],
+) -> list[dict[str, Any]]:
+    requests = []
+    for item in (source_peeks or {}).get("source_peeks", []) or []:
+        cluster_ids = [str(cluster_id) for cluster_id in item.get("cluster_ids", []) or []]
+        if cluster_ids and observed_cluster_ids and not (set(cluster_ids) & observed_cluster_ids):
+            continue
+        endpoint = str(item.get("endpoint") or "profile source context")
+        files = compact_source_refs(item.get("files", []) or [])
+        requests.append(
+            {
+                "id": f"PEEK-profile-{safe_probe_id(endpoint)}",
+                "trigger": "profile-source-context",
+                "status": "answered" if files else "needs-resolution",
+                "entrypoint": endpoint,
+                "cluster_ids": cluster_ids,
+                "reason": "Profile declared narrow source context for a cluster that has black-box evidence in this run.",
+                "questions": [
+                    "Which narrow source files explain the observed endpoint behavior?",
+                    "Do the configured source line refs support the black-box policy checks?",
+                ],
+                "source_refs": files,
+                "line_refs": item.get("relevant_lines", {}),
+                "conclusion": item.get("conclusion"),
+                "answer_artifact": "source-peek-results.json",
+                "max_files": max(1, len(files)),
+                "max_call_depth": 1,
+            }
+        )
+    return requests
+
+
+def server_action_source_peek_requests(source_peeks: dict[str, Any] | None) -> list[dict[str, Any]]:
+    requests = []
+    for action in discovered_server_actions_from_source_peeks(source_peeks):
+        source_ref = str(action.get("source_ref") or action.get("file") or action.get("id") or "unknown")
+        action_names = server_action_names(action)
+        requests.append(
+            {
+                "id": f"PEEK-server-action-{safe_probe_id(source_ref)}",
+                "trigger": "source-only-server-action-discovery",
+                "status": "manual-review",
+                "entrypoint": "Next.js Server Action",
+                "cluster_ids": ["server-actions"],
+                "reason": "Server Actions are source-discovered mutation boundaries; they are not invoked by the tool.",
+                "questions": [
+                    "Are authentication and authorization checked before side effects?",
+                    "Are inputs validated before persistence, upstream calls, wallet, or transaction work?",
+                    "Are CSRF, origin, replay, and idempotency assumptions explicit for browser-reachable mutations?",
+                ],
+                "source_refs": [source_ref],
+                "line_refs": action.get("line_refs", {}),
+                "action_names": action_names,
+                "answer_artifact": "source-peek-results.json",
+                "max_files": 1,
+                "max_call_depth": 1,
+                "safety": "Source review only; do not invoke the action or submit forms automatically.",
+            }
+        )
+    return requests
+
+
+def suspicion_source_peek_requests(suspicions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    requests = []
+    for item in suspicions:
+        suspicion_id = str(item.get("id") or "suspicion")
+        evidence_refs = []
+        for row in item.get("blackbox_evidence", []) or []:
+            probe_id = row.get("probe_id")
+            if probe_id:
+                evidence_refs.append(f"PROBE-{probe_id}")
+        source_refs = compact_source_refs(item.get("source_refs", []) or [])
+        requests.append(
+            {
+                "id": f"PEEK-{safe_probe_id(suspicion_id)}",
+                "trigger": "suspicion",
+                "status": "answered" if source_refs else "needs-resolution",
+                "suspicion_id": suspicion_id,
+                "entrypoint": item.get("entrypoint"),
+                "cluster_ids": compact_source_refs([row.get("category") for row in item.get("blackbox_evidence", []) or []]),
+                "reason": item.get("hypothesis"),
+                "questions": item.get("source_questions", []) or [
+                    "Which source boundary explains the black-box behavior?"
+                ],
+                "source_refs": source_refs,
+                "blackbox_evidence_refs": compact_source_refs(evidence_refs),
+                "answer_artifact": "source-peek-results.json",
+                "max_files": max(1, min(5, len(source_refs) or 5)),
+                "max_call_depth": 2,
+            }
+        )
+    return requests
+
+
+def evidence_gap_source_peek_requests(
+    evidence_gaps: dict[str, Any] | None,
+    cluster_source_refs: dict[str, list[str]],
+) -> list[dict[str, Any]]:
+    requests = []
+    for gap in (evidence_gaps or {}).get("gaps", []) or []:
+        candidates = gap.get("review_candidates", []) or []
+        source_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.get("type") == "server-action-source-review"
+            or candidate.get("source_ref")
+            or candidate.get("source_refs")
+        ]
+        source_review_text = "source review" in str(gap.get("safe_next_step") or gap.get("safety_gate") or "").lower()
+        if not source_candidates and not source_review_text:
+            continue
+        gap_id = str(gap.get("id") or "gap")
+        cluster_id = str(gap.get("cluster_id") or "unknown")
+        candidate_refs: list[Any] = []
+        for candidate in source_candidates:
+            candidate_refs.append(candidate.get("source_ref"))
+            candidate_refs.extend(candidate.get("source_refs", []) or [])
+        source_refs = compact_source_refs([*candidate_refs, *cluster_source_refs.get(cluster_id, [])])
+        questions = [
+            str(gap.get("safe_next_step") or "Review the source context for this evidence gap."),
+        ]
+        for candidate in source_candidates:
+            questions.extend(candidate.get("review_questions", []) or [])
+        requests.append(
+            {
+                "id": f"PEEK-gap-{safe_probe_id(gap_id)}",
+                "trigger": "evidence-gap",
+                "status": "manual-review",
+                "gap_id": gap_id,
+                "entrypoint": gap.get("title"),
+                "cluster_ids": [cluster_id],
+                "reason": gap.get("reason"),
+                "questions": compact_source_refs(questions),
+                "source_refs": source_refs,
+                "review_candidate_ids": compact_source_refs([candidate.get("id") for candidate in source_candidates]),
+                "answer_artifact": "source-peek-results.json",
+                "max_files": max(1, min(5, len(source_refs) or 5)),
+                "max_call_depth": 1,
+                "safety": gap.get("safety_gate"),
+            }
+        )
+    return requests
+
+
+def endpoint_source_peek_requests(
+    traffic_index: dict[str, Any] | None,
+    clusters: dict[str, Any],
+    source_peeks: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    requests = []
+    cluster_refs = cluster_source_refs_by_id(clusters)
+    resolution_by_endpoint = source_resolver_observed_resolution_map(source_peeks)
+    for endpoint in (traffic_index or {}).get("endpoints", []) or []:
+        method = str(endpoint.get("method") or "")
+        path = str(endpoint.get("path") or "")
+        if not method or not path:
+            continue
+        key = endpoint_request_key(method, path)
+        cluster_ids = sorted(
+            set(str(cluster_id) for cluster_id in endpoint.get("cluster_ids", []) or [])
+            | classify_endpoint(method, path, clusters)
+        )
+        resolution = resolution_by_endpoint.get(key)
+        source_refs = compact_source_refs(
+            [
+                *source_refs_from_observed_resolution(resolution),
+                *[
+                    ref
+                    for cluster_id in cluster_ids
+                    for ref in cluster_refs.get(cluster_id, [])
+                ],
+            ]
+        )
+        probe_ids = compact_source_refs(endpoint.get("probe_ids", []) or [])
+        requests.append(
+            {
+                "id": f"PEEK-endpoint-{safe_probe_id(key)}",
+                "trigger": "observed-endpoint",
+                "status": "answered" if source_refs else "needs-resolution",
+                "entrypoint": key,
+                "method": method.upper(),
+                "path": path,
+                "cluster_ids": cluster_ids,
+                "observed_via": endpoint.get("observed_via"),
+                "observed_statuses": endpoint.get("statuses", []),
+                "probe_refs": [f"PROBE-{probe_id}" for probe_id in probe_ids if probe_id != "burp-history"],
+                "burp_history_observed": "burp-history" in probe_ids or "burp" in str(endpoint.get("observed_via") or ""),
+                "reason": "Endpoint has black-box evidence from Burp history and/or bounded probes; source context should answer only the observed routing and policy question.",
+                "questions": [
+                    "Which local handler, rewrite, middleware, or route policy implements this observed endpoint?",
+                    "Do the source-enforced method, input-shape, origin, and upstream boundaries explain the observed black-box behavior?",
+                ],
+                "source_refs": source_refs,
+                "resolver_match_count": None if resolution is None else resolution.get("match_count", 0),
+                "answer_artifact": "source-peek-results.json",
+                "max_files": max(1, min(5, len(source_refs) or 5)),
+                "max_call_depth": 1,
+            }
+        )
+    return requests
+
+
+def build_source_peek_requests(
+    clusters: dict[str, Any],
+    traffic_index: dict[str, Any] | None,
+    source_peeks: dict[str, Any] | None,
+    suspicions: list[dict[str, Any]] | None,
+    evidence_gaps: dict[str, Any] | None,
+) -> dict[str, Any]:
+    cluster_refs = cluster_source_refs_by_id(clusters)
+    observed_clusters = observed_cluster_ids_from_traffic_index(traffic_index, clusters)
+    requests: list[dict[str, Any]] = []
+    for item in [
+        *endpoint_source_peek_requests(traffic_index, clusters, source_peeks),
+        *configured_source_peek_requests(source_peeks, observed_clusters),
+        *suspicion_source_peek_requests(suspicions or []),
+        *server_action_source_peek_requests(source_peeks),
+        *evidence_gap_source_peek_requests(evidence_gaps, cluster_refs),
+    ]:
+        requests.append(item)
+
+    seen_ids: set[str] = set()
+    deduped = []
+    for item in requests:
+        request_id = str(item.get("id") or f"PEEK-{len(deduped) + 1}")
+        if request_id in seen_ids:
+            continue
+        seen_ids.add(request_id)
+        deduped.append(item)
+    requests = deduped
+
+    trigger_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    for item in requests:
+        trigger = str(item.get("trigger") or "unknown")
+        status = str(item.get("status") or "unknown")
+        trigger_counts[trigger] = trigger_counts.get(trigger, 0) + 1
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    if not requests:
+        status = "no-source-peek-requests"
+    elif status_counts.get("needs-resolution"):
+        status = "needs-source-resolution"
+    elif status_counts.get("manual-review"):
+        status = "answered-with-manual-review"
+    else:
+        status = "answered"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "methodology": "Source-peek requests explain why source context was consulted: concrete observed endpoints, suspicions, source-only Server Actions, or evidence gaps. This artifact is read-only and does not run probes.",
+        "summary": {
+            "requests": len(requests),
+            "trigger_counts": trigger_counts,
+            "status_counts": status_counts,
+            "observed_clusters": sorted(observed_clusters),
+        },
+        "requests": requests,
+        "artifact_refs": {
+            "traffic_index": "traffic-index.json",
+            "source_peeks": "source-peek-results.json",
+            "suspicions": "suspicions.json",
+            "evidence_gaps": "evidence-gaps.json",
+            "endpoint_clusters": "endpoint-clusters.json",
+        },
+        "safety": "Read-only source-context planning artifact. It does not send HTTP requests, invoke Server Actions, sign wallets, or submit transactions.",
+    }
+
+
+def observation_run_cluster_ids(burp_observation_run: dict[str, Any] | None) -> set[str]:
+    clusters = {
+        str(cluster_id)
+        for cluster_id in ((burp_observation_run or {}).get("summary", {}) or {}).get("clusters", []) or []
+        if cluster_id
+    }
+    for request in (burp_observation_run or {}).get("requests", []) or []:
+        if request.get("cluster"):
+            clusters.add(str(request.get("cluster")))
+    websocket_upgrade = (burp_observation_run or {}).get("websocket_upgrade")
+    if isinstance(websocket_upgrade, dict) and websocket_upgrade.get("cluster"):
+        clusters.add(str(websocket_upgrade.get("cluster")))
+    return clusters
+
+
+def review_candidates_by_cluster(profile: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
+    by_cluster: dict[str, list[dict[str, Any]]] = {}
+    for candidate in collect_review_observation_candidates(profile or {}):
+        cluster_id = str(candidate.get("cluster") or "")
+        if not cluster_id:
+            continue
+        by_cluster.setdefault(cluster_id, []).append(candidate)
+    return by_cluster
+
+
+def evidence_gap_ids_by_cluster(evidence_gaps: dict[str, Any] | None) -> dict[str, list[str]]:
+    by_cluster: dict[str, list[str]] = {}
+    for gap in (evidence_gaps or {}).get("gaps", []) or []:
+        cluster_id = str(gap.get("cluster_id") or "")
+        gap_id = str(gap.get("id") or "")
+        if not cluster_id or not gap_id:
+            continue
+        by_cluster.setdefault(cluster_id, []).append(gap_id)
+    return by_cluster
+
+
+def build_burp_observation_coverage(
+    target: str,
+    profile: dict[str, Any] | None,
+    clusters: dict[str, Any],
+    burp_history: list[dict[str, Any]],
+    burp_observation_run: dict[str, Any] | None,
+    evidence_gaps: dict[str, Any] | None,
+) -> dict[str, Any]:
+    history_cluster_ids = observed_cluster_ids(build_traffic_index([], burp_history), clusters)
+    run_cluster_ids = observation_run_cluster_ids(burp_observation_run)
+    run_unexpected = int(((burp_observation_run or {}).get("summary", {}) or {}).get("unexpected", 0) or 0)
+    active_plan_error = None
+    try:
+        active_plan = build_burp_observation_plan(target, profile)
+    except ValueError as error:
+        active_plan = []
+        active_plan_error = str(error)
+    active_plan_by_cluster: dict[str, list[dict[str, Any]]] = {}
+    for item in active_plan:
+        active_plan_by_cluster.setdefault(str(item.get("cluster") or "unknown"), []).append(item)
+    ws_profile = websocket_observation_config(profile)
+    if ws_profile is not None:
+        active_plan_by_cluster.setdefault(str(ws_profile.get("cluster") or "solana-rpc-ws"), []).append(
+            {
+                "id": ws_profile.get("id") or "burp_observe_ws_upgrade",
+                "method": "WS",
+                "path": ws_profile.get("path"),
+                "expected_statuses": ws_profile.get("expected_statuses", [101]),
+                "cluster": ws_profile.get("cluster") or "solana-rpc-ws",
+            }
+        )
+    review_by_cluster = review_candidates_by_cluster(profile)
+    gap_by_cluster = evidence_gap_ids_by_cluster(evidence_gaps)
+
+    cluster_rows = []
+    status_counts: dict[str, int] = {}
+    for cluster in clusters.get("clusters", []) or []:
+        cluster_id = str(cluster.get("id") or "unknown")
+        history_observed = cluster_id in history_cluster_ids
+        observe_run_generated = cluster_id in run_cluster_ids
+        active_items = active_plan_by_cluster.get(cluster_id, [])
+        review_candidates = review_by_cluster.get(cluster_id, [])
+        if history_observed:
+            status = "burp-history-observed"
+            next_action = "No Burp observation action is required for coverage; keep history fresh with burp-sync when flows change."
+        elif observe_run_generated and run_unexpected:
+            status = "observe-run-unexpected"
+            next_action = "Inspect burp-observation-run.json before importing this flow as coverage evidence."
+        elif observe_run_generated:
+            status = "observe-run-generated-not-imported"
+            next_action = "Run burp-sync to import the generated Burp Proxy history into burp-history-observations.jsonl."
+        elif active_items:
+            status = "ready-to-observe"
+            next_action = "Run burp-sync --observe to generate and import this profile-defined Burp observation flow."
+        elif review_candidates:
+            status = "needs-reviewed-observation-promotion"
+            next_action = "Review one concrete local read-only path, promote the review candidate into a reviewed profile, then run burp-sync --observe."
+        else:
+            status = "needs-manual-browser-flow"
+            next_action = "Exercise the relevant UI flow in Burp's built-in browser, then run burp-sync to import the history."
+        status_counts[status] = status_counts.get(status, 0) + 1
+        cluster_rows.append(
+            {
+                "cluster_id": cluster_id,
+                "kind": cluster.get("kind"),
+                "priority": cluster.get("priority"),
+                "status": status,
+                "burp_history_observed": history_observed,
+                "observe_run_generated": observe_run_generated,
+                "active_observation_count": len(active_items),
+                "active_observations": [
+                    {
+                        "id": item.get("id"),
+                        "method": item.get("method"),
+                        "path": item.get("path"),
+                        "expected_statuses": item.get("expected_statuses", []),
+                    }
+                    for item in active_items
+                ],
+                "review_candidate_count": len(review_candidates),
+                "review_candidate_ids": [candidate.get("id") for candidate in review_candidates],
+                "evidence_gaps": gap_by_cluster.get(cluster_id, []),
+                "next_action": next_action,
+            }
+        )
+
+    if active_plan_error:
+        status = "blocked-profile-validation"
+    elif status_counts.get("observe-run-unexpected"):
+        status = "observe-run-unexpected"
+    elif status_counts.get("needs-reviewed-observation-promotion") or status_counts.get("needs-manual-browser-flow"):
+        status = "needs-human-review"
+    elif status_counts.get("ready-to-observe") or status_counts.get("observe-run-generated-not-imported"):
+        status = "needs-burp-sync"
+    elif cluster_rows:
+        status = "covered"
+    else:
+        status = "no-clusters"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "summary": {
+            "clusters": len(cluster_rows),
+            "burp_history_observed_clusters": sorted(history_cluster_ids),
+            "observe_run_clusters": sorted(run_cluster_ids),
+            "active_observation_clusters": sorted(active_plan_by_cluster),
+            "review_candidate_clusters": sorted(review_by_cluster),
+            "status_counts": status_counts,
+            "observe_run_unexpected": run_unexpected,
+            "active_plan_error": active_plan_error,
+        },
+        "clusters": cluster_rows,
+        "artifact_refs": {
+            "burp_history": "burp-history-observations.jsonl",
+            "burp_observation_run": "burp-observation-run.json",
+            "evidence_gaps": "evidence-gaps.json",
+            "target_profile": TARGET_PROFILE_ARTIFACT,
+            "review_candidates": "review-observation-candidates.json",
+            "reviewed_profile": "reviewed-profile.json",
+        },
+        "safety": "Read-only Burp coverage planning artifact. It does not send HTTP requests; use burp-sync --observe for deterministic low-volume observation traffic.",
+    }
+
+
+def source_peek_cluster_ids(source_peeks: dict[str, Any] | None) -> set[str]:
+    observed: set[str] = set()
+    for item in (source_peeks or {}).get("source_peeks", []):
+        for cluster_id in item.get("cluster_ids", []):
+            observed.add(str(cluster_id))
+        endpoint = str(item.get("endpoint", ""))
+        if "/api/quote" in endpoint:
+            observed.add("quote")
+        if "/api/rpc" in endpoint and endpoint.upper().startswith("WS"):
+            observed.add("solana-rpc-ws")
+        elif "/api/rpc" in endpoint:
+            observed.add("solana-rpc-http")
+        if "/api/orca/pools" in endpoint:
+            observed.add("orca-pools")
+        if "/health" in endpoint:
+            observed.add("health")
+    return observed
+
+
+def build_blackbox_coverage(
+    clusters: dict[str, Any],
+    results: list[dict[str, Any]],
+    burp_history: list[dict[str, Any]],
+    source_peeks: dict[str, Any] | None,
+    evidence_gaps: dict[str, Any] | None,
+    burp_observation_run: dict[str, Any] | None,
+    environment_readiness: dict[str, Any] | None,
+    transaction_decoder_selftest: dict[str, Any] | None,
+) -> dict[str, Any]:
+    burp_cluster_ids = observed_cluster_ids(build_traffic_index([], burp_history), clusters)
+    source_cluster_ids_seen = source_peek_cluster_ids(source_peeks)
+    observation_clusters = set((burp_observation_run or {}).get("summary", {}).get("clusters", []))
+    observation_unexpected = int((burp_observation_run or {}).get("summary", {}).get("unexpected", 0) or 0)
+    gap_ids = [gap.get("id") for gap in (evidence_gaps or {}).get("gaps", [])]
+    gap_ids_by_cluster: dict[str, list[str]] = {}
+    for gap in (evidence_gaps or {}).get("gaps", []):
+        gap_ids_by_cluster.setdefault(str(gap.get("cluster_id")), []).append(str(gap.get("id")))
+
+    rows_by_cluster: dict[str, list[dict[str, Any]]] = {}
+    for row in results:
+        rows_by_cluster.setdefault(str(row.get("category", "unknown")), []).append(row)
+
+    cluster_coverage = []
+    required_failures = []
+    warnings = []
+    external_blockers = []
+
+    def make_check(check_id: str, status: str, evidence: Any, required: bool = True) -> dict[str, Any]:
+        return {
+            "id": check_id,
+            "status": status,
+            "required": required,
+            "evidence": evidence,
+        }
+
+    for cluster in clusters.get("clusters", []):
+        cluster_id = cluster["id"]
+        cluster_kind = str(cluster.get("kind") or "")
+        priority = cluster.get("priority")
+        rows = rows_by_cluster.get(cluster_id, [])
+        unexpected = [row for row in rows if not row.get("expected")]
+        policy_fields = sorted(
+            {
+                str(row.get("policy_field"))
+                for row in rows
+                if row.get("policy_field") is not None
+            }
+        )
+        active_probe_required = cluster_id != "health" and cluster_kind not in {"rewrite-proxy"}
+        burp_observed = cluster_id in burp_cluster_ids
+        safe_probe_status = (
+            "failed"
+            if unexpected
+            else ("passed" if rows else ("failed" if active_probe_required else "not-applicable"))
+        )
+        policy_status = (
+            "not-applicable"
+            if cluster_id == "health" or not active_probe_required
+            else ("passed" if policy_fields else "failed")
+        )
+        checks = [
+            make_check(
+                "burp-history-observed",
+                "passed" if burp_observed else "warning",
+                burp_observed,
+                required=False,
+            ),
+            make_check(
+                "safe-probes-executed",
+                safe_probe_status,
+                {"probe_count": len(rows), "unexpected_count": len(unexpected)},
+                required=active_probe_required,
+            ),
+            make_check(
+                "source-context-available",
+                "passed" if cluster_id == "health" or cluster_id in source_cluster_ids_seen else "failed",
+                cluster_id in source_cluster_ids_seen,
+                required=cluster_id != "health",
+            ),
+            make_check(
+                "policy-fields-covered",
+                policy_status,
+                policy_fields,
+                required=active_probe_required,
+            ),
+            make_check(
+                "burp-observe-flow-generated",
+                "passed" if cluster_id in observation_clusters and observation_unexpected == 0 else "warning",
+                {
+                    "cluster_observed_in_burp_observation_run": cluster_id in observation_clusters,
+                    "observation_unexpected": observation_unexpected,
+                },
+                required=False,
+            ),
+        ]
+
+        cluster_gap_ids = gap_ids_by_cluster.get(cluster_id, [])
+        if cluster_gap_ids == ["GAP-quote-transaction-corpus"]:
+            checks.append(
+                make_check(
+                    "real-transaction-corpus",
+                    "blocked",
+                    "Waiting for a successful M0 quote transaction payload corpus.",
+                    required=False,
+                )
+            )
+
+        failed_required = [check for check in checks if check["required"] and check["status"] == "failed"]
+        warning_checks = [check for check in checks if check["status"] in {"warning", "blocked"}]
+        if failed_required:
+            cluster_status = "failed"
+            required_failures.extend([f"{cluster_id}:{check['id']}" for check in failed_required])
+        elif warning_checks:
+            cluster_status = "covered-with-open-items"
+            warnings.extend([f"{cluster_id}:{check['id']}" for check in warning_checks])
+        else:
+            cluster_status = "covered"
+
+        cluster_coverage.append(
+            {
+                "cluster_id": cluster_id,
+                "kind": cluster.get("kind"),
+                "priority": priority,
+                "status": cluster_status,
+                "checks": checks,
+                "evidence_gaps": cluster_gap_ids,
+            }
+        )
+
+    readiness_status = (environment_readiness or {}).get("status")
+    if readiness_status and readiness_status != "ready":
+        external_blockers.append(
+            {
+                "id": "environment-readiness",
+                "status": readiness_status,
+                "next_steps": (environment_readiness or {}).get("next_steps", []),
+            }
+        )
+    if (transaction_decoder_selftest or {}).get("status") != "passed":
+        required_failures.append("transaction-decoder-selftest")
+
+    non_external_gaps = [gap_id for gap_id in gap_ids if gap_id != "GAP-quote-transaction-corpus"]
+    if required_failures:
+        status = "failed"
+    elif non_external_gaps:
+        status = "covered-with-evidence-gaps"
+    elif external_blockers:
+        status = "covered-with-external-blocker"
+    else:
+        status = "covered"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "methodology": "Burp-observed black-box surface plus safe probes, narrow source context, and finding/evidence gates.",
+        "summary": {
+            "cluster_count": len(cluster_coverage),
+            "covered_clusters": sum(1 for item in cluster_coverage if item["status"] == "covered"),
+            "covered_with_open_items": sum(1 for item in cluster_coverage if item["status"] == "covered-with-open-items"),
+            "failed_clusters": sum(1 for item in cluster_coverage if item["status"] == "failed"),
+            "evidence_gaps": gap_ids,
+            "non_external_evidence_gaps": non_external_gaps,
+            "required_failures": required_failures,
+            "warnings": warnings,
+        },
+        "external_blockers": external_blockers,
+        "cluster_coverage": cluster_coverage,
+        "safety": "Coverage gate summarizes existing evidence only; it does not run active probes or submit transactions.",
+    }
+
+
+def source_peeks_for_cluster(source_peeks: dict[str, Any] | None, cluster_id: str) -> list[dict[str, Any]]:
+    selected = []
+    for item in (source_peeks or {}).get("source_peeks", []):
+        endpoint = str(item.get("endpoint", ""))
+        item_clusters = {str(item_cluster_id) for item_cluster_id in item.get("cluster_ids", [])}
+        if "/api/quote" in endpoint:
+            item_clusters.add("quote")
+        if "/api/rpc" in endpoint and endpoint.upper().startswith("WS"):
+            item_clusters.add("solana-rpc-ws")
+        elif "/api/rpc" in endpoint:
+            item_clusters.add("solana-rpc-http")
+        if "/api/orca/pools" in endpoint:
+            item_clusters.add("orca-pools")
+        if "/health" in endpoint:
+            item_clusters.add("health")
+        if cluster_id in item_clusters:
+            selected.append(
+                {
+                    "endpoint": item.get("endpoint"),
+                    "files": item.get("files", []),
+                    "relevant_lines": item.get("relevant_lines", {}),
+                    "conclusion": item.get("conclusion"),
+                }
+            )
+    return selected
+
+
+def build_evidence_chain(
+    clusters: dict[str, Any],
+    results: list[dict[str, Any]],
+    burp_history: list[dict[str, Any]],
+    source_peeks: dict[str, Any] | None,
+    finding_gate: dict[str, Any] | None,
+    evidence_gaps: dict[str, Any] | None,
+    blackbox_coverage: dict[str, Any] | None,
+    environment_readiness: dict[str, Any] | None,
+    transaction_intent: dict[str, Any] | None,
+    transaction_decoder_selftest: dict[str, Any] | None,
+) -> dict[str, Any]:
+    rows_by_cluster: dict[str, list[dict[str, Any]]] = {}
+    for row in results:
+        rows_by_cluster.setdefault(str(row.get("category", "unknown")), []).append(row)
+
+    burp_by_cluster: dict[str, list[dict[str, Any]]] = {}
+    for row in burp_history:
+        for cluster_id in classify_endpoint(str(row.get("method", "")), str(row.get("path", "")), clusters):
+            burp_by_cluster.setdefault(cluster_id, []).append(row)
+
+    gaps_by_cluster: dict[str, list[dict[str, Any]]] = {}
+    for gap in (evidence_gaps or {}).get("gaps", []):
+        gaps_by_cluster.setdefault(str(gap.get("cluster_id")), []).append(gap)
+
+    coverage_by_cluster = {
+        item.get("cluster_id"): item
+        for item in (blackbox_coverage or {}).get("cluster_coverage", [])
+    }
+
+    cluster_chains = []
+    for cluster in clusters.get("clusters", []):
+        cluster_id = cluster["id"]
+        probe_rows = rows_by_cluster.get(cluster_id, [])
+        burp_rows = burp_by_cluster.get(cluster_id, [])
+        policy_fields = sorted(
+            {
+                str(row.get("policy_field"))
+                for row in probe_rows
+                if row.get("policy_field") is not None
+            }
+        )
+        unexpected = [row for row in probe_rows if not row.get("expected")]
+        cluster_chains.append(
+            {
+                "cluster_id": cluster_id,
+                "kind": cluster.get("kind"),
+                "priority": cluster.get("priority"),
+                "coverage_status": (coverage_by_cluster.get(cluster_id) or {}).get("status"),
+                "burp_observations": [
+                    {
+                        "method": row.get("method"),
+                        "path": row.get("path"),
+                        "host": row.get("host"),
+                        "status": row.get("status"),
+                        "source": row.get("source"),
+                    }
+                    for row in burp_rows
+                ],
+                "probe_evidence": {
+                    "probe_count": len(probe_rows),
+                    "unexpected_count": len(unexpected),
+                    "policy_fields_covered": policy_fields,
+                    "probes": [
+                        {
+                            "probe_id": row.get("probe_id"),
+                            "method": row.get("method"),
+                            "path": row.get("path"),
+                            "status": row.get("status"),
+                            "expected": row.get("expected"),
+                            "policy_field": row.get("policy_field"),
+                            "expectation": row.get("expectation_result"),
+                        }
+                        for row in probe_rows
+                    ],
+                },
+                "source_context": source_peeks_for_cluster(source_peeks, cluster_id),
+                "coverage_checks": (coverage_by_cluster.get(cluster_id) or {}).get("checks", []),
+                "evidence_gaps": [
+                    {
+                        "id": gap.get("id"),
+                        "priority": gap.get("priority"),
+                        "title": gap.get("title"),
+                        "safe_next_step": gap.get("safe_next_step"),
+                    }
+                    for gap in gaps_by_cluster.get(cluster_id, [])
+                ],
+            }
+        )
+
+    return {
+        "generated_at": utc_now(),
+        "status": (blackbox_coverage or {}).get("status", "unknown"),
+        "purpose": "Machine-readable chain from Burp observations to probes, source context, gates, and remaining gaps.",
+        "artifact_refs": {
+            "burp_history": "burp-history-observations.jsonl",
+            "probe_results": "probe-results.jsonl",
+            "response_delta_analysis": "response-delta-analysis.json",
+            "source_peeks": "source-peek-results.json",
+            "source_peek_requests": "source-peek-requests.json",
+            "finding_gate": "finding-gate.json",
+            "evidence_gaps": "evidence-gaps.json",
+            "blackbox_coverage": "blackbox-coverage.json",
+            "environment_readiness": "environment-readiness.json",
+            "transaction_intent": "transaction-intent.json",
+            "transaction_decoder_selftest": "transaction-decoder-selftest.json",
+        },
+        "summary": {
+            "clusters": len(cluster_chains),
+            "burp_observations": len(burp_history),
+            "probes": len(results),
+            "unexpected_probes": sum(1 for row in results if not row.get("expected")),
+            "finding_gates": len((finding_gate or {}).get("gates", [])),
+            "evidence_gaps": [gap.get("id") for gap in (evidence_gaps or {}).get("gaps", [])],
+            "readiness": (environment_readiness or {}).get("status"),
+            "transaction_candidates": (transaction_intent or {}).get("candidates_seen", 0),
+            "decoded_transactions": (transaction_intent or {}).get("decoded_transactions", 0),
+            "transaction_decoder_selftest": (transaction_decoder_selftest or {}).get("status"),
+        },
+        "clusters": cluster_chains,
+        "finding_gate": finding_gate or {"gates": []},
+        "safety": "Evidence chain is an index over existing artifacts; it does not run probes, sign wallets, or submit transactions.",
+    }
+
+
+def cluster_docs_by_id(clusters: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    return {
+        str(cluster.get("id")): cluster
+        for cluster in (clusters or {}).get("clusters", [])
+        if cluster.get("id")
+    }
+
+
+def source_refs_for_cluster(
+    cluster_map: dict[str, dict[str, Any]],
+    cluster_id: str,
+    fallback: list[str],
+    *,
+    allow_fallback: bool,
+) -> list[str]:
+    if cluster_id in cluster_map:
+        return list(cluster_map[cluster_id].get("source_refs", []))
+    return list(fallback) if allow_fallback else []
+
+
+def entrypoint_for_cluster(
+    cluster_map: dict[str, dict[str, Any]],
+    cluster_id: str,
+    rows: list[dict[str, Any]],
+    fallback: str,
+) -> str:
+    cluster = cluster_map.get(cluster_id, {})
+    first = rows[0] if rows else {}
+    method = str(cluster.get("method") or first.get("method") or "").upper()
+    path = str(first.get("path") or cluster.get("path") or "")
+    if method and path:
+        return f"{method} {path}"
+    return fallback
+
+
+def is_generic_nextjs_route_result(row: dict[str, Any]) -> bool:
+    return str(row.get("risk") or "").startswith("safe-generic-route-")
+
+
+def build_suspicions(
+    results: list[dict[str, Any]],
+    clusters: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    by_id = {row["probe_id"]: row for row in results}
+    cluster_map = cluster_docs_by_id(clusters)
+    allow_static_fallbacks = clusters is None
+    suspicions = []
+
+    malformed = [
+        by_id.get("quote_malformed_json"),
+        by_id.get("quote_text_plain_invalid_json"),
+    ]
+    if any(row and row.get("status") == 500 for row in malformed):
+        suspicions.append(
+            {
+                "id": "SUSP-quote-json-001",
+                "status": "hardening-note",
+                "entrypoint": "POST /api/quote",
+                "hypothesis": "Malformed request bodies are handled as server errors and leak parser details.",
+                "blackbox_evidence": [
+                    row for row in malformed if row and row.get("status") == 500
+                ],
+                "source_questions": [
+                    "Does the route catch SyntaxError separately from upstream or runtime failures?"
+                ],
+                "source_refs": source_refs_for_cluster(
+                    cluster_map,
+                    "quote",
+                    ["infrafi-web/src/app/api/quote/route.ts"],
+                    allow_fallback=allow_static_fallbacks,
+                ),
+                "final_classification": "hardening-note",
+            }
+        )
+
+    local_validation_misses = [
+        row
+        for row in results
+        if row.get("category") == "quote"
+        and row.get("policy_field")
+        and not row.get("external")
+        and row.get("probe_id") not in {"quote_malformed_json", "quote_text_plain_invalid_json"}
+        and row.get("status") not in set(row.get("expected_statuses", []))
+    ]
+    if local_validation_misses:
+        suspicions.append(
+            {
+                "id": "SUSP-quote-shape-validation-003",
+                "status": "hardening-note",
+                "entrypoint": "POST /api/quote",
+                "hypothesis": "Some malformed or incomplete quote request shapes are not rejected by local validation.",
+                "blackbox_evidence": local_validation_misses,
+                "source_questions": [
+                    "Is every required quote field type-checked before any upstream call or generic exception handler?"
+                ],
+                "source_refs": source_refs_for_cluster(
+                    cluster_map,
+                    "quote",
+                    ["infrafi-web/src/app/api/quote/route.ts"],
+                    allow_fallback=allow_static_fallbacks,
+                ),
+                "final_classification": "hardening-note",
+            }
+        )
+
+    forwarded_policy_probes = [
+        row
+        for row in results
+        if row.get("category") == "quote"
+        and row.get("external")
+        and row.get("policy_field")
+        and row.get("status") not in {400, None}
+    ]
+    if forwarded_policy_probes:
+        suspicions.append(
+            {
+                "id": "SUSP-quote-validation-002",
+                "status": "hardening-note",
+                "entrypoint": "POST /api/quote",
+                "hypothesis": "Shape-valid but business-invalid quote bodies are forwarded to M0 before local policy validation.",
+                "blackbox_evidence": forwarded_policy_probes,
+                "source_questions": [
+                    "Does the server validate chain, mint, wallet, amount, recipient, and maxNumQuotes before forwarding?"
+                ],
+                "source_refs": source_refs_for_cluster(
+                    cluster_map,
+                    "quote",
+                    ["infrafi-web/src/app/api/quote/route.ts"],
+                    allow_fallback=allow_static_fallbacks,
+                ),
+                "final_classification": "hardening-note",
+            }
+        )
+
+    rpc_policy_misses = [
+        row
+        for row in results
+        if row.get("category") == "solana-rpc-http"
+        and row.get("policy_field")
+        and not row.get("expected")
+    ]
+    if rpc_policy_misses:
+        suspicions.append(
+            {
+                "id": "SUSP-rpc-policy-001",
+                "status": "hardening-note",
+                "entrypoint": "POST /api/rpc/solana/[cluster]",
+                "hypothesis": "One or more Solana RPC proxy policy probes did not receive the expected local enforcement response.",
+                "blackbox_evidence": rpc_policy_misses,
+                "source_questions": [
+                    "Are content type, request source, duplicate JSON keys, method allowlists, and mixed batches rejected before upstream forwarding?"
+                ],
+                "source_refs": source_refs_for_cluster(
+                    cluster_map,
+                    "solana-rpc-http",
+                    ["infrafi-web/src/app/api/rpc/_shared.ts"],
+                    allow_fallback=allow_static_fallbacks,
+                ),
+                "final_classification": "hardening-note",
+            }
+        )
+
+    ws_policy_misses = [
+        row
+        for row in results
+        if row.get("category") == "solana-rpc-ws"
+        and row.get("policy_field")
+        and not row.get("expected")
+    ]
+    if ws_policy_misses:
+        suspicions.append(
+            {
+                "id": "SUSP-rpc-ws-policy-001",
+                "status": "hardening-note",
+                "entrypoint": "WS /api/rpc/solana/[cluster]",
+                "hypothesis": "One or more Solana WebSocket RPC proxy policy probes did not receive the expected local close or handshake rejection.",
+                "blackbox_evidence": ws_policy_misses,
+                "source_questions": [
+                    "Are origin, binary frame, malformed JSON, duplicate JSON keys, batch size, and method allowlist checks enforced before upstream forwarding?"
+                ],
+                "source_refs": source_refs_for_cluster(
+                    cluster_map,
+                    "solana-rpc-ws",
+                    ["infrafi-web/server.js"],
+                    allow_fallback=allow_static_fallbacks,
+                ),
+                "final_classification": "hardening-note",
+            }
+        )
+
+    orca_policy_misses = [
+        row
+        for row in results
+        if row.get("category") == "orca-pools"
+        and row.get("policy_field")
+        and not row.get("expected")
+    ]
+    if orca_policy_misses:
+        suspicions.append(
+            {
+                "id": "SUSP-orca-policy-001",
+                "status": "hardening-note",
+                "entrypoint": "GET /api/orca/pools/[address]",
+                "hypothesis": "One or more Orca fixed-upstream proxy probes did not receive the expected local address, method, or route guard response.",
+                "blackbox_evidence": orca_policy_misses,
+                "source_questions": [
+                    "Are invalid base58 characters, address length boundaries, traversal markers, query injection attempts, and unsupported methods rejected before upstream forwarding?"
+                ],
+                "source_refs": source_refs_for_cluster(
+                    cluster_map,
+                    "orca-pools",
+                    ["infrafi-web/src/app/api/orca/pools/[address]/route.ts"],
+                    allow_fallback=allow_static_fallbacks,
+                ),
+                "final_classification": "hardening-note",
+            }
+        )
+
+    generic_policy_misses_by_cluster: dict[str, list[dict[str, Any]]] = {}
+    for row in results:
+        if not is_generic_nextjs_route_result(row):
+            continue
+        if not row.get("policy_field") or row.get("expected"):
+            continue
+        cluster_id = str(row.get("category") or "unknown-route")
+        generic_policy_misses_by_cluster.setdefault(cluster_id, []).append(row)
+
+    for cluster_id, rows in sorted(generic_policy_misses_by_cluster.items()):
+        first = rows[0]
+        path = str(first.get("path") or (cluster_map.get(cluster_id) or {}).get("path") or "unknown path")
+        policy_fields = sorted({str(row.get("policy_field")) for row in rows if row.get("policy_field")})
+        field_summary = ", ".join(policy_fields) if policy_fields else "route policy"
+        source_refs = source_refs_for_cluster(
+            cluster_map,
+            cluster_id,
+            [],
+            allow_fallback=False,
+        )
+        suspicions.append(
+            {
+                "id": f"SUSP-nextjs-route-policy-{safe_probe_id(cluster_id)}",
+                "status": "hardening-note",
+                "entrypoint": entrypoint_for_cluster(
+                    cluster_map,
+                    cluster_id,
+                    rows,
+                    f"{str(first.get('method') or 'HTTP').upper()} {path}",
+                ),
+                "hypothesis": (
+                    f"Generic Next.js route `{path}` did not match the expected low-risk "
+                    f"{field_summary} probe baseline."
+                ),
+                "blackbox_evidence": rows,
+                "source_questions": [
+                    "Does the route intentionally expose the observed HEAD, OPTIONS, or GET behavior?",
+                    "Are unsupported methods and CORS preflight responses enforced before handler logic or upstream calls?",
+                ],
+                "source_refs": source_refs,
+                "observed_policy_fields": policy_fields,
+                "final_classification": "hardening-note",
+            }
+        )
+
+    return suspicions
+
+
+def gate_index(finding_gate: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    return {
+        str(item.get("suspicion_id")): item
+        for item in (finding_gate or {}).get("gates", [])
+    }
+
+
+def build_findings(
+    suspicions: list[dict[str, Any]],
+    finding_gate: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    gates = gate_index(finding_gate)
+    return [
+        {
+            "id": item["id"],
+            "classification": item["final_classification"],
+            "entrypoint": item["entrypoint"],
+            "title": item["hypothesis"],
+            "severity": item.get("severity", "needs-triage"),
+            "source_refs": item["source_refs"],
+            "gate_status": gates.get(item["id"], {}).get("gate_status"),
+        }
+        for item in suspicions
+        if item["final_classification"] == "valid-finding"
+        and gates.get(item["id"], {}).get("gate_status") == "passed"
+    ]
+
+
+def build_hardening_notes(
+    suspicions: list[dict[str, Any]],
+    finding_gate: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    gates = gate_index(finding_gate)
+    notes = []
+    for item in suspicions:
+        gate = gates.get(item["id"], {})
+        if item.get("final_classification") != "hardening-note":
+            continue
+        if gate.get("gate_status") != "accepted-hardening-note":
+            continue
+        notes.append(
+            {
+                "id": item["id"],
+                "classification": item["final_classification"],
+                "entrypoint": item["entrypoint"],
+                "title": item["hypothesis"],
+                "severity": "informational",
+                "blackbox_evidence_count": len(item.get("blackbox_evidence", [])),
+                "source_refs": item.get("source_refs", []),
+                "gate_status": gate.get("gate_status"),
+            }
+        )
+    return notes
+
+
+def build_adjudication(
+    suspicions: list[dict[str, Any]],
+    finding_gate: dict[str, Any] | None,
+    findings: list[dict[str, Any]],
+    hardening_notes: list[dict[str, Any]],
+    evidence_gaps: dict[str, Any] | None,
+    blackbox_coverage: dict[str, Any] | None,
+    environment_readiness: dict[str, Any] | None,
+    evidence_chain: dict[str, Any] | None,
+) -> dict[str, Any]:
+    gates = (finding_gate or {}).get("gates", [])
+    suspicion_by_id = {item.get("id"): item for item in suspicions}
+    blocked_gates = [item for item in gates if item.get("gate_status") == "blocked"]
+    manual_review_gates = [item for item in gates if item.get("gate_status") == "manual-review"]
+    accepted_hardening = [
+        item for item in gates if item.get("gate_status") == "accepted-hardening-note"
+    ]
+    external_blockers = list((blackbox_coverage or {}).get("external_blockers", []))
+    readiness_status = (environment_readiness or {}).get("status")
+    if readiness_status and readiness_status != "ready" and not external_blockers:
+        external_blockers.append(
+            {
+                "id": "environment-readiness",
+                "status": readiness_status,
+                "next_steps": (environment_readiness or {}).get("next_steps", []),
+            }
+        )
+    gap_ids = [gap.get("id") for gap in (evidence_gaps or {}).get("gaps", [])]
+
+    decisions = []
+    for gate in gates:
+        suspicion = suspicion_by_id.get(gate.get("suspicion_id"), {})
+        classification = gate.get("classification")
+        gate_status = gate.get("gate_status")
+        if classification == "valid-finding" and gate_status == "passed":
+            bucket = "findings"
+        elif classification == "hardening-note" and gate_status == "accepted-hardening-note":
+            bucket = "hardening-notes"
+        elif gate_status == "manual-review":
+            bucket = "manual-review"
+        elif gate_status == "blocked":
+            bucket = "blocked"
+        else:
+            bucket = "not-reportable"
+        decisions.append(
+            {
+                "suspicion_id": gate.get("suspicion_id"),
+                "entrypoint": gate.get("entrypoint"),
+                "classification": classification,
+                "gate_status": gate_status,
+                "report_bucket": bucket,
+                "title": suspicion.get("hypothesis"),
+                "checks": gate.get("checks", []),
+            }
+        )
+
+    if findings:
+        status = "reportable-findings"
+    elif manual_review_gates:
+        status = "manual-review"
+    elif blocked_gates:
+        status = "blocked"
+    elif hardening_notes:
+        status = "hardening-notes-only"
+    elif external_blockers:
+        status = "no-reportable-findings-with-external-blocker"
+    else:
+        status = "no-reportable-findings"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "policy": [
+            "findings.json contains only valid-finding entries whose finding gate passed.",
+            "hardening-notes.json contains accepted hardening-note entries and must not be reported as exploitable vulnerabilities.",
+            "external blockers are not findings; they are prerequisites for collecting stronger evidence.",
+        ],
+        "summary": {
+            "suspicions": len(suspicions),
+            "reportable_findings": len(findings),
+            "accepted_hardening_notes": len(hardening_notes),
+            "manual_review": len(manual_review_gates),
+            "blocked": len(blocked_gates),
+            "evidence_gaps": gap_ids,
+            "external_blockers": [item.get("id") for item in external_blockers],
+            "coverage": (blackbox_coverage or {}).get("status"),
+            "readiness": readiness_status,
+            "evidence_chain": (evidence_chain or {}).get("status"),
+        },
+        "decisions": decisions,
+        "external_blockers": external_blockers,
+        "artifact_policy": {
+            "findings": "findings.json",
+            "hardening_notes": "hardening-notes.json",
+            "finding_gate": "finding-gate.json",
+            "evidence_chain": "evidence-chain.json",
+            "coverage": "blackbox-coverage.json",
+        },
+        "safety": "Adjudication reads existing artifacts only; it does not run probes, sign wallets, or submit transactions.",
+    }
+
+
+def compact_probe_evidence(row: dict[str, Any]) -> dict[str, Any]:
+    response_sample = row.get("body_sample")
+    return {
+        "evidence_id": f"PROBE-{row.get('probe_id', 'unknown')}",
+        "artifact": "probe-results.jsonl",
+        "ts": row.get("ts"),
+        "phase": row.get("phase", "probe"),
+        "probe_id": row.get("probe_id"),
+        "label": row.get("label"),
+        "method": row.get("method"),
+        "path": row.get("path"),
+        "request": row.get(
+            "request",
+            {
+                "method": row.get("method"),
+                "path": row.get("path"),
+                "headers": {
+                    key: value
+                    for key, value in {
+                        "Origin": row.get("origin"),
+                        "Referer": row.get("referer"),
+                    }.items()
+                    if value
+                },
+                "body_sha256": None,
+                "body_length": None,
+                "body_sample": None,
+            },
+        ),
+        "response": {
+            "status": row.get("status"),
+            "expected_statuses": row.get("expected_statuses", []),
+            "expected": row.get("expected"),
+            "expectation": row.get("expectation"),
+            "expectation_result": row.get("expectation_result"),
+            "duration_ms": row.get("duration_ms"),
+            "error": row.get("error"),
+            "body_sha256": row.get("body_sha256"),
+            "body_length": row.get("body_length"),
+            "body_truncated": row.get("body_truncated"),
+            "body_sample": redact_text(response_sample, max_chars=500),
+        },
+        "classification": {
+            "cluster_id": row.get("category"),
+            "policy_field": row.get("policy_field"),
+            "risk": row.get("risk"),
+            "external": row.get("external"),
+            "interesting": row.get("interesting"),
+        },
+        "retry": {
+            "attempt_count": row.get("attempt_count", 1),
+            "retry_reason": row.get("retry_reason"),
+            "first_attempt": row.get("first_attempt"),
+        },
+    }
+
+
+def compact_burp_evidence(row: dict[str, Any], index: int) -> dict[str, Any]:
+    return {
+        "evidence_id": f"BURP-{index:03d}",
+        "artifact": "burp-history-observations.jsonl",
+        "ts": row.get("ts"),
+        "source": row.get("source"),
+        "method": row.get("method"),
+        "path": row.get("path"),
+        "host": row.get("host"),
+        "status": row.get("status"),
+        "content_type": row.get("content_type"),
+        "request_user_agent": row.get("request_user_agent"),
+        "response_sample": redact_text(row.get("response_sample"), max_chars=500),
+        "notes": row.get("notes"),
+    }
+
+
+def select_representative_probe_rows(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    def add(row: dict[str, Any]) -> None:
+        probe_id = str(row.get("probe_id"))
+        if probe_id in seen_ids or len(selected) >= limit:
+            return
+        seen_ids.add(probe_id)
+        selected.append(row)
+
+    for row in rows:
+        if not row.get("expected") or row.get("interesting"):
+            add(row)
+
+    by_policy_field: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        policy_field = row.get("policy_field")
+        if policy_field and str(policy_field) not in by_policy_field:
+            by_policy_field[str(policy_field)] = row
+    for row in by_policy_field.values():
+        add(row)
+
+    for row in rows:
+        add(row)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def count_values(values: list[Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        key = "null" if value is None else str(value)
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: item[0]))
+
+
+def response_shape_signature(row: dict[str, Any]) -> str:
+    body_sample = row.get("body_sample")
+    if body_sample is None:
+        return "body:missing"
+    text = str(body_sample)
+    if not text:
+        return "body:empty"
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        normalized = re.sub(r"\s+", " ", text.strip())[:80]
+        return f"text:{normalized}"
+    if isinstance(parsed, dict):
+        keys = ",".join(sorted(str(key) for key in parsed.keys())[:16])
+        return f"json-object:{keys}"
+    if isinstance(parsed, list):
+        item_types = ",".join(sorted({type(item).__name__ for item in parsed[:16]}))
+        return f"json-array:{len(parsed)}:{item_types}"
+    return f"json-{type(parsed).__name__}"
+
+
+def body_length_range(rows: list[dict[str, Any]]) -> dict[str, int | None]:
+    lengths = [
+        int(row.get("body_length"))
+        for row in rows
+        if isinstance(row.get("body_length"), int)
+    ]
+    if not lengths:
+        return {"min": None, "max": None}
+    return {"min": min(lengths), "max": max(lengths)}
+
+
+def response_delta_flags(rows: list[dict[str, Any]]) -> list[str]:
+    statuses = {row.get("status") for row in rows}
+    hashes = {row.get("body_sha256") for row in rows if row.get("body_sha256")}
+    shapes = {response_shape_signature(row) for row in rows}
+    expectation_results = {row.get("expectation_result") for row in rows if row.get("expectation_result")}
+    flags = []
+    if len(statuses) > 1:
+        flags.append("status-variant")
+    if len(hashes) > 1:
+        flags.append("body-hash-variant")
+    if len(shapes) > 1:
+        flags.append("body-shape-variant")
+    if len(expectation_results) > 1:
+        flags.append("expectation-variant")
+    if any(not row.get("expected") for row in rows):
+        flags.append("unexpected-response")
+    if any(row.get("interesting") for row in rows):
+        flags.append("interesting-response")
+    if any(row.get("error") and not row.get("expected") for row in rows):
+        flags.append("transport-error")
+    elif any(row.get("error") for row in rows):
+        flags.append("expected-error-signal")
+    if any(int(row.get("attempt_count") or 1) > 1 for row in rows):
+        flags.append("retry-used")
+    if any(row.get("body_truncated") for row in rows):
+        flags.append("truncated-response")
+    return flags
+
+
+def response_delta_status(flags: list[str]) -> str:
+    if any(flag in flags for flag in ["unexpected-response", "transport-error"]):
+        return "review-needed"
+    if any(flag in flags for flag in ["interesting-response", "retry-used", "truncated-response"]):
+        return "interesting"
+    if flags:
+        return "expected-deltas"
+    return "stable"
+
+
+def summarize_response_delta_group(rows: list[dict[str, Any]], *, group_id: str) -> dict[str, Any]:
+    flags = response_delta_flags(rows)
+    policy_fields = sorted({str(row.get("policy_field")) for row in rows if row.get("policy_field")})
+    risks = sorted({str(row.get("risk")) for row in rows if row.get("risk")})
+    representatives = [
+        compact_probe_evidence(row)
+        for row in select_representative_probe_rows(rows, limit=5)
+    ]
+    return {
+        "id": group_id,
+        "status": response_delta_status(flags),
+        "delta_flags": flags,
+        "probe_count": len(rows),
+        "unexpected_count": sum(1 for row in rows if not row.get("expected")),
+        "interesting_count": sum(1 for row in rows if row.get("interesting")),
+        "error_count": sum(1 for row in rows if row.get("error")),
+        "retry_count": sum(1 for row in rows if int(row.get("attempt_count") or 1) > 1),
+        "status_counts": count_values([row.get("status") for row in rows]),
+        "expectation_result_counts": count_values([row.get("expectation_result") for row in rows if row.get("expectation_result")]),
+        "body_hash_count": len({row.get("body_sha256") for row in rows if row.get("body_sha256")}),
+        "body_shape_counts": count_values([response_shape_signature(row) for row in rows]),
+        "body_length_range": body_length_range(rows),
+        "policy_fields": policy_fields,
+        "risks": risks,
+        "representative_probe_evidence": representatives,
+    }
+
+
+def build_response_delta_analysis(
+    clusters: dict[str, Any],
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    cluster_docs = {
+        str(cluster.get("id")): cluster
+        for cluster in clusters.get("clusters", []) or []
+        if cluster.get("id")
+    }
+    rows_by_cluster: dict[str, list[dict[str, Any]]] = {}
+    for row in results:
+        rows_by_cluster.setdefault(str(row.get("category") or "unknown"), []).append(row)
+
+    cluster_summaries = []
+    total_endpoint_groups = 0
+    review_needed = 0
+    interesting = 0
+    expected_delta_groups = 0
+    stable_groups = 0
+
+    for cluster_id in sorted(rows_by_cluster):
+        rows = rows_by_cluster[cluster_id]
+        endpoint_groups: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            endpoint_key = endpoint_request_key(str(row.get("method") or ""), str(row.get("path") or ""))
+            endpoint_groups.setdefault(endpoint_key, []).append(row)
+        endpoints = []
+        for endpoint_key, endpoint_rows in sorted(endpoint_groups.items()):
+            endpoint_summary = summarize_response_delta_group(
+                endpoint_rows,
+                group_id=f"DELTA-endpoint-{safe_probe_id(cluster_id + '-' + endpoint_key)}",
+            )
+            endpoint_summary["endpoint"] = endpoint_key
+            endpoints.append(endpoint_summary)
+            total_endpoint_groups += 1
+            if endpoint_summary["status"] == "review-needed":
+                review_needed += 1
+            elif endpoint_summary["status"] == "interesting":
+                interesting += 1
+            elif endpoint_summary["status"] == "expected-deltas":
+                expected_delta_groups += 1
+            else:
+                stable_groups += 1
+
+        cluster_summary = summarize_response_delta_group(
+            rows,
+            group_id=f"DELTA-cluster-{safe_probe_id(cluster_id)}",
+        )
+        cluster_doc = cluster_docs.get(cluster_id, {})
+        cluster_summary.update(
+            {
+                "cluster_id": cluster_id,
+                "kind": cluster_doc.get("kind"),
+                "priority": cluster_doc.get("priority"),
+                "strategy_set": cluster_doc.get("strategy_set"),
+                "endpoint_count": len(endpoints),
+                "endpoints": endpoints,
+            }
+        )
+        cluster_summaries.append(cluster_summary)
+
+    unexpected_rows = sum(1 for row in results if not row.get("expected"))
+    if not results:
+        status = "no-probe-results"
+    elif review_needed:
+        status = "review-needed"
+    elif interesting:
+        status = "interesting-deltas"
+    elif expected_delta_groups:
+        status = "expected-deltas-indexed"
+    else:
+        status = "stable"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "methodology": "Read-only response delta analysis over probe-results.jsonl. Deltas are evidence indexes, not findings; unexpected or transport-error deltas still require the finding gate.",
+        "summary": {
+            "probe_rows": len(results),
+            "clusters": len(cluster_summaries),
+            "endpoint_groups": total_endpoint_groups,
+            "unexpected_probe_rows": unexpected_rows,
+            "review_needed_groups": review_needed,
+            "interesting_groups": interesting,
+            "expected_delta_groups": expected_delta_groups,
+            "stable_groups": stable_groups,
+        },
+        "clusters": cluster_summaries,
+        "artifact_refs": {
+            "probe_results": "probe-results.jsonl",
+            "endpoint_clusters": "endpoint-clusters.json",
+            "evidence_appendix": "evidence-appendix.json",
+            "suspicions": "suspicions.json",
+        },
+        "safety": "Read-only evidence analysis. It does not send HTTP requests, fuzz, sign wallets, submit transactions, or invoke Server Actions.",
+    }
+
+
+def build_evidence_appendix(
+    clusters: dict[str, Any],
+    results: list[dict[str, Any]],
+    burp_history: list[dict[str, Any]],
+    burp_observation_run: dict[str, Any] | None,
+    blackbox_coverage: dict[str, Any] | None,
+    evidence_chain: dict[str, Any] | None,
+    adjudication: dict[str, Any] | None,
+    environment_readiness: dict[str, Any] | None,
+    *,
+    examples_per_cluster: int = 8,
+) -> dict[str, Any]:
+    rows_by_cluster: dict[str, list[dict[str, Any]]] = {}
+    for row in results:
+        rows_by_cluster.setdefault(str(row.get("category", "unknown")), []).append(row)
+
+    burp_by_cluster: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for index, row in enumerate(burp_history, 1):
+        for cluster_id in classify_endpoint(str(row.get("method", "")), str(row.get("path", "")), clusters):
+            burp_by_cluster.setdefault(cluster_id, []).append((index, row))
+
+    coverage_by_cluster = {
+        item.get("cluster_id"): item
+        for item in (blackbox_coverage or {}).get("cluster_coverage", [])
+    }
+    observation_clusters = set((burp_observation_run or {}).get("summary", {}).get("clusters", []))
+    cluster_docs = []
+    total_probe_examples = 0
+    total_burp_examples = 0
+
+    for cluster in clusters.get("clusters", []):
+        cluster_id = cluster["id"]
+        probe_rows = rows_by_cluster.get(cluster_id, [])
+        selected_probes = select_representative_probe_rows(probe_rows, examples_per_cluster)
+        burp_rows = burp_by_cluster.get(cluster_id, [])
+        total_probe_examples += len(selected_probes)
+        total_burp_examples += len(burp_rows)
+        cluster_docs.append(
+            {
+                "cluster_id": cluster_id,
+                "kind": cluster.get("kind"),
+                "priority": cluster.get("priority"),
+                "source_refs": cluster.get("source_refs", []),
+                "coverage_status": (coverage_by_cluster.get(cluster_id) or {}).get("status"),
+                "coverage_checks": (coverage_by_cluster.get(cluster_id) or {}).get("checks", []),
+                "burp_observe_flow_generated": cluster_id in observation_clusters,
+                "burp_evidence": [
+                    compact_burp_evidence(row, index)
+                    for index, row in burp_rows
+                ],
+                "probe_summary": {
+                    "total": len(probe_rows),
+                    "expected": sum(1 for row in probe_rows if row.get("expected")),
+                    "unexpected": sum(1 for row in probe_rows if not row.get("expected")),
+                    "policy_fields": sorted(
+                        {
+                            str(row.get("policy_field"))
+                            for row in probe_rows
+                            if row.get("policy_field") is not None
+                        }
+                    ),
+                },
+                "representative_probe_evidence": [
+                    compact_probe_evidence(row)
+                    for row in selected_probes
+                ],
+            }
+        )
+
+    external_blockers = (blackbox_coverage or {}).get("external_blockers", [])
+    unexpected_probes = sum(1 for row in results if not row.get("expected"))
+    if not results and not burp_history:
+        status = "missing-evidence"
+    elif unexpected_probes:
+        status = "indexed-with-unexpected-probes"
+    elif external_blockers:
+        status = "indexed-with-external-blocker"
+    else:
+        status = "indexed"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "purpose": "Compact request/response evidence appendix for reproducing report claims without rerunning probes.",
+        "summary": {
+            "clusters": len(cluster_docs),
+            "probe_rows": len(results),
+            "representative_probe_examples": total_probe_examples,
+            "burp_observations": len(burp_history),
+            "burp_examples": total_burp_examples,
+            "unexpected_probes": unexpected_probes,
+            "coverage": (blackbox_coverage or {}).get("status"),
+            "evidence_chain": (evidence_chain or {}).get("status"),
+            "adjudication": (adjudication or {}).get("status"),
+            "readiness": (environment_readiness or {}).get("status"),
+            "external_blockers": [item.get("id") for item in external_blockers],
+        },
+        "artifact_refs": {
+            "probe_results": "probe-results.jsonl",
+            "response_delta_analysis": "response-delta-analysis.json",
+            "burp_history": "burp-history-observations.jsonl",
+            "burp_observation_run": "burp-observation-run.json",
+            "coverage": "blackbox-coverage.json",
+            "evidence_chain": "evidence-chain.json",
+            "adjudication": "adjudication.json",
+        },
+        "redaction": {
+            "headers": sorted(SENSITIVE_HEADER_NAMES),
+            "text_patterns": "authorization bearer values and common api-key/token/secret/password/cookie assignments",
+        },
+        "clusters": cluster_docs,
+        "safety": "Appendix indexes existing evidence only; it does not run probes, sign wallets, submit transactions, or enumerate upstream resources.",
+    }
+
+
+def curl_command_for_probe(target: str, evidence: dict[str, Any]) -> str | None:
+    method = str(evidence.get("method") or "").upper()
+    if not method or method == "WS":
+        return None
+    request = evidence.get("request", {})
+    path = str(request.get("path") or evidence.get("path") or "/")
+    url = target.rstrip("/") + path
+    parts = ["curl", "-i", "-sS", "-X", method]
+    for key, value in (request.get("headers") or {}).items():
+        if value is None:
+            continue
+        parts.extend(["-H", f"{key}: {value}"])
+    body_sample = request.get("body_sample")
+    if body_sample is not None and not request.get("body_truncated"):
+        parts.extend(["--data-raw", str(body_sample)])
+    return " ".join(shlex.quote(part) for part in parts + [url])
+
+
+def verification_command_prefix(clusters: dict[str, Any], artifact_dir: Path | None) -> str:
+    parts = ["python3", "scripts/inferforge.py"]
+    profile = clusters.get("profile") or {}
+    profile_path = profile.get("profile_path")
+    if profile_path and profile_path != "builtin-default":
+        path = Path(str(profile_path))
+        rendered = repo_relative_or_absolute(path) if path.is_absolute() else str(profile_path)
+        parts.extend(["--profile", rendered])
+    if artifact_dir is not None:
+        parts.extend(["--artifact-dir", repo_relative_or_absolute(artifact_dir)])
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def verification_command(clusters: dict[str, Any], artifact_dir: Path | None, subcommand: str) -> str:
+    return f"{verification_command_prefix(clusters, artifact_dir)} {subcommand}"
+
+
+def verification_artifact_path(artifact_dir: Path | None, name: str) -> str:
+    if artifact_dir is None:
+        return f".greybox/{name}"
+    return repo_relative_or_absolute(artifact_dir / name)
+
+
+def normalize_manual_placeholder_command(command: str) -> str:
+    return (
+        command
+        .replace("<real-wallet>", PLACEHOLDER_REAL_WALLET)
+        .replace("<approved-pool-address>", PLACEHOLDER_APPROVED_POOL_ADDRESS)
+        .replace("<approved-concrete-local-path>", PLACEHOLDER_APPROVED_CONCRETE_PATH)
+    )
+
+
+def classify_verification_command(command: str, *, source: str, item_status: str | None = None) -> dict[str, Any]:
+    normalized = normalize_manual_placeholder_command(str(command))
+    placeholders = [
+        token
+        for token in [
+            PLACEHOLDER_REAL_WALLET,
+            PLACEHOLDER_APPROVED_POOL_ADDRESS,
+            PLACEHOLDER_APPROVED_CONCRETE_PATH,
+        ]
+        if token in normalized
+    ]
+    shell_angle_tokens = [
+        token
+        for token in ["<", ">"]
+        if token in normalized
+    ]
+    unsafe_shell_operators = [
+        token
+        for token in ["&&", "||", ";", "`", "$("]
+        if token in normalized
+    ]
+    issues = []
+    if shell_angle_tokens:
+        issues.append("shell-angle-placeholder-or-redirection")
+    if unsafe_shell_operators:
+        issues.append("shell-control-operator")
+
+    if issues:
+        classification = "unsafe-template"
+        runnable = False
+        requires_manual_input = True
+    elif placeholders:
+        classification = "manual-template"
+        runnable = False
+        requires_manual_input = True
+    elif item_status in {"manual-review", "blocked", "blocked-external"}:
+        classification = "review-gated"
+        runnable = False
+        requires_manual_input = item_status == "manual-review"
+    else:
+        classification = "ready"
+        runnable = True
+        requires_manual_input = False
+
+    return {
+        "command": normalized,
+        "source": source,
+        "classification": classification,
+        "runnable": runnable,
+        "requires_manual_input": requires_manual_input,
+        "blocked_external": item_status == "blocked-external",
+        "placeholders": placeholders,
+        "issues": issues,
+    }
+
+
+def command_safety_summary(command_refs: list[dict[str, Any]]) -> dict[str, Any]:
+    classification_counts: dict[str, int] = {}
+    placeholder_counts: dict[str, int] = {}
+    issue_counts: dict[str, int] = {}
+    runnable_count = 0
+    manual_count = 0
+    blocked_external_count = 0
+    for ref in command_refs:
+        classification = str(ref.get("classification") or "unknown")
+        classification_counts[classification] = classification_counts.get(classification, 0) + 1
+        if ref.get("runnable"):
+            runnable_count += 1
+        if ref.get("requires_manual_input"):
+            manual_count += 1
+        if ref.get("blocked_external"):
+            blocked_external_count += 1
+        for placeholder in ref.get("placeholders", []):
+            placeholder_counts[str(placeholder)] = placeholder_counts.get(str(placeholder), 0) + 1
+        for issue in ref.get("issues", []):
+            issue_counts[str(issue)] = issue_counts.get(str(issue), 0) + 1
+    return {
+        "commands": len(command_refs),
+        "runnable": runnable_count,
+        "requires_manual_input": manual_count,
+        "blocked_external": blocked_external_count,
+        "classification_counts": classification_counts,
+        "placeholder_counts": placeholder_counts,
+        "issue_counts": issue_counts,
+        "unsafe_template_count": classification_counts.get("unsafe-template", 0),
+    }
+
+
+def annotate_verification_queue_commands(items: list[dict[str, Any]]) -> dict[str, Any]:
+    command_refs: list[dict[str, Any]] = []
+    for item in items:
+        item_id = str(item.get("id") or "unknown")
+        item_status = str(item.get("status") or "")
+        item_command_refs = []
+        for index, command in enumerate(item.get("commands", []), start=1):
+            ref = classify_verification_command(
+                str(command),
+                source=f"{item_id}:commands[{index}]",
+                item_status=item_status,
+            )
+            item_command_refs.append(ref)
+            command_refs.append(ref)
+        if item_command_refs:
+            item["command_safety"] = {
+                "summary": command_safety_summary(item_command_refs),
+                "commands": item_command_refs,
+            }
+
+        for candidate in item.get("review_candidates", []) or []:
+            candidate_id = str(candidate.get("id") or "candidate")
+            candidate_refs = []
+            for index, command in enumerate(candidate.get("command_templates", []), start=1):
+                ref = classify_verification_command(
+                    str(command),
+                    source=f"{item_id}:review_candidates:{candidate_id}:command_templates[{index}]",
+                    item_status=item_status,
+                )
+                candidate_refs.append(ref)
+                command_refs.append(ref)
+            if candidate_refs:
+                candidate["command_safety"] = {
+                    "summary": command_safety_summary(candidate_refs),
+                    "commands": candidate_refs,
+                }
+
+    return command_safety_summary(command_refs)
+
+
+def verification_command_for_profile(profile_path: str, artifact_dir: Path | None, subcommand: str) -> str:
+    parts = ["python3", "scripts/inferforge.py", "--profile", profile_path]
+    if artifact_dir is not None:
+        parts.extend(["--artifact-dir", repo_relative_or_absolute(artifact_dir)])
+    return f"{' '.join(shlex.quote(part) for part in parts)} {subcommand}"
+
+
+def review_candidate_command_templates(
+    candidate: dict[str, Any],
+    clusters: dict[str, Any],
+    artifact_dir: Path | None,
+) -> list[str]:
+    if candidate.get("type") != "burp-http-observation":
+        return []
+    candidate_id = str(candidate.get("id") or "")
+    if not candidate_id:
+        return []
+    reviewed_profile = verification_artifact_path(artifact_dir, "reviewed-profile.json")
+    return [
+        cmd
+        for cmd in [
+            verification_command(
+                clusters,
+                artifact_dir,
+                (
+                    "promote-observation-candidate "
+                    f"--candidate-id {shlex.quote(candidate_id)} "
+                    f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH} "
+                    f"--output {shlex.quote(reviewed_profile)}"
+                ),
+            ),
+            verification_command_for_profile(
+                reviewed_profile,
+                artifact_dir,
+                "burp-sync --observe --ws-upgrade --replace --count 80",
+            ),
+            verification_command_for_profile(
+                reviewed_profile,
+                artifact_dir,
+                "audit --include-external --ws-resource-probes",
+            ),
+        ]
+        if cmd
+    ]
+
+
+def contextualize_review_candidates(
+    candidates: list[dict[str, Any]],
+    clusters: dict[str, Any],
+    artifact_dir: Path | None,
+) -> list[dict[str, Any]]:
+    contextualized = []
+    prefix = "python3 scripts/inferforge.py "
+    for candidate in candidates:
+        item = json_clone(candidate)
+        promote_template = item.get("promote_to_burp_observation_plan")
+        if isinstance(promote_template, dict) and isinstance(promote_template.get("path"), str):
+            promote_template["path"] = normalize_manual_placeholder_command(promote_template["path"])
+        raw_templates = item.get("command_templates", [])
+        generated_templates = False
+        if not raw_templates:
+            raw_templates = review_candidate_command_templates(item, clusters, artifact_dir)
+            generated_templates = True
+        templates = []
+        for command in raw_templates:
+            command_text = normalize_manual_placeholder_command(str(command))
+            if not generated_templates and command_text.startswith(prefix):
+                templates.append(verification_command(clusters, artifact_dir, command_text[len(prefix):]))
+            else:
+                templates.append(command_text)
+        if templates:
+            item["command_templates"] = templates
+        contextualized.append(item)
+    return contextualized
+
+
+def build_verification_queue(
+    target: str,
+    clusters: dict[str, Any],
+    evidence_appendix: dict[str, Any] | None,
+    evidence_gaps: dict[str, Any] | None,
+    blackbox_coverage: dict[str, Any] | None,
+    adjudication: dict[str, Any] | None,
+    environment_readiness: dict[str, Any] | None,
+    artifact_dir: Path | None = None,
+) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    cmd = lambda subcommand: verification_command(clusters, artifact_dir, subcommand)
+
+    def add_item(
+        item_id: str,
+        title: str,
+        status: str,
+        priority: str,
+        reason: str,
+        *,
+        commands: list[str] | None = None,
+        evidence_refs: list[str] | None = None,
+        prerequisites: list[str] | None = None,
+        safety: str = "No signing, no transaction submission, and no broad fuzzing.",
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        item = {
+            "id": item_id,
+            "title": title,
+            "status": status,
+            "priority": priority,
+            "reason": reason,
+            "commands": commands or [],
+            "evidence_refs": evidence_refs or [],
+            "prerequisites": prerequisites or [],
+            "safety": safety,
+        }
+        if extra:
+            item.update(extra)
+        items.append(item)
+
+    add_item(
+        "VERIFY-safe-audit-loop",
+        "Rerun the bounded safe audit loop",
+        "ready",
+        "high",
+        "Refreshes probes, source peeks, coverage, adjudication, and reports in one deterministic pass.",
+        commands=[cmd("audit --include-external --ws-resource-probes")],
+        evidence_refs=[
+            "probe-results.jsonl",
+            "blackbox-coverage.json",
+            "evidence-chain.json",
+            "evidence-appendix.json",
+            "adjudication.json",
+        ],
+    )
+    add_item(
+        "VERIFY-reportability-gates",
+        "Recompute reportability gates without probing",
+        "ready",
+        "high",
+        "Verifies that findings and hardening notes are separated from raw observations.",
+        commands=[
+            cmd("gate"),
+            cmd("adjudicate"),
+        ],
+        evidence_refs=["finding-gate.json", "adjudication.json", "findings.json", "hardening-notes.json"],
+    )
+    add_item(
+        "VERIFY-evidence-indexes",
+        "Refresh evidence indexes without probing",
+        "ready",
+        "medium",
+        "Rebuilds the machine-readable evidence chain and compact request/response appendix from current artifacts.",
+        commands=[
+            cmd("response-deltas"),
+            cmd("source-peek-requests"),
+            cmd("evidence-chain"),
+            cmd("evidence-appendix"),
+        ],
+        evidence_refs=[
+            "response-delta-analysis.json",
+            "source-peek-requests.json",
+            "evidence-chain.json",
+            "evidence-appendix.json",
+        ],
+    )
+    add_item(
+        "VERIFY-burp-observation-coverage",
+        "Refresh Burp observation coverage without probing",
+        "ready",
+        "medium",
+        "Rebuilds the per-cluster view of Burp history coverage, generated observe flows, active observation paths, and review-only observation candidates.",
+        commands=[cmd("burp-observation-coverage")],
+        evidence_refs=[
+            "burp-observation-coverage.json",
+            "burp-history-observations.jsonl",
+            "burp-observation-run.json",
+            "evidence-gaps.json",
+        ],
+        safety="Read-only artifact refresh. Use burp-sync --observe separately when observation traffic is needed.",
+    )
+
+    for cluster in (evidence_appendix or {}).get("clusters", []):
+        cluster_id = str(cluster.get("cluster_id", "unknown"))
+        replay_commands = []
+        replay_refs = []
+        for evidence in cluster.get("representative_probe_evidence", [])[:4]:
+            command = curl_command_for_probe(target, evidence)
+            if command:
+                replay_commands.append(command)
+            replay_refs.append(str(evidence.get("evidence_id")))
+        if not replay_commands and cluster_id == "solana-rpc-ws":
+            replay_commands.append(cmd("audit --ws-resource-probes"))
+        add_item(
+            f"REPLAY-{cluster_id}",
+            f"Replay representative evidence for {cluster_id}",
+            "ready" if replay_commands else "manual-review",
+            str(cluster.get("priority") or "medium"),
+            f"Cluster coverage is `{cluster.get('coverage_status')}` with {cluster.get('probe_summary', {}).get('total', 0)} probe rows.",
+            commands=replay_commands,
+            evidence_refs=replay_refs,
+            safety="Representative replay only. Keep request volume low and stay within the configured target.",
+        )
+
+    for gap in (evidence_gaps or {}).get("gaps", []):
+        gap_id = str(gap.get("id"))
+        contextual_candidates = contextualize_review_candidates(
+            gap.get("review_candidates") or [],
+            clusters,
+            artifact_dir,
+        )
+        candidate_commands = [
+            command
+            for candidate in contextual_candidates
+            for command in candidate.get("command_templates", [])
+        ]
+        if gap_id == "GAP-quote-transaction-corpus":
+            prerequisites = (environment_readiness or {}).get("next_steps", [])
+            transaction_payload_path = shlex.quote(verification_artifact_path(artifact_dir, "transaction-payloads.json"))
+            commands = [
+                cmd(f"collect-quote --direction buy --wallet {PLACEHOLDER_REAL_WALLET} --amount-in 1000000"),
+                cmd(f"decode-transactions --input {transaction_payload_path}"),
+                cmd("audit --include-external --ws-resource-probes"),
+            ]
+            status = "blocked-external"
+        elif gap_id == "GAP-orca-real-address-cache-baseline":
+            prerequisites = [str(gap.get("safe_next_step"))]
+            commands = [
+                cmd(f"collect-orca-baseline --address {PLACEHOLDER_APPROVED_POOL_ADDRESS}"),
+                cmd("audit --include-external --ws-resource-probes"),
+            ]
+            status = "manual-review"
+        else:
+            prerequisites = [str(gap.get("safe_next_step"))]
+            commands = candidate_commands
+            status = "manual-review"
+        evidence_refs = ["evidence-gaps.json", "environment-readiness.json"]
+        if any(candidate.get("type") == "server-action-source-review" for candidate in contextual_candidates):
+            evidence_refs.append("source-peek-results.json")
+        extra = {}
+        if contextual_candidates:
+            extra["review_candidates"] = contextual_candidates
+        add_item(
+            f"RESOLVE-{gap_id}",
+            str(gap.get("title") or gap_id),
+            status,
+            str(gap.get("priority") or "medium"),
+            str(gap.get("reason") or gap.get("safe_next_step") or "Evidence gap requires follow-up."),
+            commands=commands,
+            evidence_refs=evidence_refs,
+            prerequisites=prerequisites,
+            safety=str(gap.get("safety_gate") or "Do not escalate without explicit evidence."),
+            extra=extra,
+        )
+
+    for blocker in (adjudication or {}).get("external_blockers", []):
+        add_item(
+            f"BLOCKER-{blocker.get('id', 'external')}",
+            f"External blocker: {blocker.get('id', 'external')}",
+            "blocked-external",
+            "high",
+            f"Current status is `{blocker.get('status')}`.",
+            evidence_refs=["adjudication.json", "environment-readiness.json"],
+            prerequisites=blocker.get("next_steps", []),
+            safety="Configuration follow-up only. Do not print secrets in artifacts or logs.",
+        )
+
+    gate_decisions = (adjudication or {}).get("decisions", [])
+    for decision in gate_decisions:
+        status = "ready"
+        if decision.get("report_bucket") in {"manual-review", "blocked"}:
+            status = str(decision.get("report_bucket"))
+        add_item(
+            f"VERIFY-{decision.get('suspicion_id', 'suspicion')}",
+            f"Verify gated item {decision.get('suspicion_id', 'suspicion')}",
+            status,
+            "high",
+            str(decision.get("title") or "Gated suspicion requires verification."),
+            evidence_refs=["finding-gate.json", "adjudication.json"],
+            safety="Do not report unless the finding gate passes and reproduction evidence is complete.",
+        )
+
+    status_counts: dict[str, int] = {}
+    for item in items:
+        status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
+    if status_counts.get("blocked") or status_counts.get("manual-review"):
+        status = "needs-human-review"
+    elif status_counts.get("blocked-external"):
+        status = "ready-with-external-blockers"
+    else:
+        status = "ready"
+    command_safety = annotate_verification_queue_commands(items)
+    if command_safety.get("unsafe_template_count"):
+        status = "invalid-command-templates"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "summary": {
+            "items": len(items),
+            "status_counts": status_counts,
+            "clusters": len(clusters.get("clusters", [])),
+            "coverage": (blackbox_coverage or {}).get("status"),
+            "adjudication": (adjudication or {}).get("status"),
+            "readiness": (environment_readiness or {}).get("status"),
+            "command_safety": command_safety,
+        },
+        "items": items,
+        "artifact_refs": {
+            "evidence_appendix": "evidence-appendix.json",
+            "evidence_chain": "evidence-chain.json",
+            "adjudication": "adjudication.json",
+            "coverage": "blackbox-coverage.json",
+            "readiness": "environment-readiness.json",
+        },
+        "safety": "Queue generation is read-only. Commands are bounded reproductions and must stay in target scope.",
+    }
+
+
+def write_reproduction_steps(artifact_dir: Path, verification_queue: dict[str, Any]) -> None:
+    command_safety = (verification_queue.get("summary", {}) or {}).get("command_safety", {}) or {}
+    lines = [
+        "# InferForge Reproduction Steps",
+        "",
+        f"Generated: {utc_now()}",
+        "",
+        f"- Target: `{verification_queue.get('target')}`",
+        f"- Queue status: `{verification_queue.get('status')}`",
+        f"- Items: `{verification_queue.get('summary', {}).get('items', 0)}`",
+        f"- Command safety: `{json.dumps(command_safety.get('classification_counts', {}), sort_keys=True)}`",
+        f"- Runnable commands: `{command_safety.get('runnable', 0)}`",
+        f"- Manual-template commands: `{command_safety.get('classification_counts', {}).get('manual-template', 0)}`",
+        f"- Unsafe command templates: `{command_safety.get('unsafe_template_count', 0)}`",
+        "",
+        "## Safety",
+        "",
+        "- Keep Burp Proxy Intercept off for unattended automation.",
+        "- Do not sign wallets or submit Solana transactions from these steps.",
+        "- Keep replay volume low and stay within the configured target.",
+        "- Replace REPLACE_WITH_* placeholders before running any manual-review command.",
+        "",
+        "## Queue",
+        "",
+    ]
+    for item in verification_queue.get("items", []):
+        lines.extend(
+            [
+                f"### {item.get('id')}",
+                "",
+                f"- Status: `{item.get('status')}`",
+                f"- Priority: `{item.get('priority')}`",
+                f"- Title: {item.get('title')}",
+                f"- Reason: {item.get('reason')}",
+            ]
+        )
+        prerequisites = item.get("prerequisites", [])
+        if prerequisites:
+            lines.append("- Prerequisites:")
+            lines.extend(f"  - {entry}" for entry in prerequisites)
+        commands = item.get("commands", [])
+        if commands:
+            command_summary = (item.get("command_safety", {}) or {}).get("summary", {})
+            if command_summary:
+                lines.append(f"- Command safety: `{json.dumps(command_summary.get('classification_counts', {}), sort_keys=True)}`")
+            lines.append("")
+            lines.append("Commands:")
+            lines.append("")
+            lines.append("```bash")
+            lines.extend(commands)
+            lines.append("```")
+        review_candidates = item.get("review_candidates", [])
+        if review_candidates:
+            lines.append("")
+            lines.append("Review candidates:")
+            for candidate in review_candidates:
+                lines.append(f"- `{candidate.get('id')}` ({candidate.get('type')}, {candidate.get('status')})")
+                if candidate.get("source_ref"):
+                    lines.append(f"  - Source: `{candidate.get('source_ref')}`")
+                if candidate.get("action_names"):
+                    lines.append(f"  - Actions: `{', '.join(str(name) for name in candidate.get('action_names', []))}`")
+                if candidate.get("line_refs"):
+                    line_refs = [
+                        f"{key}: {value}"
+                        for key, value in list((candidate.get("line_refs") or {}).items())[:6]
+                    ]
+                    lines.append(f"  - Line refs: `{'; '.join(line_refs)}`")
+                review_questions = candidate.get("review_questions", [])
+                if review_questions:
+                    lines.append("  - Review questions:")
+                    lines.extend(f"    - {entry}" for entry in review_questions)
+                if candidate.get("path_template"):
+                    lines.append(f"  - Path template: `{candidate.get('path_template')}`")
+                if candidate.get("example_path"):
+                    lines.append(f"  - Example path: `{candidate.get('example_path')}`")
+                if candidate.get("command_templates"):
+                    command_summary = (candidate.get("command_safety", {}) or {}).get("summary", {})
+                    if command_summary:
+                        lines.append(f"  - Command safety: `{json.dumps(command_summary.get('classification_counts', {}), sort_keys=True)}`")
+                    lines.append("  - Command templates:")
+                    for command in candidate.get("command_templates", []):
+                        lines.append(f"    - `{command}`")
+                approval_required = candidate.get("approval_required", [])
+                if approval_required:
+                    lines.append("  - Approval required:")
+                    lines.extend(f"    - {entry}" for entry in approval_required)
+        refs = item.get("evidence_refs", [])
+        if refs:
+            lines.append("")
+            lines.append("Evidence refs: " + ", ".join(f"`{ref}`" for ref in refs))
+        lines.extend(["", f"Safety: {item.get('safety')}", ""])
+    (artifact_dir / "reproduction-steps.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def artifact_kind(path: Path) -> str:
+    if path.suffix == ".json":
+        return "json"
+    if path.suffix == ".jsonl":
+        return "jsonl"
+    if path.suffix in {".md", ".markdown"}:
+        return "markdown"
+    if path.suffix == ".html":
+        return "html"
+    if path.suffix == ".txt":
+        return "text"
+    if path.suffix == ".log":
+        return "log"
+    return path.suffix.lstrip(".") or "file"
+
+
+def artifact_link_names(artifact_dir: Path) -> list[str]:
+    existing = {path.name for path in artifact_dir.iterdir() if path.is_file()}
+    always = set(REQUIRED_ARTIFACTS) | {MANIFEST_NAME}
+    names: list[str] = []
+    for name in INDEX_ARTIFACT_ORDER:
+        if name in existing or name in always:
+            if name not in names:
+                names.append(name)
+    for name in sorted(existing - set(names)):
+        names.append(name)
+    return names
+
+
+def json_status_snapshot(data: dict[str, Any]) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+    for key in ["generated_at", "status", "target", "path", "safety"]:
+        if key in data:
+            snapshot[key] = data[key]
+    if "summary" in data and isinstance(data["summary"], dict):
+        snapshot["summary"] = data["summary"]
+    if "diagnosis" in data and isinstance(data["diagnosis"], dict):
+        snapshot["diagnosis"] = {
+            key: data["diagnosis"].get(key)
+            for key in ["classification", "summary", "next_step"]
+            if key in data["diagnosis"]
+        }
+    return snapshot
+
+
+def build_artifact_manifest(
+    artifact_dir: Path,
+    target: str,
+    *,
+    command: str,
+) -> dict[str, Any]:
+    artifact_rows = []
+    status_sources: dict[str, Any] = {}
+    status_source_names = {
+        "blackbox-coverage.json",
+        "burp-observation-coverage.json",
+        "evidence-chain.json",
+        "evidence-appendix.json",
+        "response-delta-analysis.json",
+        "source-peek-requests.json",
+        "verification-queue.json",
+        "adjudication.json",
+        "environment-readiness.json",
+        PROFILE_VALIDATION_ARTIFACT,
+        "discovered-profile-validation.json",
+        "review-observation-candidates.json",
+        "reviewed-profile-validation.json",
+        "reviewed-observation-promotion.json",
+        "profile-routing-selftest.json",
+        "burp-mcp-sync.json",
+        "quote-collection.json",
+        "transaction-intent.json",
+        "transaction-decoder-selftest.json",
+    }
+
+    for path in sorted(artifact_dir.iterdir(), key=lambda item: item.name):
+        if not path.is_file() or path.name == MANIFEST_NAME:
+            continue
+        stat = path.stat()
+        row: dict[str, Any] = {
+            "name": path.name,
+            "kind": artifact_kind(path),
+            "size_bytes": stat.st_size,
+            "sha256": sha256_file(path),
+            "mtime_utc": datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        if path.suffix == ".json":
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as error:
+                row["json_error"] = str(error)
+            else:
+                row.update(
+                    {
+                        "generated_at": data.get("generated_at"),
+                        "status": data.get("status"),
+                    }
+                )
+                if path.name in status_source_names:
+                    status_sources[path.name] = json_status_snapshot(data)
+        elif path.suffix == ".jsonl":
+            lines = path.read_text(encoding="utf-8").splitlines()
+            row["line_count"] = sum(1 for line in lines if line.strip())
+        artifact_rows.append(row)
+
+    names = {row["name"] for row in artifact_rows}
+    missing_required = [name for name in REQUIRED_ARTIFACTS if name not in names]
+    review_artifacts_present = [name for name in REVIEW_ARTIFACTS if name in names]
+    discovery_artifacts_present = [name for name in DISCOVERY_ARTIFACTS if name in names]
+    optional_artifacts_present = [name for name in KNOWN_OPTIONAL_ARTIFACTS if name in names]
+    stale_inputs = []
+    readiness_status = (status_sources.get("environment-readiness.json") or {}).get("status")
+    coverage_status = (status_sources.get("blackbox-coverage.json") or {}).get("status")
+    adjudication_status = (status_sources.get("adjudication.json") or {}).get("status")
+    verification_status = (status_sources.get("verification-queue.json") or {}).get("status")
+    profile_validation_status = (status_sources.get(PROFILE_VALIDATION_ARTIFACT) or {}).get("status")
+    burp_observation_status = (status_sources.get("burp-observation-coverage.json") or {}).get("status")
+    response_delta_status = (status_sources.get("response-delta-analysis.json") or {}).get("status")
+    source_peek_request_status = (status_sources.get("source-peek-requests.json") or {}).get("status")
+    external_blocked = any(
+        status in {"covered-with-external-blocker", "no-reportable-findings-with-external-blocker", "ready-with-external-blockers", "waiting-for-external-configuration"}
+        for status in [coverage_status, adjudication_status, verification_status, readiness_status]
+    )
+    if missing_required:
+        manifest_status = "incomplete"
+    elif profile_validation_status == "failed":
+        manifest_status = "failed-profile-validation"
+    elif external_blocked:
+        manifest_status = "complete-with-external-blocker"
+    else:
+        manifest_status = "complete"
+
+    return {
+        "generated_at": utc_now(),
+        "status": manifest_status,
+        "target": target,
+        "command": command,
+        "artifact_dir": str(artifact_dir),
+        "summary": {
+            "artifact_count": len(artifact_rows),
+            "required_count": len(REQUIRED_ARTIFACTS),
+            "missing_required": missing_required,
+            "stale_inputs": stale_inputs,
+            "coverage": coverage_status,
+            "adjudication": adjudication_status,
+            "verification_queue": verification_status,
+            "readiness": readiness_status,
+            "profile_validation": profile_validation_status,
+            "burp_observation_coverage": burp_observation_status,
+            "response_delta_analysis": response_delta_status,
+            "source_peek_requests": source_peek_request_status,
+            "review_artifacts_present": review_artifacts_present,
+            "discovery_artifacts_present": discovery_artifacts_present,
+            "known_optional_artifacts_present": optional_artifacts_present,
+        },
+        "required_artifacts": REQUIRED_ARTIFACTS,
+        "optional_artifacts": {
+            "review": REVIEW_ARTIFACTS,
+            "discovery": DISCOVERY_ARTIFACTS,
+            "known_optional": KNOWN_OPTIONAL_ARTIFACTS,
+        },
+        "status_sources": status_sources,
+        "artifacts": artifact_rows,
+        "integrity": {
+            "hash_algorithm": "sha256",
+            "self_excluded": MANIFEST_NAME,
+            "note": "Manifest hashes artifacts as they existed when the manifest was generated. Regenerate after changing artifacts.",
+        },
+        "safety": "Manifest generation is read-only except for writing artifact-manifest.json.",
+    }
+
+
+def write_artifact_manifest(artifact_dir: Path, target: str, *, command: str) -> dict[str, Any]:
+    manifest = build_artifact_manifest(artifact_dir, target, command=command)
+    write_json(artifact_dir / MANIFEST_NAME, manifest)
+    return manifest
+
+
+def decode_base64_candidate(value: str) -> bytes | None:
+    normalized = "".join(value.strip().split())
+    if len(normalized) < 80:
+        return None
+    try:
+        padded = normalized + ("=" * ((4 - len(normalized) % 4) % 4))
+        decoded = base64.b64decode(padded, validate=True)
+    except ValueError:
+        return None
+    if len(decoded) < 48:
+        return None
+    return decoded
+
+
+def add_transaction_candidate(
+    candidates: list[dict[str, Any]],
+    seen: set[str],
+    value: str,
+    *,
+    source: str,
+    json_path: str,
+    probe_id: str | None = None,
+) -> None:
+    normalized = "".join(value.strip().split())
+    decoded = decode_base64_candidate(normalized)
+    if decoded is None:
+        return
+
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    if digest in seen:
+        return
+    seen.add(digest)
+    candidates.append(
+        {
+            "id": f"txcand-{digest[:12]}",
+            "source": source,
+            "probe_id": probe_id,
+            "json_path": json_path,
+            "base64": normalized,
+            "base64_length": len(normalized),
+            "base64_sha256": digest,
+            "decoded_byte_length": len(decoded),
+        }
+    )
+
+
+def walk_transaction_json(
+    value: Any,
+    *,
+    source: str,
+    json_path: str,
+    probe_id: str | None,
+    candidates: list[dict[str, Any]],
+    seen: set[str],
+) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{json_path}.{key}" if json_path else str(key)
+            walk_transaction_json(
+                child,
+                source=source,
+                json_path=child_path,
+                probe_id=probe_id,
+                candidates=candidates,
+                seen=seen,
+            )
+        return
+
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            walk_transaction_json(
+                child,
+                source=source,
+                json_path=f"{json_path}[{index}]",
+                probe_id=probe_id,
+                candidates=candidates,
+                seen=seen,
+            )
+        return
+
+    if not isinstance(value, str):
+        return
+
+    path_lower = json_path.lower()
+    if "transaction" in path_lower or decode_base64_candidate(value) is not None:
+        add_transaction_candidate(
+            candidates,
+            seen,
+            value,
+            source=source,
+            json_path=json_path,
+            probe_id=probe_id,
+        )
+
+
+def extract_transaction_candidates_from_text(
+    text: str,
+    *,
+    source: str,
+    probe_id: str | None,
+    candidates: list[dict[str, Any]],
+    seen: set[str],
+) -> None:
+    if not text.strip():
+        return
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if parsed is not None:
+        walk_transaction_json(
+            parsed,
+            source=source,
+            json_path="$",
+            probe_id=probe_id,
+            candidates=candidates,
+            seen=seen,
+        )
+
+    for match in BASE64_CANDIDATE_RE.finditer(text):
+        add_transaction_candidate(
+            candidates,
+            seen,
+            match.group(1),
+            source=source,
+            json_path="$regex",
+            probe_id=probe_id,
+        )
+
+
+def extract_transaction_candidates_from_burp_items(
+    items: list[dict[str, Any]],
+    *,
+    target_netloc: str | None,
+    source: str,
+    quote_path: str = "/api/quote",
+) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    quote_response_count = 0
+
+    for item in items:
+        request = parse_raw_http_request(str(item.get("request") or ""))
+        response = parse_raw_http_response(str(item.get("response") or ""))
+        if target_netloc and request["host"] != target_netloc:
+            continue
+        if request["method"] != "POST" or request["path"].split("?", 1)[0] != quote_path:
+            continue
+
+        quote_response_count += 1
+        extract_transaction_candidates_from_text(
+            response.get("body") or "",
+            source=f"{source}:POST {quote_path}:{response.get('status')}",
+            probe_id=None,
+            candidates=candidates,
+            seen=seen,
+        )
+
+    return {
+        "generated_at": utc_now(),
+        "source": source,
+        "quote_path": quote_path,
+        "quote_response_count": quote_response_count,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "safety": "Extracted from Burp HTTP history only. No wallet signing or transaction submission is performed.",
+    }
+
+
+def merge_transaction_candidate_docs(
+    docs: list[dict[str, Any]],
+    *,
+    source: str,
+) -> dict[str, Any]:
+    seen: set[str] = set()
+    candidates = []
+    quote_response_count = 0
+
+    for doc in docs:
+        quote_response_count += int(doc.get("quote_response_count", 0))
+        for candidate in doc.get("candidates", []):
+            if not isinstance(candidate, dict):
+                continue
+            digest = candidate.get("base64_sha256")
+            if not digest or digest in seen:
+                continue
+            seen.add(str(digest))
+            candidates.append(candidate)
+
+    return {
+        "generated_at": utc_now(),
+        "source": source,
+        "quote_response_count": quote_response_count,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "safety": "Extracted transaction payload candidates only. No wallet signing or transaction submission is performed.",
+    }
+
+
+def ensure_burp_transaction_candidates_artifact(artifact_dir: Path) -> None:
+    path = artifact_dir / "burp-transaction-candidates.json"
+    if path.exists():
+        return
+    write_json(
+        path,
+        {
+            "generated_at": utc_now(),
+            "source": "not-imported",
+            "quote_response_count": 0,
+            "candidate_count": 0,
+            "candidates": [],
+            "safety": "No Burp quote transaction candidates imported yet. No wallet signing or transaction submission is performed.",
+        },
+    )
+
+
+def ensure_initial_audit_artifacts(artifact_dir: Path) -> None:
+    history_path = artifact_dir / "burp-history-observations.jsonl"
+    if not history_path.exists():
+        history_path.write_text("", encoding="utf-8")
+
+    observation_path = artifact_dir / "burp-observation-run.json"
+    if not observation_path.exists():
+        write_json(
+            observation_path,
+            {
+                "generated_at": utc_now(),
+                "status": "not-run",
+                "summary": {
+                    "observations": 0,
+                    "unexpected": 0,
+                    "clusters": [],
+                },
+                "observations": [],
+                "websocket_upgrade": None,
+                "safety": "Placeholder only. Run burp-sync --observe to collect Burp Proxy observations.",
+            },
+        )
+
+    quote_collection_path = artifact_dir / "quote-collection.json"
+    if not quote_collection_path.exists():
+        write_json(
+            quote_collection_path,
+            {
+                "generated_at": utc_now(),
+                "status": "not-collected",
+                "success": False,
+                "diagnosis": {
+                    "classification": "quote-collection-not-run",
+                    "next_step": "Run collect-quote after M0 configuration is ready; decode only, with no signing or Solana submission.",
+                },
+                "safety": "Placeholder only. No quote request was sent and no transaction payload was collected.",
+            },
+        )
+
+
+def collect_transaction_candidates(
+    artifact_dir: Path,
+    results: list[dict[str, Any]],
+    extra_inputs: list[Path] | None = None,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for row in results:
+        if row.get("category") != "quote" and row.get("path") != "/api/quote":
+            continue
+        body_text = row.get("body_text") or row.get("body_sample") or ""
+        extract_transaction_candidates_from_text(
+            body_text,
+            source="probe-results.jsonl",
+            probe_id=row.get("probe_id"),
+            candidates=candidates,
+            seen=seen,
+        )
+
+    sidecars = [
+        artifact_dir / "transaction-payloads.json",
+        artifact_dir / "transaction-payloads.jsonl",
+        artifact_dir / "transaction-payloads.txt",
+        artifact_dir / "burp-transaction-candidates.json",
+    ]
+    if extra_inputs:
+        sidecars.extend(extra_inputs)
+
+    for path in sidecars:
+        if not path.exists() or not path.is_file():
+            continue
+        if path.suffix == ".jsonl":
+            for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+                if not line.strip():
+                    continue
+                extract_transaction_candidates_from_text(
+                    line,
+                    source=f"{path.name}:{index}",
+                    probe_id=None,
+                    candidates=candidates,
+                    seen=seen,
+                )
+        else:
+            extract_transaction_candidates_from_text(
+                read_text(path),
+                source=path.name,
+                probe_id=None,
+                candidates=candidates,
+                seen=seen,
+            )
+
+    return candidates
+
+
+def fallback_decode_transactions(candidates: list[dict[str, Any]], reason: str) -> dict[str, Any]:
+    transactions = []
+    for candidate in candidates:
+        decoded = decode_base64_candidate(candidate["base64"])
+        transactions.append(
+            {
+                "id": candidate["id"],
+                "source": candidate["source"],
+                "probe_id": candidate.get("probe_id"),
+                "json_path": candidate["json_path"],
+                "base64_length": candidate["base64_length"],
+                "base64_sha256": candidate["base64_sha256"],
+                "byte_length": len(decoded) if decoded is not None else None,
+                "decoded": False,
+                "classification": "unknown-versioned-transaction",
+                "warnings": [reason],
+            }
+        )
+
+    return {
+        "decoder": {
+            "mode": "base64-only",
+            "reason": reason,
+        },
+        "transactions": transactions,
+    }
+
+
+def node_decode_transactions(
+    candidates: list[dict[str, Any]],
+    node: str,
+    source_root: Path,
+) -> dict[str, Any]:
+    node_path = Path(node)
+    if not node_path.exists():
+        fallback = command_result(["node", "-v"])
+        if not fallback["ok"]:
+            return fallback_decode_transactions(candidates, f"Node not found at {node}")
+        node = "node"
+
+    script = """
+import fs from 'node:fs'
+import { VersionedTransaction } from '@solana/web3.js'
+
+const input = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))
+
+function compactError(error) {
+  return error && error.message ? error.message : String(error)
+}
+
+function messageKeys(message) {
+  return Array.from(message.staticAccountKeys ?? message.accountKeys ?? []).map((key) => key.toBase58())
+}
+
+function boolFromMessage(message, name, index) {
+  try {
+    return Boolean(message[name](index))
+  } catch {
+    return null
+  }
+}
+
+function instructionAccounts(ix) {
+  return Array.from(ix.accountKeyIndexes ?? ix.accounts ?? [])
+}
+
+const transactions = input.candidates.map((candidate) => {
+  const result = {
+    id: candidate.id,
+    source: candidate.source,
+    probe_id: candidate.probe_id ?? null,
+    json_path: candidate.json_path,
+    base64_length: candidate.base64_length,
+    base64_sha256: candidate.base64_sha256,
+    byte_length: null,
+    decoded: false,
+    classification: 'decode-failed',
+    warnings: [],
+  }
+
+  try {
+    const bytes = Buffer.from(candidate.base64, 'base64')
+    result.byte_length = bytes.length
+    const tx = VersionedTransaction.deserialize(bytes)
+    const message = tx.message
+    const keys = messageKeys(message)
+    result.decoded = true
+    result.classification = 'solana-versioned-transaction'
+    result.version = String(tx.version ?? message.version ?? 'legacy')
+    result.signature_count = tx.signatures.length
+    result.recent_blockhash = message.recentBlockhash
+    result.static_account_keys = keys.map((key, index) => ({
+      index,
+      pubkey: key,
+      signer: boolFromMessage(message, 'isAccountSigner', index),
+      writable: boolFromMessage(message, 'isAccountWritable', index),
+    }))
+    result.compiled_instructions = Array.from(message.compiledInstructions ?? message.instructions ?? []).map((ix, index) => {
+      const accountIndexes = instructionAccounts(ix)
+      const programIdIndex = ix.programIdIndex
+      return {
+        index,
+        program_id_index: programIdIndex,
+        program_id: keys[programIdIndex] ?? null,
+        account_indexes: accountIndexes,
+        account_keys: accountIndexes.map((accountIndex) => keys[accountIndex] ?? null),
+        data_length: ix.data ? ix.data.length : 0,
+      }
+    })
+    result.address_table_lookups = Array.from(message.addressTableLookups ?? []).map((lookup, index) => ({
+      index,
+      account_key: lookup.accountKey?.toBase58 ? lookup.accountKey.toBase58() : String(lookup.accountKey),
+      writable_indexes: Array.from(lookup.writableIndexes ?? []),
+      readonly_indexes: Array.from(lookup.readonlyIndexes ?? []),
+    }))
+  } catch (error) {
+    result.warnings.push(compactError(error))
+  }
+
+  return result
+})
+
+console.log(JSON.stringify({
+  decoder: {
+    mode: 'solana-web3.js',
+    node: process.version,
+    package: '@solana/web3.js',
+  },
+  transactions,
+}, null, 2))
+"""
+
+    if not source_root.is_dir():
+        return fallback_decode_transactions(candidates, f"Source root not found: {source_root}")
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        suffix=".json",
+        prefix=".inferforge-tx-input-",
+        dir=str(source_root),
+        delete=False,
+        encoding="utf-8",
+    ) as input_handle:
+        json.dump({"candidates": candidates}, input_handle)
+        input_path = input_handle.name
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        suffix=".mjs",
+        prefix=".inferforge-tx-decode-",
+        dir=str(source_root),
+        delete=False,
+        encoding="utf-8",
+    ) as script_handle:
+        script_handle.write(script)
+        script_path = script_handle.name
+
+    try:
+        proc = subprocess.run(
+            [node, script_path, input_path],
+            cwd=str(source_root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+            check=False,
+        )
+    finally:
+        Path(input_path).unlink(missing_ok=True)
+        Path(script_path).unlink(missing_ok=True)
+
+    if proc.returncode != 0:
+        return fallback_decode_transactions(
+            candidates,
+            f"solana-web3.js decoder failed: {proc.stdout[-1000:]}",
+        )
+
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return fallback_decode_transactions(
+            candidates,
+            f"solana-web3.js decoder returned non-JSON output: {proc.stdout[-1000:]}",
+        )
+
+
+def expected_mints_for_direction(direction: str) -> tuple[str, str] | None:
+    if direction == "buy":
+        return USDC_MINT, USDTEL_MINT
+    if direction == "sell":
+        return USDTEL_MINT, USDC_MINT
+    return None
+
+
+def normalize_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def normalize_transaction_intent_policy(raw: dict[str, Any]) -> dict[str, Any]:
+    direction = raw.get("direction")
+    wallet = raw.get("wallet") or raw.get("walletAddress") or raw.get("sender")
+    amount_in = raw.get("amountIn") or raw.get("amount_in")
+    source_mint = raw.get("sourceMint") or raw.get("source_mint")
+    destination_mint = raw.get("destinationMint") or raw.get("destination_mint")
+    allowed_programs = normalize_string_list(raw.get("allowedPrograms") or raw.get("allowed_programs"))
+
+    if isinstance(direction, str):
+        direction = direction.strip().lower()
+    if isinstance(wallet, str):
+        wallet = wallet.strip()
+    if isinstance(amount_in, str):
+        amount_in = amount_in.strip()
+
+    expected = expected_mints_for_direction(direction) if isinstance(direction, str) else None
+    if expected:
+        source_mint = source_mint or expected[0]
+        destination_mint = destination_mint or expected[1]
+
+    policy = {
+        "direction": direction,
+        "wallet": wallet,
+        "amountIn": amount_in,
+        "sourceMint": source_mint,
+        "destinationMint": destination_mint,
+        "allowedPrograms": allowed_programs,
+    }
+    issues = []
+    if direction not in {"buy", "sell"}:
+        issues.append("direction must be buy or sell")
+    if not isinstance(wallet, str) or not wallet:
+        issues.append("wallet must be provided")
+    if amount_in is not None and (not isinstance(amount_in, str) or not re.fullmatch(r"[1-9]\d*", amount_in)):
+        issues.append("amountIn must be a positive integer string when provided")
+    if not isinstance(source_mint, str) or not source_mint:
+        issues.append("sourceMint must be provided or derivable from direction")
+    if not isinstance(destination_mint, str) or not destination_mint:
+        issues.append("destinationMint must be provided or derivable from direction")
+    if raw.get("allowedPrograms") is not None and not allowed_programs:
+        issues.append("allowedPrograms must be a non-empty string or array when provided")
+
+    return {
+        "configured": True,
+        "valid": not issues,
+        "issues": issues,
+        **policy,
+    }
+
+
+def load_transaction_intent_policy(
+    artifact_dir: Path,
+    *,
+    policy_path: Path | None = None,
+    direction: str | None = None,
+    wallet: str | None = None,
+    amount_in: str | None = None,
+    allowed_programs: list[str] | None = None,
+) -> dict[str, Any]:
+    raw: dict[str, Any] = {}
+    sources = []
+
+    sidecar = artifact_dir / "transaction-intent-policy.json"
+    paths = [path for path in [sidecar, policy_path] if path is not None]
+    for path in paths:
+        if path.exists():
+            loaded = json.loads(read_text(path))
+            if not isinstance(loaded, dict):
+                return {
+                    "configured": True,
+                    "valid": False,
+                    "issues": [f"{path} must contain a JSON object"],
+                    "sources": [str(path)],
+                }
+            raw.update(loaded)
+            sources.append(str(path))
+
+    overrides = {
+        "direction": direction,
+        "wallet": wallet,
+        "amountIn": amount_in,
+        "allowedPrograms": allowed_programs,
+    }
+    raw.update({key: value for key, value in overrides.items() if value is not None})
+    if any(value is not None for value in overrides.values()):
+        sources.append("cli-arguments")
+
+    if not raw:
+        return {
+            "configured": False,
+            "valid": False,
+            "issues": ["No transaction intent policy configured."],
+            "sources": [],
+        }
+
+    policy = normalize_transaction_intent_policy(raw)
+    policy["sources"] = sources
+    return policy
+
+
+def transaction_pubkeys(transaction: dict[str, Any]) -> set[str]:
+    keys = {
+        item.get("pubkey")
+        for item in transaction.get("static_account_keys", [])
+        if isinstance(item, dict) and item.get("pubkey")
+    }
+    for lookup in transaction.get("address_table_lookups", []):
+        if isinstance(lookup, dict) and lookup.get("account_key"):
+            keys.add(lookup["account_key"])
+    return {str(key) for key in keys if key}
+
+
+def transaction_signer_keys(transaction: dict[str, Any]) -> set[str]:
+    return {
+        str(item.get("pubkey"))
+        for item in transaction.get("static_account_keys", [])
+        if isinstance(item, dict) and item.get("pubkey") and item.get("signer") is True
+    }
+
+
+def transaction_program_ids(transaction: dict[str, Any]) -> set[str]:
+    return {
+        str(item.get("program_id"))
+        for item in transaction.get("compiled_instructions", [])
+        if isinstance(item, dict) and item.get("program_id")
+    }
+
+
+def make_intent_check(
+    check_id: str,
+    label: str,
+    status: str,
+    evidence: Any = None,
+    severity: str = "required",
+) -> dict[str, Any]:
+    return {
+        "id": check_id,
+        "label": label,
+        "status": status,
+        "severity": severity,
+        "evidence": evidence,
+    }
+
+
+def build_transaction_intent_checks(
+    transactions: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    if not policy.get("configured"):
+        return {
+            "status": "not-configured",
+            "checks": [],
+            "summary": "No transaction intent policy configured.",
+        }
+    if not policy.get("valid"):
+        return {
+            "status": "invalid-policy",
+            "checks": [
+                make_intent_check("policy-valid", "Intent policy is valid", "failed", policy.get("issues", []))
+            ],
+            "summary": "Transaction intent policy is invalid.",
+        }
+    if not transactions:
+        return {
+            "status": "waiting-for-transaction-candidates",
+            "checks": [
+                make_intent_check(
+                    "transaction-candidates-present",
+                    "Transaction payload candidates are present",
+                    "waiting",
+                    "No transaction payload candidates found.",
+                )
+            ],
+            "summary": "Intent policy is configured, but no transaction payloads are available yet.",
+        }
+
+    checks = [
+        make_intent_check(
+            "policy-direction",
+            "Policy direction is supported",
+            "passed",
+            policy.get("direction"),
+        )
+    ]
+
+    for transaction in transactions:
+        tx_id = transaction.get("id", "unknown")
+        if not transaction.get("decoded"):
+            checks.append(
+                make_intent_check(
+                    f"{tx_id}:decoded",
+                    "Transaction decodes successfully",
+                    "failed",
+                    transaction.get("warnings", []),
+                )
+            )
+            continue
+
+        pubkeys = transaction_pubkeys(transaction)
+        signer_keys = transaction_signer_keys(transaction)
+        wallet = policy["wallet"]
+        source_mint = policy["sourceMint"]
+        destination_mint = policy["destinationMint"]
+        allowed_programs = set(policy.get("allowedPrograms", []))
+        program_ids = transaction_program_ids(transaction)
+        unexpected_programs = sorted(program_ids - allowed_programs) if allowed_programs else []
+        has_address_lookups = bool(transaction.get("address_table_lookups"))
+
+        checks.extend(
+            [
+                make_intent_check(
+                    f"{tx_id}:wallet-account",
+                    "Wallet appears in transaction account keys",
+                    "passed" if wallet in pubkeys else "failed",
+                    wallet,
+                ),
+                make_intent_check(
+                    f"{tx_id}:wallet-signer",
+                    "Wallet is marked as a signer",
+                    "passed" if wallet in signer_keys else "failed",
+                    wallet,
+                ),
+                make_intent_check(
+                    f"{tx_id}:source-mint",
+                    "Expected source mint appears in static account keys",
+                    "passed" if source_mint in pubkeys else "review",
+                    source_mint,
+                    severity="review" if has_address_lookups else "required",
+                ),
+                make_intent_check(
+                    f"{tx_id}:destination-mint",
+                    "Expected destination mint appears in static account keys",
+                    "passed" if destination_mint in pubkeys else "review",
+                    destination_mint,
+                    severity="review" if has_address_lookups else "required",
+                ),
+                make_intent_check(
+                    f"{tx_id}:instructions-present",
+                    "Transaction contains compiled instructions",
+                    "passed" if transaction.get("compiled_instructions") else "failed",
+                    len(transaction.get("compiled_instructions", [])),
+                ),
+            ]
+        )
+        if allowed_programs:
+            checks.append(
+                make_intent_check(
+                    f"{tx_id}:program-allowlist",
+                    "Compiled instruction programs are in the configured allowlist",
+                    "passed" if not unexpected_programs else "failed",
+                    {
+                        "allowedPrograms": sorted(allowed_programs),
+                        "programIds": sorted(program_ids),
+                        "unexpectedPrograms": unexpected_programs,
+                    },
+                )
+            )
+
+    required_failures = [
+        check for check in checks if check["status"] == "failed" and check["severity"] == "required"
+    ]
+    review_items = [check for check in checks if check["status"] == "review"]
+    if required_failures:
+        status = "failed"
+    elif review_items:
+        status = "review-required"
+    else:
+        status = "passed"
+
+    return {
+        "status": status,
+        "checks": checks,
+        "summary": f"{len(required_failures)} required failures, {len(review_items)} review items.",
+    }
+
+
+def build_transaction_intent(
+    artifact_dir: Path,
+    results: list[dict[str, Any]],
+    node: str,
+    source_root: Path,
+    extra_inputs: list[Path] | None = None,
+    policy_path: Path | None = None,
+    intent_direction: str | None = None,
+    intent_wallet: str | None = None,
+    intent_amount_in: str | None = None,
+    intent_allowed_programs: list[str] | None = None,
+) -> dict[str, Any]:
+    candidates = collect_transaction_candidates(artifact_dir, results, extra_inputs)
+    summaries = [
+        {key: value for key, value in candidate.items() if key != "base64"}
+        for candidate in candidates
+    ]
+
+    if candidates:
+        decoded = node_decode_transactions(candidates, node, source_root)
+        warnings: list[str] = []
+    else:
+        decoded = {"decoder": {"mode": "none"}, "transactions": []}
+        warnings = [
+            "No transaction payload candidates found in quote probe responses, Burp-derived candidates, or transaction-payloads sidecars."
+        ]
+
+    transactions = decoded.get("transactions", [])
+    decoded_count = sum(1 for item in transactions if item.get("decoded"))
+    policy = load_transaction_intent_policy(
+        artifact_dir,
+        policy_path=policy_path,
+        direction=intent_direction,
+        wallet=intent_wallet,
+        amount_in=intent_amount_in,
+        allowed_programs=intent_allowed_programs,
+    )
+    policy_checks = build_transaction_intent_checks(transactions, policy)
+    return {
+        "generated_at": utc_now(),
+        "purpose": "Decode Solana transaction payloads for intent review only. This artifact never signs or submits transactions.",
+        "candidate_sources": [
+            "quote probe response bodies",
+            "burp-transaction-candidates.json",
+            "transaction-payloads.json",
+            "transaction-payloads.jsonl",
+            "transaction-payloads.txt",
+        ],
+        "candidates_seen": len(candidates),
+        "decoded_transactions": decoded_count,
+        "candidate_summaries": summaries,
+        "decoder": decoded.get("decoder", {}),
+        "intent_policy": policy,
+        "intent_policy_checks": policy_checks,
+        "transactions": transactions,
+        "warnings": warnings,
+    }
+
+
+def generate_synthetic_transaction_payload(
+    node: str,
+    source_root: Path,
+    *,
+    direction: str,
+    wallet: str,
+) -> dict[str, Any]:
+    node_path = Path(node)
+    if not node_path.exists():
+        fallback = command_result(["node", "-v"])
+        if not fallback["ok"]:
+            return {"ok": False, "error": f"Node not found at {node}"}
+        node = "node"
+
+    expected = expected_mints_for_direction(direction)
+    if expected is None:
+        return {"ok": False, "error": "direction must be buy or sell"}
+
+    if not source_root.is_dir():
+        return {"ok": False, "error": f"Source root not found: {source_root}"}
+
+    script = """
+import fs from 'node:fs'
+import {
+  PublicKey,
+  SystemProgram,
+  TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
+} from '@solana/web3.js'
+
+const input = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))
+const wallet = new PublicKey(input.wallet)
+const sourceMint = new PublicKey(input.sourceMint)
+const destinationMint = new PublicKey(input.destinationMint)
+const ix = new TransactionInstruction({
+  programId: SystemProgram.programId,
+  keys: [
+    { pubkey: wallet, isSigner: true, isWritable: true },
+    { pubkey: sourceMint, isSigner: false, isWritable: false },
+    { pubkey: destinationMint, isSigner: false, isWritable: false },
+  ],
+  data: Buffer.from([0]),
+})
+const message = new TransactionMessage({
+  payerKey: wallet,
+  recentBlockhash: '11111111111111111111111111111111',
+  instructions: [ix],
+}).compileToV0Message()
+const tx = new VersionedTransaction(message)
+const base64 = Buffer.from(tx.serialize()).toString('base64')
+console.log(JSON.stringify({
+  base64,
+  sourceMint: sourceMint.toBase58(),
+  destinationMint: destinationMint.toBase58(),
+  wallet: wallet.toBase58(),
+  allowedProgram: SystemProgram.programId.toBase58(),
+}, null, 2))
+"""
+    with tempfile.NamedTemporaryFile(
+        "w",
+        suffix=".json",
+        prefix=".inferforge-tx-selftest-input-",
+        dir=str(source_root),
+        delete=False,
+        encoding="utf-8",
+    ) as input_handle:
+        json.dump({"wallet": wallet, "sourceMint": expected[0], "destinationMint": expected[1]}, input_handle)
+        input_path = input_handle.name
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        suffix=".mjs",
+        prefix=".inferforge-tx-selftest-",
+        dir=str(source_root),
+        delete=False,
+        encoding="utf-8",
+    ) as script_handle:
+        script_handle.write(script)
+        script_path = script_handle.name
+
+    try:
+        proc = subprocess.run(
+            [node, script_path, input_path],
+            cwd=str(source_root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+            check=False,
+        )
+    finally:
+        Path(input_path).unlink(missing_ok=True)
+        Path(script_path).unlink(missing_ok=True)
+
+    if proc.returncode != 0:
+        return {"ok": False, "error": proc.stdout[-1000:]}
+    parsed = parse_json_object(proc.stdout)
+    if not parsed or not isinstance(parsed.get("base64"), str):
+        return {"ok": False, "error": f"unexpected self-test output: {proc.stdout[-1000:]}"}
+    parsed["ok"] = True
+    return parsed
+
+
+def build_transaction_decoder_selftest(
+    artifact_dir: Path,
+    source_root: Path,
+    node: str,
+    *,
+    direction: str,
+    wallet: str,
+    amount_in: str,
+) -> dict[str, Any]:
+    payload = generate_synthetic_transaction_payload(
+        node,
+        source_root,
+        direction=direction,
+        wallet=wallet,
+    )
+    if not payload.get("ok"):
+        return {
+            "generated_at": utc_now(),
+            "status": "failed",
+            "error": payload.get("error"),
+            "safety": "Synthetic transaction generation only. No signing with a real wallet and no Solana submission.",
+        }
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    add_transaction_candidate(
+        candidates,
+        seen,
+        str(payload["base64"]),
+        source="synthetic-transaction-decoder-selftest",
+        json_path="$.payloads[0].data.transaction",
+        probe_id="transaction_decoder_selftest",
+    )
+    decoded = node_decode_transactions(candidates, node, source_root) if candidates else {"transactions": []}
+    transactions = decoded.get("transactions", [])
+    policy = normalize_transaction_intent_policy(
+        {
+            "direction": direction,
+            "wallet": payload["wallet"],
+            "amountIn": amount_in,
+            "sourceMint": payload["sourceMint"],
+            "destinationMint": payload["destinationMint"],
+            "allowedPrograms": [payload["allowedProgram"]],
+        }
+    )
+    policy_checks = build_transaction_intent_checks(transactions, policy)
+    decoded_count = sum(1 for item in transactions if item.get("decoded"))
+    status = "passed" if decoded_count == 1 and policy_checks.get("status") == "passed" else "failed"
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "purpose": "Exercise the transaction candidate extractor, Solana decoder, and intent-policy checks using a local synthetic transaction.",
+        "safety": "Synthetic transaction only. No real quote corpus, no wallet signing, and no Solana submission.",
+        "input_intent": {
+            "direction": direction,
+            "wallet": payload["wallet"],
+            "amountIn": amount_in,
+            "sourceMint": payload["sourceMint"],
+            "destinationMint": payload["destinationMint"],
+            "allowedPrograms": [payload["allowedProgram"]],
+        },
+        "candidate_count": len(candidates),
+        "decoded_transactions": decoded_count,
+        "decoder": decoded.get("decoder", {}),
+        "intent_policy_checks": policy_checks,
+        "transactions": transactions,
+        "note": "This self-test proves decoder mechanics only; it does not satisfy GAP-quote-transaction-corpus.",
+    }
+
+
+def build_finding_gate(
+    suspicions: list[dict[str, Any]],
+    burp_history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    gates = []
+    burp_paths = {row.get("path") for row in burp_history}
+
+    for suspicion in suspicions:
+        evidence = suspicion.get("blackbox_evidence", [])
+        entrypoint_path = suspicion["entrypoint"].split(" ", 1)[-1]
+        has_reproduction = bool(evidence)
+        has_source = bool(suspicion.get("source_refs"))
+        has_burp_context = entrypoint_path in burp_paths
+        classification = suspicion.get("final_classification", "manual-review")
+
+        checks = [
+            {
+                "id": "blackbox-reproduction",
+                "passed": has_reproduction,
+                "evidence": "probe-results.jsonl" if has_reproduction else None,
+            },
+            {
+                "id": "source-context",
+                "passed": has_source,
+                "evidence": suspicion.get("source_refs", []),
+            },
+            {
+                "id": "burp-observation",
+                "passed": has_burp_context,
+                "evidence": "burp-history-observations.jsonl" if has_burp_context else None,
+                "note": "Helpful for black-box-first workflow; not required for a hardening note generated from controlled probes.",
+            },
+            {
+                "id": "attacker-model",
+                "passed": classification == "hardening-note",
+                "evidence": "Implicit unauthenticated client for hardening notes; valid findings require explicit model.",
+            },
+            {
+                "id": "impact",
+                "passed": classification == "hardening-note",
+                "evidence": "Informational/hardening impact only unless additional exploitation evidence is added.",
+            },
+        ]
+
+        if classification == "valid-finding":
+            gate_status = "passed" if all(check["passed"] for check in checks) else "blocked"
+        elif classification == "hardening-note":
+            gate_status = "accepted-hardening-note" if has_reproduction and has_source else "manual-review"
+        else:
+            gate_status = "manual-review"
+
+        gates.append(
+            {
+                "suspicion_id": suspicion["id"],
+                "entrypoint": suspicion["entrypoint"],
+                "classification": classification,
+                "gate_status": gate_status,
+                "checks": checks,
+            }
+        )
+
+    return {
+        "generated_at": utc_now(),
+        "policy": [
+            "valid-finding requires black-box reproduction, source context when needed, explicit attacker model, impact, and counter-evidence review.",
+            "hardening-note may pass with controlled probe reproduction plus source context, but must not be reported as an exploitable vulnerability.",
+        ],
+        "gates": gates,
+    }
+
+
+def build_capabilities(target: str, artifact_dir: Path, profile: dict[str, Any] | None = None) -> dict[str, Any]:
+    codex = command_result(["codex", "mcp", "get", "burp"], timeout=10)
+    script = ROOT / "scripts/check-burp-mcp.sh"
+    script_check = command_result([str(script)], timeout=30) if script.exists() else {"ok": False, "output": "missing"}
+    health_path = probe_target_path(profile, "health", "path", "/health")
+    health = http_request(target, "GET", health_path)
+    health_json = parse_json_object(health.get("body_text") or "")
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    history_status = (
+        "ok_reads_builtin_browser_proxy_history"
+        if burp_history
+        else "not_observed_by_cli_run"
+    )
+
+    return {
+        "generated_at": utc_now(),
+        "target": {
+            "base_url": target,
+            "health_path": health_path,
+            "health_status": health["status"],
+            "reachable": health["status"] == 200,
+            "service": (health_json or {}).get("service"),
+            "m0_key_present": (health_json or {}).get("m0KeyPresent"),
+        },
+        "burp": {
+            "mcp_endpoint": "http://127.0.0.1:9876",
+            "mcp_port_open": socket_open("127.0.0.1", 9876),
+            "proxy_8080_open": socket_open("127.0.0.1", 8080),
+            "proxy_8081_open": socket_open("127.0.0.1", 8081),
+            "codex_mcp_get_burp_ok": codex["ok"],
+            "check_script_ok": script_check["ok"],
+            "approval_sensitive_tools": {
+                "observed_get_proxy_http_history": history_status,
+                "observed_send_http1_request": "ok_after_127.0.0.1_3100_request_approval",
+                "observed_create_repeater_tab": "ok_from_codex_tool_call",
+                "observed_set_proxy_intercept_state": "ok_disabled_for_automation",
+            },
+        },
+        "artifacts": {
+            "directory": str(artifact_dir),
+        },
+    }
+
+
+def build_environment_readiness(
+    target: str,
+    source_root: Path,
+    artifact_dir: Path,
+    *,
+    capabilities: dict[str, Any] | None = None,
+    quote_collection: dict[str, Any] | None = None,
+    transaction_intent: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    env_paths = [source_root / ".env.local", source_root / ".env"]
+    env_values: dict[str, tuple[Path, str]] = {}
+    for path in env_paths:
+        for key, value in parse_dotenv_file(path).items():
+            env_values.setdefault(key, (path, value))
+
+    def env_status(key: str, *, secret: bool) -> dict[str, Any]:
+        item = env_values.get(key)
+        value = item[1] if item else None
+        result = classify_env_value(value, secret=secret)
+        if item:
+            result["source"] = str(item[0].relative_to(ROOT))
+        return result
+
+    quote_diagnosis = (quote_collection or {}).get("diagnosis", {})
+    tx_candidates = int((transaction_intent or {}).get("candidates_seen", 0) or 0)
+    decoded_transactions = int((transaction_intent or {}).get("decoded_transactions", 0) or 0)
+    m0_key = env_status("M0_ORCHESTRATION_API_KEY", secret=True)
+    preview_wallet = env_status("NEXT_PUBLIC_M0_QUOTE_PREVIEW_WALLET", secret=False)
+    target_info = (capabilities or {}).get("target", {})
+
+    checks = [
+        {
+            "id": "target-health",
+            "status": "passed" if target_info.get("reachable") else "failed",
+            "evidence": {
+                "target": target,
+                "health_status": target_info.get("health_status"),
+            },
+        },
+        {
+            "id": "m0-orchestration-key-configured",
+            "status": "passed" if m0_key.get("status") == "configured" else "blocked",
+            "evidence": m0_key,
+        },
+        {
+            "id": "health-reports-m0-key-present",
+            "status": "passed" if target_info.get("m0_key_present") is True else "blocked",
+            "evidence": target_info.get("m0_key_present"),
+        },
+        {
+            "id": "m0-preview-wallet-configured",
+            "status": "passed" if preview_wallet.get("status") == "configured" else "blocked",
+            "evidence": preview_wallet,
+        },
+        {
+            "id": "quote-collection-ready",
+            "status": "passed" if quote_diagnosis.get("classification") == "quote-payload-collected" else "blocked",
+            "evidence": quote_diagnosis or "quote-collection.json not available",
+        },
+        {
+            "id": "transaction-corpus-present",
+            "status": "passed" if tx_candidates > 0 and decoded_transactions > 0 else "blocked",
+            "evidence": {
+                "candidates_seen": tx_candidates,
+                "decoded_transactions": decoded_transactions,
+            },
+        },
+    ]
+    blocked = [check for check in checks if check["status"] == "blocked"]
+    failed = [check for check in checks if check["status"] == "failed"]
+    if failed:
+        status = "failed"
+    elif blocked:
+        status = "waiting-for-external-configuration"
+    else:
+        status = "ready"
+
+    next_steps = []
+    if m0_key.get("status") != "configured":
+        next_steps.append("Set a real M0_ORCHESTRATION_API_KEY and restart the target server.")
+    if preview_wallet.get("status") != "configured":
+        next_steps.append("Set NEXT_PUBLIC_M0_QUOTE_PREVIEW_WALLET to a real Solana wallet address for quote previews.")
+    if quote_diagnosis.get("classification") != "quote-payload-collected":
+        next_steps.append("Rerun collect-quote after M0 configuration is ready; decode only, with no signing or submission.")
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target_info,
+        "source_root": str(source_root),
+        "checks": checks,
+        "next_steps": next_steps,
+        "safety": "Readiness checks do not print secret values and do not sign or submit transactions.",
+    }
+
+
+def display_report_value(value: Any) -> str:
+    if value is None or value == "":
+        return "none"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) if value else "none"
+    return str(value)
+
+
+def source_resolver_condition_counts(endpoint_resolver: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for resolution in endpoint_resolver.get("observed_endpoint_resolution", []) or []:
+        for match in resolution.get("matches", []) or []:
+            status = match.get("condition_status")
+            if status:
+                counts[str(status)] = counts.get(str(status), 0) + 1
+        for policy in resolution.get("route_policy_context", []) or []:
+            status = policy.get("condition_status")
+            if status:
+                counts[str(status)] = counts.get(str(status), 0) + 1
+    return counts
+
+
+def source_resolver_entrypoint_lines(endpoint_resolver: dict[str, Any]) -> list[str]:
+    lines = []
+    entrypoints = endpoint_resolver.get("discovered_entrypoints", []) or []
+    priority_kinds = {"rewrite-proxy", "websocket-json-rpc-proxy", "custom-websocket-upgrade"}
+    selected = [
+        item
+        for item in entrypoints
+        if item.get("kind") in priority_kinds
+        or item.get("source_path")
+        or (item.get("next_config") or {}).get("base_path_applied")
+        or (item.get("next_config") or {}).get("trailing_slash") is not None
+        or ((item.get("next_config") or {}).get("i18n") or {}).get("locale_aware")
+    ]
+    if not selected:
+        selected = entrypoints[:8]
+    for item in selected[:16]:
+        source_path = item.get("source_path") or item.get("path")
+        runtime_path = item.get("path")
+        details = [
+            f"kind `{display_report_value(item.get('kind'))}`",
+            f"strategy `{display_report_value(item.get('strategy_set'))}`",
+        ]
+        rewrite = item.get("rewrite") or {}
+        if rewrite:
+            details.append(f"phase `{display_report_value(rewrite.get('phase'))}`")
+            details.append(f"conditional `{display_report_value(rewrite.get('conditional'))}`")
+        upstreams = item.get("fixed_upstreams") or []
+        if upstreams:
+            details.append(f"upstreams `{display_report_value(upstreams[:3])}`")
+        runtime = item.get("next_config") or {}
+        runtime_reasons = next_runtime_reasons(runtime)
+        if runtime_reasons:
+            details.append(f"runtime `{display_report_value(runtime_reasons)}`")
+        line = (
+            f"- `{display_report_value(item.get('cluster_id'))}` "
+            f"`{display_report_value(source_path)}` -> `{display_report_value(runtime_path)}` "
+            + "; ".join(details)
+        )
+        lines.append(line)
+    if not lines:
+        lines.append("- No source resolver entrypoints are available.")
+    return lines
+
+
+def source_resolver_policy_lines(endpoint_resolver: dict[str, Any]) -> list[str]:
+    lines = []
+    for policy in (endpoint_resolver.get("discovered_route_policies", []) or [])[:16]:
+        route_policy = policy.get("route_policy") or {}
+        policy_type = route_policy.get("type") or policy.get("kind")
+        source_path = policy.get("source_path") or route_policy.get("source_framework_pattern") or policy.get("path")
+        runtime_path = policy.get("path")
+        details = [
+            f"type `{display_report_value(policy_type)}`",
+            f"conditional `{display_report_value(route_policy.get('conditional'))}`",
+        ]
+        if route_policy.get("status_code"):
+            details.append(f"status `{display_report_value(route_policy.get('status_code'))}`")
+        if route_policy.get("header_keys"):
+            details.append(f"headers `{display_report_value(route_policy.get('header_keys'))}`")
+        runtime_reasons = next_runtime_reasons(policy.get("next_config") or {})
+        if runtime_reasons:
+            details.append(f"runtime `{display_report_value(runtime_reasons)}`")
+        lines.append(
+            f"- `{display_report_value(policy.get('id'))}` "
+            f"`{display_report_value(source_path)}` -> `{display_report_value(runtime_path)}` "
+            + "; ".join(details)
+        )
+    if not lines:
+        lines.append("- No `next.config.*` redirect/header route-policy entries were discovered.")
+    return lines
+
+
+def source_resolver_server_action_lines(endpoint_resolver: dict[str, Any]) -> list[str]:
+    lines = []
+    for action in (endpoint_resolver.get("discovered_server_actions", []) or [])[:16]:
+        action_names = action.get("action_names") or []
+        details = [
+            f"scope `{display_report_value(action.get('scope'))}`",
+            f"exports `{display_report_value(action_names[:8])}`",
+            f"directives `{display_report_value(action.get('use_server_directive_count'))}`",
+        ]
+        lines.append(
+            f"- `{display_report_value(action.get('id'))}` "
+            f"`{display_report_value(action.get('source_ref'))}` "
+            + "; ".join(details)
+        )
+    if not lines:
+        lines.append("- No Next.js Server Actions were statically discovered.")
+    return lines
+
+
+def source_resolver_observed_lines(endpoint_resolver: dict[str, Any]) -> list[str]:
+    lines = []
+    for resolution in endpoint_resolver.get("observed_endpoint_resolution", []) or []:
+        endpoint = f"{resolution.get('method')} {resolution.get('path')}"
+        for match in resolution.get("matches", []) or []:
+            reasons = [
+                reason
+                for reason in match.get("match_reasons", [])
+                if str(reason).startswith(("basePath:", "locale-prefix:", "trailingSlash:", "condition-"))
+                or str(reason) in {"conditional-route"}
+            ]
+            interesting = bool(reasons or match.get("condition_status") or match.get("rewrite"))
+            if not interesting:
+                continue
+            source_path = match.get("source_path") or match.get("entrypoint_path")
+            line = (
+                f"- `{endpoint}` -> `{display_report_value(match.get('cluster_id'))}` "
+                f"source `{display_report_value(source_path)}` applicability `{display_report_value(match.get('applicability'))}`"
+            )
+            if match.get("condition_status"):
+                line += f" condition `{display_report_value(match.get('condition_status'))}`"
+            if reasons:
+                line += f" reasons `{display_report_value(reasons)}`"
+            lines.append(line)
+        for policy in resolution.get("route_policy_context", []) or []:
+            route_policy = policy.get("route_policy") or {}
+            line = (
+                f"- `{endpoint}` route-policy `{display_report_value(policy.get('kind'))}` "
+                f"path `{display_report_value(policy.get('path'))}` applicability `{display_report_value(policy.get('applicability'))}`"
+            )
+            if policy.get("condition_status"):
+                line += f" condition `{display_report_value(policy.get('condition_status'))}`"
+            if route_policy.get("header_keys"):
+                line += f" headers `{display_report_value(route_policy.get('header_keys'))}`"
+            if route_policy.get("status_code"):
+                line += f" status `{display_report_value(route_policy.get('status_code'))}`"
+            lines.append(line)
+    if not lines:
+        lines.append("- No observed endpoint runtime rewrites or route-policy condition decisions were recorded.")
+    return lines[:24]
+
+
+def build_source_resolver_report_summary(source_peeks: dict[str, Any] | None) -> dict[str, Any]:
+    endpoint_resolver = (source_peeks or {}).get("endpoint_resolver") or {}
+    inventory_summary = endpoint_resolver.get("inventory_summary") or {}
+    runtime = inventory_summary.get("next_config_runtime") or {}
+    condition_counts = source_resolver_condition_counts(endpoint_resolver)
+    summary_lines = [
+        f"- Resolver status: `{display_report_value(endpoint_resolver.get('status'))}`",
+        (
+            "- Inventory: "
+            f"`{inventory_summary.get('route_count', 0)}` routes, "
+            f"`{inventory_summary.get('rewrite_count', 0)}` rewrites, "
+            f"`{inventory_summary.get('route_policy_count', 0)}` route policies, "
+            f"`{inventory_summary.get('middleware_count', 0)}` middleware/proxy files, "
+            f"`{inventory_summary.get('server_action_file_count', 0)}` Server Action files"
+        ),
+        (
+            "- Next.js runtime: "
+            f"basePath `{display_report_value(runtime.get('base_path'))}`, "
+            f"trailingSlash `{display_report_value(runtime.get('trailing_slash'))}`, "
+            f"i18n `{display_report_value(runtime.get('i18n_configured'))}`, "
+            f"locales `{display_report_value(runtime.get('locale_count'))}`"
+        ),
+        f"- Observed endpoint resolutions: `{len(endpoint_resolver.get('observed_endpoint_resolution', []) or [])}`",
+        f"- Condition decisions: `{json.dumps(condition_counts, sort_keys=True)}`",
+    ]
+    if not endpoint_resolver:
+        summary_lines = ["- Source resolver output is not available yet; run `audit` to write `source-peek-results.json`."]
+    return {
+        "summary_lines": summary_lines,
+        "entrypoint_lines": source_resolver_entrypoint_lines(endpoint_resolver) if endpoint_resolver else ["- No source resolver entrypoints are available."],
+        "policy_lines": source_resolver_policy_lines(endpoint_resolver) if endpoint_resolver else ["- No route-policy context is available."],
+        "server_action_lines": source_resolver_server_action_lines(endpoint_resolver) if endpoint_resolver else ["- No Server Actions context is available."],
+        "observed_lines": source_resolver_observed_lines(endpoint_resolver) if endpoint_resolver else ["- No observed endpoint resolver context is available."],
+        "runtime": runtime,
+        "condition_counts": condition_counts,
+    }
+
+
+def generate_report(
+    artifact_dir: Path,
+    target: str,
+    results: list[dict[str, Any]],
+    suspicions: list[dict[str, Any]],
+    capabilities: dict[str, Any],
+    attack_strategy: dict[str, Any],
+    burp_history: list[dict[str, Any]],
+    finding_gate: dict[str, Any],
+    transaction_intent: dict[str, Any],
+    warmup_results: dict[str, Any] | None = None,
+    evidence_gaps: dict[str, Any] | None = None,
+    rpc_method_policy: dict[str, Any] | None = None,
+    environment_readiness: dict[str, Any] | None = None,
+    transaction_decoder_selftest: dict[str, Any] | None = None,
+    blackbox_coverage: dict[str, Any] | None = None,
+    evidence_chain: dict[str, Any] | None = None,
+    hardening_notes: list[dict[str, Any]] | None = None,
+    adjudication: dict[str, Any] | None = None,
+    evidence_appendix: dict[str, Any] | None = None,
+    verification_queue: dict[str, Any] | None = None,
+    profile: dict[str, Any] | None = None,
+) -> str:
+    profile_name = profile_display_name(profile)
+    report_title = f"InferForge {profile_name} Greybox Run"
+    profile_info = profile_summary(profile)
+    status_lines = [
+        f"- Target profile: `{profile_info.get('display_name') or profile_info.get('name') or 'unknown'}`",
+        f"- Target: `{target}`",
+        f"- Target health status: `{capabilities['target']['health_status']}`",
+        f"- Burp MCP port open: `{capabilities['burp']['mcp_port_open']}`",
+        f"- Burp Proxy 8080 open: `{capabilities['burp']['proxy_8080_open']}`",
+        f"- Burp Proxy 8081 open: `{capabilities['burp']['proxy_8081_open']}`",
+        f"- Codex `burp` MCP registration: `{capabilities['burp']['codex_mcp_get_burp_ok']}`",
+    ]
+    profile_lines = [
+        f"- Profile artifact: `{TARGET_PROFILE_ARTIFACT}`",
+        f"- Strategy registry: `{STRATEGY_REGISTRY_ARTIFACT}`",
+        f"- Profile validation: `{PROFILE_VALIDATION_ARTIFACT}`",
+        f"- Profile path: `{profile_info.get('profile_path', 'unknown')}`",
+        f"- Loaded from: `{profile_info.get('loaded_from', 'unknown')}`",
+        f"- Target type: `{profile_info.get('target_type', 'unknown')}`",
+        f"- Frameworks: `{', '.join(profile_info.get('frameworks', [])) or 'unknown'}`",
+        f"- Enabled strategy sets: `{', '.join(sorted(enabled_strategy_set_ids(profile))) or 'none'}`",
+    ]
+
+    probe_lines = []
+    for row in results:
+        marker = "ok" if row["expected"] else "unexpected"
+        interesting = " interesting" if row["interesting"] else ""
+        expectation = ""
+        if row.get("expectation") != "status":
+            expectation = f", expectation `{row.get('expectation_result')}`"
+        probe_lines.append(
+            f"- `{row['probe_id']}` {row['method']} `{row['path']}` -> `{row['status']}` ({marker}{interesting}{expectation})"
+        )
+
+    suspicion_lines = []
+    if suspicions:
+        for item in suspicions:
+            suspicion_lines.append(
+                f"- `{item['id']}` `{item['entrypoint']}`: {item['hypothesis']} Classification: `{item['final_classification']}`."
+            )
+    else:
+        suspicion_lines.append("- No suspicions generated from this run.")
+
+    strategy_lines = [
+        f"- `{item['id']}`: {item['title']}"
+        for item in attack_strategy["strategies"]
+    ]
+    gate_lines = [
+        f"- `{item['suspicion_id']}` `{item['entrypoint']}` -> `{item['gate_status']}`"
+        for item in finding_gate["gates"]
+    ] or ["- No finding gates generated."]
+    burp_lines = [
+        f"- `{row['method']} {row['path']}` `{row['host']}` -> `{row['status']}` via `{row['source']}`"
+        for row in burp_history
+    ] or ["- No Burp built-in-browser history observations recorded yet."]
+    warmup_rows = (warmup_results or {}).get("results", [])
+    warmup_lines = [
+        (
+            f"- `{row['probe_id']}` {row['method']} `{row['path']}` -> `{row['status']}` "
+            f"({'ok' if row['expected'] else 'unexpected'}, attempts `{row.get('attempt_count', 1)}`)"
+        )
+        for row in warmup_rows
+    ] or ["- No route warm-up results recorded."]
+    transaction_lines = [
+        f"- Candidates seen: `{transaction_intent.get('candidates_seen', 0)}`",
+        f"- Decoded transactions: `{transaction_intent.get('decoded_transactions', 0)}`",
+        f"- Decoder mode: `{transaction_intent.get('decoder', {}).get('mode', 'unknown')}`",
+        f"- Intent policy status: `{transaction_intent.get('intent_policy_checks', {}).get('status', 'unknown')}`",
+        f"- Decoder self-test: `{(transaction_decoder_selftest or {}).get('status', 'not-run')}`",
+        "- Safety: decode only; no wallet signing or transaction submission.",
+    ]
+    for warning in transaction_intent.get("warnings", []):
+        transaction_lines.append(f"- Warning: {warning}")
+    rpc_policy_lines = [
+        f"- Policy posture: `{(rpc_method_policy or {}).get('policy_posture', 'unknown')}`",
+        (
+            "- Default high-impact methods: "
+            f"`{', '.join((rpc_method_policy or {}).get('default_high_impact_methods', [])) or 'none'}`"
+        ),
+        (
+            "- Transaction method gate present: "
+            f"`{(rpc_method_policy or {}).get('explicit_transaction_method_gate_present', 'unknown')}`"
+        ),
+        (
+            "- Transaction method probe results: "
+            f"`{len((rpc_method_policy or {}).get('transaction_probe_results', []))}`"
+        ),
+    ]
+    evidence_gap_lines = [
+        (
+            f"- `{item['id']}` `{item['cluster_id']}` `{item['priority']}`: "
+            f"{item['title']} Safe next step: {item['safe_next_step']}"
+        )
+        for item in (evidence_gaps or {}).get("gaps", [])
+    ] or ["- No evidence gaps recorded."]
+    readiness_lines = [
+        f"- Overall readiness: `{(environment_readiness or {}).get('status', 'unknown')}`",
+    ]
+    for check in (environment_readiness or {}).get("checks", []):
+        readiness_lines.append(f"- `{check['id']}` -> `{check['status']}`")
+    coverage_lines = [
+        f"- Overall coverage: `{(blackbox_coverage or {}).get('status', 'unknown')}`",
+    ]
+    for item in (blackbox_coverage or {}).get("cluster_coverage", []):
+        coverage_lines.append(f"- `{item['cluster_id']}` -> `{item['status']}`")
+    evidence_chain_lines = [
+        f"- Evidence chain status: `{(evidence_chain or {}).get('status', 'unknown')}`",
+        f"- Indexed clusters: `{(evidence_chain or {}).get('summary', {}).get('clusters', 0)}`",
+        f"- Indexed probes: `{(evidence_chain or {}).get('summary', {}).get('probes', 0)}`",
+        f"- Indexed Burp observations: `{(evidence_chain or {}).get('summary', {}).get('burp_observations', 0)}`",
+    ]
+    adjudication_summary = (adjudication or {}).get("summary", {})
+    adjudication_lines = [
+        f"- Overall adjudication: `{(adjudication or {}).get('status', 'unknown')}`",
+        f"- Reportable findings: `{adjudication_summary.get('reportable_findings', 0)}`",
+        f"- Accepted hardening notes: `{adjudication_summary.get('accepted_hardening_notes', 0)}`",
+        f"- Manual review items: `{adjudication_summary.get('manual_review', 0)}`",
+        f"- Blocked gate items: `{adjudication_summary.get('blocked', 0)}`",
+        f"- External blockers: `{len((adjudication or {}).get('external_blockers', []))}`",
+    ]
+    hardening_note_lines = [
+        f"- `{item['id']}` `{item['entrypoint']}`: {item['title']} Gate: `{item['gate_status']}`."
+        for item in (hardening_notes or [])
+    ] or ["- No accepted hardening notes generated."]
+    evidence_appendix_summary = (evidence_appendix or {}).get("summary", {})
+    evidence_appendix_lines = [
+        f"- Appendix status: `{(evidence_appendix or {}).get('status', 'unknown')}`",
+        f"- Probe rows indexed: `{evidence_appendix_summary.get('probe_rows', 0)}`",
+        f"- Representative probe examples: `{evidence_appendix_summary.get('representative_probe_examples', 0)}`",
+        f"- Burp observations indexed: `{evidence_appendix_summary.get('burp_observations', 0)}`",
+        f"- Redaction: `{(evidence_appendix or {}).get('redaction', {}).get('text_patterns', 'unknown')}`",
+    ]
+    verification_summary = (verification_queue or {}).get("summary", {})
+    command_safety_summary_doc = verification_summary.get("command_safety", {}) or {}
+    command_safety_counts = command_safety_summary_doc.get("classification_counts", {}) or {}
+    verification_lines = [
+        f"- Queue status: `{(verification_queue or {}).get('status', 'unknown')}`",
+        f"- Queue items: `{verification_summary.get('items', 0)}`",
+        f"- Status counts: `{json.dumps(verification_summary.get('status_counts', {}), sort_keys=True)}`",
+        f"- Command safety: `{json.dumps(command_safety_counts, sort_keys=True)}`",
+        f"- Runnable commands: `{command_safety_summary_doc.get('runnable', 0)}`",
+        f"- Manual-template commands: `{command_safety_counts.get('manual-template', 0)}`",
+        f"- Unsafe command templates: `{command_safety_summary_doc.get('unsafe_template_count', 0)}`",
+        "- Reproduction steps: `reproduction-steps.md`",
+    ]
+    review_artifact_lines = [
+        f"- `{name}`"
+        for name in [*DISCOVERY_ARTIFACTS, *REVIEW_ARTIFACTS]
+        if (artifact_dir / name).exists()
+    ] or ["- No discovery or review-only observation artifacts are present in this artifact directory yet."]
+    burp_observation_coverage = load_optional_json(artifact_dir / "burp-observation-coverage.json") or {}
+    burp_observation_summary = burp_observation_coverage.get("summary", {}) or {}
+    burp_observation_coverage_lines = [
+        f"- Coverage status: `{burp_observation_coverage.get('status', 'unknown')}`",
+        f"- Clusters: `{burp_observation_summary.get('clusters', 0)}`",
+        f"- Status counts: `{json.dumps(burp_observation_summary.get('status_counts', {}), sort_keys=True)}`",
+        f"- Burp history clusters: `{display_report_value(burp_observation_summary.get('burp_history_observed_clusters', []))}`",
+        f"- Active observation clusters: `{display_report_value(burp_observation_summary.get('active_observation_clusters', []))}`",
+        f"- Review candidate clusters: `{display_report_value(burp_observation_summary.get('review_candidate_clusters', []))}`",
+    ]
+    for item in (burp_observation_coverage.get("clusters", []) or [])[:12]:
+        burp_observation_coverage_lines.append(
+            f"- `{item.get('cluster_id')}` `{item.get('status')}` "
+            f"active `{item.get('active_observation_count')}` review `{item.get('review_candidate_count')}` "
+            f"next: {item.get('next_action')}"
+        )
+    response_delta_analysis = load_optional_json(artifact_dir / "response-delta-analysis.json") or {}
+    response_delta_summary = response_delta_analysis.get("summary", {}) or {}
+    response_delta_lines = [
+        f"- Delta status: `{response_delta_analysis.get('status', 'unknown')}`",
+        f"- Probe rows: `{response_delta_summary.get('probe_rows', 0)}`",
+        f"- Endpoint groups: `{response_delta_summary.get('endpoint_groups', 0)}`",
+        f"- Review-needed groups: `{response_delta_summary.get('review_needed_groups', 0)}`",
+        f"- Interesting groups: `{response_delta_summary.get('interesting_groups', 0)}`",
+        f"- Expected-delta groups: `{response_delta_summary.get('expected_delta_groups', 0)}`",
+    ]
+    for item in (response_delta_analysis.get("clusters", []) or [])[:12]:
+        response_delta_lines.append(
+            f"- `{item.get('cluster_id')}` `{item.get('status')}` "
+            f"probes `{item.get('probe_count')}` endpoints `{item.get('endpoint_count')}` "
+            f"flags `{display_report_value(item.get('delta_flags', []))}`"
+        )
+    source_peek_requests = load_optional_json(artifact_dir / "source-peek-requests.json") or {}
+    source_peek_request_summary = source_peek_requests.get("summary", {}) or {}
+    source_peek_request_lines = [
+        f"- Request status: `{source_peek_requests.get('status', 'unknown')}`",
+        f"- Requests: `{source_peek_request_summary.get('requests', 0)}`",
+        f"- Triggers: `{json.dumps(source_peek_request_summary.get('trigger_counts', {}), sort_keys=True)}`",
+        f"- Status counts: `{json.dumps(source_peek_request_summary.get('status_counts', {}), sort_keys=True)}`",
+    ]
+    for item in (source_peek_requests.get("requests", []) or [])[:10]:
+        source_peek_request_lines.append(
+            f"- `{item.get('id')}` `{item.get('trigger')}` `{item.get('status')}` "
+            f"{display_report_value(item.get('entrypoint'))} refs `{len(item.get('source_refs', []) or [])}`"
+        )
+    source_resolver_summary = build_source_resolver_report_summary(
+        load_optional_json(artifact_dir / "source-peek-results.json")
+    )
+
+    source_summary_lines = []
+    for cluster in (profile or {}).get("clusters", []):
+        refs = ", ".join(f"`{ref}`" for ref in cluster.get("source_refs", [])) or "`none`"
+        source_summary_lines.append(
+            f"- `{cluster.get('id')}` `{cluster.get('kind')}` strategy `{strategy_set_for_cluster(cluster) or 'unassigned'}` source refs: {refs}"
+        )
+    if not source_summary_lines:
+        source_summary_lines.append("- No source references declared by the target profile.")
+
+    report = f"""# {report_title}
+
+Generated: {utc_now()}
+
+## Scope
+
+{chr(10).join(status_lines)}
+
+## Target Profile
+
+{chr(10).join(profile_lines)}
+
+## Artifact Manifest
+
+- Manifest: `artifact-manifest.json`
+- Integrity: SHA256 hashes for generated artifacts, excluding the manifest itself.
+
+## Burp MCP Status
+
+Burp MCP is installed and reachable on `127.0.0.1:9876`. Codex can send approved requests, create Repeater tabs, and read Proxy HTTP history after Burp's built-in browser generates traffic. For automation, Proxy Intercept should stay off unless a human explicitly wants to pause and edit a request.
+
+## Environment Readiness
+
+{chr(10).join(readiness_lines)}
+
+## Black-Box Coverage Gate
+
+{chr(10).join(coverage_lines)}
+
+## Burp Observation Coverage
+
+{chr(10).join(burp_observation_coverage_lines)}
+
+## Response Delta Analysis
+
+{chr(10).join(response_delta_lines)}
+
+## Evidence Chain
+
+{chr(10).join(evidence_chain_lines)}
+
+## Evidence Appendix
+
+{chr(10).join(evidence_appendix_lines)}
+
+## Finding Adjudication
+
+{chr(10).join(adjudication_lines)}
+
+## Verification Queue
+
+{chr(10).join(verification_lines)}
+
+## Discovery And Review Artifacts
+
+{chr(10).join(review_artifact_lines)}
+
+## Source Peek Requests
+
+{chr(10).join(source_peek_request_lines)}
+
+## Source Resolver And Route Policies
+
+### Resolver Summary
+
+{chr(10).join(source_resolver_summary['summary_lines'])}
+
+### Runtime And Rewrite Entry Points
+
+{chr(10).join(source_resolver_summary['entrypoint_lines'])}
+
+### Redirect And Header Policies
+
+{chr(10).join(source_resolver_summary['policy_lines'])}
+
+### Server Actions
+
+{chr(10).join(source_resolver_summary['server_action_lines'])}
+
+### Observed Runtime And Condition Decisions
+
+{chr(10).join(source_resolver_summary['observed_lines'])}
+
+## Burp Browser History
+
+{chr(10).join(burp_lines)}
+
+## Local Route Warmup
+
+{chr(10).join(warmup_lines)}
+
+## Probe Results
+
+{chr(10).join(probe_lines)}
+
+## Suspicions
+
+{chr(10).join(suspicion_lines)}
+
+## Accepted Hardening Notes
+
+{chr(10).join(hardening_note_lines)}
+
+## Finding Gate
+
+{chr(10).join(gate_lines)}
+
+## Transaction Intent Decoder
+
+{chr(10).join(transaction_lines)}
+
+## RPC Method Policy
+
+{chr(10).join(rpc_policy_lines)}
+
+## Evidence Gaps
+
+{chr(10).join(evidence_gap_lines)}
+
+## Attack Strategy
+
+{chr(10).join(strategy_lines)}
+
+## Source Peek Summary
+
+{chr(10).join(source_summary_lines)}
+
+## Next Steps
+
+1. Feed a successful M0 quote response into `transaction-intent.json` so decoded instructions can be checked against wallet, direction, and mint intent.
+2. Add program-specific transaction intent parsers after a real M0 payload corpus is available.
+3. Add manually approved WebSocket pending-queue and connection-limit probes with strict low-volume bounds.
+"""
+    (artifact_dir / "report.md").write_text(report, encoding="utf-8")
+    generate_index_html(
+        artifact_dir,
+        target,
+        results,
+        suspicions,
+        capabilities,
+        transaction_intent,
+        warmup_results,
+        evidence_gaps,
+        rpc_method_policy,
+        environment_readiness,
+        transaction_decoder_selftest,
+        blackbox_coverage,
+        evidence_chain,
+        hardening_notes,
+        adjudication,
+        evidence_appendix,
+        verification_queue,
+        profile,
+    )
+    return report
+
+
+def generate_index_html(
+    artifact_dir: Path,
+    target: str,
+    results: list[dict[str, Any]],
+    suspicions: list[dict[str, Any]],
+    capabilities: dict[str, Any],
+    transaction_intent: dict[str, Any],
+    warmup_results: dict[str, Any] | None = None,
+    evidence_gaps: dict[str, Any] | None = None,
+    rpc_method_policy: dict[str, Any] | None = None,
+    environment_readiness: dict[str, Any] | None = None,
+    transaction_decoder_selftest: dict[str, Any] | None = None,
+    blackbox_coverage: dict[str, Any] | None = None,
+    evidence_chain: dict[str, Any] | None = None,
+    hardening_notes: list[dict[str, Any]] | None = None,
+    adjudication: dict[str, Any] | None = None,
+    evidence_appendix: dict[str, Any] | None = None,
+    verification_queue: dict[str, Any] | None = None,
+    profile: dict[str, Any] | None = None,
+) -> None:
+    def e(value: Any) -> str:
+        return html.escape(str(value))
+
+    rows = []
+    for row in results:
+        state = "ok" if row["expected"] else "unexpected"
+        rows.append(
+            "<tr>"
+            f"<td>{e(row['probe_id'])}</td>"
+            f"<td>{e(row['method'])}</td>"
+            f"<td><code>{e(row['path'])}</code></td>"
+            f"<td>{e(row['status'])}</td>"
+            f"<td class='{state}'>{state}</td>"
+            f"<td>{e(row.get('expectation_result', ''))}</td>"
+            f"<td>{e(row['body_sample'][:120])}</td>"
+            "</tr>"
+        )
+
+    notes = []
+    if suspicions:
+        for item in suspicions:
+            notes.append(
+                "<li>"
+                f"<strong>{e(item['id'])}</strong> "
+                f"<code>{e(item['entrypoint'])}</code> "
+                f"{e(item['hypothesis'])}"
+                "</li>"
+            )
+    else:
+        notes.append("<li>No suspicions generated.</li>")
+
+    warmup_ready = (warmup_results or {}).get("ready", "unknown")
+    warmup_count = len((warmup_results or {}).get("results", []))
+    evidence_gap_count = len((evidence_gaps or {}).get("gaps", []))
+    rpc_policy_posture = (rpc_method_policy or {}).get("policy_posture", "unknown")
+    readiness_status = (environment_readiness or {}).get("status", "unknown")
+    decoder_selftest_status = (transaction_decoder_selftest or {}).get("status", "not-run")
+    blackbox_coverage_status = (blackbox_coverage or {}).get("status", "unknown")
+    evidence_chain_status = (evidence_chain or {}).get("status", "unknown")
+    adjudication_status = (adjudication or {}).get("status", "unknown")
+    reportable_findings = (adjudication or {}).get("summary", {}).get("reportable_findings", 0)
+    hardening_note_count = len(hardening_notes or [])
+    evidence_appendix_status = (evidence_appendix or {}).get("status", "unknown")
+    verification_queue_status = (verification_queue or {}).get("status", "unknown")
+    command_safety_summary_doc = ((verification_queue or {}).get("summary", {}) or {}).get("command_safety", {}) or {}
+    command_safety_counts = command_safety_summary_doc.get("classification_counts", {}) or {}
+    burp_observation_coverage = load_optional_json(artifact_dir / "burp-observation-coverage.json") or {}
+    burp_observation_summary = burp_observation_coverage.get("summary", {}) or {}
+    burp_observation_coverage_status = burp_observation_coverage.get("status", "unknown")
+    burp_observation_coverage_lines = [
+        f"- Status `{burp_observation_coverage_status}`",
+        f"- Clusters `{burp_observation_summary.get('clusters', 0)}`",
+        f"- Status counts `{json.dumps(burp_observation_summary.get('status_counts', {}), sort_keys=True)}`",
+        f"- Burp history clusters `{display_report_value(burp_observation_summary.get('burp_history_observed_clusters', []))}`",
+        f"- Review candidate clusters `{display_report_value(burp_observation_summary.get('review_candidate_clusters', []))}`",
+    ]
+    for item in (burp_observation_coverage.get("clusters", []) or [])[:12]:
+        burp_observation_coverage_lines.append(
+            f"- `{item.get('cluster_id')}` `{item.get('status')}` next: {item.get('next_action')}"
+        )
+    response_delta_analysis = load_optional_json(artifact_dir / "response-delta-analysis.json") or {}
+    response_delta_summary = response_delta_analysis.get("summary", {}) or {}
+    response_delta_status = response_delta_analysis.get("status", "unknown")
+    response_delta_lines = [
+        f"- Status `{response_delta_status}`",
+        f"- Probe rows `{response_delta_summary.get('probe_rows', 0)}`",
+        f"- Endpoint groups `{response_delta_summary.get('endpoint_groups', 0)}`",
+        f"- Review-needed groups `{response_delta_summary.get('review_needed_groups', 0)}`",
+        f"- Interesting groups `{response_delta_summary.get('interesting_groups', 0)}`",
+        f"- Expected-delta groups `{response_delta_summary.get('expected_delta_groups', 0)}`",
+    ]
+    for item in (response_delta_analysis.get("clusters", []) or [])[:12]:
+        response_delta_lines.append(
+            f"- `{item.get('cluster_id')}` `{item.get('status')}` probes `{item.get('probe_count')}` flags `{display_report_value(item.get('delta_flags', []))}`"
+        )
+    source_peek_requests = load_optional_json(artifact_dir / "source-peek-requests.json") or {}
+    source_peek_request_summary = source_peek_requests.get("summary", {}) or {}
+    source_peek_request_status = source_peek_requests.get("status", "unknown")
+    source_peek_request_count = source_peek_request_summary.get("requests", 0)
+    source_peek_request_lines = [
+        f"- Status `{source_peek_request_status}`",
+        f"- Requests `{source_peek_request_count}`",
+        f"- Triggers `{json.dumps(source_peek_request_summary.get('trigger_counts', {}), sort_keys=True)}`",
+        f"- Status counts `{json.dumps(source_peek_request_summary.get('status_counts', {}), sort_keys=True)}`",
+    ]
+    for item in (source_peek_requests.get("requests", []) or [])[:10]:
+        source_peek_request_lines.append(
+            f"- `{item.get('id')}` `{item.get('trigger')}` `{item.get('status')}` {display_report_value(item.get('entrypoint'))}"
+        )
+    profile_name = profile_display_name(profile)
+    page_title = f"InferForge {profile_name} Greybox Run"
+    artifact_links = "\n".join(
+        f'      <li><a href="{e(name)}">{e(name)}</a></li>'
+        for name in artifact_link_names(artifact_dir)
+    )
+    source_resolver_summary = build_source_resolver_report_summary(
+        load_optional_json(artifact_dir / "source-peek-results.json")
+    )
+
+    def html_list(lines: list[str]) -> str:
+        items = []
+        for line in lines:
+            item = line[2:] if line.startswith("- ") else line
+            items.append(f"<li>{e(item)}</li>")
+        return "\n".join(items)
+
+    doc = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{e(page_title)}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f7f8fa;
+      --text: #15171a;
+      --muted: #5d6673;
+      --line: #d9dee7;
+      --panel: #ffffff;
+      --ok: #146c43;
+      --warn: #9a3412;
+      --accent: #0f5f6f;
+    }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 15px;
+      line-height: 1.5;
+    }}
+    main {{
+      width: min(1180px, calc(100vw - 48px));
+      margin: 32px auto 48px;
+    }}
+    h1, h2, h3 {{
+	      margin: 0;
+	      letter-spacing: 0;
+	    }}
+    h1 {{
+      font-size: 32px;
+      line-height: 1.15;
+    }}
+	    h2 {{
+	      margin-top: 28px;
+	      font-size: 20px;
+	    }}
+    h3 {{
+      margin-top: 18px;
+      font-size: 16px;
+    }}
+    .meta {{
+      margin-top: 10px;
+      color: var(--muted);
+    }}
+    .summary {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 12px;
+      margin-top: 24px;
+    }}
+    .metric {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px 16px;
+    }}
+    .metric span {{
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .metric strong {{
+      display: block;
+      margin-top: 5px;
+      font-size: 18px;
+    }}
+    table {{
+      width: 100%;
+      margin-top: 12px;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }}
+    th, td {{
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      font-size: 14px;
+    }}
+    th {{
+      color: var(--muted);
+      font-weight: 650;
+      background: #eef2f5;
+    }}
+    tr:last-child td {{
+      border-bottom: 0;
+    }}
+    code {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+    }}
+    .ok {{
+      color: var(--ok);
+      font-weight: 700;
+    }}
+    .unexpected {{
+      color: var(--warn);
+      font-weight: 700;
+    }}
+    ul {{
+      margin-top: 12px;
+      padding-left: 22px;
+    }}
+    a {{
+      color: var(--accent);
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{e(page_title)}</h1>
+    <p class="meta">Generated {e(utc_now())} · Target <code>{e(target)}</code></p>
+
+    <section class="summary" aria-label="Run summary">
+      <div class="metric"><span>Target Profile</span><strong>{e(profile_name)}</strong></div>
+      <div class="metric"><span>Target Health</span><strong>{e(capabilities['target']['health_status'])}</strong></div>
+      <div class="metric"><span>Burp MCP Port</span><strong>{e(capabilities['burp']['mcp_port_open'])}</strong></div>
+      <div class="metric"><span>Proxy 8080</span><strong>{e(capabilities['burp']['proxy_8080_open'])}</strong></div>
+      <div class="metric"><span>Proxy 8081</span><strong>{e(capabilities['burp']['proxy_8081_open'])}</strong></div>
+      <div class="metric"><span>Warmup Ready</span><strong>{e(warmup_ready)}</strong></div>
+      <div class="metric"><span>Warmup Checks</span><strong>{warmup_count}</strong></div>
+      <div class="metric"><span>Probes</span><strong>{len(results)}</strong></div>
+      <div class="metric"><span>Suspicions</span><strong>{len(suspicions)}</strong></div>
+      <div class="metric"><span>Findings</span><strong>{e(reportable_findings)}</strong></div>
+      <div class="metric"><span>Hardening Notes</span><strong>{e(hardening_note_count)}</strong></div>
+      <div class="metric"><span>Evidence Gaps</span><strong>{evidence_gap_count}</strong></div>
+      <div class="metric"><span>Adjudication</span><strong>{e(adjudication_status)}</strong></div>
+      <div class="metric"><span>RPC Policy</span><strong>{e(rpc_policy_posture)}</strong></div>
+      <div class="metric"><span>Readiness</span><strong>{e(readiness_status)}</strong></div>
+      <div class="metric"><span>Coverage Gate</span><strong>{e(blackbox_coverage_status)}</strong></div>
+      <div class="metric"><span>Burp Observation</span><strong>{e(burp_observation_coverage_status)}</strong></div>
+      <div class="metric"><span>Response Deltas</span><strong>{e(response_delta_status)}</strong></div>
+      <div class="metric"><span>Evidence Chain</span><strong>{e(evidence_chain_status)}</strong></div>
+      <div class="metric"><span>Source Peek Requests</span><strong>{e(source_peek_request_count)} · {e(source_peek_request_status)}</strong></div>
+      <div class="metric"><span>Evidence Appendix</span><strong>{e(evidence_appendix_status)}</strong></div>
+      <div class="metric"><span>Verification Queue</span><strong>{e(verification_queue_status)}</strong></div>
+      <div class="metric"><span>Command Templates</span><strong>{e(command_safety_counts.get('manual-template', 0))} manual · {e(command_safety_summary_doc.get('unsafe_template_count', 0))} unsafe</strong></div>
+      <div class="metric"><span>Tx Candidates</span><strong>{e(transaction_intent.get('candidates_seen', 0))}</strong></div>
+      <div class="metric"><span>Decoded Tx</span><strong>{e(transaction_intent.get('decoded_transactions', 0))}</strong></div>
+      <div class="metric"><span>Intent Policy</span><strong>{e(transaction_intent.get('intent_policy_checks', {}).get('status', 'unknown'))}</strong></div>
+      <div class="metric"><span>Tx Self-Test</span><strong>{e(decoder_selftest_status)}</strong></div>
+    </section>
+
+	    <h2>Findings And Notes</h2>
+	    <ul>{''.join(notes)}</ul>
+
+    <h2>Burp Observation Coverage</h2>
+    <ul>{html_list(burp_observation_coverage_lines)}</ul>
+
+    <h2>Response Delta Analysis</h2>
+    <ul>{html_list(response_delta_lines)}</ul>
+
+    <h2>Source Resolver And Route Policies</h2>
+    <h3>Source Peek Requests</h3>
+    <ul>{html_list(source_peek_request_lines)}</ul>
+    <h3>Resolver Summary</h3>
+    <ul>{html_list(source_resolver_summary['summary_lines'])}</ul>
+    <h3>Runtime And Rewrite Entry Points</h3>
+    <ul>{html_list(source_resolver_summary['entrypoint_lines'])}</ul>
+    <h3>Redirect And Header Policies</h3>
+    <ul>{html_list(source_resolver_summary['policy_lines'])}</ul>
+    <h3>Server Actions</h3>
+    <ul>{html_list(source_resolver_summary['server_action_lines'])}</ul>
+    <h3>Observed Runtime And Condition Decisions</h3>
+    <ul>{html_list(source_resolver_summary['observed_lines'])}</ul>
+
+	    <h2>Probe Results</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Probe</th>
+          <th>Method</th>
+          <th>Path</th>
+          <th>Status</th>
+          <th>State</th>
+          <th>Expectation</th>
+          <th>Response Sample</th>
+        </tr>
+      </thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+
+    <h2>Artifacts</h2>
+    <ul>
+{artifact_links}
+    </ul>
+  </main>
+</body>
+</html>
+"""
+    (artifact_dir / "index.html").write_text(doc, encoding="utf-8")
+
+
+def write_plan(
+    artifact_dir: Path,
+    probes: list[Probe],
+    selection: dict[str, Any],
+    *,
+    ws_enabled: bool,
+    ranking: dict[str, Any] | None = None,
+) -> None:
+    rank_by_id = {
+        item["probe_id"]: item
+        for item in (ranking or {}).get("ranked_probes", [])
+    }
+    write_json(
+        artifact_dir / "probe-plan.json",
+        {
+            "generated_at": utc_now(),
+            "selection": selection,
+            "ranking": {
+                "artifact": "probe-ranking.json" if ranking else None,
+                "max_probes": (ranking or {}).get("max_probes"),
+                "selected_probe_count": (ranking or {}).get("selected_probe_count", len(probes)),
+                "total_probe_count": (ranking or {}).get("total_probe_count", len(probes)),
+            },
+            "safety": {
+                "mode": "safe",
+                "destructive_actions": False,
+                "wallet_signing": False,
+                "high_volume_fuzzing": False,
+            },
+            "websocket_probes_enabled": ws_enabled,
+            "probes": [
+                {
+                    "id": probe.id,
+                    "label": probe.label,
+                    "cluster_id": probe.category,
+                    "strategy_set": strategy_set_for_probe(probe),
+                    "method": probe.method,
+                    "path": probe.path,
+                    "origin": probe.origin,
+                    "referer": probe.referer,
+                    "content_type": probe.content_type,
+                    "expected_statuses": list(probe.expected_statuses),
+                    "expectation": probe.expectation,
+                    "external": probe.external,
+                    "policy_field": probe.policy_field,
+                    "risk": probe.risk,
+                    "rank": rank_by_id.get(probe.id, {}).get("rank"),
+                    "rank_score": rank_by_id.get(probe.id, {}).get("score"),
+                    "rank_reasons": rank_by_id.get(probe.id, {}).get("reasons", []),
+                }
+                for probe in probes
+            ],
+        },
+    )
+
+
+def run_audit(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    ensure_burp_transaction_candidates_artifact(artifact_dir)
+    ensure_initial_audit_artifacts(artifact_dir)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    clusters = build_clusters(profile, source_root)
+    write_json(artifact_dir / "endpoint-clusters.json", clusters)
+    pre_probe_traffic_index = build_traffic_index([], burp_history)
+    selection = select_cluster_ids(
+        pre_probe_traffic_index,
+        clusters,
+        source_assisted=not args.observed_only,
+    )
+    selected_clusters = set(selection["selected_cluster_ids"])
+    candidate_probes = build_probe_plan(
+        target,
+        include_external=args.include_external,
+        selected_clusters=selected_clusters,
+        profile=profile,
+    )
+    ranking = build_probe_ranking(candidate_probes, selection, clusters, max_probes=args.max_probes)
+    probes = apply_probe_ranking(candidate_probes, ranking)
+    ws_enabled = (
+        args.ws
+        and "solana-rpc-ws" in selected_clusters
+        and websocket_observation_config(profile) is not None
+    )
+    write_json(artifact_dir / "probe-ranking.json", ranking)
+    write_plan(artifact_dir, probes, selection, ws_enabled=ws_enabled, ranking=ranking)
+    try:
+        with TargetProbeLock(target, purpose="audit"):
+            warmup_results = run_audit_warmup(target, artifact_dir, profile, selected_clusters)
+            results = run_http_probes(target, probes, phase="probe", timeout=20, max_attempts=2)
+            if ws_enabled:
+                results.extend(run_ws_probes(target, args.node, source_root, profile))
+                if args.ws_resource_probes:
+                    results.extend(run_ws_resource_probes(target, args.node, source_root, profile))
+    except RuntimeError as error:
+        write_json(
+            artifact_dir / "target-probe-lock.json",
+            {
+                "generated_at": utc_now(),
+                "status": "blocked",
+                "target": target,
+                "error": str(error),
+                "safety": "Only one active probe run may target the same service at a time.",
+            },
+        )
+        print(f"Target probe lock blocked audit: {error}")
+        print(f"Wrote {artifact_dir / 'target-probe-lock.json'}")
+        return 2
+
+    append_jsonl(artifact_dir / "probe-results.jsonl", results)
+    response_delta_analysis = build_response_delta_analysis(clusters, results)
+    write_json(artifact_dir / "response-delta-analysis.json", response_delta_analysis)
+    traffic_index = build_traffic_index(results, burp_history)
+    write_json(artifact_dir / "traffic-index.json", traffic_index)
+    source_peeks = build_source_peeks(source_root, profile, traffic_index.get("endpoints", []))
+    write_json(artifact_dir / "source-peek-results.json", source_peeks)
+    transaction_intent = build_transaction_intent(
+        artifact_dir,
+        results,
+        args.node,
+        source_root,
+        policy_path=Path(args.intent_policy).resolve() if args.intent_policy else None,
+        intent_direction=args.intent_direction,
+        intent_wallet=args.intent_wallet,
+        intent_amount_in=args.intent_amount_in,
+        intent_allowed_programs=args.intent_allowed_program or None,
+    )
+    write_json(artifact_dir / "transaction-intent.json", transaction_intent)
+    transaction_decoder_selftest = build_transaction_decoder_selftest(
+        artifact_dir,
+        source_root,
+        args.node,
+        direction=args.intent_direction or "buy",
+        wallet=args.intent_wallet or DEFAULT_TEST_WALLET,
+        amount_in=args.intent_amount_in or "1000000",
+    )
+    write_json(artifact_dir / "transaction-decoder-selftest.json", transaction_decoder_selftest)
+    rpc_method_policy = build_rpc_method_policy(source_root, results)
+    write_json(artifact_dir / "rpc-method-policy.json", rpc_method_policy)
+    orca_baseline_path = artifact_dir / "orca-baseline.json"
+    orca_baseline = json.loads(read_text(orca_baseline_path)) if orca_baseline_path.exists() else None
+    quote_collection_path = artifact_dir / "quote-collection.json"
+    quote_collection = json.loads(read_text(quote_collection_path)) if quote_collection_path.exists() else None
+    suspicions = build_suspicions(results, clusters)
+    write_json(artifact_dir / "suspicions.json", {"generated_at": utc_now(), "suspicions": suspicions})
+    finding_gate = build_finding_gate(suspicions, burp_history)
+    write_json(artifact_dir / "finding-gate.json", finding_gate)
+    findings = build_findings(suspicions, finding_gate)
+    hardening_notes = build_hardening_notes(suspicions, finding_gate)
+    write_json(artifact_dir / "findings.json", {"generated_at": utc_now(), "findings": findings})
+    write_json(
+        artifact_dir / "hardening-notes.json",
+        {"generated_at": utc_now(), "hardening_notes": hardening_notes},
+    )
+    attack_strategy = build_attack_strategy(clusters, suspicions, burp_history)
+    write_json(artifact_dir / "attack-strategy.json", attack_strategy)
+    capabilities = build_capabilities(target, artifact_dir, profile)
+    quote_collection_for_readiness = quote_collection
+    environment_readiness = build_environment_readiness(
+        target,
+        source_root,
+        artifact_dir,
+        capabilities=capabilities,
+        quote_collection=quote_collection_for_readiness,
+        transaction_intent=transaction_intent,
+    )
+    write_json(artifact_dir / "environment-readiness.json", environment_readiness)
+    evidence_gaps = build_evidence_gaps(
+        clusters,
+        results,
+        burp_history,
+        transaction_intent,
+        rpc_method_policy,
+        orca_baseline,
+        quote_collection,
+        source_peeks,
+    )
+    write_json(artifact_dir / "evidence-gaps.json", evidence_gaps)
+    burp_observation_run = load_optional_json(artifact_dir / "burp-observation-run.json")
+    burp_observation_coverage = build_burp_observation_coverage(
+        target,
+        profile,
+        clusters,
+        burp_history,
+        burp_observation_run,
+        evidence_gaps,
+    )
+    write_json(artifact_dir / "burp-observation-coverage.json", burp_observation_coverage)
+    source_peek_requests = build_source_peek_requests(
+        clusters,
+        traffic_index,
+        source_peeks,
+        suspicions,
+        evidence_gaps,
+    )
+    write_json(artifact_dir / "source-peek-requests.json", source_peek_requests)
+    blackbox_coverage = build_blackbox_coverage(
+        clusters,
+        results,
+        burp_history,
+        source_peeks,
+        evidence_gaps,
+        burp_observation_run,
+        environment_readiness,
+        transaction_decoder_selftest,
+    )
+    write_json(artifact_dir / "blackbox-coverage.json", blackbox_coverage)
+    evidence_chain = build_evidence_chain(
+        clusters,
+        results,
+        burp_history,
+        source_peeks,
+        finding_gate,
+        evidence_gaps,
+        blackbox_coverage,
+        environment_readiness,
+        transaction_intent,
+        transaction_decoder_selftest,
+    )
+    write_json(artifact_dir / "evidence-chain.json", evidence_chain)
+    adjudication = build_adjudication(
+        suspicions,
+        finding_gate,
+        findings,
+        hardening_notes,
+        evidence_gaps,
+        blackbox_coverage,
+        environment_readiness,
+        evidence_chain,
+    )
+    write_json(artifact_dir / "adjudication.json", adjudication)
+    evidence_appendix = build_evidence_appendix(
+        clusters,
+        results,
+        burp_history,
+        burp_observation_run,
+        blackbox_coverage,
+        evidence_chain,
+        adjudication,
+        environment_readiness,
+    )
+    write_json(artifact_dir / "evidence-appendix.json", evidence_appendix)
+    verification_queue = build_verification_queue(
+        target,
+        clusters,
+        evidence_appendix,
+        evidence_gaps,
+        blackbox_coverage,
+        adjudication,
+        environment_readiness,
+        artifact_dir,
+    )
+    write_json(artifact_dir / "verification-queue.json", verification_queue)
+    write_reproduction_steps(artifact_dir, verification_queue)
+    write_json(artifact_dir / "burp-capabilities.json", capabilities)
+    write_json(
+        artifact_dir / "config.json",
+        {
+            "generated_at": utc_now(),
+            "tool": "InferForge local",
+            "profile": profile_summary(profile),
+            "target_profile": TARGET_PROFILE_ARTIFACT,
+            "strategy_registry": STRATEGY_REGISTRY_ARTIFACT,
+            "enabled_strategy_sets": sorted(enabled_strategy_set_ids(profile)),
+            "target": target,
+            "source_root": str(source_root),
+            "artifact_dir": str(artifact_dir),
+            "include_external": args.include_external,
+            "max_probes": args.max_probes,
+            "ws": ws_enabled,
+            "ws_resource_probes": bool(args.ws_resource_probes),
+            "selection_mode": selection["mode"],
+            "warmup_ready": warmup_results["ready"],
+            "http_probe_max_attempts": 2,
+        },
+    )
+    generate_report(
+        artifact_dir,
+        target,
+        results,
+        suspicions,
+        capabilities,
+        attack_strategy,
+        burp_history,
+        finding_gate,
+        transaction_intent,
+        warmup_results,
+        evidence_gaps,
+        rpc_method_policy,
+        environment_readiness,
+        transaction_decoder_selftest,
+        blackbox_coverage,
+        evidence_chain,
+        hardening_notes,
+        adjudication,
+        evidence_appendix,
+        verification_queue,
+        profile,
+    )
+    artifact_manifest = write_artifact_manifest(artifact_dir, target, command="audit")
+
+    unexpected = [row for row in results if not row["expected"]]
+    print(f"InferForge wrote artifacts to {artifact_dir}")
+    print(f"Warmup: {'ready' if warmup_results['ready'] else 'unexpected warmup result'}")
+    print(f"Probes: {len(results)} total, {len(unexpected)} unexpected, {len(suspicions)} suspicions")
+    print(
+        "Transactions: "
+        f"{transaction_intent['candidates_seen']} candidates, "
+        f"{transaction_intent['decoded_transactions']} decoded"
+    )
+    print(f"Evidence gaps: {len(evidence_gaps['gaps'])}")
+    print(f"Evidence chain: {evidence_chain['status']}")
+    print(f"Adjudication: {adjudication['status']}")
+    print(f"Evidence appendix: {evidence_appendix['status']}")
+    print(f"Verification queue: {verification_queue['status']}")
+    print(
+        "Command safety: "
+        f"{json.dumps(verification_queue['summary'].get('command_safety', {}).get('classification_counts', {}), sort_keys=True)}"
+    )
+    print(f"Artifact manifest: {artifact_manifest['status']}")
+    for row in unexpected:
+        print(f"unexpected: {row['probe_id']} status={row['status']} expected={row['expected_statuses']}")
+    return 0
+
+
+def run_collect(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    clusters = build_clusters(profile, source_root)
+    traffic_index = build_traffic_index([], burp_history)
+    selection = select_cluster_ids(
+        traffic_index,
+        clusters,
+        source_assisted=not args.observed_only,
+    )
+
+    write_json(artifact_dir / "endpoint-clusters.json", clusters)
+    write_json(artifact_dir / "traffic-index.json", traffic_index)
+    write_json(
+        artifact_dir / "collection-summary.json",
+        {
+            "generated_at": utc_now(),
+            "source": "burp-history-observations.jsonl",
+            "profile": profile_summary(profile),
+            "target": target,
+            "burp_history_items": len(burp_history),
+            "selection": selection,
+        },
+    )
+
+    print(f"Collected {len(burp_history)} Burp history observations")
+    print(f"Selected clusters: {', '.join(selection['selected_cluster_ids']) or '(none)'}")
+    return 0
+
+
+def run_burp_observe(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    if not args.allow_nonlocal_target and not is_loopback_target(target):
+        print("burp-observe refuses non-loopback targets unless --allow-nonlocal-target is set")
+        return 2
+
+    parsed_proxy = urllib.parse.urlparse(args.proxy)
+    proxy_open = bool(
+        parsed_proxy.hostname
+        and socket_open(parsed_proxy.hostname, parsed_proxy.port or 8080)
+    )
+    requests = []
+    try:
+        observation_plan = build_burp_observation_plan(target, profile)
+    except ValueError as error:
+        write_json(
+            artifact_dir / "burp-observation-run.json",
+            {
+                "generated_at": utc_now(),
+                "status": "blocked-profile-validation",
+                "profile": profile_summary(profile),
+                "target": target,
+                "error": str(error),
+                "requests": [],
+                "websocket_upgrade": None,
+                "summary": {"total": 0, "unexpected": 0, "clusters": []},
+                "safety": "No request was sent because the active Burp observation plan is not a reviewed concrete local path set.",
+            },
+        )
+        print(f"Burp observation blocked by profile validation: {error}")
+        print(f"Wrote {artifact_dir / 'burp-observation-run.json'}")
+        return 2
+    try:
+        with TargetProbeLock(target, purpose="burp-observe"):
+            for item in observation_plan:
+                response = http_request_through_proxy(
+                    target,
+                    args.proxy,
+                    item["method"],
+                    item["path"],
+                    body=item.get("body"),
+                    headers=item.get("headers"),
+                    timeout=20,
+                )
+                expected = response.get("status") in set(item["expected_statuses"])
+                requests.append(
+                    {
+                        "id": item["id"],
+                        "cluster": item["cluster"],
+                        "method": item["method"],
+                        "path": item["path"],
+                        "expected_statuses": item["expected_statuses"],
+                        "status": response.get("status"),
+                        "expected": expected,
+                        "duration_ms": response.get("duration_ms"),
+                        "error": response.get("error"),
+                        "body_sha256": response.get("body_sha256"),
+                        "body_length": response.get("body_length"),
+                        "body_sample": response.get("body_sample", "")[:240],
+                    }
+                )
+
+            ws_observation = None
+            if args.ws_upgrade:
+                ws_observation = run_ws_upgrade_observation_through_proxy(
+                    target,
+                    args.proxy,
+                    args.node,
+                    source_root,
+                    profile,
+                )
+                ws_observation["expected"] = (
+                    True
+                    if ws_observation.get("skipped")
+                    else ws_observation.get("status") in set(ws_observation.get("expected_statuses", []))
+                )
+    except RuntimeError as error:
+        write_json(
+            artifact_dir / "target-probe-lock.json",
+            {
+                "generated_at": utc_now(),
+                "status": "blocked",
+                "target": target,
+                "error": str(error),
+                "safety": "Only one active observation/probe run may target the same service at a time.",
+            },
+        )
+        print(f"Target probe lock blocked burp-observe: {error}")
+        print(f"Wrote {artifact_dir / 'target-probe-lock.json'}")
+        return 2
+
+    all_items = requests + ([ws_observation] if ws_observation else [])
+    unexpected = [item for item in all_items if not item.get("expected")]
+    history_regex = build_burp_history_regex(
+        target,
+        observation_plan,
+        include_ws_upgrade=bool(ws_observation),
+    )
+    artifact = {
+        "generated_at": utc_now(),
+        "profile": profile_summary(profile),
+        "target": target,
+        "proxy": args.proxy,
+        "proxy_open": proxy_open,
+        "safety": [
+            "Generates a minimal, deterministic observation set through Burp Proxy.",
+            "Does not sign wallets, submit Solana transactions, run Burp Scanner, or fuzz broadly.",
+            "Non-loopback targets require --allow-nonlocal-target.",
+        ],
+        "requests": requests,
+        "websocket_upgrade": ws_observation,
+        "summary": {
+            "total": len(all_items),
+            "unexpected": len(unexpected),
+            "clusters": sorted({str(item.get("cluster")) for item in all_items if item}),
+        },
+        "history_import": {
+            "mcp_regex": history_regex,
+            "next_step": (
+                "Run burp-sync to read matching Burp Proxy HTTP history through MCP and import it."
+            ),
+            "import_command": "python3 scripts/inferforge.py burp-sync --replace",
+        },
+    }
+    write_json(artifact_dir / "burp-observation-run.json", artifact)
+
+    print(f"Burp proxy open: {proxy_open}")
+    for item in all_items:
+        print(
+            f"{item.get('id')} {item.get('method')} {item.get('path')} -> "
+            f"{item.get('status')} ({'ok' if item.get('expected') else 'unexpected'})"
+        )
+    print(f"Wrote {artifact_dir / 'burp-observation-run.json'}")
+    print(f"History regex: {history_regex}")
+    return 0 if proxy_open and not unexpected else 1
+
+
+def import_burp_history_inputs(
+    *,
+    inputs: list[tuple[str, str]],
+    profile: dict[str, Any],
+    artifact_dir: Path,
+    target: str,
+    source_root: Path,
+    node: str,
+    replace: bool,
+    all_hosts: bool,
+    source: str,
+    observed_only: bool,
+) -> dict[str, Any]:
+    target_netloc = None if all_hosts else urllib.parse.urlparse(target).netloc
+    quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
+    imported: list[dict[str, Any]] = []
+    burp_transaction_candidate_docs: list[dict[str, Any]] = []
+    input_summaries: list[dict[str, Any]] = []
+    for label, text in inputs:
+        items = parse_burp_mcp_history_items(text)
+        observations = normalize_burp_history_items(
+            items,
+            target_netloc=target_netloc,
+            source=source,
+        )
+        transaction_candidate_doc = extract_transaction_candidates_from_burp_items(
+            items,
+            target_netloc=target_netloc,
+            source=source,
+            quote_path=quote_path,
+        )
+        imported.extend(observations)
+        burp_transaction_candidate_docs.append(transaction_candidate_doc)
+        input_summaries.append(
+            {
+                "input": label,
+                "mcp_items": len(items),
+                "observations_after_filter": len(observations),
+                "quote_responses": transaction_candidate_doc["quote_response_count"],
+                "transaction_candidates": transaction_candidate_doc["candidate_count"],
+            }
+        )
+
+    history_path = artifact_dir / "burp-history-observations.jsonl"
+    existing = [] if replace else load_jsonl(history_path)
+    merged = dedupe_observations(existing + imported)
+    append_jsonl(history_path, merged)
+    burp_transaction_candidates = merge_transaction_candidate_docs(
+        burp_transaction_candidate_docs,
+        source=source,
+    )
+    write_json(artifact_dir / "burp-transaction-candidates.json", burp_transaction_candidates)
+
+    clusters = build_clusters(profile, source_root)
+    traffic_index = build_traffic_index([], merged)
+    selection = select_cluster_ids(
+        traffic_index,
+        clusters,
+        source_assisted=not observed_only,
+    )
+    write_json(artifact_dir / "endpoint-clusters.json", clusters)
+    write_json(artifact_dir / "traffic-index.json", traffic_index)
+    transaction_intent = build_transaction_intent(
+        artifact_dir,
+        load_jsonl(artifact_dir / "probe-results.jsonl"),
+        node,
+        source_root,
+    )
+    write_json(artifact_dir / "transaction-intent.json", transaction_intent)
+    summary = {
+        "generated_at": utc_now(),
+        "source": source,
+        "profile": profile_summary(profile),
+        "target_filter": target_netloc or "all-hosts",
+        "replace": replace,
+        "inputs": input_summaries,
+        "imported_observations": len(imported),
+        "burp_history_items": len(merged),
+        "burp_transaction_candidates": burp_transaction_candidates["candidate_count"],
+        "transaction_intent_candidates": transaction_intent["candidates_seen"],
+        "decoded_transactions": transaction_intent["decoded_transactions"],
+        "selection": selection,
+        "history_path": str(history_path),
+    }
+    write_json(artifact_dir / "collection-summary.json", summary)
+    return summary
+
+
+def run_import_burp_history(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    inputs: list[tuple[str, str]] = []
+    for item in args.input or []:
+        if item == "-":
+            inputs.append(("stdin", sys.stdin.read()))
+            continue
+        path = Path(item).resolve()
+        inputs.append((str(path), read_text(path)))
+
+    if not inputs and not sys.stdin.isatty():
+        inputs.append(("stdin", sys.stdin.read()))
+
+    if not inputs:
+        print("No Burp MCP history input provided; pass --input PATH or pipe raw MCP output on stdin")
+        return 2
+
+    summary = import_burp_history_inputs(
+        inputs=inputs,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        target=target,
+        source_root=source_root,
+        node=args.node,
+        replace=args.replace,
+        all_hosts=args.all_hosts,
+        source=args.source,
+        observed_only=args.observed_only,
+    )
+
+    print(f"Imported {summary['imported_observations']} observations from Burp MCP history")
+    print(f"Stored {summary['burp_history_items']} total observations in {summary['history_path']}")
+    print(f"Extracted {summary['burp_transaction_candidates']} Burp transaction candidates")
+    print(
+        "Transactions: "
+        f"{summary['transaction_intent_candidates']} candidates, "
+        f"{summary['decoded_transactions']} decoded"
+    )
+    print(f"Selected clusters: {', '.join(summary['selection']['selected_cluster_ids']) or '(none)'}")
+    return 0
+
+
+def build_profile_routing_selftest_profile() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "name": "profile-routing-selftest",
+        "display_name": "Profile Routing Self-Test",
+        "description": "Synthetic profile proving built-in strategies honor profile-owned concrete paths.",
+        "target_type": "self-test",
+        "frameworks": ["Next.js App Router", "Solana"],
+        "default_target": "http://127.0.0.1:9999",
+        "default_source_root": ".",
+        "strategy_sets": [
+            "nextjs-api-routes",
+            "solana-json-rpc-proxy",
+            "quote-transaction-decoder",
+            "fixed-upstream-proxy",
+        ],
+        "safety": {
+            "no_wallet_signing": True,
+            "no_transaction_submission": True,
+            "no_burp_scanner": True,
+            "no_broad_fuzzing": True,
+            "prefer_loopback_targets": True,
+        },
+        "probe_targets": {
+            "health": {"path": "/statusz"},
+            "route-custom-api-widgets": {"path": "/custom/api/widgets"},
+            "quote": {"path": "/bridge/quote"},
+            "solana-rpc-http": {
+                "path": "/chain/solana/devnet",
+                "root_path": "/chain/rpc",
+                "unknown_cluster_path": "/chain/solana/localnet",
+                "cluster": "devnet",
+                "unknown_cluster": "localnet",
+            },
+            "solana-rpc-ws": {"path": "/ws/solana/devnet"},
+            "orca-pools": {
+                "path_template": "/poolz/{address}",
+                "invalid_address_path": "/poolz/not-an-address",
+                "invalid_base58_path": "/poolz/0OIlnotbase58",
+                "too_short_path": "/poolz/1111111111111111111111111111111",
+                "too_long_path": "/poolz/111111111111111111111111111111111111111111111",
+                "encoded_traversal_path": "/poolz/%2e%2e%2fstatusz",
+                "extra_segment_path": "/poolz/not-an-address/extra",
+                "query_injection_path": "/poolz/not-an-address?url=https://evil.example",
+            },
+        },
+        "clusters": [
+            {
+                "id": "health",
+                "method": "GET",
+                "path": "/statusz",
+                "kind": "health",
+                "priority": "low",
+                "strategy_set": "nextjs-api-routes",
+                "match": {"methods": ["GET"], "paths": ["/statusz"]},
+                "source_refs": [],
+            },
+            {
+                "id": "quote",
+                "method": "POST",
+                "path": "/bridge/quote",
+                "kind": "orchestration-proxy",
+                "priority": "high",
+                "strategy_set": "quote-transaction-decoder",
+                "match": {"methods": ["POST"], "paths": ["/bridge/quote"]},
+                "source_refs": [],
+            },
+            {
+                "id": "route-custom-api-widgets",
+                "method": "POST",
+                "path": "/custom/api/widgets",
+                "kind": "api-route",
+                "priority": "medium",
+                "strategy_set": "nextjs-api-routes",
+                "match": {"methods": ["POST"], "paths": ["/custom/api/widgets"]},
+                "source_refs": ["scripts/inferforge.py"],
+            },
+            {
+                "id": "solana-rpc-http",
+                "method": "POST",
+                "path": "/chain/solana/{cluster}",
+                "kind": "json-rpc-proxy",
+                "priority": "high",
+                "strategy_set": "solana-json-rpc-proxy",
+                "match": {
+                    "methods": ["OPTIONS", "POST"],
+                    "paths": ["/chain/rpc"],
+                    "path_prefixes": ["/chain/solana/"],
+                },
+                "source_refs": [],
+            },
+            {
+                "id": "solana-rpc-ws",
+                "method": "WS",
+                "path": "/ws/solana/{cluster}",
+                "kind": "websocket-json-rpc-proxy",
+                "priority": "high",
+                "strategy_set": "solana-json-rpc-proxy",
+                "match": {"methods": ["WS"], "path_prefixes": ["/ws/solana/"]},
+                "source_refs": [],
+            },
+            {
+                "id": "orca-pools",
+                "method": "GET",
+                "path": "/poolz/{address}",
+                "kind": "fixed-upstream-proxy",
+                "priority": "medium",
+                "strategy_set": "fixed-upstream-proxy",
+                "match": {"methods": ["GET"], "path_prefixes": ["/poolz/"]},
+                "source_refs": [],
+            },
+        ],
+        "source_peeks": [],
+        "burp_observation_plan": [
+            {
+                "id": "burp_observe_statusz",
+                "method": "GET",
+                "path": "/statusz",
+                "headers": {"User-Agent": "InferForge-Burp-Observe/0.1"},
+                "expected_statuses": [200],
+                "cluster": "health",
+            }
+        ],
+        "websocket_observation": {
+            "id": "burp_observe_ws_upgrade",
+            "path": "/ws/solana/devnet",
+            "cluster": "solana-rpc-ws",
+            "expected_statuses": [101],
+            "subscribe_method": "slotSubscribe",
+        },
+        "_profile_path": "self-test",
+        "_profile_loaded_from": "file",
+        "_profile_defaulted_keys": [],
+    }
+
+
+def run_profile_routing_selftest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, _target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    test_profile = build_profile_routing_selftest_profile()
+    target = test_profile["default_target"]
+    clusters = build_clusters(test_profile, ROOT)
+    cluster_ids = {str(cluster["id"]) for cluster in clusters.get("clusters", [])}
+    probes = build_probe_plan(target, include_external=True, selected_clusters=cluster_ids, profile=test_profile)
+    warmups = build_warmup_probes(target, test_profile, cluster_ids)
+    observation_plan = build_burp_observation_plan(target, test_profile)
+    validation = build_profile_validation_artifact(test_profile, clusters, ROOT)
+    unsafe_observation_profile = json_clone(test_profile)
+    unsafe_observation_profile["burp_observation_plan"] = [
+        {
+            "id": "burp_observe_placeholder_path",
+            "method": "GET",
+            "path": PLACEHOLDER_APPROVED_CONCRETE_PATH,
+            "headers": {"User-Agent": "InferForge-Burp-Observe/0.1"},
+            "expected_statuses": [200],
+            "cluster": "health",
+        }
+    ]
+    unsafe_observation_validation = build_profile_validation_artifact(
+        unsafe_observation_profile,
+        build_clusters(unsafe_observation_profile, ROOT),
+        ROOT,
+    )
+    unsafe_observation_build_blocked = False
+    unsafe_observation_build_error = None
+    try:
+        build_burp_observation_plan(target, unsafe_observation_profile)
+    except ValueError as error:
+        unsafe_observation_build_blocked = True
+        unsafe_observation_build_error = str(error)
+    unsafe_observation_validation_passed = (
+        unsafe_observation_validation.get("status") == "failed"
+        and unsafe_observation_build_blocked
+        and any(
+            item.get("id") == "burp-observation-plan:burp_observe_placeholder_path:unsafe-path"
+            for item in unsafe_observation_validation.get("issues", [])
+        )
+    )
+    with tempfile.TemporaryDirectory(prefix="inferforge-discovery-selftest-") as temp_dir:
+        rewrite_source_root = Path(temp_dir) / "rewrite-app"
+        (rewrite_source_root / "src/app/health").mkdir(parents=True)
+        (rewrite_source_root / "src/app/health/route.ts").write_text(
+            "export async function GET() { return Response.json({ ok: true }) }\n",
+            encoding="utf-8",
+        )
+        (rewrite_source_root / "app/api/root").mkdir(parents=True)
+        (rewrite_source_root / "app/api/root/route.ts").write_text(
+            "export async function POST() { return Response.json({ ok: true }) }\n",
+            encoding="utf-8",
+        )
+        (rewrite_source_root / "src/app/actions.ts").write_text(
+            textwrap.dedent(
+                """
+                'use server'
+
+                export async function updateWidget(id: string) {
+                  return { ok: Boolean(id) }
+                }
+
+                export const deleteWidget = async (id: string) => {
+                  return { deleted: Boolean(id) }
+                }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (rewrite_source_root / "src/pages/api").mkdir(parents=True)
+        (rewrite_source_root / "src/pages/api/widgets.ts").write_text(
+            textwrap.dedent(
+                """
+                export default function handler(req, res) {
+                  if (req.method === 'GET') {
+                    res.status(200).json({ ok: true })
+                    return
+                  }
+                  res.status(405).end()
+                }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (rewrite_source_root / "src/middleware.ts").write_text(
+            textwrap.dedent(
+                """
+                import { NextResponse } from 'next/server'
+
+                export function middleware() {
+                  return NextResponse.next()
+                }
+
+                export const config = {
+                  matcher: ['/api/:path*'],
+                }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (rewrite_source_root / "next.config.ts").write_text(
+            textwrap.dedent(
+                """
+                const API_TARGET = process.env.API_TARGET ?? 'https://api.example.test'
+
+                const nextConfig = {
+                  async rewrites() {
+                    return {
+                      beforeFiles: [
+                        {
+                          source: '/api/proxy/:path*',
+                          destination: `${API_TARGET}/v1/:path*`,
+                          has: [
+                            { type: 'header', key: 'x-approved-proxy', value: 'yes' },
+                          ],
+                        },
+                      ],
+                    }
+                  },
+                  async redirects() {
+                    return [
+                      {
+                        source: '/old/:path*',
+                        destination: '/api/proxy/:path*',
+                        permanent: false,
+                        missing: [
+                          { type: 'cookie', key: 'new-ui' },
+                        ],
+                      },
+                    ]
+                  },
+                  async headers() {
+                    return [
+                      {
+                        source: '/api/:path*',
+                        has: [
+                          { type: 'query', key: 'debug', value: '1' },
+                        ],
+                        headers: [
+                          { key: 'X-InferForge-Selftest', value: 'enabled' },
+                        ],
+                      },
+                    ]
+                  },
+                }
+
+                export default nextConfig
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (rewrite_source_root / "server.js").write_text(
+            textwrap.dedent(
+                """
+                import http from 'node:http'
+                import { WebSocketServer } from 'ws'
+
+                const SOLANA_RPC_PATH_PREFIX = '/api/rpc/solana/'
+                const wss = new WebSocketServer({ noServer: true })
+
+                function getSolanaClusterFromPathname(pathname) {
+                  if (!pathname.startsWith(SOLANA_RPC_PATH_PREFIX)) {
+                    return null
+                  }
+                  return pathname.slice(SOLANA_RPC_PATH_PREFIX.length)
+                }
+
+                function isAllowedOrigin(req) {
+                  return Boolean(req.headers.origin)
+                }
+
+                function handleSolanaWsProxy(cluster, req, socket, head) {
+                  wss.handleUpgrade(req, socket, head, () => {})
+                }
+
+                const server = http.createServer()
+                server.on('upgrade', (req, socket, head) => {
+                  const cluster = getSolanaClusterFromPathname(new URL(req.url || '/', 'http://localhost').pathname)
+                  if (cluster) {
+                    handleSolanaWsProxy(cluster, req, socket, head)
+                  }
+                })
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        rewrite_inventory = discover_nextjs_routes(rewrite_source_root)
+        rewrite_profile = build_discovered_profile(
+            rewrite_inventory,
+            name="rewrite-discovery-selftest",
+            display_name="Rewrite Discovery Self-Test",
+            target="http://127.0.0.1:9998",
+            source_root=rewrite_source_root,
+        )
+        rewrite_observation_clusters = {
+            str(item.get("cluster"))
+            for item in rewrite_profile.get("burp_observation_plan", [])
+        }
+        rewrite_profile_candidates = [
+            item
+            for item in rewrite_profile.get("review_observation_candidates", [])
+            if item.get("cluster") == "route-api-proxy-path"
+        ]
+        rewrite_normalized = normalize_target_profile(rewrite_profile)
+        rewrite_clusters = build_clusters(rewrite_normalized, rewrite_source_root)
+        rewrite_validation = build_profile_validation_artifact(
+            rewrite_normalized,
+            rewrite_clusters,
+            rewrite_source_root,
+        )
+        rewrite_cluster = next(
+            (
+                cluster
+                for cluster in rewrite_clusters.get("clusters", [])
+                if cluster.get("id") == "route-api-proxy-path"
+            ),
+            None,
+        )
+        pages_api_cluster = next(
+            (
+                cluster
+                for cluster in rewrite_clusters.get("clusters", [])
+                if cluster.get("id") == "route-api-widgets"
+            ),
+            None,
+        )
+        root_app_cluster = next(
+            (
+                cluster
+                for cluster in rewrite_clusters.get("clusters", [])
+                if cluster.get("id") == "route-api-root"
+            ),
+            None,
+        )
+        server_action_entries = rewrite_inventory.get("server_actions", [])
+        rewrite_cluster_candidates = (
+            []
+            if rewrite_cluster is None
+            else rewrite_cluster.get("discovery", {}).get("review_observation_candidates", [])
+        )
+        rewrite_condition_context = build_request_context(
+            "GET",
+            "/api/proxy/users/42",
+            {"x-approved-proxy": "yes", "host": "127.0.0.1:9998"},
+            "127.0.0.1:9998",
+        )
+        rewrite_condition_missing_context = build_request_context(
+            "GET",
+            "/api/proxy/users/42",
+            {"host": "127.0.0.1:9998"},
+            "127.0.0.1:9998",
+        )
+        rewrite_resolution = resolve_endpoint_sources(
+            rewrite_source_root,
+            "GET",
+            "/api/proxy/users/42",
+            rewrite_inventory,
+            rewrite_condition_context,
+        )
+        rewrite_condition_missing_resolution = resolve_endpoint_sources(
+            rewrite_source_root,
+            "GET",
+            "/api/proxy/users/42",
+            rewrite_inventory,
+            rewrite_condition_missing_context,
+        )
+        rewrite_resolution_match = next(
+            (
+                match
+                for match in rewrite_resolution.get("matches", [])
+                if match.get("cluster_id") == "route-api-proxy-path"
+            ),
+            None,
+        )
+        rewrite_condition_missing_match = next(
+            (
+                match
+                for match in rewrite_condition_missing_resolution.get("matches", [])
+                if match.get("cluster_id") == "route-api-proxy-path"
+            ),
+            None,
+        )
+        ws_resolution = resolve_endpoint_sources(
+            rewrite_source_root,
+            "WS",
+            "/api/rpc/solana/devnet",
+            rewrite_inventory,
+        )
+        ws_resolution_match = next(
+            (
+                match
+                for match in ws_resolution.get("matches", [])
+                if match.get("cluster_id") == "solana-rpc-ws"
+            ),
+            None,
+        )
+        pages_api_debug_context = build_request_context(
+            "GET",
+            "/api/widgets?debug=1",
+            {"host": "127.0.0.1:9998"},
+            "127.0.0.1:9998",
+        )
+        pages_api_no_debug_context = build_request_context(
+            "GET",
+            "/api/widgets",
+            {"host": "127.0.0.1:9998"},
+            "127.0.0.1:9998",
+        )
+        pages_api_resolution = resolve_endpoint_sources(
+            rewrite_source_root,
+            "GET",
+            "/api/widgets?debug=1",
+            rewrite_inventory,
+            pages_api_debug_context,
+        )
+        pages_api_no_debug_resolution = resolve_endpoint_sources(
+            rewrite_source_root,
+            "GET",
+            "/api/widgets",
+            rewrite_inventory,
+            pages_api_no_debug_context,
+        )
+        pages_api_resolution_match = next(
+            (
+                match
+                for match in pages_api_resolution.get("matches", [])
+                if match.get("cluster_id") == "route-api-widgets"
+            ),
+            None,
+        )
+        root_app_resolution = resolve_endpoint_sources(
+            rewrite_source_root,
+            "POST",
+            "/api/root",
+            rewrite_inventory,
+        )
+        root_app_resolution_match = next(
+            (
+                match
+                for match in root_app_resolution.get("matches", [])
+                if match.get("cluster_id") == "route-api-root"
+            ),
+            None,
+        )
+        redirect_missing_cookie_context = build_request_context(
+            "GET",
+            "/old/users/42",
+            {"host": "127.0.0.1:9998"},
+            "127.0.0.1:9998",
+        )
+        redirect_cookie_present_context = build_request_context(
+            "GET",
+            "/old/users/42",
+            {"host": "127.0.0.1:9998", "cookie": "new-ui=1"},
+            "127.0.0.1:9998",
+        )
+        redirect_resolution = resolve_endpoint_sources(
+            rewrite_source_root,
+            "GET",
+            "/old/users/42",
+            rewrite_inventory,
+            redirect_missing_cookie_context,
+        )
+        redirect_cookie_present_resolution = resolve_endpoint_sources(
+            rewrite_source_root,
+            "GET",
+            "/old/users/42",
+            rewrite_inventory,
+            redirect_cookie_present_context,
+        )
+        rewrite_middleware_context = rewrite_resolution.get("middleware_context", [])
+        pages_api_middleware_context = pages_api_resolution.get("middleware_context", [])
+        pages_api_route_policy_context = pages_api_resolution.get("route_policy_context", [])
+        pages_api_no_debug_route_policy_context = pages_api_no_debug_resolution.get("route_policy_context", [])
+        rewrite_route_policy_context = rewrite_resolution.get("route_policy_context", [])
+        redirect_route_policy_context = redirect_resolution.get("route_policy_context", [])
+        redirect_cookie_present_route_policy_context = redirect_cookie_present_resolution.get("route_policy_context", [])
+        promoted_rewrite_profile = None
+        promoted_rewrite_observation = None
+        promoted_rewrite_paths: set[str] = set()
+        promotion_error = None
+        try:
+            promoted_rewrite_profile, promoted_rewrite_observation = promote_review_observation_candidate(
+                rewrite_profile,
+                candidate_id="review_observe_route_api_proxy_path_approved_path",
+                approved_path="/api/proxy/users/42",
+                note="self-test approved read-only path",
+            )
+            promoted_rewrite_plan = build_burp_observation_plan(
+                "http://127.0.0.1:9998",
+                normalize_target_profile(promoted_rewrite_profile),
+            )
+            promoted_rewrite_paths = {str(item.get("path")) for item in promoted_rewrite_plan}
+        except ValueError as error:
+            promotion_error = str(error)
+        rejected_promotion_paths: dict[str, bool] = {}
+        for invalid_path in [
+            "/api/proxy/{path*}",
+            "/api/proxy/<approved-read-only-path>",
+            "https://api.example.test/v1/users/42",
+            "/api/other/users/42",
+        ]:
+            try:
+                promote_review_observation_candidate(
+                    rewrite_profile,
+                    candidate_id="review_observe_route_api_proxy_path_approved_path",
+                    approved_path=invalid_path,
+                )
+                rejected_promotion_paths[invalid_path] = False
+            except ValueError:
+                rejected_promotion_paths[invalid_path] = True
+        promotion_selftest_passed = (
+            promoted_rewrite_observation is not None
+            and promoted_rewrite_observation.get("path") == "/api/proxy/users/42"
+            and promoted_rewrite_observation.get("cluster") == "route-api-proxy-path"
+            and "/api/proxy/users/42" in promoted_rewrite_paths
+            and all(rejected_promotion_paths.values())
+        )
+        queue_artifact_dir = Path(temp_dir) / "queue-artifacts"
+        queue_artifact_dir.mkdir()
+        rewrite_gap_id = "GAP-route-api-proxy-path-burp-observation"
+        rewrite_queue = build_verification_queue(
+            "http://127.0.0.1:9998",
+            rewrite_clusters,
+            {"clusters": []},
+            {
+                "gaps": [
+                    {
+                        "id": rewrite_gap_id,
+                        "cluster_id": "route-api-proxy-path",
+                        "title": "Browser-flow observation missing",
+                        "priority": "low",
+                        "reason": "Review-only rewrite observation candidate requires promotion.",
+                        "safe_next_step": "Promote one approved concrete path.",
+                        "safety_gate": "Review-only candidate; no automatic request.",
+                        "review_candidates": rewrite_profile_candidates,
+                    }
+                ]
+            },
+            {"status": "covered-with-evidence-gaps"},
+            {"status": "no-reportable-findings", "external_blockers": [], "decisions": []},
+            {"status": "ready"},
+            queue_artifact_dir,
+        )
+        rewrite_queue_item = next(
+            (
+                item
+                for item in rewrite_queue.get("items", [])
+                if item.get("id") == f"RESOLVE-{rewrite_gap_id}"
+            ),
+            None,
+        )
+        rewrite_queue_commands = [] if rewrite_queue_item is None else rewrite_queue_item.get("commands", [])
+        rewrite_queue_command_safety = (
+            {}
+            if rewrite_queue_item is None
+            else (rewrite_queue_item.get("command_safety", {}) or {}).get("summary", {})
+        )
+        rewrite_queue_command_counts = rewrite_queue_command_safety.get("classification_counts", {})
+        rewrite_queue_global_command_safety = rewrite_queue.get("summary", {}).get("command_safety", {})
+        unsafe_command_classification = classify_verification_command(
+            "python3 scripts/inferforge.py promote-observation-candidate --path <approved-path>",
+            source="self-test:unsafe-shell-placeholder",
+        )
+        queue_promotion_selftest_passed = (
+            rewrite_queue_item is not None
+            and len(rewrite_queue_commands) == 3
+            and "promote-observation-candidate" in rewrite_queue_commands[0]
+            and f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH}" in rewrite_queue_commands[0]
+            and "reviewed-profile.json" in rewrite_queue_commands[0]
+            and "burp-sync --observe" in rewrite_queue_commands[1]
+            and "audit --include-external --ws-resource-probes" in rewrite_queue_commands[2]
+            and all(command.count("--profile") <= 1 for command in rewrite_queue_commands)
+            and all(command.count("--artifact-dir") == 1 for command in rewrite_queue_commands)
+            and rewrite_queue_command_counts.get("manual-template") == 1
+            and rewrite_queue_command_counts.get("review-gated") == 2
+            and rewrite_queue_command_safety.get("unsafe_template_count") == 0
+            and rewrite_queue_global_command_safety.get("unsafe_template_count") == 0
+            and unsafe_command_classification.get("classification") == "unsafe-template"
+            and "shell-angle-placeholder-or-redirection" in unsafe_command_classification.get("issues", [])
+        )
+        rewrite_source_peeks = build_source_peeks(
+            rewrite_source_root,
+            rewrite_profile,
+            [
+                {
+                    "method": "POST",
+                    "path": "/api/root",
+                    "request_context": build_request_context(
+                        "POST",
+                        "/api/root",
+                        {"host": "127.0.0.1:9998"},
+                        "127.0.0.1:9998",
+                    ),
+                }
+            ],
+        )
+        rewrite_source_resolver_report = build_source_resolver_report_summary(rewrite_source_peeks)
+        server_action_only_clusters = {
+            "generated_at": utc_now(),
+            "profile": rewrite_clusters.get("profile", {}),
+            "clusters": [],
+        }
+        rewrite_server_action_gaps = build_evidence_gaps(
+            server_action_only_clusters,
+            [],
+            [],
+            {"candidates_seen": 1},
+            source_peeks=rewrite_source_peeks,
+        )
+        rewrite_server_action_gap = next(
+            (
+                gap
+                for gap in rewrite_server_action_gaps.get("gaps", [])
+                if str(gap.get("id", "")).startswith("GAP-server-action-")
+            ),
+            None,
+        )
+        rewrite_server_action_queue = build_verification_queue(
+            "http://127.0.0.1:9998",
+            server_action_only_clusters,
+            {"clusters": []},
+            rewrite_server_action_gaps,
+            {"status": "covered-with-evidence-gaps"},
+            {"status": "no-reportable-findings", "external_blockers": [], "decisions": []},
+            {"status": "ready"},
+            queue_artifact_dir,
+        )
+        rewrite_server_action_queue_item = next(
+            (
+                item
+                for item in rewrite_server_action_queue.get("items", [])
+                if item.get("id") == f"RESOLVE-{rewrite_server_action_gap.get('id')}"
+            ),
+            None,
+        ) if rewrite_server_action_gap else None
+        rewrite_server_action_candidates = (
+            []
+            if rewrite_server_action_queue_item is None
+            else rewrite_server_action_queue_item.get("review_candidates", [])
+        )
+        rewrite_server_action_gap_passed = (
+            rewrite_server_action_gap is not None
+            and rewrite_server_action_gap.get("cluster_id") == "server-actions"
+            and rewrite_server_action_gap.get("priority") == "high"
+            and "updateWidget" in rewrite_server_action_gap.get("reason", "")
+            and "deleteWidget" in rewrite_server_action_gap.get("reason", "")
+            and rewrite_server_action_queue_item is not None
+            and rewrite_server_action_queue_item.get("status") == "manual-review"
+            and rewrite_server_action_queue_item.get("commands") == []
+            and "source-peek-results.json" in rewrite_server_action_queue_item.get("evidence_refs", [])
+            and len(rewrite_server_action_candidates) == 1
+            and rewrite_server_action_candidates[0].get("type") == "server-action-source-review"
+            and rewrite_server_action_candidates[0].get("status") == "manual-review"
+            and {"updateWidget", "deleteWidget"}.issubset(set(rewrite_server_action_candidates[0].get("action_names", [])))
+            and rewrite_server_action_queue.get("summary", {}).get("command_safety", {}).get("unsafe_template_count") == 0
+            and not any(str(cluster.get("id", "")).startswith("server_action") for cluster in rewrite_clusters.get("clusters", []))
+        )
+        rewrite_source_peek_requests = build_source_peek_requests(
+            rewrite_clusters,
+            {
+                "generated_at": utc_now(),
+                "endpoints": [
+                    {
+                        "method": "POST",
+                        "path": "/api/root",
+                        "statuses": [200],
+                        "probe_ids": ["selftest-root-route"],
+                        "observed_via": "safe-local-probe",
+                    }
+                ],
+            },
+            rewrite_source_peeks,
+            [],
+            rewrite_server_action_gaps,
+        )
+        rewrite_source_peek_request_ids = {
+            str(item.get("id"))
+            for item in rewrite_source_peek_requests.get("requests", [])
+        }
+        rewrite_source_peek_request_triggers = (
+            rewrite_source_peek_requests.get("summary", {}).get("trigger_counts", {})
+        )
+        rewrite_source_peek_requests_passed = (
+            rewrite_source_peek_requests.get("status") == "answered-with-manual-review"
+            and any(request_id.startswith("PEEK-endpoint-") for request_id in rewrite_source_peek_request_ids)
+            and any(request_id.startswith("PEEK-server-action-") for request_id in rewrite_source_peek_request_ids)
+            and any(request_id.startswith("PEEK-gap-gap_server_action_") for request_id in rewrite_source_peek_request_ids)
+            and rewrite_source_peek_request_triggers.get("observed-endpoint") == 1
+            and rewrite_source_peek_request_triggers.get("source-only-server-action-discovery") == 1
+            and rewrite_source_peek_request_triggers.get("evidence-gap") == 1
+        )
+        rewrite_burp_observation_coverage = build_burp_observation_coverage(
+            "http://127.0.0.1:9998",
+            rewrite_profile,
+            rewrite_clusters,
+            [],
+            {
+                "generated_at": utc_now(),
+                "status": "observed",
+                "summary": {
+                    "total": 1,
+                    "unexpected": 0,
+                    "clusters": ["route-api-root"],
+                },
+                "requests": [
+                    {
+                        "id": "burp_observe_route_api_root",
+                        "cluster": "route-api-root",
+                        "method": "POST",
+                        "path": "/api/root",
+                        "expected": True,
+                    }
+                ],
+            },
+            {
+                "gaps": [
+                    {
+                        "id": rewrite_gap_id,
+                        "cluster_id": "route-api-proxy-path",
+                    }
+                ]
+            },
+        )
+        rewrite_burp_rows = {
+            item.get("cluster_id"): item
+            for item in rewrite_burp_observation_coverage.get("clusters", [])
+        }
+        rewrite_burp_observation_coverage_passed = (
+            rewrite_burp_observation_coverage.get("status") == "needs-human-review"
+            and rewrite_burp_rows.get("route-api-root", {}).get("status") == "observe-run-generated-not-imported"
+            and rewrite_burp_rows.get("route-api-proxy-path", {}).get("status") == "needs-reviewed-observation-promotion"
+            and rewrite_burp_rows.get("route-api-proxy-path", {}).get("review_candidate_count") == 1
+            and rewrite_gap_id in rewrite_burp_rows.get("route-api-proxy-path", {}).get("evidence_gaps", [])
+        )
+        rewrite_server_action_report_lines = rewrite_source_resolver_report.get("server_action_lines", [])
+        rewrite_discovery_passed = (
+            rewrite_inventory.get("summary", {}).get("rewrite_count") == 1
+            and rewrite_inventory.get("summary", {}).get("app_router_route_count") == 2
+            and rewrite_inventory.get("summary", {}).get("pages_router_api_route_count") == 1
+            and rewrite_inventory.get("summary", {}).get("middleware_count") == 1
+            and rewrite_inventory.get("summary", {}).get("server_action_file_count") == 1
+            and rewrite_inventory.get("summary", {}).get("server_action_export_count") == 2
+            and rewrite_inventory.get("summary", {}).get("redirect_count") == 1
+            and rewrite_inventory.get("summary", {}).get("header_route_count") == 1
+            and rewrite_inventory.get("summary", {}).get("custom_server_entrypoint_count") == 1
+            and "health" in rewrite_observation_clusters
+            and "route-api-widgets" in rewrite_observation_clusters
+            and "route-api-root" in rewrite_observation_clusters
+            and "route-api-proxy-path" not in rewrite_observation_clusters
+            and "Next.js Server Actions" in rewrite_profile.get("frameworks", [])
+            and (rewrite_profile.get("websocket_observation") or {}).get("cluster") == "solana-rpc-ws"
+            and rewrite_validation.get("status") != "failed"
+            and rewrite_cluster is not None
+            and rewrite_cluster.get("kind") == "rewrite-proxy"
+            and rewrite_cluster.get("strategy_set") == "fixed-upstream-proxy"
+            and any(str(ref).endswith("next.config.ts") for ref in rewrite_cluster.get("source_refs", []))
+            and "/api/proxy/" in (rewrite_cluster.get("match") or {}).get("path_prefixes", [])
+            and "https://api.example.test" in rewrite_cluster.get("discovery", {}).get("fixed_upstreams", [])
+            and any(
+                item.get("phase") == "beforeFiles"
+                and item.get("conditional") is True
+                and (item.get("conditions") or {}).get("has")
+                for item in rewrite_cluster.get("discovery", {}).get("rewrites", [])
+            )
+            and len(rewrite_profile_candidates) == 1
+            and rewrite_profile_candidates[0].get("status") == "review-only"
+            and rewrite_profile_candidates[0].get("example_path") == "/api/proxy/<approved-read-only-path>"
+            and rewrite_cluster_candidates
+            and rewrite_cluster_candidates[0].get("status") == "review-only"
+            and "route-api-proxy-path" in classify_endpoint("GET", "/api/proxy/users/42", rewrite_clusters)
+            and rewrite_resolution_match is not None
+            and str(rewrite_resolution_match.get("source_ref", "")).endswith("next.config.ts")
+            and "rewrite-phase:beforeFiles" in rewrite_resolution_match.get("match_reasons", [])
+            and "conditional-route" in rewrite_resolution_match.get("match_reasons", [])
+            and "condition-satisfied" in rewrite_resolution_match.get("match_reasons", [])
+            and rewrite_resolution_match.get("condition_status") == "condition-satisfied"
+            and rewrite_resolution_match.get("applicability") == "path-match-condition-satisfied"
+            and not str((rewrite_resolution_match.get("line_refs") or {}).get("rewrite_source", "")).endswith(":not-found")
+            and not str((rewrite_resolution_match.get("line_refs") or {}).get("rewrite_destination", "")).endswith(":not-found")
+            and not str((rewrite_resolution_match.get("line_refs") or {}).get("has_conditions", "")).endswith(":not-found")
+            and rewrite_condition_missing_match is not None
+            and rewrite_condition_missing_match.get("condition_status") == "condition-not-satisfied"
+            and rewrite_condition_missing_match.get("applicability") == "path-match-condition-not-satisfied"
+            and ws_resolution_match is not None
+            and str(ws_resolution_match.get("source_ref", "")).endswith("server.js")
+            and not str((ws_resolution_match.get("line_refs") or {}).get("upgrade_handler", "")).endswith(":not-found")
+            and not str((ws_resolution_match.get("line_refs") or {}).get("proxy_handler", "")).endswith(":not-found")
+            and pages_api_cluster is not None
+            and pages_api_cluster.get("strategy_set") == "nextjs-api-routes"
+            and any(
+                route.get("router") == "pages"
+                for route in pages_api_cluster.get("discovery", {}).get("routes", [])
+            )
+            and pages_api_resolution_match is not None
+            and str(pages_api_resolution_match.get("source_ref", "")).endswith("src/pages/api/widgets.ts")
+            and root_app_cluster is not None
+            and root_app_cluster.get("strategy_set") == "nextjs-api-routes"
+            and any(
+                route.get("router") == "app" and route.get("source_path") == "/api/root"
+                for route in root_app_cluster.get("discovery", {}).get("routes", [])
+            )
+            and root_app_resolution_match is not None
+            and str(root_app_resolution_match.get("source_ref", "")).endswith("app/api/root/route.ts")
+            and len(server_action_entries) == 1
+            and {"updateWidget", "deleteWidget"}.issubset(set(server_action_entries[0].get("action_names", [])))
+            and not any(str(cluster.get("id", "")).startswith("server_action") for cluster in rewrite_clusters.get("clusters", []))
+            and any("updateWidget" in line and "deleteWidget" in line for line in rewrite_server_action_report_lines)
+            and rewrite_server_action_gap_passed
+            and rewrite_source_peek_requests_passed
+            and rewrite_burp_observation_coverage_passed
+            and any(
+                item.get("match_status") == "matched-static-matcher"
+                and str(item.get("source_ref", "")).endswith("src/middleware.ts")
+                for item in pages_api_middleware_context
+            )
+            and any(
+                item.get("match_status") == "matched-static-matcher"
+                and str(item.get("source_ref", "")).endswith("src/middleware.ts")
+                for item in rewrite_middleware_context
+            )
+            and any(
+                item.get("kind") == "next-config-headers"
+                and item.get("match_status") == "matched-conditional-policy"
+                and item.get("condition_status") == "condition-satisfied"
+                and item.get("applicability") == "path-match-condition-satisfied"
+                and "X-InferForge-Selftest" in (item.get("route_policy") or {}).get("header_keys", [])
+                and (item.get("route_policy") or {}).get("conditional") is True
+                and (item.get("route_policy") or {}).get("conditions", {}).get("has")
+                for item in pages_api_route_policy_context
+            )
+            and any(
+                item.get("kind") == "next-config-headers"
+                and item.get("match_status") == "matched-conditional-policy"
+                and item.get("condition_status") == "condition-not-satisfied"
+                and item.get("applicability") == "path-match-condition-not-satisfied"
+                for item in pages_api_no_debug_route_policy_context
+            )
+            and any(
+                item.get("kind") == "next-config-headers"
+                and item.get("match_status") == "matched-conditional-policy"
+                and item.get("condition_status") == "condition-not-satisfied"
+                for item in rewrite_route_policy_context
+            )
+            and any(
+                item.get("kind") == "next-config-redirect"
+                and item.get("match_status") == "matched-conditional-policy"
+                and item.get("condition_status") == "condition-satisfied"
+                and item.get("applicability") == "path-match-condition-satisfied"
+                and (item.get("route_policy") or {}).get("status_code") == 307
+                and (item.get("route_policy") or {}).get("conditions", {}).get("missing")
+                for item in redirect_route_policy_context
+            )
+            and any(
+                item.get("kind") == "next-config-redirect"
+                and item.get("match_status") == "matched-conditional-policy"
+                and item.get("condition_status") == "condition-not-satisfied"
+                and item.get("applicability") == "path-match-condition-not-satisfied"
+                for item in redirect_cookie_present_route_policy_context
+            )
+            and promotion_selftest_passed
+            and queue_promotion_selftest_passed
+        )
+        initial_artifact_dir = Path(temp_dir) / "initial-artifacts"
+        initial_artifact_dir.mkdir()
+        ensure_initial_audit_artifacts(initial_artifact_dir)
+        initial_observation = json.loads(read_text(initial_artifact_dir / "burp-observation-run.json"))
+        initial_quote_collection = json.loads(read_text(initial_artifact_dir / "quote-collection.json"))
+        initial_artifacts_passed = (
+            (initial_artifact_dir / "burp-history-observations.jsonl").exists()
+            and initial_observation.get("status") == "not-run"
+            and initial_quote_collection.get("status") == "not-collected"
+            and initial_quote_collection.get("diagnosis", {}).get("classification") == "quote-collection-not-run"
+        )
+        target_lock = TargetProbeLock("http://127.0.0.1:9997", purpose="self-test")
+        nested_lock_blocked = False
+        with target_lock:
+            try:
+                with TargetProbeLock("http://127.0.0.1:9997", purpose="self-test-nested"):
+                    pass
+            except RuntimeError:
+                nested_lock_blocked = True
+        target_lock_passed = nested_lock_blocked and not target_lock.path.exists()
+
+        configured_source_root = Path(temp_dir) / "configured-app"
+        (configured_source_root / "src/app/api/widgets").mkdir(parents=True)
+        (configured_source_root / "src/app/api/widgets/route.ts").write_text(
+            "export async function GET() { return Response.json({ ok: true }) }\n",
+            encoding="utf-8",
+        )
+        (configured_source_root / "src/pages/api").mkdir(parents=True)
+        (configured_source_root / "src/pages/api/legacy.ts").write_text(
+            textwrap.dedent(
+                """
+                export default function handler(req, res) {
+                  if (req.method === 'POST') {
+                    res.status(200).json({ ok: true })
+                    return
+                  }
+                  res.status(405).end()
+                }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (configured_source_root / "next.config.ts").write_text(
+            textwrap.dedent(
+                """
+                const nextConfig = {
+                  async headers() {
+                    return [
+                      {
+                        source: '/static/:path*',
+                        basePath: false,
+                        headers: [
+                          { key: 'X-Selftest-Static', value: '1' },
+                        ],
+                      },
+                    ]
+                  },
+                  basePath: '/console',
+                  trailingSlash: true,
+                  i18n: {
+                    locales: ['en', 'fr'],
+                    defaultLocale: 'en',
+                  },
+                  async rewrites() {
+                    return [
+                      {
+                        source: '/api/proxy/:path*',
+                        destination: 'https://api.example.test/:path*',
+                        has: [
+                          { type: 'header', key: 'x-approved-proxy', value: 'yes' },
+                        ],
+                      },
+                    ]
+                  },
+                }
+
+                export default nextConfig
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        configured_inventory = discover_nextjs_routes(configured_source_root)
+        configured_profile = build_discovered_profile(
+            configured_inventory,
+            name="configured-nextjs-selftest",
+            display_name="Configured Next.js Self-Test",
+            target="http://127.0.0.1:9996",
+            source_root=configured_source_root,
+        )
+        configured_clusters = build_clusters(normalize_target_profile(configured_profile), configured_source_root)
+        configured_widget_route = next(
+            (
+                route
+                for route in configured_inventory.get("routes", [])
+                if route.get("source_path") == "/api/widgets"
+            ),
+            None,
+        )
+        configured_legacy_route = next(
+            (
+                route
+                for route in configured_inventory.get("routes", [])
+                if route.get("source_path") == "/api/legacy"
+            ),
+            None,
+        )
+        configured_rewrite = next(
+            (
+                rewrite
+                for rewrite in configured_inventory.get("rewrites", [])
+                if rewrite.get("source_path") == "/api/proxy/{path*}"
+            ),
+            None,
+        )
+        configured_widget_resolution = resolve_endpoint_sources(
+            configured_source_root,
+            "GET",
+            "/console/fr/api/widgets/",
+            configured_inventory,
+            build_request_context("GET", "/console/fr/api/widgets/", {"host": "127.0.0.1:9996"}, "127.0.0.1:9996"),
+        )
+        configured_widget_match = next(
+            (
+                match
+                for match in configured_widget_resolution.get("matches", [])
+                if match.get("cluster_id") == "route-api-widgets"
+            ),
+            None,
+        )
+        configured_rewrite_resolution = resolve_endpoint_sources(
+            configured_source_root,
+            "GET",
+            "/console/fr/api/proxy/users/42",
+            configured_inventory,
+            build_request_context(
+                "GET",
+                "/console/fr/api/proxy/users/42",
+                {"host": "127.0.0.1:9996", "x-approved-proxy": "yes"},
+                "127.0.0.1:9996",
+            ),
+        )
+        configured_rewrite_match = next(
+            (
+                match
+                for match in configured_rewrite_resolution.get("matches", [])
+                if match.get("cluster_id") == "route-api-proxy-path"
+            ),
+            None,
+        )
+        configured_source_resolver_report = build_source_resolver_report_summary(
+            build_source_peeks(
+                configured_source_root,
+                configured_profile,
+                [
+                    {
+                        "method": "GET",
+                        "path": "/console/fr/api/widgets/",
+                        "request_context": build_request_context(
+                            "GET",
+                            "/console/fr/api/widgets/",
+                            {"host": "127.0.0.1:9996"},
+                            "127.0.0.1:9996",
+                        ),
+                    },
+                    {
+                        "method": "GET",
+                        "path": "/console/fr/api/proxy/users/42",
+                        "request_context": build_request_context(
+                            "GET",
+                            "/console/fr/api/proxy/users/42",
+                            {"host": "127.0.0.1:9996", "x-approved-proxy": "yes"},
+                            "127.0.0.1:9996",
+                        ),
+                    },
+                ],
+            )
+        )
+        configured_observation_paths = {
+            str(item.get("path"))
+            for item in configured_profile.get("burp_observation_plan", [])
+        }
+        configured_report_lines = [
+            *configured_source_resolver_report.get("summary_lines", []),
+            *configured_source_resolver_report.get("entrypoint_lines", []),
+            *configured_source_resolver_report.get("policy_lines", []),
+            *configured_source_resolver_report.get("observed_lines", []),
+        ]
+        configured_nextjs_runtime_passed = (
+            configured_inventory.get("summary", {}).get("next_config_runtime", {}).get("base_path") == "/console"
+            and configured_inventory.get("summary", {}).get("next_config_runtime", {}).get("trailing_slash") is True
+            and configured_inventory.get("summary", {}).get("next_config_runtime", {}).get("i18n_configured") is True
+            and configured_widget_route is not None
+            and configured_widget_route.get("path") == "/console/api/widgets/"
+            and configured_widget_route.get("cluster_id") == "route-api-widgets"
+            and "/console/fr/api/widgets/" in (configured_widget_route.get("match") or {}).get("paths", [])
+            and "/console/fr/api/widgets" in (configured_widget_route.get("match") or {}).get("paths", [])
+            and configured_legacy_route is not None
+            and configured_legacy_route.get("path") == "/console/api/legacy/"
+            and configured_rewrite is not None
+            and configured_rewrite.get("path") == "/console/api/proxy/{path*}"
+            and "/console/fr/api/proxy/{path*}" in (configured_rewrite.get("match") or {}).get("path_patterns", [])
+            and configured_widget_match is not None
+            and str(configured_widget_match.get("source_ref", "")).endswith("src/app/api/widgets/route.ts")
+            and "basePath:/console" in configured_widget_match.get("match_reasons", [])
+            and "locale-prefix:fr" in configured_widget_match.get("match_reasons", [])
+            and "trailingSlash:canonical" in configured_widget_match.get("match_reasons", [])
+            and configured_rewrite_match is not None
+            and configured_rewrite_match.get("condition_status") == "condition-satisfied"
+            and "locale-prefix:fr" in configured_rewrite_match.get("match_reasons", [])
+            and "condition-satisfied" in configured_rewrite_match.get("match_reasons", [])
+            and any("basePath `/console`" in line for line in configured_report_lines)
+            and any("/console/api/proxy/{path*}" in line for line in configured_report_lines)
+            and any("condition `condition-satisfied`" in line for line in configured_report_lines)
+            and any("basePath:/console" in line and "locale-prefix:fr" in line for line in configured_report_lines)
+            and "route-api-widgets" in {cluster.get("id") for cluster in configured_clusters.get("clusters", [])}
+            and "/console/api/widgets/" in configured_observation_paths
+        )
+    generic_unexpected_row = {
+        "ts": utc_now(),
+        "phase": "self-test",
+        "probe_id": "nextjs_route_custom_api_widgets_get_method_confusion",
+        "label": "Next.js route GET method confusion route-custom-api-widgets",
+        "target": target,
+        "method": "GET",
+        "path": "/custom/api/widgets",
+        "origin": None,
+        "referer": None,
+        "category": "route-custom-api-widgets",
+        "external": False,
+        "policy_field": "method",
+        "risk": "safe-generic-route-method-probe",
+        "expectation": "status",
+        "expectation_result": "unexpected-status",
+        "expected_statuses": [400, 403, 404, 405],
+        "status": 200,
+        "expected": False,
+        "duration_ms": 1,
+        "error": None,
+        "body_sample": '{"ok":true}',
+        "body_text": '{"ok":true}',
+        "body_sha256": hashlib.sha256(b'{"ok":true}').hexdigest(),
+        "body_truncated": False,
+        "body_length": len('{"ok":true}'),
+        "interesting": True,
+        "attempt_count": 1,
+    }
+    generic_suspicions = build_suspicions([generic_unexpected_row], clusters)
+    generic_gate = build_finding_gate(generic_suspicions, [])
+    generic_hardening_notes = build_hardening_notes(generic_suspicions, generic_gate)
+    generic_suspicion = next(
+        (
+            item
+            for item in generic_suspicions
+            if item.get("id") == "SUSP-nextjs-route-policy-route_custom_api_widgets"
+        ),
+        None,
+    )
+    generic_gate_item = next(
+        (
+            item
+            for item in generic_gate.get("gates", [])
+            if item.get("suspicion_id") == "SUSP-nextjs-route-policy-route_custom_api_widgets"
+        ),
+        None,
+    )
+    generic_attribution_passed = (
+        generic_suspicion is not None
+        and generic_gate_item is not None
+        and generic_gate_item.get("gate_status") == "accepted-hardening-note"
+        and "scripts/inferforge.py" in generic_suspicion.get("source_refs", [])
+        and any(
+            item.get("id") == "SUSP-nextjs-route-policy-route_custom_api_widgets"
+            for item in generic_hardening_notes
+        )
+    )
+    generic_expected_row = json_clone(generic_unexpected_row)
+    generic_expected_row.update(
+        {
+            "probe_id": "nextjs_route_custom_api_widgets_head_expected",
+            "label": "Next.js route HEAD expected route-custom-api-widgets",
+            "method": "HEAD",
+            "status": 405,
+            "expected": True,
+            "expected_statuses": [400, 403, 404, 405],
+            "expectation_result": "status",
+            "body_sample": '{"error":"method not allowed"}',
+            "body_text": '{"error":"method not allowed"}',
+            "body_sha256": hashlib.sha256(b'{"error":"method not allowed"}').hexdigest(),
+            "body_length": len('{"error":"method not allowed"}'),
+            "interesting": False,
+        }
+    )
+    response_delta_selftest = build_response_delta_analysis(
+        clusters,
+        [generic_expected_row, generic_unexpected_row],
+    )
+    response_delta_cluster = next(
+        (
+            item
+            for item in response_delta_selftest.get("clusters", [])
+            if item.get("cluster_id") == "route-custom-api-widgets"
+        ),
+        None,
+    )
+    response_delta_endpoint = None
+    if response_delta_cluster:
+        response_delta_endpoint = next(
+            (
+                item
+                for item in response_delta_cluster.get("endpoints", [])
+                if item.get("endpoint") == "GET /custom/api/widgets"
+            ),
+            None,
+        )
+    response_delta_selftest_passed = (
+        response_delta_selftest.get("status") == "review-needed"
+        and response_delta_cluster is not None
+        and response_delta_cluster.get("status") == "review-needed"
+        and "status-variant" in response_delta_cluster.get("delta_flags", [])
+        and "body-hash-variant" in response_delta_cluster.get("delta_flags", [])
+        and "unexpected-response" in response_delta_cluster.get("delta_flags", [])
+        and response_delta_endpoint is not None
+        and response_delta_endpoint.get("status") == "review-needed"
+        and response_delta_endpoint.get("unexpected_count") == 1
+    )
+
+    probe_paths = {probe.path for probe in probes}
+    warmup_paths = {probe.path for probe in warmups}
+    observation_paths = {str(item["path"]) for item in observation_plan}
+    ws_config = websocket_observation_config(test_profile)
+    ws_path = None if ws_config is None else str(ws_config.get("path"))
+    all_paths = sorted(probe_paths | warmup_paths | observation_paths | ({ws_path} if ws_path else set()))
+    forbidden_paths = {
+        "/health",
+        "/api/quote",
+        "/api/rpc",
+        "/api/rpc/solana/devnet",
+        "/api/rpc/solana/localnet",
+        "/api/orca/pools/not-an-address",
+        "/api/orca/pools/0OIlnotbase58",
+        "/api/orca/pools/1111111111111111111111111111111",
+        "/api/orca/pools/111111111111111111111111111111111111111111111",
+        "/api/orca/pools/%2e%2e%2fhealth",
+        "/api/orca/pools/not-an-address/extra",
+        "/api/orca/pools/not-an-address?url=https://evil.example",
+    }
+    required_paths = {
+        "/statusz",
+        "/bridge/quote",
+        "/custom/api/widgets",
+        "/chain/solana/devnet",
+        "/chain/rpc",
+        "/chain/solana/localnet",
+        "/poolz/not-an-address",
+        "/poolz/0OIlnotbase58",
+        "/poolz/1111111111111111111111111111111",
+        "/poolz/111111111111111111111111111111111111111111111",
+        "/poolz/%2e%2e%2fstatusz",
+        "/poolz/not-an-address/extra",
+        "/poolz/not-an-address?url=https://evil.example",
+        "/ws/solana/devnet",
+    }
+    leaked_paths = sorted(path for path in all_paths if path in forbidden_paths)
+    missing_paths = sorted(path for path in required_paths if path not in all_paths)
+    passed = (
+        validation["status"] != "failed"
+        and not leaked_paths
+        and not missing_paths
+        and generic_attribution_passed
+        and response_delta_selftest_passed
+        and unsafe_observation_validation_passed
+        and rewrite_discovery_passed
+        and configured_nextjs_runtime_passed
+        and initial_artifacts_passed
+        and target_lock_passed
+    )
+
+    artifact = {
+        "generated_at": utc_now(),
+        "status": "passed" if passed else "failed",
+        "profile_under_test": profile_summary(test_profile),
+        "current_profile_context": profile_summary(profile),
+        "validation_status": validation["status"],
+        "probe_count": len(probes),
+        "warmup_count": len(warmups),
+        "observation_count": len(observation_plan),
+        "websocket_path": ws_path,
+        "forbidden_default_paths": sorted(forbidden_paths),
+        "leaked_default_paths": leaked_paths,
+        "required_custom_paths": sorted(required_paths),
+        "missing_custom_paths": missing_paths,
+        "observed_paths": all_paths,
+        "generic_route_attribution": {
+            "status": "passed" if generic_attribution_passed else "failed",
+            "suspicion_ids": [item.get("id") for item in generic_suspicions],
+            "gate_status": None if generic_gate_item is None else generic_gate_item.get("gate_status"),
+            "source_refs": [] if generic_suspicion is None else generic_suspicion.get("source_refs", []),
+            "hardening_note_ids": [item.get("id") for item in generic_hardening_notes],
+        },
+        "response_delta_analysis": {
+            "status": "passed" if response_delta_selftest_passed else "failed",
+            "artifact_status": response_delta_selftest.get("status"),
+            "summary": response_delta_selftest.get("summary", {}),
+            "cluster": response_delta_cluster,
+            "endpoint": response_delta_endpoint,
+        },
+        "active_observation_validation": {
+            "status": "passed" if unsafe_observation_validation_passed else "failed",
+            "validation_status": unsafe_observation_validation.get("status"),
+            "issue_ids": [item.get("id") for item in unsafe_observation_validation.get("issues", [])],
+            "build_blocked": unsafe_observation_build_blocked,
+            "build_error": unsafe_observation_build_error,
+        },
+        "rewrite_discovery": {
+            "status": "passed" if rewrite_discovery_passed else "failed",
+            "inventory_summary": rewrite_inventory.get("summary", {}),
+            "cluster_id": None if rewrite_cluster is None else rewrite_cluster.get("id"),
+            "cluster_kind": None if rewrite_cluster is None else rewrite_cluster.get("kind"),
+            "strategy_set": None if rewrite_cluster is None else rewrite_cluster.get("strategy_set"),
+            "source_refs": [] if rewrite_cluster is None else rewrite_cluster.get("source_refs", []),
+            "match": {} if rewrite_cluster is None else rewrite_cluster.get("match", {}),
+            "fixed_upstreams": []
+            if rewrite_cluster is None
+            else rewrite_cluster.get("discovery", {}).get("fixed_upstreams", []),
+            "classification_check_path": "/api/proxy/users/42",
+            "endpoint_resolution": rewrite_resolution,
+            "websocket_endpoint_resolution": ws_resolution,
+            "pages_api_endpoint_resolution": pages_api_resolution,
+            "middleware_context": {
+                "rewrite": rewrite_middleware_context,
+                "pages_api": pages_api_middleware_context,
+            },
+            "route_policy_context": {
+                "rewrite": rewrite_route_policy_context,
+                "pages_api": pages_api_route_policy_context,
+                "pages_api_no_debug": pages_api_no_debug_route_policy_context,
+                "redirect": redirect_route_policy_context,
+                "redirect_cookie_present": redirect_cookie_present_route_policy_context,
+            },
+            "conditional_rewrite_without_required_header": rewrite_condition_missing_resolution,
+            "pages_api_cluster": pages_api_cluster,
+            "root_app_cluster": root_app_cluster,
+            "root_app_endpoint_resolution": root_app_resolution,
+            "server_actions": server_action_entries,
+            "server_action_evidence_gap": {
+                "status": "passed" if rewrite_server_action_gap_passed else "failed",
+                "gap": rewrite_server_action_gap,
+                "queue_item": rewrite_server_action_queue_item,
+                "queue_status": rewrite_server_action_queue.get("status"),
+                "queue_command_safety": rewrite_server_action_queue.get("summary", {}).get("command_safety", {}),
+            },
+            "source_peek_requests": {
+                "status": "passed" if rewrite_source_peek_requests_passed else "failed",
+                "artifact_status": rewrite_source_peek_requests.get("status"),
+                "summary": rewrite_source_peek_requests.get("summary", {}),
+                "request_ids": sorted(rewrite_source_peek_request_ids),
+            },
+            "burp_observation_coverage": {
+                "status": "passed" if rewrite_burp_observation_coverage_passed else "failed",
+                "artifact_status": rewrite_burp_observation_coverage.get("status"),
+                "summary": rewrite_burp_observation_coverage.get("summary", {}),
+                "clusters": rewrite_burp_observation_coverage.get("clusters", []),
+            },
+            "source_resolver_report_summary": rewrite_source_resolver_report,
+            "observation_clusters": sorted(rewrite_observation_clusters),
+            "review_observation_candidates": rewrite_profile_candidates,
+            "promotion_selftest": {
+                "status": "passed" if promotion_selftest_passed else "failed",
+                "promoted_observation": promoted_rewrite_observation,
+                "promoted_paths": sorted(promoted_rewrite_paths),
+                "rejected_paths": rejected_promotion_paths,
+                "queue_commands": rewrite_queue_commands,
+                "queue_status": "passed" if queue_promotion_selftest_passed else "failed",
+                "queue_command_safety": rewrite_queue_command_safety,
+                "queue_global_command_safety": rewrite_queue_global_command_safety,
+                "unsafe_command_classification": unsafe_command_classification,
+                "error": promotion_error,
+            },
+        },
+        "configured_nextjs_runtime": {
+            "status": "passed" if configured_nextjs_runtime_passed else "failed",
+            "inventory_summary": configured_inventory.get("summary", {}),
+            "widget_route": configured_widget_route,
+            "legacy_route": configured_legacy_route,
+            "rewrite": configured_rewrite,
+            "widget_resolution": configured_widget_resolution,
+            "rewrite_resolution": configured_rewrite_resolution,
+            "source_resolver_report_summary": configured_source_resolver_report,
+            "observation_paths": sorted(configured_observation_paths),
+        },
+        "initial_audit_artifacts": {
+            "status": "passed" if initial_artifacts_passed else "failed",
+            "history_exists": (initial_artifact_dir / "burp-history-observations.jsonl").exists(),
+            "observation_status": initial_observation.get("status"),
+            "quote_collection_status": initial_quote_collection.get("status"),
+            "quote_collection_classification": initial_quote_collection.get("diagnosis", {}).get("classification"),
+        },
+        "target_probe_lock": {
+            "status": "passed" if target_lock_passed else "failed",
+            "nested_lock_blocked": nested_lock_blocked,
+            "lock_path_removed": not target_lock.path.exists(),
+        },
+        "safety": "Static self-test only. No HTTP requests, Burp calls, signing, or transaction submission are performed.",
+    }
+    write_json(artifact_dir / "profile-routing-selftest.json", artifact)
+    print(f"Profile routing self-test: {artifact['status']}")
+    print(f"Probes: {len(probes)}, warmups: {len(warmups)}, observations: {len(observation_plan)}")
+    print(f"Wrote {artifact_dir / 'profile-routing-selftest.json'}")
+    return 0 if passed else 1
+
+
+def run_burp_sync(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    observe_result = None
+    if args.observe:
+        observe_result = run_burp_observe(args)
+        if observe_result != 0:
+            return observe_result
+
+    observation_plan = build_burp_observation_plan(target, profile)
+    observation_artifact_path = artifact_dir / "burp-observation-run.json"
+    observed_ws_upgrade = False
+    if observation_artifact_path.exists():
+        observation_artifact = json.loads(read_text(observation_artifact_path))
+        observed_ws_upgrade = bool(observation_artifact.get("websocket_upgrade"))
+
+    history_regex = args.regex or build_burp_history_regex(
+        target,
+        observation_plan,
+        include_ws_upgrade=args.ws_upgrade or observed_ws_upgrade,
+    )
+    raw_path = resolve_repo_path(args.raw_output) if args.raw_output else artifact_dir / "burp-mcp-history-latest.txt"
+    ws_raw_path = (
+        resolve_repo_path(args.websocket_raw_output)
+        if args.websocket_raw_output
+        else artifact_dir / "burp-mcp-websocket-history-latest.txt"
+    )
+
+    sync_artifact: dict[str, Any] = {
+        "generated_at": utc_now(),
+        "profile": profile_summary(profile),
+        "target": target,
+        "mcp_url": args.mcp_url,
+        "history_regex": history_regex,
+        "http_history": {
+            "tool": "get_proxy_http_history_regex",
+            "count": args.count,
+            "offset": args.offset,
+            "raw_output": str(raw_path),
+        },
+        "websocket_history": None,
+        "intercept": {
+            "requested_off": not args.keep_intercept_state,
+            "ok": None,
+            "error": None,
+        },
+        "observe_before_sync": bool(args.observe),
+        "safety": [
+            "Uses Burp MCP only for Proxy Intercept state and history retrieval.",
+            "Does not run Burp Scanner, sign wallets, submit Solana transactions, or fuzz broadly.",
+        ],
+    }
+
+    try:
+        with McpSseClient(args.mcp_url, timeout=args.mcp_timeout) as client:
+            if not args.keep_intercept_state:
+                try:
+                    client.call_tool("set_proxy_intercept_state", {"intercepting": False})
+                    sync_artifact["intercept"]["ok"] = True
+                except Exception as error:
+                    sync_artifact["intercept"]["ok"] = False
+                    sync_artifact["intercept"]["error"] = str(error)
+                    raise
+
+            http_result = client.call_tool(
+                "get_proxy_http_history_regex",
+                {"count": args.count, "offset": args.offset, "regex": history_regex},
+            )
+            if http_result.get("isError"):
+                raise RuntimeError(mcp_tool_text(http_result))
+            raw_text = mcp_tool_text(http_result)
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_path.write_text(raw_text, encoding="utf-8")
+
+            if args.websocket_history:
+                ws_result = client.call_tool(
+                    "get_proxy_websocket_history_regex",
+                    {"count": args.count, "offset": args.offset, "regex": history_regex},
+                )
+                if ws_result.get("isError"):
+                    raise RuntimeError(mcp_tool_text(ws_result))
+                ws_raw_text = mcp_tool_text(ws_result)
+                ws_raw_path.parent.mkdir(parents=True, exist_ok=True)
+                ws_raw_path.write_text(ws_raw_text, encoding="utf-8")
+                sync_artifact["websocket_history"] = {
+                    "tool": "get_proxy_websocket_history_regex",
+                    "count": args.count,
+                    "offset": args.offset,
+                    "raw_output": str(ws_raw_path),
+                    "bytes": len(ws_raw_text.encode("utf-8")),
+                }
+
+    except Exception as error:
+        sync_artifact["status"] = "failed"
+        sync_artifact["error"] = str(error)
+        write_json(artifact_dir / "burp-mcp-sync.json", sync_artifact)
+        print(f"Burp MCP sync failed: {error}")
+        return 1
+
+    try:
+        import_summary = import_burp_history_inputs(
+            inputs=[(str(raw_path), raw_text)],
+            profile=profile,
+            artifact_dir=artifact_dir,
+            target=target,
+            source_root=source_root,
+            node=args.node,
+            replace=args.replace,
+            all_hosts=args.all_hosts,
+            source=args.source,
+            observed_only=args.observed_only,
+        )
+    except Exception as error:
+        sync_artifact["status"] = "failed-import"
+        sync_artifact["error"] = str(error)
+        sync_artifact["http_history"]["bytes"] = len(raw_text.encode("utf-8"))
+        write_json(artifact_dir / "burp-mcp-sync.json", sync_artifact)
+        print(f"Burp MCP history import failed: {error}")
+        return 1
+    sync_artifact["status"] = "synced"
+    sync_artifact["http_history"]["bytes"] = len(raw_text.encode("utf-8"))
+    sync_artifact["import"] = import_summary
+    write_json(artifact_dir / "burp-mcp-sync.json", sync_artifact)
+
+    print(f"Burp MCP sync: synced via {args.mcp_url}")
+    print(f"Raw HTTP history: {raw_path}")
+    print(f"Imported {import_summary['imported_observations']} observations")
+    print(f"Stored {import_summary['burp_history_items']} total observations in {import_summary['history_path']}")
+    selection = import_summary["selection"]
+    print(f"Observed clusters: {', '.join(selection['observed_cluster_ids']) or '(none)'}")
+    print(f"Source-assisted selected clusters: {', '.join(selection['selected_cluster_ids']) or '(none)'}")
+    return 0
+
+
+def run_plan(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    clusters = build_clusters(profile, source_root)
+    traffic_path = artifact_dir / "traffic-index.json"
+    traffic_index = json.loads(read_text(traffic_path)) if traffic_path.exists() else build_traffic_index([], burp_history)
+    selection = select_cluster_ids(
+        traffic_index,
+        clusters,
+        source_assisted=not args.observed_only,
+    )
+    selected_clusters = set(selection["selected_cluster_ids"])
+    candidate_probes = build_probe_plan(
+        target,
+        include_external=args.include_external,
+        selected_clusters=selected_clusters,
+        profile=profile,
+    )
+    ranking = build_probe_ranking(candidate_probes, selection, clusters, max_probes=args.max_probes)
+    probes = apply_probe_ranking(candidate_probes, ranking)
+    ws_enabled = args.ws and "solana-rpc-ws" in selected_clusters
+
+    write_json(artifact_dir / "endpoint-clusters.json", clusters)
+    write_json(artifact_dir / "probe-ranking.json", ranking)
+    write_plan(artifact_dir, probes, selection, ws_enabled=ws_enabled, ranking=ranking)
+    write_json(artifact_dir / "attack-strategy.json", build_attack_strategy(clusters, [], burp_history))
+
+    print(f"Planned {len(probes)} HTTP probes from {len(candidate_probes)} candidates")
+    print(f"WebSocket probes: {'enabled' if ws_enabled else 'disabled'}")
+    print(f"Selection mode: {selection['mode']}")
+    print(f"Selected clusters: {', '.join(selection['selected_cluster_ids']) or '(none)'}")
+    return 0
+
+
+def run_gate(args: argparse.Namespace) -> int:
+    artifact_dir = Path(args.artifact_dir).resolve()
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    suspicions_path = artifact_dir / "suspicions.json"
+    if not suspicions_path.exists():
+        write_json(artifact_dir / "finding-gate.json", build_finding_gate([], burp_history))
+        print("No suspicions.json found; wrote empty finding gate")
+        return 0
+
+    suspicions_doc = json.loads(read_text(suspicions_path))
+    suspicions = suspicions_doc.get("suspicions", [])
+    gate = build_finding_gate(suspicions, burp_history)
+    write_json(artifact_dir / "finding-gate.json", gate)
+    print(f"Gated {len(gate['gates'])} suspicions")
+    return 0
+
+
+def run_coverage(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    clusters_path = artifact_dir / "endpoint-clusters.json"
+    clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
+    results = load_jsonl(artifact_dir / "probe-results.jsonl")
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+
+    coverage = build_blackbox_coverage(
+        clusters,
+        results,
+        burp_history,
+        load_optional_json(artifact_dir / "source-peek-results.json"),
+        load_optional_json(artifact_dir / "evidence-gaps.json"),
+        load_optional_json(artifact_dir / "burp-observation-run.json"),
+        load_optional_json(artifact_dir / "environment-readiness.json"),
+        load_optional_json(artifact_dir / "transaction-decoder-selftest.json"),
+    )
+    write_json(artifact_dir / "blackbox-coverage.json", coverage)
+    print(f"Coverage gate: {coverage['status']}")
+    print(f"Wrote {artifact_dir / 'blackbox-coverage.json'}")
+    return 0 if coverage["status"] in {"covered", "covered-with-external-blocker"} else 1
+
+
+def run_burp_observation_coverage(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    clusters_path = artifact_dir / "endpoint-clusters.json"
+    clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
+    coverage = build_burp_observation_coverage(
+        target,
+        profile,
+        clusters,
+        load_jsonl(artifact_dir / "burp-history-observations.jsonl"),
+        load_optional_json(artifact_dir / "burp-observation-run.json"),
+        load_optional_json(artifact_dir / "evidence-gaps.json"),
+    )
+    write_json(artifact_dir / "burp-observation-coverage.json", coverage)
+    print(f"Burp observation coverage: {coverage['status']}")
+    print(
+        "Clusters: "
+        f"{coverage['summary']['clusters']} total, "
+        f"status_counts={json.dumps(coverage['summary']['status_counts'], sort_keys=True)}"
+    )
+    print(f"Wrote {artifact_dir / 'burp-observation-coverage.json'}")
+    return 0 if coverage["status"] in {"covered", "needs-burp-sync"} else 1
+
+
+def run_response_deltas(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    clusters_path = artifact_dir / "endpoint-clusters.json"
+    clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
+    response_delta_analysis = build_response_delta_analysis(
+        clusters,
+        load_jsonl(artifact_dir / "probe-results.jsonl"),
+    )
+    write_json(artifact_dir / "response-delta-analysis.json", response_delta_analysis)
+    print(f"Response delta analysis: {response_delta_analysis['status']}")
+    print(
+        "Deltas: "
+        f"{response_delta_analysis['summary']['endpoint_groups']} endpoint groups, "
+        f"review_needed={response_delta_analysis['summary']['review_needed_groups']}, "
+        f"expected_deltas={response_delta_analysis['summary']['expected_delta_groups']}"
+    )
+    print(f"Wrote {artifact_dir / 'response-delta-analysis.json'}")
+    return 0 if response_delta_analysis["status"] not in {"review-needed", "no-probe-results"} else 1
+
+
+def run_evidence_chain(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    clusters_path = artifact_dir / "endpoint-clusters.json"
+    clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
+    results = load_jsonl(artifact_dir / "probe-results.jsonl")
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    source_peeks = load_optional_json(artifact_dir / "source-peek-results.json")
+    finding_gate = load_optional_json(artifact_dir / "finding-gate.json")
+    evidence_gaps = load_optional_json(artifact_dir / "evidence-gaps.json")
+    environment_readiness = load_optional_json(artifact_dir / "environment-readiness.json")
+    transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json")
+    transaction_decoder_selftest = load_optional_json(artifact_dir / "transaction-decoder-selftest.json")
+    blackbox_coverage = load_optional_json(artifact_dir / "blackbox-coverage.json")
+    if blackbox_coverage is None:
+        blackbox_coverage = build_blackbox_coverage(
+            clusters,
+            results,
+            burp_history,
+            source_peeks,
+            evidence_gaps,
+            load_optional_json(artifact_dir / "burp-observation-run.json"),
+            environment_readiness,
+            transaction_decoder_selftest,
+        )
+
+    evidence_chain = build_evidence_chain(
+        clusters,
+        results,
+        burp_history,
+        source_peeks,
+        finding_gate,
+        evidence_gaps,
+        blackbox_coverage,
+        environment_readiness,
+        transaction_intent,
+        transaction_decoder_selftest,
+    )
+    write_json(artifact_dir / "evidence-chain.json", evidence_chain)
+    print(f"Evidence chain: {evidence_chain['status']}")
+    print(
+        "Indexed: "
+        f"{evidence_chain['summary']['clusters']} clusters, "
+        f"{evidence_chain['summary']['probes']} probes, "
+        f"{evidence_chain['summary']['burp_observations']} Burp observations"
+    )
+    print(f"Wrote {artifact_dir / 'evidence-chain.json'}")
+    return 0 if evidence_chain["status"] in {"covered", "covered-with-external-blocker"} else 1
+
+
+def run_source_peek_requests(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    clusters_path = artifact_dir / "endpoint-clusters.json"
+    clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
+    traffic_index = load_optional_json(artifact_dir / "traffic-index.json")
+    if traffic_index is None:
+        traffic_index = build_traffic_index(
+            load_jsonl(artifact_dir / "probe-results.jsonl"),
+            load_jsonl(artifact_dir / "burp-history-observations.jsonl"),
+        )
+        write_json(artifact_dir / "traffic-index.json", traffic_index)
+    source_peeks = load_optional_json(artifact_dir / "source-peek-results.json")
+    suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
+    source_peek_requests = build_source_peek_requests(
+        clusters,
+        traffic_index,
+        source_peeks,
+        suspicions_doc.get("suspicions", []),
+        load_optional_json(artifact_dir / "evidence-gaps.json"),
+    )
+    write_json(artifact_dir / "source-peek-requests.json", source_peek_requests)
+    print(f"Source-peek requests: {source_peek_requests['status']}")
+    print(
+        "Requests: "
+        f"{source_peek_requests['summary']['requests']} total, "
+        f"triggers={json.dumps(source_peek_requests['summary']['trigger_counts'], sort_keys=True)}"
+    )
+    print(f"Wrote {artifact_dir / 'source-peek-requests.json'}")
+    return 0
+
+
+def run_evidence_appendix(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    clusters_path = artifact_dir / "endpoint-clusters.json"
+    clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
+    results = load_jsonl(artifact_dir / "probe-results.jsonl")
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    evidence_appendix = build_evidence_appendix(
+        clusters,
+        results,
+        burp_history,
+        load_optional_json(artifact_dir / "burp-observation-run.json"),
+        load_optional_json(artifact_dir / "blackbox-coverage.json"),
+        load_optional_json(artifact_dir / "evidence-chain.json"),
+        load_optional_json(artifact_dir / "adjudication.json"),
+        load_optional_json(artifact_dir / "environment-readiness.json"),
+    )
+    write_json(artifact_dir / "evidence-appendix.json", evidence_appendix)
+    print(f"Evidence appendix: {evidence_appendix['status']}")
+    print(
+        "Indexed: "
+        f"{evidence_appendix['summary']['probe_rows']} probe rows, "
+        f"{evidence_appendix['summary']['representative_probe_examples']} representative probe examples, "
+        f"{evidence_appendix['summary']['burp_observations']} Burp observations"
+    )
+    print(f"Wrote {artifact_dir / 'evidence-appendix.json'}")
+    return 0 if evidence_appendix["status"] != "missing-evidence" else 1
+
+
+def run_verification_queue(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    clusters_path = artifact_dir / "endpoint-clusters.json"
+    clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
+    verification_queue = build_verification_queue(
+        target,
+        clusters,
+        load_optional_json(artifact_dir / "evidence-appendix.json"),
+        load_optional_json(artifact_dir / "evidence-gaps.json"),
+        load_optional_json(artifact_dir / "blackbox-coverage.json"),
+        load_optional_json(artifact_dir / "adjudication.json"),
+        load_optional_json(artifact_dir / "environment-readiness.json"),
+        artifact_dir,
+    )
+    write_json(artifact_dir / "verification-queue.json", verification_queue)
+    write_reproduction_steps(artifact_dir, verification_queue)
+    print(f"Verification queue: {verification_queue['status']}")
+    print(
+        "Items: "
+        f"{verification_queue['summary']['items']} total, "
+        f"status_counts={json.dumps(verification_queue['summary']['status_counts'], sort_keys=True)}"
+    )
+    print(
+        "Command safety: "
+        f"{json.dumps(verification_queue['summary'].get('command_safety', {}).get('classification_counts', {}), sort_keys=True)}"
+    )
+    print(f"Wrote {artifact_dir / 'verification-queue.json'}")
+    print(f"Wrote {artifact_dir / 'reproduction-steps.md'}")
+    if verification_queue["status"] == "invalid-command-templates":
+        return 2
+    return 0 if verification_queue["status"] != "needs-human-review" else 1
+
+
+def run_manifest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    manifest = write_artifact_manifest(artifact_dir, target, command=args.command)
+    print(f"Artifact manifest: {manifest['status']}")
+    print(
+        "Artifacts: "
+        f"{manifest['summary']['artifact_count']} indexed, "
+        f"missing_required={len(manifest['summary']['missing_required'])}"
+    )
+    print(f"Wrote {artifact_dir / MANIFEST_NAME}")
+    return 0 if manifest["status"] != "incomplete" else 1
+
+
+def run_profile(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    profile_doc = write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    clusters = build_clusters(profile, source_root)
+    validation = load_optional_json(artifact_dir / PROFILE_VALIDATION_ARTIFACT) or {}
+    write_json(artifact_dir / "endpoint-clusters.json", clusters)
+    print(f"Target profile: {profile_doc.get('display_name') or profile_doc.get('name')}")
+    print(f"Loaded from: {profile_doc.get('loaded_from')} ({profile_doc.get('profile_path')})")
+    print(f"Effective target: {target}")
+    print(f"Effective source root: {source_root}")
+    print(f"Enabled strategy sets: {', '.join(sorted(enabled_strategy_set_ids(profile))) or '(none)'}")
+    print(f"Clusters: {len(clusters['clusters'])}")
+    print(f"Profile validation: {validation.get('status', 'unknown')}")
+    print(f"Wrote {artifact_dir / TARGET_PROFILE_ARTIFACT}")
+    print(f"Wrote {artifact_dir / STRATEGY_REGISTRY_ARTIFACT}")
+    print(f"Wrote {artifact_dir / PROFILE_VALIDATION_ARTIFACT}")
+    print(f"Wrote {artifact_dir / 'endpoint-clusters.json'}")
+    return 0
+
+
+def run_review_candidates(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    candidates = collect_review_observation_candidates(profile)
+    artifact = {
+        "generated_at": utc_now(),
+        "status": "listed",
+        "profile": profile_summary(profile),
+        "target": target,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "safety": "Review candidates are inert templates. Listing them does not send HTTP traffic or modify the profile.",
+    }
+    write_json(artifact_dir / "review-observation-candidates.json", artifact)
+    print(f"Review observation candidates: {len(candidates)}")
+    for candidate in candidates:
+        print(
+            f"- {candidate.get('id')} "
+            f"cluster={candidate.get('cluster')} "
+            f"type={candidate.get('type')} "
+            f"status={candidate.get('status')}"
+        )
+        if candidate.get("example_path"):
+            print(f"  example_path={candidate.get('example_path')}")
+    print(f"Wrote {artifact_dir / 'review-observation-candidates.json'}")
+    return 0
+
+
+def run_promote_observation_candidate(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    output_path = Path(args.output).resolve() if args.output else artifact_dir / "reviewed-profile.json"
+    if output_path.exists() and not args.force:
+        print(f"Refusing to overwrite existing profile without --force: {output_path}")
+        return 2
+    expected_statuses = [int(value) for value in args.expected_status] if args.expected_status else None
+    try:
+        promoted_profile, observation = promote_review_observation_candidate(
+            profile,
+            candidate_id=args.candidate_id,
+            approved_path=args.path,
+            observation_id=args.observation_id,
+            method=args.method,
+            expected_statuses=expected_statuses,
+            note=args.note,
+        )
+    except ValueError as error:
+        print(f"Could not promote candidate: {error}")
+        return 2
+
+    write_json(output_path, promoted_profile)
+    normalized = normalize_target_profile(promoted_profile, profile_path=output_path)
+    clusters = build_clusters(normalized, source_root)
+    validation = build_profile_validation_artifact(normalized, clusters, source_root)
+    write_json(artifact_dir / "reviewed-profile-validation.json", validation)
+    write_json(
+        artifact_dir / "reviewed-observation-promotion.json",
+        {
+            "generated_at": utc_now(),
+            "status": "promoted",
+            "profile": profile_summary(profile),
+            "output_profile": repo_relative_or_absolute(output_path),
+            "candidate_id": args.candidate_id,
+            "observation": observation,
+            "validation_status": validation["status"],
+            "safety": "Profile edit only. No HTTP request was sent; use the output profile with burp-sync --observe after review.",
+        },
+    )
+    print(f"Promoted candidate: {args.candidate_id}")
+    print(f"Observation: {observation['method']} {observation['path']} cluster={observation['cluster']}")
+    print(f"Profile validation: {validation['status']}")
+    print(f"Wrote {output_path}")
+    print(f"Wrote {artifact_dir / 'reviewed-profile-validation.json'}")
+    print(f"Wrote {artifact_dir / 'reviewed-observation-promotion.json'}")
+    return 0 if validation["status"] != "failed" else 1
+
+
+def run_discover_profile(args: argparse.Namespace) -> int:
+    base_profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    route_inventory = discover_nextjs_routes(source_root)
+    write_json(artifact_dir / ROUTE_INVENTORY_ARTIFACT, route_inventory)
+
+    default_name = re.sub(r"[^A-Za-z0-9_-]+", "-", source_root.name.lower()).strip("-") or "discovered-target"
+    name = args.name or default_name
+    display_name = args.display_name or source_root.name
+    discovered_profile = build_discovered_profile(
+        route_inventory,
+        name=name,
+        display_name=display_name,
+        target=target,
+        source_root=source_root,
+    )
+    output_path = Path(args.output).resolve() if args.output else artifact_dir / DISCOVERED_PROFILE_ARTIFACT
+    explicit_output = bool(args.output)
+    if explicit_output and output_path.exists() and not args.force:
+        print(f"Refusing to overwrite existing profile without --force: {output_path}")
+        print(f"Wrote {artifact_dir / ROUTE_INVENTORY_ARTIFACT}")
+        return 2
+
+    write_json(output_path, discovered_profile)
+    normalized = normalize_target_profile(discovered_profile, profile_path=output_path)
+    clusters = build_clusters(normalized, source_root)
+    validation = build_profile_validation_artifact(normalized, clusters, source_root)
+    write_json(artifact_dir / "discovered-profile-validation.json", validation)
+
+    print(f"Discovered routes: {route_inventory.get('summary', {}).get('route_count', 0)}")
+    print(f"Discovered rewrites: {route_inventory.get('summary', {}).get('rewrite_count', 0)}")
+    print(f"Discovered custom server entrypoints: {route_inventory.get('summary', {}).get('custom_server_entrypoint_count', 0)}")
+    print(f"Discovered middleware: {route_inventory.get('summary', {}).get('middleware_count', 0)}")
+    print(f"Discovered Server Action files: {route_inventory.get('summary', {}).get('server_action_file_count', 0)}")
+    print(f"Discovered redirects: {route_inventory.get('summary', {}).get('redirect_count', 0)}")
+    print(f"Discovered header routes: {route_inventory.get('summary', {}).get('header_route_count', 0)}")
+    print(f"Suggested strategy sets: {', '.join(discovered_profile.get('strategy_sets', [])) or '(none)'}")
+    print(f"Suggested clusters: {len(discovered_profile.get('clusters', []))}")
+    print(f"Generated profile validation: {validation['status']}")
+    print(f"Wrote {artifact_dir / ROUTE_INVENTORY_ARTIFACT}")
+    print(f"Wrote {output_path}")
+    print(f"Wrote {artifact_dir / 'discovered-profile-validation.json'}")
+    if route_inventory.get("status") != "discovered":
+        return 1
+    return 0 if validation["status"] != "failed" else 1
+
+
+def run_adjudicate(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
+    suspicions = suspicions_doc.get("suspicions", [])
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    finding_gate = load_optional_json(artifact_dir / "finding-gate.json")
+    if finding_gate is None:
+        finding_gate = build_finding_gate(suspicions, burp_history)
+        write_json(artifact_dir / "finding-gate.json", finding_gate)
+
+    findings = build_findings(suspicions, finding_gate)
+    hardening_notes = build_hardening_notes(suspicions, finding_gate)
+    evidence_gaps = load_optional_json(artifact_dir / "evidence-gaps.json")
+    blackbox_coverage = load_optional_json(artifact_dir / "blackbox-coverage.json")
+    environment_readiness = load_optional_json(artifact_dir / "environment-readiness.json")
+    evidence_chain = load_optional_json(artifact_dir / "evidence-chain.json")
+    adjudication = build_adjudication(
+        suspicions,
+        finding_gate,
+        findings,
+        hardening_notes,
+        evidence_gaps,
+        blackbox_coverage,
+        environment_readiness,
+        evidence_chain,
+    )
+    write_json(artifact_dir / "findings.json", {"generated_at": utc_now(), "findings": findings})
+    write_json(
+        artifact_dir / "hardening-notes.json",
+        {"generated_at": utc_now(), "hardening_notes": hardening_notes},
+    )
+    write_json(artifact_dir / "adjudication.json", adjudication)
+    print(f"Adjudication: {adjudication['status']}")
+    print(
+        "Decisions: "
+        f"{len(findings)} findings, "
+        f"{len(hardening_notes)} hardening notes, "
+        f"{adjudication['summary']['manual_review']} manual review, "
+        f"{adjudication['summary']['blocked']} blocked"
+    )
+    print(f"Wrote {artifact_dir / 'adjudication.json'}")
+    return 0 if adjudication["status"] not in {"manual-review", "blocked"} else 1
+
+
+def run_capabilities(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    capabilities = build_capabilities(target, artifact_dir, profile)
+    write_json(artifact_dir / "burp-capabilities.json", capabilities)
+    print(json.dumps(capabilities, indent=2))
+    return 0 if capabilities["target"]["reachable"] and capabilities["burp"]["mcp_port_open"] else 1
+
+
+def run_readiness(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    capabilities = build_capabilities(target, artifact_dir, profile)
+    quote_path = artifact_dir / "quote-collection.json"
+    quote_collection = json.loads(read_text(quote_path)) if quote_path.exists() else None
+    transaction_path = artifact_dir / "transaction-intent.json"
+    transaction_intent = json.loads(read_text(transaction_path)) if transaction_path.exists() else None
+    readiness = build_environment_readiness(
+        target,
+        source_root,
+        artifact_dir,
+        capabilities=capabilities,
+        quote_collection=quote_collection,
+        transaction_intent=transaction_intent,
+    )
+    write_json(artifact_dir / "burp-capabilities.json", capabilities)
+    write_json(artifact_dir / "environment-readiness.json", readiness)
+    print(json.dumps(readiness, indent=2))
+    return 0 if readiness["status"] == "ready" else 1
+
+
+def run_decode_transactions(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    ensure_burp_transaction_candidates_artifact(artifact_dir)
+    results = load_jsonl(artifact_dir / "probe-results.jsonl")
+    extra_inputs = [Path(item).resolve() for item in args.input or []]
+    transaction_intent = build_transaction_intent(
+        artifact_dir,
+        results,
+        args.node,
+        source_root,
+        extra_inputs,
+        policy_path=Path(args.intent_policy).resolve() if args.intent_policy else None,
+        intent_direction=args.intent_direction,
+        intent_wallet=args.intent_wallet,
+        intent_amount_in=args.intent_amount_in,
+        intent_allowed_programs=args.intent_allowed_program or None,
+    )
+    write_json(artifact_dir / "transaction-intent.json", transaction_intent)
+    print(f"Wrote {artifact_dir / 'transaction-intent.json'}")
+    print(
+        "Transactions: "
+        f"{transaction_intent['candidates_seen']} candidates, "
+        f"{transaction_intent['decoded_transactions']} decoded"
+    )
+    return 0
+
+
+def run_transaction_decoder_selftest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    result = build_transaction_decoder_selftest(
+        artifact_dir,
+        source_root,
+        args.node,
+        direction=args.direction,
+        wallet=args.wallet,
+        amount_in=args.amount_in,
+    )
+    write_json(artifact_dir / "transaction-decoder-selftest.json", result)
+    print(f"Transaction decoder self-test: {result['status']}")
+    print(f"Wrote {artifact_dir / 'transaction-decoder-selftest.json'}")
+    return 0 if result["status"] == "passed" else 1
+
+
+def build_quote_collection_body(direction: str, wallet: str, amount_in: str) -> dict[str, Any]:
+    expected = expected_mints_for_direction(direction)
+    if expected is None:
+        raise ValueError("direction must be buy or sell")
+    source_mint, destination_mint = expected
+    return {
+        "route": {
+            "source": {"chain": "Solana", "address": source_mint},
+            "destination": {"chain": "Solana", "address": destination_mint},
+        },
+        "amountIn": amount_in,
+        "sender": wallet,
+        "recipient": wallet,
+        "maxNumQuotes": 1,
+    }
+
+
+def diagnose_quote_collection_response(response: dict[str, Any], saved_payload: str | None) -> dict[str, Any]:
+    status = response.get("status")
+    body_sample = response.get("body_sample") or response.get("body_text") or ""
+
+    if status == 200 and saved_payload:
+        return {
+            "classification": "quote-payload-collected",
+            "summary": "A quote response was saved for transaction candidate extraction.",
+            "next_step": "Decode the saved payload and compare transaction intent before any signing flow.",
+        }
+
+    if status is None:
+        return {
+            "classification": "local-transport-error",
+            "summary": "The local quote collector could not reach the target quote endpoint.",
+            "next_step": "Confirm the target server is running and rerun collect-quote.",
+        }
+
+    if status == 500 and "Quote service is not configured" in body_sample:
+        return {
+            "classification": "m0-config-missing-or-placeholder",
+            "summary": "The target rejected quote collection before upstream forwarding because the M0 key is missing or still set to a template placeholder.",
+            "next_step": "Configure a real M0_ORCHESTRATION_API_KEY, restart the target server, and rerun collect-quote.",
+        }
+
+    if status in {401, 403} and "M0 orchestration quote failed" in body_sample:
+        return {
+            "classification": "m0-upstream-auth-or-policy-rejected",
+            "summary": "The target reached M0, but upstream rejected the quote request after local validation.",
+            "next_step": "Verify the M0 key, account permissions, route, wallet, and amount, then rerun collect-quote.",
+        }
+
+    if status == 400 and "Invalid quote request body" in body_sample:
+        return {
+            "classification": "local-quote-policy-rejected",
+            "summary": "The target rejected the quote body during local validation.",
+            "next_step": "Review the generated quote request and local quote policy before rerunning collect-quote.",
+        }
+
+    if status == 502 and "Invalid response shape" in body_sample:
+        return {
+            "classification": "m0-response-shape-unexpected",
+            "summary": "M0 returned a successful HTTP response, but the target did not recognize the quote response shape.",
+            "next_step": "Capture the response shape in a controlled environment and update transaction extraction only after reviewing it.",
+        }
+
+    return {
+        "classification": "quote-collection-no-payload",
+        "summary": f"Quote collection returned HTTP {status} without a saved transaction payload.",
+        "next_step": "Inspect quote-collection.json and rerun collect-quote after the upstream/configuration issue is resolved.",
+    }
+
+
+def run_collect_quote(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    ensure_burp_transaction_candidates_artifact(artifact_dir)
+
+    body = build_quote_collection_body(args.direction, args.wallet, args.amount_in)
+    quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
+    output_path = Path(args.output).resolve() if args.output else artifact_dir / "transaction-payloads.json"
+    policy = {
+        "direction": args.direction,
+        "wallet": args.wallet,
+        "amountIn": args.amount_in,
+    }
+    if args.intent_allowed_program:
+        policy["allowedPrograms"] = args.intent_allowed_program
+    write_json(artifact_dir / "transaction-intent-policy.json", policy)
+
+    try:
+        with TargetProbeLock(target, purpose="collect-quote"):
+            response = http_request(
+                target,
+                "POST",
+                quote_path,
+                body=json.dumps(body),
+                headers={
+                    "Content-Type": "application/json",
+                    "Origin": origin_for(target),
+                    "User-Agent": "InferForge-Quote-Collector/0.1",
+                },
+                timeout=30,
+            )
+    except RuntimeError as error:
+        write_json(
+            artifact_dir / "target-probe-lock.json",
+            {
+                "generated_at": utc_now(),
+                "status": "blocked",
+                "target": target,
+                "error": str(error),
+                "safety": "Only one active collection/probe run may target the same service at a time.",
+            },
+        )
+        print(f"Target probe lock blocked collect-quote: {error}")
+        print(f"Wrote {artifact_dir / 'target-probe-lock.json'}")
+        return 2
+
+    saved_payload = None
+    if response["status"] == 200 and response["body_text"]:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(response["body_text"], encoding="utf-8")
+        saved_payload = str(output_path)
+
+    diagnosis = diagnose_quote_collection_response(response, saved_payload)
+    quote_collection = {
+        "generated_at": utc_now(),
+        "profile": profile_summary(profile),
+        "target": target,
+        "path": quote_path,
+        "safety": "Quote collection only. No wallet signing or transaction submission is performed.",
+        "request": {
+            "direction": args.direction,
+            "amountIn": args.amount_in,
+            "wallet": args.wallet,
+            "sourceMint": body["route"]["source"]["address"],
+            "destinationMint": body["route"]["destination"]["address"],
+        },
+        "response": {
+            "status": response["status"],
+            "duration_ms": response["duration_ms"],
+            "body_sha256": response["body_sha256"],
+            "body_length": response["body_length"],
+            "body_truncated": response["body_truncated"],
+            "body_sample": response["body_sample"],
+            "saved_payload": saved_payload,
+        },
+        "diagnosis": diagnosis,
+    }
+    write_json(artifact_dir / "quote-collection.json", quote_collection)
+
+    extra_inputs = [output_path] if saved_payload else []
+    transaction_intent = build_transaction_intent(
+        artifact_dir,
+        load_jsonl(artifact_dir / "probe-results.jsonl"),
+        args.node,
+        source_root,
+        extra_inputs=extra_inputs,
+        intent_direction=args.direction,
+        intent_wallet=args.wallet,
+        intent_amount_in=args.amount_in,
+        intent_allowed_programs=args.intent_allowed_program or None,
+    )
+    write_json(artifact_dir / "transaction-intent.json", transaction_intent)
+    results = load_jsonl(artifact_dir / "probe-results.jsonl")
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    rpc_policy_path = artifact_dir / "rpc-method-policy.json"
+    rpc_method_policy = (
+        json.loads(read_text(rpc_policy_path))
+        if rpc_policy_path.exists()
+        else build_rpc_method_policy(source_root, results)
+    )
+    orca_baseline_path = artifact_dir / "orca-baseline.json"
+    orca_baseline = json.loads(read_text(orca_baseline_path)) if orca_baseline_path.exists() else None
+    source_peeks = load_optional_json(artifact_dir / "source-peek-results.json") or build_source_peeks(source_root, profile, [])
+    evidence_gaps = build_evidence_gaps(
+        build_clusters(profile, source_root),
+        results,
+        burp_history,
+        transaction_intent,
+        rpc_method_policy,
+        orca_baseline,
+        quote_collection,
+        source_peeks,
+    )
+    write_json(artifact_dir / "evidence-gaps.json", evidence_gaps)
+    transaction_decoder_selftest = build_transaction_decoder_selftest(
+        artifact_dir,
+        source_root,
+        args.node,
+        direction=args.direction,
+        wallet=args.wallet,
+        amount_in=args.amount_in,
+    )
+    write_json(artifact_dir / "transaction-decoder-selftest.json", transaction_decoder_selftest)
+    capabilities = build_capabilities(target, artifact_dir, profile)
+    write_json(artifact_dir / "burp-capabilities.json", capabilities)
+    environment_readiness = build_environment_readiness(
+        target,
+        source_root,
+        artifact_dir,
+        capabilities=capabilities,
+        quote_collection=quote_collection,
+        transaction_intent=transaction_intent,
+    )
+    write_json(artifact_dir / "environment-readiness.json", environment_readiness)
+
+    print(f"Quote status: {response['status']}")
+    print(f"Diagnosis: {diagnosis['classification']}")
+    print(f"Wrote {artifact_dir / 'quote-collection.json'}")
+    if saved_payload:
+        print(f"Saved quote payload to {saved_payload}")
+    print(
+        "Transactions: "
+        f"{transaction_intent['candidates_seen']} candidates, "
+        f"{transaction_intent['decoded_transactions']} decoded, "
+        f"policy={transaction_intent['intent_policy_checks']['status']}"
+    )
+    print(f"Decoder self-test: {transaction_decoder_selftest['status']}")
+    print(f"Readiness: {environment_readiness['status']}")
+    print(f"Evidence gaps: {len(evidence_gaps['gaps'])}")
+    return 0
+
+
+def run_collect_orca_baseline(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    try:
+        with TargetProbeLock(target, purpose="collect-orca-baseline"):
+            baseline = build_orca_baseline(
+                target,
+                source_root,
+                address=args.address,
+                strategy_id=args.strategy_id,
+                profile=profile,
+            )
+    except RuntimeError as error:
+        write_json(
+            artifact_dir / "target-probe-lock.json",
+            {
+                "generated_at": utc_now(),
+                "status": "blocked",
+                "target": target,
+                "error": str(error),
+                "safety": "Only one active collection/probe run may target the same service at a time.",
+            },
+        )
+        print(f"Target probe lock blocked collect-orca-baseline: {error}")
+        print(f"Wrote {artifact_dir / 'target-probe-lock.json'}")
+        return 2
+    write_json(artifact_dir / "orca-baseline.json", baseline)
+
+    results = load_jsonl(artifact_dir / "probe-results.jsonl")
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    transaction_intent_path = artifact_dir / "transaction-intent.json"
+    transaction_intent = (
+        json.loads(read_text(transaction_intent_path))
+        if transaction_intent_path.exists()
+        else build_transaction_intent(artifact_dir, results, args.node, source_root)
+    )
+    rpc_policy_path = artifact_dir / "rpc-method-policy.json"
+    rpc_method_policy = (
+        json.loads(read_text(rpc_policy_path))
+        if rpc_policy_path.exists()
+        else build_rpc_method_policy(source_root, results)
+    )
+    quote_collection_path = artifact_dir / "quote-collection.json"
+    quote_collection = json.loads(read_text(quote_collection_path)) if quote_collection_path.exists() else None
+    source_peeks = load_optional_json(artifact_dir / "source-peek-results.json") or build_source_peeks(source_root, profile, [])
+    evidence_gaps = build_evidence_gaps(
+        build_clusters(profile, source_root),
+        results,
+        burp_history,
+        transaction_intent,
+        rpc_method_policy,
+        baseline,
+        quote_collection,
+        source_peeks,
+    )
+    write_json(artifact_dir / "evidence-gaps.json", evidence_gaps)
+
+    response = baseline.get("response", {})
+    request = baseline.get("request", {})
+    print(f"Orca baseline status: {response.get('status')}")
+    print(f"Success: {baseline.get('success')}")
+    print(f"Address: {request.get('address')}")
+    print(f"Wrote {artifact_dir / 'orca-baseline.json'}")
+    print(f"Evidence gaps: {len(evidence_gaps['gaps'])}")
+    return 0 if baseline.get("success") else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="InferForge local greybox runner")
+    parser.add_argument(
+        "--profile",
+        default=str(DEFAULT_PROFILE_PATH),
+        help="Target profile JSON. Defaults to profiles/infrafi-web.json.",
+    )
+    parser.add_argument("--target", help="Base URL for the local target. Defaults to the target profile.")
+    parser.add_argument("--artifact-dir", default=str(DEFAULT_ARTIFACT_DIR), help="Artifact directory")
+    parser.add_argument("--source-root", help="Target source root. Defaults to the target profile.")
+    parser.add_argument("--node", default=DEFAULT_NODE, help="Node binary for WebSocket probes")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_intent_policy_args(command: argparse.ArgumentParser) -> None:
+        command.add_argument(
+            "--intent-policy",
+            help="JSON file describing expected transaction intent for transaction-intent checks",
+        )
+        command.add_argument(
+            "--intent-direction",
+            choices=["buy", "sell"],
+            help="Expected swap direction for transaction-intent checks",
+        )
+        command.add_argument(
+            "--intent-wallet",
+            help="Expected Solana wallet/sender for transaction-intent checks",
+        )
+        command.add_argument(
+            "--intent-amount-in",
+            help="Expected raw positive integer amountIn for transaction-intent checks",
+        )
+        command.add_argument(
+            "--intent-allowed-program",
+            action="append",
+            help="Allowed compiled instruction program ID for transaction-intent checks. Repeat as needed.",
+        )
+
+    profile = sub.add_parser("profile", help="Write the effective target profile and endpoint clusters")
+    profile.set_defaults(func=run_profile)
+
+    review_candidates = sub.add_parser(
+        "review-candidates",
+        help="List inert review-only observation candidates from the current profile",
+    )
+    review_candidates.set_defaults(func=run_review_candidates)
+
+    promote_candidate = sub.add_parser(
+        "promote-observation-candidate",
+        help="Promote one reviewed observation candidate into a new profile without sending traffic",
+    )
+    promote_candidate.add_argument("--candidate-id", required=True, help="review_observation_candidates id to promote")
+    promote_candidate.add_argument("--path", required=True, help="Approved concrete local path, for example /api/proxy/status")
+    promote_candidate.add_argument("--output", help="Where to write the promoted profile. Defaults to .greybox/reviewed-profile.json")
+    promote_candidate.add_argument("--force", action="store_true", help="Allow overwriting the output profile")
+    promote_candidate.add_argument("--observation-id", help="Override the generated burp_observation_plan id")
+    promote_candidate.add_argument("--method", choices=sorted(HTTP_METHODS), help="Override the observation HTTP method")
+    promote_candidate.add_argument(
+        "--expected-status",
+        action="append",
+        type=int,
+        help="Allowed response status for the promoted observation. Repeat as needed.",
+    )
+    promote_candidate.add_argument("--note", help="Short review note to store with the promoted observation")
+    promote_candidate.set_defaults(func=run_promote_observation_candidate)
+
+    discover_profile = sub.add_parser(
+        "discover-profile",
+        help="Statically discover Next.js route handlers and write a starter target profile",
+    )
+    discover_profile.add_argument(
+        "--output",
+        help="Where to write the generated starter profile. Defaults to .greybox/discovered-profile.json",
+    )
+    discover_profile.add_argument("--name", help="Profile machine name. Defaults to the source-root directory name")
+    discover_profile.add_argument("--display-name", help="Profile display name. Defaults to the source-root directory name")
+    discover_profile.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwriting an explicit --output profile path",
+    )
+    discover_profile.set_defaults(func=run_discover_profile)
+
+    collect = sub.add_parser("collect", help="Normalize available Burp history observations into traffic artifacts")
+    collect.add_argument(
+        "--observed-only",
+        action="store_true",
+        help="Select only endpoint kinds seen in Burp/history observations",
+    )
+    collect.set_defaults(func=run_collect)
+
+    burp_observe = sub.add_parser(
+        "burp-observe",
+        help="Generate a minimal safe observation flow through Burp Proxy",
+    )
+    burp_observe.add_argument(
+        "--proxy",
+        default="http://127.0.0.1:8080",
+        help="Burp Proxy URL for observation traffic",
+    )
+    burp_observe.add_argument(
+        "--ws-upgrade",
+        action="store_true",
+        help="Also open one low-volume Solana RPC WebSocket upgrade through Burp Proxy",
+    )
+    burp_observe.add_argument(
+        "--allow-nonlocal-target",
+        action="store_true",
+        help="Allow observation traffic to non-loopback targets",
+    )
+    burp_observe.set_defaults(func=run_burp_observe)
+
+    burp_sync = sub.add_parser(
+        "burp-sync",
+        help="Read Burp MCP history directly and import normalized observations",
+    )
+    burp_sync.add_argument(
+        "--mcp-url",
+        default="http://127.0.0.1:9876",
+        help="Burp MCP SSE URL. Defaults to http://127.0.0.1:9876",
+    )
+    burp_sync.add_argument(
+        "--mcp-timeout",
+        type=positive_int,
+        default=10,
+        help="Timeout in seconds for each Burp MCP HTTP/SSE operation",
+    )
+    burp_sync.add_argument(
+        "--proxy",
+        default="http://127.0.0.1:8080",
+        help="Burp Proxy URL used when --observe is enabled",
+    )
+    burp_sync.add_argument(
+        "--observe",
+        action="store_true",
+        help="First generate the profile's deterministic observation flow through Burp Proxy",
+    )
+    burp_sync.add_argument(
+        "--ws-upgrade",
+        action="store_true",
+        help="When --observe is enabled, also open one low-volume WebSocket upgrade through Burp Proxy",
+    )
+    burp_sync.add_argument(
+        "--allow-nonlocal-target",
+        action="store_true",
+        help="Allow --observe traffic to non-loopback targets",
+    )
+    burp_sync.add_argument(
+        "--keep-intercept-state",
+        action="store_true",
+        help="Do not force Burp Proxy Intercept off before syncing history",
+    )
+    burp_sync.add_argument(
+        "--regex",
+        help="Override the generated Burp history regex",
+    )
+    burp_sync.add_argument(
+        "--count",
+        type=positive_int,
+        default=200,
+        help="Maximum Burp history items to request from MCP",
+    )
+    burp_sync.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Burp history offset to request from MCP",
+    )
+    burp_sync.add_argument(
+        "--raw-output",
+        help="Where to save raw MCP HTTP history text. Defaults to .greybox/burp-mcp-history-latest.txt",
+    )
+    burp_sync.add_argument(
+        "--websocket-history",
+        action="store_true",
+        help="Also save raw Burp MCP WebSocket history text when the tool is available",
+    )
+    burp_sync.add_argument(
+        "--websocket-raw-output",
+        help="Where to save raw MCP WebSocket history text. Defaults to .greybox/burp-mcp-websocket-history-latest.txt",
+    )
+    burp_sync.add_argument(
+        "--replace",
+        action="store_true",
+        help="Replace burp-history-observations.jsonl instead of merging and deduplicating",
+    )
+    burp_sync.add_argument(
+        "--all-hosts",
+        action="store_true",
+        help="Do not filter imported history to the current --target host",
+    )
+    burp_sync.add_argument(
+        "--source",
+        default="burp-proxy-http-history",
+        help="Source label to write into imported observations",
+    )
+    burp_sync.add_argument(
+        "--observed-only",
+        action="store_true",
+        help="Select only endpoint kinds seen in imported Burp observations",
+    )
+    burp_sync.set_defaults(func=run_burp_sync)
+
+    import_history = sub.add_parser(
+        "import-burp-history",
+        help="Import raw Burp MCP HTTP history output into normalized observations",
+    )
+    import_history.add_argument(
+        "--input",
+        action="append",
+        help="Raw Burp MCP history text/JSON file. Use '-' to read stdin.",
+    )
+    import_history.add_argument(
+        "--replace",
+        action="store_true",
+        help="Replace burp-history-observations.jsonl instead of merging and deduplicating",
+    )
+    import_history.add_argument(
+        "--all-hosts",
+        action="store_true",
+        help="Do not filter imported history to the current --target host",
+    )
+    import_history.add_argument(
+        "--source",
+        default="burp-proxy-http-history",
+        help="Source label to write into imported observations",
+    )
+    import_history.add_argument(
+        "--observed-only",
+        action="store_true",
+        help="Select only endpoint kinds seen in imported Burp observations",
+    )
+    import_history.set_defaults(func=run_import_burp_history)
+
+    plan = sub.add_parser("plan", help="Generate endpoint-aware safe probe plan without running probes")
+    plan.add_argument("--include-external", action="store_true", help="Plan bounded M0 quote validation probes")
+    plan.add_argument("--max-probes", type=positive_int, help="Limit planned HTTP probes to the top-ranked N")
+    plan.add_argument("--no-ws", dest="ws", action="store_false", help="Skip WebSocket probes")
+    plan.add_argument(
+        "--observed-only",
+        action="store_true",
+        help="Plan only for endpoint kinds seen in traffic-index.json",
+    )
+    plan.set_defaults(func=run_plan, ws=True)
+
+    audit = sub.add_parser("audit", help="Run safe probes, source peeks, clustering, and report generation")
+    audit.add_argument("--include-external", action="store_true", help="Allow bounded M0 quote validation probes")
+    audit.add_argument("--max-probes", type=positive_int, help="Limit executed HTTP probes to the top-ranked N")
+    audit.add_argument("--no-ws", dest="ws", action="store_false", help="Skip WebSocket probes")
+    audit.add_argument(
+        "--ws-resource-probes",
+        action="store_true",
+        help="Run approval-gated low-volume WebSocket connection-limit probes",
+    )
+    audit.add_argument(
+        "--observed-only",
+        action="store_true",
+        help="Run only probes selected from observed traffic, without source-assisted expansion",
+    )
+    add_intent_policy_args(audit)
+    audit.set_defaults(func=run_audit, ws=True, ws_resource_probes=False)
+
+    gate = sub.add_parser("gate", help="Recompute finding gate decisions from suspicions and evidence")
+    gate.set_defaults(func=run_gate)
+
+    coverage = sub.add_parser("coverage", help="Recompute black-box coverage gate from current artifacts")
+    coverage.set_defaults(func=run_coverage)
+
+    burp_observation_coverage = sub.add_parser(
+        "burp-observation-coverage",
+        help="Recompute Burp browser observation coverage from current artifacts",
+    )
+    burp_observation_coverage.set_defaults(func=run_burp_observation_coverage)
+
+    response_deltas = sub.add_parser(
+        "response-deltas",
+        help="Recompute response delta analysis from current probe results",
+    )
+    response_deltas.set_defaults(func=run_response_deltas)
+
+    evidence_chain = sub.add_parser(
+        "evidence-chain",
+        help="Recompute machine-readable evidence chain from current artifacts",
+    )
+    evidence_chain.set_defaults(func=run_evidence_chain)
+
+    source_peek_requests = sub.add_parser(
+        "source-peek-requests",
+        help="Recompute source-peek request rationale from current artifacts",
+    )
+    source_peek_requests.set_defaults(func=run_source_peek_requests)
+
+    evidence_appendix = sub.add_parser(
+        "evidence-appendix",
+        help="Recompute compact request/response evidence appendix from current artifacts",
+    )
+    evidence_appendix.set_defaults(func=run_evidence_appendix)
+
+    verification_queue = sub.add_parser(
+        "verification-queue",
+        help="Recompute verification queue and reproduction steps from current artifacts",
+    )
+    verification_queue.set_defaults(func=run_verification_queue)
+
+    manifest = sub.add_parser(
+        "manifest",
+        help="Hash and summarize generated artifacts for integrity/reproducibility checks",
+    )
+    manifest.add_argument(
+        "--command",
+        default="manifest",
+        help="Command label to store in artifact-manifest.json",
+    )
+    manifest.set_defaults(func=run_manifest)
+
+    adjudicate = sub.add_parser(
+        "adjudicate",
+        help="Recompute reportability decisions from finding gate and current artifacts",
+    )
+    adjudicate.set_defaults(func=run_adjudicate)
+
+    capabilities = sub.add_parser("capabilities", help="Check target and Burp MCP readiness")
+    capabilities.set_defaults(func=run_capabilities)
+
+    readiness = sub.add_parser(
+        "readiness",
+        help="Check external dependency readiness without printing secret values",
+    )
+    readiness.set_defaults(func=run_readiness)
+
+    decode = sub.add_parser(
+        "decode-transactions",
+        help="Decode Solana transaction payload candidates from quote responses or sidecar files",
+    )
+    decode.add_argument(
+        "--input",
+        action="append",
+        help="Additional JSON, JSONL, or text file containing base64 transaction payloads",
+    )
+    add_intent_policy_args(decode)
+    decode.set_defaults(func=run_decode_transactions)
+
+    selftest = sub.add_parser(
+        "self-test-transactions",
+        help="Run a local synthetic transaction decoder self-test without signing or submitting",
+    )
+    selftest.add_argument("--direction", choices=["buy", "sell"], default="buy", help="Synthetic swap direction")
+    selftest.add_argument("--wallet", default=DEFAULT_TEST_WALLET, help="Synthetic wallet/sender")
+    selftest.add_argument("--amount-in", default="1000000", help="Synthetic raw positive integer amountIn")
+    selftest.set_defaults(func=run_transaction_decoder_selftest)
+
+    profile_selftest = sub.add_parser(
+        "self-test-profile-routing",
+        help="Run a static self-test proving profile-owned probe paths do not leak regression target paths",
+    )
+    profile_selftest.set_defaults(func=run_profile_routing_selftest)
+
+    collect_quote = sub.add_parser(
+        "collect-quote",
+        help="Safely request /api/quote and save returned transaction payloads without signing or submitting",
+    )
+    collect_quote.add_argument("--direction", choices=["buy", "sell"], required=True, help="Swap direction to quote")
+    collect_quote.add_argument("--wallet", required=True, help="Solana wallet/sender for the quote request")
+    collect_quote.add_argument("--amount-in", required=True, help="Raw positive integer amountIn for the quote request")
+    collect_quote.add_argument(
+        "--output",
+        help="Where to save a successful quote response. Defaults to .greybox/transaction-payloads.json",
+    )
+    collect_quote.add_argument(
+        "--intent-allowed-program",
+        action="append",
+        help="Allowed compiled instruction program ID for immediate transaction-intent checks. Repeat as needed.",
+    )
+    collect_quote.set_defaults(func=run_collect_quote)
+
+    collect_orca = sub.add_parser(
+        "collect-orca-baseline",
+        help="Collect one source-known or explicitly supplied Orca pool baseline without enumeration",
+    )
+    collect_orca.add_argument(
+        "--strategy-id",
+        help="Source ORCA_WHIRLPOOLS key to baseline. Defaults to the first source-known pool.",
+    )
+    collect_orca.add_argument(
+        "--address",
+        help="Explicit single Orca pool address to baseline instead of reading ORCA_WHIRLPOOLS.",
+    )
+    collect_orca.set_defaults(func=run_collect_orca_baseline)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

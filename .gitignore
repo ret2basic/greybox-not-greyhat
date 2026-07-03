@@ -1,0 +1,40 @@
+.greybox/
+
+# Local dependencies and build outputs
+node_modules/
+.next/
+dist/
+build/
+coverage/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.template
+*.local
+
+# Logs and transient runtime output
+*.log
+logs/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Editor/OS noise
+.DS_Store
+.idea/
+.vscode/
+.claude/
+
+# TypeScript incremental state
+*.tsbuildinfo
+
+# Large optional fixture assets and packaged deploy output
+infrafi-web/public/anim/
+infrafi-web/helm/*.tgz
+
+# Local fixture scratch files
+infrafi-web/.tmp-*

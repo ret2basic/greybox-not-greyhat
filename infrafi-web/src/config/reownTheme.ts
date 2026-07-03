@@ -1,0 +1,31 @@
+export const reownThemeVariables = {
+  '--apkt-accent': '#E97B40',
+  '--apkt-font-family': 'inherit',
+  '--apkt-z-index': 10000,
+} as const
+
+export const reownTokenOverrides: Record<string, string> = {
+  '--apkt-tokens-theme-overlay': 'rgba(0, 0, 0, 0.72)',
+  '--apkt-tokens-theme-backgroundPrimary': '#000000',
+  '--apkt-tokens-theme-backgroundInvert': '#ffffff',
+  '--apkt-tokens-theme-textPrimary': '#ffffff',
+  '--apkt-tokens-theme-textSecondary': '#999999',
+  '--apkt-tokens-theme-textTertiary': '#b3b3b3',
+  '--apkt-tokens-theme-textInvert': '#000000',
+  '--apkt-tokens-theme-borderPrimary': '#4d4d4d',
+  '--apkt-tokens-theme-borderPrimaryDark': '#4d4d4d',
+  '--apkt-tokens-theme-borderSecondary': '#4d4d4d',
+  '--apkt-tokens-theme-foregroundPrimary': '#101010',
+  '--apkt-tokens-theme-foregroundSecondary': '#101010',
+  '--apkt-tokens-theme-foregroundTertiary': '#2b2b2b',
+  '--apkt-tokens-theme-iconDefault': '#999999',
+  '--apkt-tokens-theme-iconInverse': '#ffffff',
+  '--apkt-tokens-core-backgroundAccentPrimary': '#e97b40',
+  '--apkt-tokens-core-textAccentPrimary': '#e97b40',
+  '--apkt-tokens-core-borderAccentPrimary': '#e97b40',
+  '--apkt-tokens-core-iconAccentPrimary': '#e97b40',
+  '--apkt-tokens-core-foregroundAccent010': 'rgba(233, 123, 64, 0.1)',
+  '--apkt-tokens-core-foregroundAccent020': 'rgba(233, 123, 64, 0.2)',
+  '--apkt-tokens-core-foregroundAccent040': 'rgba(233, 123, 64, 0.4)',
+  '--apkt-tokens-core-foregroundAccent060': 'rgba(233, 123, 64, 0.6)',
+}

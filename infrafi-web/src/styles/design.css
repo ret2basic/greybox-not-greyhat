@@ -1,0 +1,867 @@
+/* InfraFi extension styles — built on top of brand.css */
+
+:root {
+  /* Override font-display to use Inter Tight (loaded from Google Fonts) */
+  --font-display: "Inter Tight", "Inter", -apple-system, ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Inter", -apple-system, ui-sans-serif, system-ui, sans-serif;
+
+  /* Semantic accents */
+  --pos: #7ED9A8;
+  --pos-bg: rgba(126,217,168,0.10);
+  --pos-line: rgba(126,217,168,0.22);
+  --neg: #EA5270;
+  --neg-bg: rgba(234,82,112,0.12);
+  --neg-line: rgba(234,82,112,0.28);
+}
+
+/* theme-dusk overrides: stronger contrast, refined */
+.theme-dusk {
+  --bg-0: #0B0814;
+  --bg-1: #110D1D;
+  --bg-2: #181226;
+  --bg-3: #221934;
+  --fg: #F2EBF8;
+  --fg-2: #B7AFCB;
+  --fg-3: #7B7290;
+  --fg-4: #4B4660;
+  --line: rgba(220,200,255,0.07);
+  --line-strong: rgba(220,200,255,0.14);
+  --grid: rgba(180,160,255,0.04);
+  --accent: var(--dawn-coral);
+  /* Brand accents used by the v5 reserves design (dawn-cyan/dawn-violet are
+     referenced throughout v5 but only --dawn-violet is defined in v5/brand.css;
+     pin both here so v5 ports render with the intended hues). */
+  --dawn-cyan: #7DD1FF;
+  --dawn-violet: #6B3F8F;
+}
+
+html, body { margin: 0; background: var(--bg-0); color: var(--fg); font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
+/* Reserve scrollbar gutter so navigating between short/tall pages
+   (e.g. Reserves & Projects vs. Dashboard) doesn't shift centered
+   content as the vertical scrollbar appears or disappears. */
+html { scrollbar-gutter: stable; }
+body { overflow-x: hidden; }
+a { color: inherit; text-decoration: none; }
+button { font-family: inherit; }
+.mono { font-family: var(--font-mono); font-feature-settings: "calt" 0; }
+.serif { font-family: var(--font-serif); font-style: italic; font-weight: 400; }
+
+/* Tabular nums for all financial figures */
+.tabular { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
+
+/* Small caps eyebrow — v3 uses sans-serif at slightly bolder weight for legibility */
+.kicker {
+  font-family: var(--font-sans);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #968CAB; /* brighter than --fg-3 for legibility on dark backgrounds */
+}
+.kicker-2 { color: var(--fg-2); }
+
+/* Hoverable interactive list row — used in legend/breakdown lists */
+.hover-row {
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+}
+.hover-row:hover {
+  background: var(--bg-3) !important;
+  border-color: var(--line) !important;
+}
+
+/* Integration row — clickable list row with leading chevron */
+.integration-row {
+  transition: background 140ms ease, color 140ms ease;
+}
+.integration-row:hover {
+  background: var(--bg-3) !important;
+}
+.integration-row:hover svg:first-child {
+  color: var(--fg-2) !important;
+}
+.integration-row:hover .venue-name {
+  color: var(--accent, var(--fg)) !important;
+}
+.integration-row .venue-name {
+  transition: color 140ms ease;
+}
+
+/* Integration action — link inside the expanded dropdown.
+   Underline appears on hover to reinforce 'this is a link'. */
+.integration-action:hover .integration-action-label {
+  border-bottom-color: var(--fg-3) !important;
+}
+.integration-action:hover svg {
+  color: var(--fg) !important;
+}
+
+/* Animations used by interactive charts and modals */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes modalIn {
+  from { opacity: 0; transform: translateY(12px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Surfaces */
+.card {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  position: relative;
+}
+.card-strong {
+  background: linear-gradient(180deg, var(--bg-2), var(--bg-1));
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+}
+.card-flat {
+  background: rgba(255,255,255,0.015);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.glow-card {
+  border: 1px solid var(--line);
+  transition: border-color 220ms ease, transform 220ms ease, box-shadow 220ms ease;
+}
+.glow-card:hover {
+  transform: translateY(-3px);
+  border-color: rgba(243, 162, 74, 0.55);
+  box-shadow: 0 22px 60px -20px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(243, 162, 74, 0.32) inset,
+    0 0 36px -10px rgba(243, 162, 74, 0.22);
+}
+
+/* Buttons */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 10px 18px; border-radius: 999px;
+  font: 500 13px/1 var(--font-sans);
+  letter-spacing: -0.005em;
+  border: 1px solid transparent;
+  cursor: pointer; transition: all 160ms cubic-bezier(.2,.7,.3,1);
+  white-space: nowrap;
+}
+.btn-primary {
+  background: var(--dawn-gradient-h);
+  color: #1A0A0A;
+  font-weight: 600;
+  box-shadow: 0 1px 0 rgba(255,255,255,0.25) inset, 0 8px 30px -8px rgba(234,82,112,0.5);
+}
+.btn-primary:hover { transform: translateY(-1px); }
+.gradient-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 20px;
+  border-radius: 999px;
+  border: none;
+  font: 600 13px/1 var(--font-sans);
+  letter-spacing: -0.005em;
+  white-space: nowrap;
+  text-decoration: none;
+  cursor: pointer;
+  color: #0B0814;
+  background: linear-gradient(90deg, var(--dawn-amber), var(--dawn-coral));
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.25) inset, 0 8px 30px -8px rgba(234, 82, 112, 0.5);
+  transition: transform 160ms cubic-bezier(.2, .7, .3, 1), box-shadow 160ms ease, opacity 160ms ease;
+}
+.gradient-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.3) inset, 0 14px 40px -8px rgba(234, 82, 112, 0.7);
+}
+.gradient-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+  transform: none;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.2) inset;
+}
+.gradient-btn-sm { padding: 8px 14px; font-size: 12px; }
+.gradient-btn-block { width: 100%; }
+.btn-ghost {
+  background: rgba(255,255,255,0.04);
+  color: var(--fg);
+  border-color: var(--line-strong);
+}
+.btn-ghost:hover { background: rgba(255,255,255,0.07); }
+.btn-square {
+  border-radius: 8px;
+}
+.btn-sm { padding: 8px 14px; font-size: 12px; }
+
+/* Pill/badge */
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--line);
+  font: 500 10px/1 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-2);
+}
+.pill-pos { background: var(--pos-bg); border-color: var(--pos-line); color: var(--pos); }
+.pill-neg { background: var(--neg-bg); border-color: var(--neg-line); color: var(--neg); }
+.pill-accent {
+  background: rgba(234,82,112,0.10);
+  border-color: rgba(234,82,112,0.24);
+  color: #F3A24A;
+}
+.pill .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; }
+.pulse-dot { animation: dawn-pulse 1.8s ease-in-out infinite; }
+
+/* Display & section text */
+.h-display { font-family: var(--font-display); font-weight: 500; letter-spacing: -0.035em; line-height: 0.96; }
+.h-section { font-family: var(--font-display); font-weight: 500; letter-spacing: -0.025em; line-height: 1.0; }
+.gradient-text {
+  background: var(--dawn-gradient-h);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+
+/* Animations */
+@keyframes dawn-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.55; transform: scale(0.85); }
+}
+@keyframes launchPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(243,162,74,0.35); }
+  50% { box-shadow: 0 0 0 6px rgba(243,162,74,0); }
+}
+@keyframes barFill {
+  from { transform: scaleX(0); transform-origin: left; }
+  to { transform: scaleX(1); transform-origin: left; }
+}
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.fade-up { animation: fadeUp 600ms cubic-bezier(.2,.7,.2,1) both; }
+
+/* Layout helpers */
+.app-container {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 0 32px;
+}
+
+/* Top stats strip (TVL · APY · sUSD.tel) */
+.stats-strip {
+  display: flex; align-items: center; gap: 28px;
+  padding: 8px 14px;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+/* Tabular monospace ticker */
+.ticker-row {
+  display: flex; align-items: center; gap: 14px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+}
+.ticker-row .sep { width: 4px; height: 4px; background: var(--fg-4); border-radius: 50%; }
+
+/* Custom scrollbar */
+.home, .home * { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 999px; }
+
+/* Decorative dashed motif */
+.dashed-line {
+  height: 1px;
+  background-image: repeating-linear-gradient(90deg, var(--line-strong) 0 6px, transparent 6px 12px);
+}
+.dashed-line-v {
+  width: 1px;
+  background-image: repeating-linear-gradient(180deg, var(--line-strong) 0 6px, transparent 6px 12px);
+}
+
+/* Reserves left panel — content slides in from the side adjacent to the map,
+   reinforcing the visual link between a pin and its detail view. */
+@keyframes reservesPanelIn {
+  from { opacity: 0; transform: translateX(12px); filter: blur(2px); }
+  to { opacity: 1; transform: translateX(0); filter: blur(0); }
+}
+.reserves-panel-fade {
+  animation: reservesPanelIn 380ms cubic-bezier(.2,.7,.2,1) both;
+}
+
+/* Pulsing amber dot for "pending claim" portfolio rows — signals the row is
+   live/clickable. Layered box-shadow rings expand outward and fade. */
+@keyframes pfPendingPulse {
+  0%   { box-shadow: 0 0 0 0 rgba(243,162,74,0.55); }
+  70%  { box-shadow: 0 0 0 6px rgba(243,162,74,0); }
+  100% { box-shadow: 0 0 0 0 rgba(243,162,74,0); }
+}
+.pf-pending-pulse { animation: pfPendingPulse 1.8s cubic-bezier(.2,.7,.2,1) infinite; }
+
+/* Inline expansion of underlying claims under the pending row. */
+@keyframes pf-claims-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Asset visualizer — node halo pulse + selected ring + transmitting/
+   receiving antenna ripples + flowing-edge dash. Used by Node3D, Edge3D,
+   AntennaWaves in src/components/reserves-projects/asset-visualizer.
+   Ported VERBATIM from v5 Asset Visualizer Concepts.html lines 36–58.
+   Critical: elements that consume these keyframes are centered via
+   margin offsets (marginLeft: -size/2, marginTop: -size/2), NOT via
+   transform. Earlier our keyframes applied translate(-50%, -50%) which
+   double-offset the elements as soon as the animation started — visible
+   as a "weird glow" because the halo would jump off-center on every
+   pulse cycle. v5's keyframes apply only `scale()`, leaving the margin-
+   based centering intact. Match exactly. */
+@keyframes av-node-pulse {
+  0%, 100% { opacity: 0.55; transform: scale(1);    }
+  50%      { opacity: 0.9;  transform: scale(1.08); }
+}
+@keyframes av-node-ring {
+  0%   { transform: scale(1);   opacity: 0.9; }
+  100% { transform: scale(1.8); opacity: 0;   }
+}
+@keyframes av-edge-flow {
+  0%   { background-position: 0 0; }
+  100% { background-position: 24px 0; }
+}
+/* Tenant broadcast antenna ripple — expanding rings (signal leaving) */
+@keyframes av-wave-out {
+  0%   { transform: scale(0.4); opacity: 0.85; }
+  100% { transform: scale(2.2); opacity: 0;    }
+}
+/* Receiving antenna ripple — contracting rings (signal arriving) */
+@keyframes av-wave-in {
+  0%   { transform: scale(2.2); opacity: 0;    }
+  30%  {                        opacity: 0.85; }
+  100% { transform: scale(0.4); opacity: 0;    }
+}
+
+/* ─── Reserves & Projects: project → buildings → asset transitions ─── */
+
+/* Buildings list reveals via a clip-path wipe from the LEFT edge → right.
+   Slide-in (translateX -16px → 0) reinforces the card-edge connection. */
+@keyframes reservesBuildingsIn {
+  0%   { opacity: 0; clip-path: inset(0 100% 0 0); transform: translateX(-16px); }
+  20%  { opacity: 1; }
+  100% { opacity: 1; clip-path: inset(0 0 0 0); transform: translateX(0); }
+}
+@keyframes reservesBuildingsOut {
+  0%   { opacity: 1; clip-path: inset(0 0 0 0); transform: translateX(0); }
+  80%  { opacity: 1; }
+  100% { opacity: 0; clip-path: inset(0 100% 0 0); transform: translateX(-16px); }
+}
+.reserves-buildings-in  { animation: reservesBuildingsIn  520ms cubic-bezier(.45,.05,.25,1) both; }
+.reserves-buildings-out { animation: reservesBuildingsOut 460ms cubic-bezier(.55,0,.55,.95) both; }
+
+/* Stagger rows in just behind the wipe. */
+.reserves-buildings-in tbody tr { animation: fadeUp 320ms cubic-bezier(.2,.7,.2,1) both; }
+.reserves-buildings-in tbody tr:nth-child(1) { animation-delay: 180ms; }
+.reserves-buildings-in tbody tr:nth-child(2) { animation-delay: 220ms; }
+.reserves-buildings-in tbody tr:nth-child(3) { animation-delay: 260ms; }
+.reserves-buildings-in tbody tr:nth-child(4) { animation-delay: 300ms; }
+.reserves-buildings-in tbody tr:nth-child(5) { animation-delay: 340ms; }
+.reserves-buildings-in tbody tr:nth-child(6) { animation-delay: 380ms; }
+.reserves-buildings-in tbody tr:nth-child(7) { animation-delay: 420ms; }
+.reserves-buildings-in tbody tr:nth-child(8) { animation-delay: 460ms; }
+
+.reserves-buildings-row {
+  transition: background 180ms ease, transform 180ms cubic-bezier(.2,.7,.2,1);
+}
+.reserves-buildings-row:hover { background: rgba(243,162,74,0.06); }
+
+/* App background — 1:1 with Figma (node 6489:10566): #050609 base, four
+   blurred ellipse glows (amber ×3 + coral at the bottom) layered above a
+   56px hairline grid. Spans the full app shell and scrolls with content,
+   sitting behind everything via a negative z-index in the shell's own
+   stacking context. */
+.app-bg {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-color: #050609;
+}
+
+/* Grid lines are rendered as a single SVG <pattern> with
+   shape-rendering:crispEdges so every 1px hairline snaps to the device
+   pixel grid. A CSS repeating-linear-gradient rounds 1px lines down to
+   zero at fractional zoom/DPR, dropping lines in a regular pattern. */
+.app-bg-grid {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* Ellipse glows sit above the grid, matching Figma layer order. */
+.app-bg-glows {
+  position: absolute;
+  inset: 0;
+  background-image:
+    radial-gradient(1200px 760px at 50% 20px,   rgba(243,162,74,0.20), transparent 60%),
+    radial-gradient(1200px 460px at 50% 700px,  rgba(243,162,74,0.12), transparent 60%),
+    radial-gradient(1200px 760px at 50% 1180px, rgba(243,162,74,0.15), transparent 60%),
+    radial-gradient(1200px 760px at 50% 1960px, rgba(232,64,102,0.16), transparent 60%);
+}
+
+/* Row "lift" — when clicked, the row pulses bright amber so the user
+   can visually tie the asset frame back to its origin row. */
+@keyframes reservesRowLift {
+  0%   { transform: translateY(0)    scale(1);     background: rgba(243,162,74,0);    box-shadow: 0 0 0 rgba(0,0,0,0); }
+  35%  { transform: translateY(-3px) scale(1.008); background: rgba(243,162,74,0.22); box-shadow: 0 10px 28px -6px rgba(243,162,74,0.55), 0 0 0 1px rgba(243,162,74,0.45) inset; }
+  100% { transform: translateY(-2px) scale(1.005); background: rgba(243,162,74,0.14); box-shadow: 0 8px 24px -8px rgba(243,162,74,0.4), 0 0 0 1px rgba(243,162,74,0.28) inset; }
+}
+.reserves-buildings-row.lifting {
+  animation: reservesRowLift 320ms cubic-bezier(.2,.7,.2,1) forwards;
+  position: relative;
+  z-index: 2;
+}
+.reserves-buildings-row.lifting > td:first-child { position: relative; }
+.reserves-buildings-row.lifting > td:first-child::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 6px; bottom: 6px;
+  width: 3px;
+  background: var(--dawn-amber, #F3A24A);
+  border-radius: 0 2px 2px 0;
+  box-shadow: 0 0 12px rgba(243,162,74,0.7);
+  animation: reservesRowAccent 280ms cubic-bezier(.2,.7,.2,1) forwards;
+}
+@keyframes reservesRowAccent {
+  0%   { transform: scaleY(0); opacity: 0; }
+  100% { transform: scaleY(1); opacity: 1; }
+}
+
+/* Asset frame morphs between row footprint and grid bbox via WAAPI.
+   Inner content fades in once the frame is docked. */
+.reserves-asset-frame {
+  transform-origin: center center;
+  will-change: transform, opacity;
+}
+.reserves-asset-frame > .reserves-asset-content {
+  transition: opacity 220ms ease 100ms;
+}
+.reserves-asset-frame.docked > .reserves-asset-content { opacity: 1; }
+.reserves-asset-frame:not(.docked) > .reserves-asset-content { opacity: 0; }
+
+/* Asset detail opens as a centered, viewport-fixed modal with a blurred
+   backdrop (mirrors the dashboard CardModal). Portaled to <body>. */
+.reserves-asset-modal-root {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+}
+.reserves-asset-backdrop,
+.reserves-asset-backdrop-out {
+  position: absolute;
+  inset: 0;
+  background: rgba(7, 8, 11, 0.72);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  cursor: zoom-out;
+}
+.reserves-asset-backdrop     { animation: reservesSheetBackdropIn 280ms ease both; }
+.reserves-asset-backdrop-out { animation: reservesSheetBackdropIn 280ms ease reverse forwards; }
+
+/* Slim crumb strip above the asset frame slides down once docked. */
+@keyframes reservesStripIn {
+  from { opacity: 0; transform: translateY(-8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.reserves-strip-in  { animation: reservesStripIn 320ms cubic-bezier(.2,.7,.2,1) both; animation-delay: 280ms; }
+.reserves-strip-out { animation: reservesStripIn 220ms cubic-bezier(.4,0,.6,1) reverse forwards; }
+
+/* The left detail card "folds away" as we cross into the asset view. */
+@keyframes reservesDetailFoldOut {
+  from { opacity: 1; transform: translateX(0)     scale(1);    }
+  to   { opacity: 0; transform: translateX(-14px) scale(0.98); }
+}
+.reserves-detail-fold-out { animation: reservesDetailFoldOut 240ms cubic-bezier(.4,.0,.7,.5) forwards; }
+
+/* The CTA pill on the buildings list ("Click a row…") pulses to draw the eye.
+   Two names: `cta-pulse-glow` is the v5 source's name (referenced inline by
+   the verbatim-ported BuildingsListPanel), `reservesCtaPulseGlow` is the
+   pre-port name still in use by the className-based variant elsewhere. */
+@keyframes cta-pulse-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(125,209,255,0.55), 0 0 16px rgba(125,209,255,0.32); }
+  50%      { box-shadow: 0 0 0 6px rgba(125,209,255,0),  0 0 24px rgba(125,209,255,0.55); }
+}
+@keyframes reservesCtaPulseGlow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(125,209,255,0.55), 0 0 16px rgba(125,209,255,0.32); }
+  50%      { box-shadow: 0 0 0 6px rgba(125,209,255,0),  0 0 24px rgba(125,209,255,0.55); }
+}
+.reserves-cta-pulse { animation: reservesCtaPulseGlow 2.4s ease-in-out infinite; }
+
+/* ─── Mobile project detail bottom-sheet (Figma 6676-76398) ─── */
+@keyframes reservesSheetBackdropIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes reservesSheetUp {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0); }
+}
+.reserves-sheet-backdrop      { animation: reservesSheetBackdropIn 240ms ease both; }
+.reserves-sheet-backdrop-out  { animation: reservesSheetBackdropIn 220ms ease reverse forwards; }
+.reserves-sheet-panel         { animation: reservesSheetUp 320ms cubic-bezier(.2,.7,.2,1) both; }
+.reserves-sheet-panel-out     { animation: reservesSheetUp 260ms cubic-bezier(.4,0,.7,.5) reverse forwards; }
+
+/* Tabbed switcher */
+.tabs {
+  display: inline-flex;
+  padding: 4px;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  gap: 2px;
+}
+.tab {
+  padding: 8px 16px;
+  font: 500 12px/1 var(--font-sans);
+  color: var(--fg-3);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  cursor: pointer;
+  letter-spacing: -0.005em;
+  transition: all 160ms;
+}
+.tab:hover { color: var(--fg-2); }
+.tab.active {
+  color: var(--fg);
+  background: var(--bg-3);
+  border-color: var(--line-strong);
+}
+
+/* Table */
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.table thead th {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+  text-align: left;
+  padding: 14px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.table thead th.right { text-align: right; }
+.table tbody td {
+  padding: 18px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--fg-2);
+  vertical-align: middle;
+}
+.table tbody td.right { text-align: right; }
+.table tbody tr:last-child td { border-bottom: none; }
+.table tbody tr:hover td { background: rgba(255,255,255,0.015); }
+
+/* Reserves & Projects deployment table rows (Figma grid layout) */
+.reserves-trow { transition: background 120ms ease; }
+.reserves-trow:hover { background: rgba(255,255,255,0.022); }
+.reserves-trow.is-selected { background: rgba(243,162,74,0.06); }
+
+/* asset bubble */
+.asset-bubble {
+  width: 32px; height: 32px;
+  border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font: 600 11px/1 var(--font-display);
+  letter-spacing: -0.02em;
+  flex-shrink: 0;
+}
+
+/* small chain pill */
+.chain-pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font: 500 9px/1 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--line);
+  color: var(--fg-2);
+}
+
+/* Underline link */
+.link-arrow {
+  display: inline-flex; align-items: center; gap: 4px;
+  color: var(--dawn-amber);
+  font: 500 12px/1 var(--font-sans);
+  cursor: pointer;
+  letter-spacing: -0.005em;
+}
+.link-arrow:hover { color: var(--dawn-coral); }
+
+/* Section header pattern */
+.section-head {
+  display: flex; justify-content: space-between; align-items: flex-end; gap: 32px;
+  margin-bottom: 28px;
+}
+
+/* Reusable row primitive (used across boost / portfolio) */
+.row-card {
+  display: grid;
+  align-items: center;
+  padding: 14px 18px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  transition: border-color 180ms;
+}
+.row-card:hover { border-color: var(--line-strong); }
+
+@media (max-width: 1024px) {
+  .app-container {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .stats-strip {
+    padding: 6px 10px;
+    gap: 10px;
+  }
+
+  .ticker-row {
+    gap: 10px;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+  }
+
+  .section-head {
+    gap: 16px;
+    margin-bottom: 18px;
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
+/* ============================================================
+   Transaction success animation — calm, deliberate confirmation
+   ============================================================ */
+@keyframes tx-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes tx-pulse {
+  0%, 100% { opacity: 0.5; transform: translate(-50%, -50%) scale(0.85); }
+  50%      { opacity: 1;   transform: translate(-50%, -50%) scale(1.15); }
+}
+@keyframes tx-step-pulse {
+  0%, 100% { opacity: 0.4; }
+  50%      { opacity: 1; }
+}
+@keyframes tx-success-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes tx-receipt-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes tx-circle-draw {
+  to { stroke-dashoffset: 0; }
+}
+@keyframes tx-check-draw {
+  to { stroke-dashoffset: 0; }
+}
+@keyframes tx-ring {
+  0%   { opacity: 0.9; transform: scale(0.7); border-width: 2px; }
+  60%  { opacity: 0.5; }
+  100% { opacity: 0; transform: scale(1.9); border-width: 1px; }
+}
+/* Dot-matrix pending loader — amber ripples diagonally across the grid
+   (Figma 6575-5901). Each cell receives a staggered delay so the lit
+   state travels rather than blinking in unison. */
+@keyframes tx-dot {
+  0%, 100% { background-color: #26272b; box-shadow: none; }
+  50%      { background-color: var(--dawn-amber); box-shadow: 0 0 6px rgba(243, 162, 74, 0.55); }
+}
+
+/* ============================================================
+   Mobile TopNav menu — "More" list rows + stats strip scroll
+   (Figma 6605-6196). Only rendered on small screens.
+   ============================================================ */
+.topnav-more-row {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 4px;
+  background: transparent;
+  border: none;
+  color: var(--fg-2);
+  font-size: 15px;
+  text-align: left;
+  cursor: pointer;
+  transition: color 160ms ease;
+}
+.topnav-more-row:hover {
+  color: var(--fg);
+}
+/* Hide the scrollbar on the horizontally-scrollable mobile stats strip. */
+.topnav-mobile-stats {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x;
+}
+.topnav-mobile-stats::-webkit-scrollbar {
+  display: none;
+}
+
+/* Boost page — hide scrollbar on mobile pill tabs (Figma 6610-8518). */
+.boost-tabs-scroll {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.boost-tabs-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+/* ============================================================
+   Stat-chip expansion modal (ChartModal + KPIModal)
+
+   Mirrors the dashboard's CardModal sizing exactly (dashboard.css
+   .dash-modal-stage / .dash-modal-card) so the FLIP morph from a
+   TopNav stat chip or mobile stat pill produces the same panel
+   shape on every breakpoint as a dashboard card's expand modal.
+
+   CSS-driven (instead of JS matchMedia) so media queries reflow
+   the panel in lockstep with the rest of the dashboard.
+   ============================================================ */
+.chart-modal-stage {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  pointer-events: none;
+}
+.chart-modal-card {
+  position: relative;
+  pointer-events: auto;
+  width: min(960px, calc(100% - 160px));
+  max-height: 90vh;
+  overflow: auto;
+  background: var(--bg-1);
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+  padding: 28px 32px 32px;
+}
+.chart-modal-close {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-3);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+.chart-modal-head {
+  margin-bottom: 24px;
+}
+.chart-modal-title {
+  font-size: 28px;
+  margin: 0;
+  letter-spacing: -0.015em;
+  padding-right: 40px;
+}
+.kpi-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+.kpi-modal-footer {
+  padding: 18px;
+  display: flex;
+  gap: 18px;
+  align-items: center;
+}
+.kpi-modal-footer-label {
+  flex: 0 0 120px;
+}
+
+/* Tablet — narrow the card a touch and reduce gutters so the chart
+   gets more width on iPad-class viewports. */
+@media (max-width: 1024px) {
+  .chart-modal-stage {
+    padding: 20px;
+  }
+  .chart-modal-card {
+    width: calc(100% - 40px);
+    padding: 24px;
+  }
+}
+
+/* Phone — mirror dashboard.css @media (max-width: 640px) for
+   .dash-modal-stage / .dash-modal-card / .dash-modal-close /
+   .dash-detail-footer-label. Same shape, same gutters. */
+@media (max-width: 640px) {
+  .chart-modal-stage {
+    padding: 12px;
+  }
+  .chart-modal-card {
+    width: calc(100% - 16px);
+    max-height: calc(100vh - 32px);
+    padding: 16px;
+    border-radius: 16px;
+  }
+  .chart-modal-close {
+    top: 10px;
+    right: 10px;
+  }
+  .chart-modal-head {
+    margin-bottom: 16px;
+  }
+  .chart-modal-title {
+    font-size: 20px;
+    padding-right: 36px;
+  }
+  .kpi-modal-body {
+    gap: 16px;
+  }
+  .kpi-modal-stats {
+    gap: 16px 20px !important;
+    width: 100%;
+  }
+  .kpi-modal-current {
+    font-size: 24px !important;
+  }
+  .kpi-modal-stat {
+    font-size: 16px !important;
+  }
+  .kpi-modal-footer {
+    padding: 14px;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .kpi-modal-footer-label {
+    flex: 0 0 auto;
+  }
+}

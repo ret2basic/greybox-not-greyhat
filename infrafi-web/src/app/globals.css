@@ -1,0 +1,102 @@
+@import 'tailwindcss';
+
+/* Midnight design system — tokens, surfaces, typography */
+@import '../styles/brand.css';
+@import '../styles/design.css';
+@import '../styles/dashboard.css';
+@import '../styles/legal.css';
+
+/* Pre-paint loader cover.
+   Set on <html> by the inline <script> in layout.tsx <head> when
+   the loader should play this session. The ::before paints the
+   loader's dark backdrop OVER the SSR'd layout shell (TopNav,
+   FooterTicker, ambient gradient) from the very first paint, so
+   the user never sees those elements flash before AppLoader takes
+   over. AppLoaderInner removes the attribute when its REVEAL phase
+   completes; AppLoader's outer gate removes it for repeat visitors
+   (when the loader doesn't play). z:9998 sits just below
+   AppLoaderInner's React-rendered backdrop at z:9999 so the
+   handoff is seamless. */
+html[data-loader="active"]::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: #050608;
+  z-index: 9998;
+  pointer-events: none;
+}
+
+/* Mobile overflow guard.
+   The page shell renders the desktop layout during SSR (the
+   `isSmallScreen` flags start false and only resolve client-side via
+   matchMedia). On a phone, if any desktop-width content overflows the
+   viewport horizontally, the browser expands the *layout viewport* to
+   fit it ("shrink-to-fit"). That pushes window.innerWidth past the
+   1024px breakpoint, so matchMedia never flips to mobile and the page
+   stays locked in the squeezed desktop layout (DAWN-1449).
+   Clipping horizontal overflow at the root keeps the layout viewport
+   pinned to device-width, so the mobile breakpoint engages correctly
+   on every page. `clip` (not `hidden`) avoids establishing a scroll
+   container, which would otherwise break the sticky TopNav. */
+html,
+body {
+  overflow-x: clip;
+  max-width: 100%;
+}
+
+@theme {
+  --breakpoint-sm: 640px;
+  --breakpoint-md: 1130px;
+  --breakpoint-lg: 1280px;
+  --breakpoint-xl: 1536px;
+  --breakpoint-2xl: 1920px;
+}
+
+@keyframes wallet-skeleton-shimmer {
+  0% {
+    transform: translateX(0);
+  }
+
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+button:not(:disabled),
+[role='button']:not([aria-disabled='true']) {
+  cursor: pointer;
+}
+
+button:disabled,
+[role='button'][aria-disabled='true'] {
+  cursor: not-allowed;
+}
+
+/* Reown AppKit modal — themed to match midnight palette */
+:root {
+  --apkt-tokens-theme-overlay: rgba(5, 6, 8, 0.78) !important;
+  --apkt-tokens-theme-backgroundPrimary: var(--bg-0) !important;
+  --apkt-tokens-theme-backgroundInvert: #ffffff !important;
+  --apkt-tokens-theme-textPrimary: var(--fg) !important;
+  --apkt-tokens-theme-textSecondary: var(--fg-2) !important;
+  --apkt-tokens-theme-textTertiary: var(--fg-3) !important;
+  --apkt-tokens-theme-textInvert: #0a0c10 !important;
+  --apkt-tokens-theme-borderPrimary: var(--line-strong) !important;
+  --apkt-tokens-theme-borderPrimaryDark: var(--line-strong) !important;
+  --apkt-tokens-theme-borderSecondary: var(--line) !important;
+  --apkt-tokens-theme-foregroundPrimary: var(--bg-2) !important;
+  --apkt-tokens-theme-foregroundSecondary: var(--bg-2) !important;
+  --apkt-tokens-theme-foregroundTertiary: var(--bg-3) !important;
+  --apkt-tokens-theme-iconDefault: var(--fg-3) !important;
+  --apkt-tokens-theme-iconInverse: var(--fg) !important;
+  --apkt-tokens-core-backgroundAccentPrimary: var(--dawn-coral) !important;
+  --apkt-tokens-core-textAccentPrimary: var(--dawn-coral) !important;
+  --apkt-tokens-core-borderAccentPrimary: var(--dawn-coral) !important;
+  --apkt-tokens-core-iconAccentPrimary: var(--dawn-coral) !important;
+  --apkt-tokens-core-foregroundAccent010: rgba(234, 82, 112, 0.1) !important;
+  --apkt-tokens-core-foregroundAccent020: rgba(234, 82, 112, 0.2) !important;
+  --apkt-tokens-core-foregroundAccent040: rgba(234, 82, 112, 0.4) !important;
+  --apkt-tokens-core-foregroundAccent060: rgba(234, 82, 112, 0.6) !important;
+  --w3m-accent: var(--dawn-coral) !important;
+  --w3m-background: var(--bg-0) !important;
+}
