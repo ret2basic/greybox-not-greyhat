@@ -12450,6 +12450,27 @@ def refresh_artifact_health_output_manifests(
     )
 
 
+def refresh_current_artifact_manifest(
+    *,
+    artifact_dir: Path,
+    target: str,
+    command: str,
+    output_paths: list[Path],
+) -> list[dict[str, Any]]:
+    return refresh_manifests_for_artifact_outputs(
+        output_paths=output_paths,
+        artifact_dir=artifact_dir,
+        check_dirs=[],
+        target=target,
+        command=command,
+    )
+
+
+def print_refreshed_manifests(refreshed_manifests: list[dict[str, Any]]) -> None:
+    for item in refreshed_manifests:
+        print(f"Refreshed {item['manifest']}: {item['status']}")
+
+
 def increment_count(counts: dict[str, int], key: str) -> None:
     counts[key] = counts.get(key, 0) + 1
 
@@ -15574,7 +15595,11 @@ def run_audit(args: argparse.Namespace) -> int:
         environment_readiness,
         artifact_dir,
     )
-    write_json(artifact_dir / "verification-queue.json", verification_queue)
+    verification_queue_path = artifact_dir / "verification-queue.json"
+    reproduction_steps_path = artifact_dir / "reproduction-steps.md"
+    review_blockers_path = artifact_dir / REVIEW_BLOCKERS_ARTIFACT
+    review_blockers_markdown_path = artifact_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT
+    write_json(verification_queue_path, verification_queue)
     write_reproduction_steps(artifact_dir, verification_queue)
     review_blockers = build_review_blockers(
         target=target,
@@ -15586,8 +15611,8 @@ def run_audit(args: argparse.Namespace) -> int:
         source_peek_requests=source_peek_requests,
         environment_readiness=environment_readiness,
     )
-    write_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT, review_blockers)
-    write_review_blockers_markdown(artifact_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT, review_blockers)
+    write_json(review_blockers_path, review_blockers)
+    write_review_blockers_markdown(review_blockers_markdown_path, review_blockers)
     write_json(artifact_dir / "burp-capabilities.json", capabilities)
     write_json(
         artifact_dir / "config.json",
@@ -17557,18 +17582,38 @@ def run_plan(args: argparse.Namespace) -> int:
 
 def run_gate(args: argparse.Namespace) -> int:
     artifact_dir = Path(args.artifact_dir).resolve()
+    profile = load_target_profile(args.profile)
+    target = resolve_target(args, profile)
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
     suspicions_path = artifact_dir / "suspicions.json"
     if not suspicions_path.exists():
-        write_json(artifact_dir / "finding-gate.json", build_finding_gate([], burp_history))
+        output_path = artifact_dir / "finding-gate.json"
+        write_json(output_path, build_finding_gate([], burp_history))
         print("No suspicions.json found; wrote empty finding gate")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="gate",
+                output_paths=[output_path],
+            )
+        )
         return 0
 
     suspicions_doc = json.loads(read_text(suspicions_path))
     suspicions = suspicions_doc.get("suspicions", [])
     gate = build_finding_gate(suspicions, burp_history)
-    write_json(artifact_dir / "finding-gate.json", gate)
+    output_path = artifact_dir / "finding-gate.json"
+    write_json(output_path, gate)
     print(f"Gated {len(gate['gates'])} suspicions")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="gate",
+            output_paths=[output_path],
+        )
+    )
     return 0
 
 
@@ -17591,9 +17636,18 @@ def run_coverage(args: argparse.Namespace) -> int:
         load_optional_json(artifact_dir / "environment-readiness.json"),
         load_optional_json(artifact_dir / "transaction-decoder-selftest.json"),
     )
-    write_json(artifact_dir / "blackbox-coverage.json", coverage)
+    output_path = artifact_dir / "blackbox-coverage.json"
+    write_json(output_path, coverage)
     print(f"Coverage gate: {coverage['status']}")
-    print(f"Wrote {artifact_dir / 'blackbox-coverage.json'}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="coverage",
+            output_paths=[output_path],
+        )
+    )
     return 0 if coverage["status"] in {"covered", "covered-with-external-blocker"} else 1
 
 
@@ -17611,14 +17665,23 @@ def run_burp_observation_coverage(args: argparse.Namespace) -> int:
         load_optional_json(artifact_dir / "burp-observation-run.json"),
         load_optional_json(artifact_dir / "evidence-gaps.json"),
     )
-    write_json(artifact_dir / "burp-observation-coverage.json", coverage)
+    output_path = artifact_dir / "burp-observation-coverage.json"
+    write_json(output_path, coverage)
     print(f"Burp observation coverage: {coverage['status']}")
     print(
         "Clusters: "
         f"{coverage['summary']['clusters']} total, "
         f"status_counts={json.dumps(coverage['summary']['status_counts'], sort_keys=True)}"
     )
-    print(f"Wrote {artifact_dir / 'burp-observation-coverage.json'}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="burp-observation-coverage",
+            output_paths=[output_path],
+        )
+    )
     return 0 if coverage["status"] in {"covered", "needs-burp-sync"} else 1
 
 
@@ -17696,7 +17759,8 @@ def run_response_deltas(args: argparse.Namespace) -> int:
         clusters,
         load_jsonl(artifact_dir / "probe-results.jsonl"),
     )
-    write_json(artifact_dir / "response-delta-analysis.json", response_delta_analysis)
+    output_path = artifact_dir / "response-delta-analysis.json"
+    write_json(output_path, response_delta_analysis)
     print(f"Response delta analysis: {response_delta_analysis['status']}")
     print(
         "Deltas: "
@@ -17704,7 +17768,15 @@ def run_response_deltas(args: argparse.Namespace) -> int:
         f"review_needed={response_delta_analysis['summary']['review_needed_groups']}, "
         f"expected_deltas={response_delta_analysis['summary']['expected_delta_groups']}"
     )
-    print(f"Wrote {artifact_dir / 'response-delta-analysis.json'}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="response-deltas",
+            output_paths=[output_path],
+        )
+    )
     return 0 if response_delta_analysis["status"] not in {"review-needed", "no-probe-results"} else 1
 
 
@@ -17747,7 +17819,8 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
         transaction_intent,
         transaction_decoder_selftest,
     )
-    write_json(artifact_dir / "evidence-chain.json", evidence_chain)
+    output_path = artifact_dir / "evidence-chain.json"
+    write_json(output_path, evidence_chain)
     print(f"Evidence chain: {evidence_chain['status']}")
     print(
         "Indexed: "
@@ -17755,7 +17828,15 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
         f"{evidence_chain['summary']['probes']} probes, "
         f"{evidence_chain['summary']['burp_observations']} Burp observations"
     )
-    print(f"Wrote {artifact_dir / 'evidence-chain.json'}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="evidence-chain",
+            output_paths=[output_path],
+        )
+    )
     return 0 if evidence_chain["status"] in {"covered", "covered-with-external-blocker"} else 1
 
 
@@ -17766,12 +17847,15 @@ def run_source_peek_requests(args: argparse.Namespace) -> int:
     clusters_path = artifact_dir / "endpoint-clusters.json"
     clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
     traffic_index = load_optional_json(artifact_dir / "traffic-index.json")
+    output_paths = []
     if traffic_index is None:
         traffic_index = build_traffic_index(
             load_jsonl(artifact_dir / "probe-results.jsonl"),
             load_jsonl(artifact_dir / "burp-history-observations.jsonl"),
         )
-        write_json(artifact_dir / "traffic-index.json", traffic_index)
+        traffic_index_path = artifact_dir / "traffic-index.json"
+        write_json(traffic_index_path, traffic_index)
+        output_paths.append(traffic_index_path)
     source_peeks = load_optional_json(artifact_dir / "source-peek-results.json")
     suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
     source_peek_requests = build_source_peek_requests(
@@ -17781,14 +17865,24 @@ def run_source_peek_requests(args: argparse.Namespace) -> int:
         suspicions_doc.get("suspicions", []),
         load_optional_json(artifact_dir / "evidence-gaps.json"),
     )
-    write_json(artifact_dir / "source-peek-requests.json", source_peek_requests)
+    output_path = artifact_dir / "source-peek-requests.json"
+    write_json(output_path, source_peek_requests)
+    output_paths.append(output_path)
     print(f"Source-peek requests: {source_peek_requests['status']}")
     print(
         "Requests: "
         f"{source_peek_requests['summary']['requests']} total, "
         f"triggers={json.dumps(source_peek_requests['summary']['trigger_counts'], sort_keys=True)}"
     )
-    print(f"Wrote {artifact_dir / 'source-peek-requests.json'}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="source-peek-requests",
+            output_paths=output_paths,
+        )
+    )
     return 0
 
 
@@ -17810,7 +17904,8 @@ def run_evidence_appendix(args: argparse.Namespace) -> int:
         load_optional_json(artifact_dir / "adjudication.json"),
         load_optional_json(artifact_dir / "environment-readiness.json"),
     )
-    write_json(artifact_dir / "evidence-appendix.json", evidence_appendix)
+    output_path = artifact_dir / "evidence-appendix.json"
+    write_json(output_path, evidence_appendix)
     print(f"Evidence appendix: {evidence_appendix['status']}")
     print(
         "Indexed: "
@@ -17818,7 +17913,15 @@ def run_evidence_appendix(args: argparse.Namespace) -> int:
         f"{evidence_appendix['summary']['representative_probe_examples']} representative probe examples, "
         f"{evidence_appendix['summary']['burp_observations']} Burp observations"
     )
-    print(f"Wrote {artifact_dir / 'evidence-appendix.json'}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="evidence-appendix",
+            output_paths=[output_path],
+        )
+    )
     return 0 if evidence_appendix["status"] != "missing-evidence" else 1
 
 
@@ -17838,7 +17941,11 @@ def run_verification_queue(args: argparse.Namespace) -> int:
         load_optional_json(artifact_dir / "environment-readiness.json"),
         artifact_dir,
     )
-    write_json(artifact_dir / "verification-queue.json", verification_queue)
+    verification_queue_path = artifact_dir / "verification-queue.json"
+    reproduction_steps_path = artifact_dir / "reproduction-steps.md"
+    review_blockers_path = artifact_dir / REVIEW_BLOCKERS_ARTIFACT
+    review_blockers_markdown_path = artifact_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT
+    write_json(verification_queue_path, verification_queue)
     write_reproduction_steps(artifact_dir, verification_queue)
     review_blockers = build_review_blockers(
         target=target,
@@ -17850,8 +17957,8 @@ def run_verification_queue(args: argparse.Namespace) -> int:
         source_peek_requests=load_optional_json(artifact_dir / "source-peek-requests.json"),
         environment_readiness=load_optional_json(artifact_dir / "environment-readiness.json"),
     )
-    write_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT, review_blockers)
-    write_review_blockers_markdown(artifact_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT, review_blockers)
+    write_json(review_blockers_path, review_blockers)
+    write_review_blockers_markdown(review_blockers_markdown_path, review_blockers)
     print(f"Verification queue: {verification_queue['status']}")
     print(
         "Items: "
@@ -17862,10 +17969,23 @@ def run_verification_queue(args: argparse.Namespace) -> int:
         "Command safety: "
         f"{json.dumps(verification_queue['summary'].get('command_safety', {}).get('classification_counts', {}), sort_keys=True)}"
     )
-    print(f"Wrote {artifact_dir / 'verification-queue.json'}")
-    print(f"Wrote {artifact_dir / 'reproduction-steps.md'}")
-    print(f"Wrote {artifact_dir / REVIEW_BLOCKERS_ARTIFACT}")
-    print(f"Wrote {artifact_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT}")
+    print(f"Wrote {verification_queue_path}")
+    print(f"Wrote {reproduction_steps_path}")
+    print(f"Wrote {review_blockers_path}")
+    print(f"Wrote {review_blockers_markdown_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="verification-queue",
+            output_paths=[
+                verification_queue_path,
+                reproduction_steps_path,
+                review_blockers_path,
+                review_blockers_markdown_path,
+            ],
+        )
+    )
     return verification_queue_exit_code(verification_queue)
 
 
@@ -18527,9 +18647,11 @@ def run_adjudicate(args: argparse.Namespace) -> int:
     suspicions = suspicions_doc.get("suspicions", [])
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
     finding_gate = load_optional_json(artifact_dir / "finding-gate.json")
+    wrote_finding_gate = False
     if finding_gate is None:
         finding_gate = build_finding_gate(suspicions, burp_history)
         write_json(artifact_dir / "finding-gate.json", finding_gate)
+        wrote_finding_gate = True
 
     findings = build_findings(suspicions, finding_gate)
     hardening_notes = build_hardening_notes(suspicions, finding_gate)
@@ -18547,12 +18669,18 @@ def run_adjudicate(args: argparse.Namespace) -> int:
         environment_readiness,
         evidence_chain,
     )
-    write_json(artifact_dir / "findings.json", {"generated_at": utc_now(), "findings": findings})
+    findings_path = artifact_dir / "findings.json"
+    hardening_notes_path = artifact_dir / "hardening-notes.json"
+    adjudication_path = artifact_dir / "adjudication.json"
+    output_paths = [findings_path, hardening_notes_path, adjudication_path]
+    if wrote_finding_gate:
+        output_paths.append(artifact_dir / "finding-gate.json")
+    write_json(findings_path, {"generated_at": utc_now(), "findings": findings})
     write_json(
-        artifact_dir / "hardening-notes.json",
+        hardening_notes_path,
         {"generated_at": utc_now(), "hardening_notes": hardening_notes},
     )
-    write_json(artifact_dir / "adjudication.json", adjudication)
+    write_json(adjudication_path, adjudication)
     print(f"Adjudication: {adjudication['status']}")
     print(
         "Decisions: "
@@ -18561,7 +18689,15 @@ def run_adjudicate(args: argparse.Namespace) -> int:
         f"{adjudication['summary']['manual_review']} manual review, "
         f"{adjudication['summary']['blocked']} blocked"
     )
-    print(f"Wrote {artifact_dir / 'adjudication.json'}")
+    print(f"Wrote {adjudication_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="adjudicate",
+            output_paths=output_paths,
+        )
+    )
     return 0 if adjudication["status"] not in {"manual-review", "blocked"} else 1
 
 

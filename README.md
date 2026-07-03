@@ -509,7 +509,12 @@ Use `--discover-child-runs` to roll up child artifact directories under
 SHA256 hashes, sizes, modification timestamps, generated-at timestamps, JSONL row
 counts, key status summaries, and missing-required-artifact checks. `audit`
 generates this manifest as its final write so the manifest covers the rendered
-report and index page.
+report and index page. Standalone local refresh commands that rewrite existing
+top-level artifacts, such as `coverage`, `burp-observation-coverage`,
+`response-deltas`, `source-peek-requests`, `evidence-chain`,
+`evidence-appendix`, `verification-queue`, `review-blockers`, `gate`,
+`adjudicate`, and `artifact-health`, also refresh the manifest when their output
+lands in the managed artifact directory.
 
 `artifact-health` writes `.greybox/artifact-health.json`, a local health summary
 over one or more artifact directories. It parses every top-level JSON and JSONL
