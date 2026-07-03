@@ -64,6 +64,7 @@ REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
 REVIEW_BLOCKERS_MARKDOWN_ARTIFACT = "review-blockers.md"
 REVIEW_BLOCKERS_SELFTEST_ARTIFACT = "review-blockers-selftest.json"
 COMMAND_SAFETY_SELFTEST_ARTIFACT = "command-safety-selftest.json"
+ARTIFACT_HEALTH_SELFTEST_ARTIFACT = "artifact-health-selftest.json"
 REQUIRED_ARTIFACTS = [
     "index.html",
     "report.md",
@@ -130,6 +131,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     DISCOVERY_COVERAGE_SELFTEST_ARTIFACT,
     REVIEW_BLOCKERS_SELFTEST_ARTIFACT,
     COMMAND_SAFETY_SELFTEST_ARTIFACT,
+    ARTIFACT_HEALTH_SELFTEST_ARTIFACT,
     "transaction-intent-policy.json",
 ]
 INDEX_ARTIFACT_ORDER = [
@@ -143,6 +145,7 @@ INDEX_ARTIFACT_ORDER = [
     DISCOVERY_COVERAGE_SELFTEST_ARTIFACT,
     REVIEW_BLOCKERS_SELFTEST_ARTIFACT,
     COMMAND_SAFETY_SELFTEST_ARTIFACT,
+    ARTIFACT_HEALTH_SELFTEST_ARTIFACT,
     TARGET_PROFILE_ARTIFACT,
     STRATEGY_REGISTRY_ARTIFACT,
     PROFILE_VALIDATION_ARTIFACT,
@@ -12271,6 +12274,7 @@ def build_artifact_manifest(
         "reviewed-observation-promotion.json",
         "profile-routing-selftest.json",
         DISCOVERY_COVERAGE_SELFTEST_ARTIFACT,
+        ARTIFACT_HEALTH_SELFTEST_ARTIFACT,
         "burp-mcp-sync.json",
         "quote-collection.json",
         "transaction-intent.json",
@@ -12455,6 +12459,67 @@ def parse_artifact_jsonl(path: Path) -> tuple[int, list[dict[str, Any]]]:
     return rows, errors
 
 
+def manifest_integrity_issues(artifact_dir: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    issues = []
+    rows_by_name: dict[str, dict[str, Any]] = {}
+    for row in manifest.get("artifacts", []) or []:
+        name = str(row.get("name") or "")
+        if not name or name == MANIFEST_NAME:
+            continue
+        if "/" in name or "\\" in name:
+            issues.append(
+                {
+                    "file": name,
+                    "reason": "invalid-manifest-artifact-name",
+                    "expected": "top-level artifact filename",
+                }
+            )
+            continue
+        rows_by_name[name] = row
+
+    for name, row in sorted(rows_by_name.items()):
+        path = artifact_dir / name
+        if not path.exists() or not path.is_file():
+            issues.append(
+                {
+                    "file": name,
+                    "reason": "missing-after-manifest",
+                    "expected_sha256": row.get("sha256"),
+                    "expected_size_bytes": row.get("size_bytes"),
+                }
+            )
+            continue
+        stat = path.stat()
+        actual_size = stat.st_size
+        actual_sha256 = sha256_file(path)
+        if row.get("size_bytes") != actual_size or row.get("sha256") != actual_sha256:
+            issues.append(
+                {
+                    "file": name,
+                    "reason": "manifest-hash-mismatch",
+                    "expected_sha256": row.get("sha256"),
+                    "actual_sha256": actual_sha256,
+                    "expected_size_bytes": row.get("size_bytes"),
+                    "actual_size_bytes": actual_size,
+                }
+            )
+
+    for path in sorted(artifact_dir.iterdir(), key=lambda item: item.name):
+        if not path.is_file() or path.name == MANIFEST_NAME:
+            continue
+        if path.name not in rows_by_name:
+            issues.append(
+                {
+                    "file": path.name,
+                    "reason": "not-listed-in-manifest",
+                    "actual_sha256": sha256_file(path),
+                    "actual_size_bytes": path.stat().st_size,
+                }
+            )
+
+    return issues
+
+
 def artifact_health_status(checks: list[dict[str, Any]], statuses: dict[str, Any]) -> str:
     if any(check.get("status") == "failed" for check in checks):
         return "failed"
@@ -12490,6 +12555,7 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
     jsonl_errors = []
     jsonl_rows: dict[str, int] = {}
     manifest: dict[str, Any] | None = None
+    stale_inputs: list[dict[str, Any]] = []
 
     if not artifact_dir.exists():
         checks.append(
@@ -12512,6 +12578,7 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
             },
             "statuses": {},
             "missing_required": [],
+            "stale_inputs": stale_inputs,
             "safety": "Read-only artifact health analysis. No requests are sent.",
         }
 
@@ -12586,6 +12653,7 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
         )
         statuses = artifact_statuses_from_manifest(manifest)
         missing_required = list((manifest.get("summary", {}) or {}).get("missing_required", []) or [])
+        stale_inputs = manifest_integrity_issues(artifact_dir, manifest)
         if missing_required:
             checks.append(
                 {
@@ -12601,6 +12669,24 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
                     "id": "required-artifacts",
                     "status": "passed",
                     "message": "No required artifacts are missing.",
+                }
+            )
+
+        if stale_inputs:
+            checks.append(
+                {
+                    "id": "manifest-integrity",
+                    "status": "failed",
+                    "message": f"{len(stale_inputs)} artifact(s) differ from {MANIFEST_NAME}.",
+                    "stale_inputs": stale_inputs[:20],
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "id": "manifest-integrity",
+                    "status": "passed",
+                    "message": f"All artifacts listed in {MANIFEST_NAME} match current files.",
                 }
             )
 
@@ -12670,6 +12756,7 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
         "checks": checks,
         "statuses": statuses,
         "missing_required": missing_required,
+        "stale_inputs": stale_inputs,
         "parse": {
             "json_files": len(json_files),
             "jsonl_files": len(jsonl_files),
@@ -12698,6 +12785,7 @@ def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
     external_blocker_dirs = []
     parse_error_count = 0
     missing_required_count = 0
+    stale_input_count = 0
 
     for item in directories:
         status = str(item.get("status") or "unknown")
@@ -12712,6 +12800,7 @@ def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
         parse_error_count += len(parse_doc.get("json_errors", []) or [])
         parse_error_count += len(parse_doc.get("jsonl_errors", []) or [])
         missing_required_count += len(item.get("missing_required", []) or [])
+        stale_input_count += len(item.get("stale_inputs", []) or [])
 
     if not directories:
         status = "no-artifact-dirs"
@@ -12735,9 +12824,110 @@ def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
             "external_blocker_dirs": external_blocker_dirs,
             "parse_error_count": parse_error_count,
             "missing_required_count": missing_required_count,
+            "stale_input_count": stale_input_count,
         },
         "directories": directories,
         "safety": "Local artifact health analysis only. It does not send HTTP requests, call Burp, fuzz, sign wallets, submit transactions, or invoke Server Actions.",
+    }
+
+
+def build_artifact_health_selftest() -> dict[str, Any]:
+    def manifest_row(path: Path) -> dict[str, Any]:
+        stat = path.stat()
+        return {
+            "name": path.name,
+            "kind": artifact_kind(path),
+            "size_bytes": stat.st_size,
+            "sha256": sha256_file(path),
+        }
+
+    def write_minimal_manifest(artifact_dir: Path, artifact_names: list[str]) -> None:
+        rows = [manifest_row(artifact_dir / name) for name in artifact_names]
+        write_json(
+            artifact_dir / MANIFEST_NAME,
+            {
+                "generated_at": utc_now(),
+                "status": "complete",
+                "summary": {"missing_required": []},
+                "artifacts": rows,
+            },
+        )
+
+    with tempfile.TemporaryDirectory(prefix="inferforge-artifact-health-selftest-") as temp_dir:
+        root = Path(temp_dir)
+        healthy_dir = root / "healthy"
+        modified_dir = root / "modified"
+        missing_dir = root / "missing"
+        untracked_dir = root / "untracked"
+        for directory in [healthy_dir, modified_dir, missing_dir, untracked_dir]:
+            directory.mkdir(parents=True)
+            write_json(directory / "ok.json", {"status": "ready"})
+            write_minimal_manifest(directory, ["ok.json"])
+
+        write_json(modified_dir / "ok.json", {"status": "changed"})
+        (missing_dir / "ok.json").unlink()
+        write_json(untracked_dir / "extra.json", {"status": "new"})
+
+        healthy = build_single_artifact_health(healthy_dir)
+        modified = build_single_artifact_health(modified_dir)
+        missing = build_single_artifact_health(missing_dir)
+        untracked = build_single_artifact_health(untracked_dir)
+        aggregate = build_artifact_health([healthy_dir, modified_dir, missing_dir, untracked_dir])
+
+    def stale_reasons(item: dict[str, Any]) -> set[str]:
+        return {str(entry.get("reason")) for entry in item.get("stale_inputs", []) or []}
+
+    assertions = [
+        {
+            "id": "healthy-manifest-passes",
+            "passed": healthy.get("status") == "healthy" and not healthy.get("stale_inputs"),
+            "expected": "healthy with no stale inputs",
+            "actual": {"status": healthy.get("status"), "stale_inputs": healthy.get("stale_inputs")},
+        },
+        {
+            "id": "modified-artifact-fails",
+            "passed": modified.get("status") == "failed" and "manifest-hash-mismatch" in stale_reasons(modified),
+            "expected": "manifest-hash-mismatch",
+            "actual": modified.get("stale_inputs"),
+        },
+        {
+            "id": "missing-artifact-fails",
+            "passed": missing.get("status") == "failed" and "missing-after-manifest" in stale_reasons(missing),
+            "expected": "missing-after-manifest",
+            "actual": missing.get("stale_inputs"),
+        },
+        {
+            "id": "untracked-artifact-fails",
+            "passed": untracked.get("status") == "failed" and "not-listed-in-manifest" in stale_reasons(untracked),
+            "expected": "not-listed-in-manifest",
+            "actual": untracked.get("stale_inputs"),
+        },
+        {
+            "id": "aggregate-counts-stale-inputs",
+            "passed": aggregate.get("status") == "failed" and aggregate.get("summary", {}).get("stale_input_count") == 3,
+            "expected": 3,
+            "actual": aggregate.get("summary", {}).get("stale_input_count"),
+        },
+    ]
+    failed = [item for item in assertions if not item["passed"]]
+    return {
+        "generated_at": utc_now(),
+        "status": "failed" if failed else "passed",
+        "summary": {
+            "assertions": len(assertions),
+            "failed": len(failed),
+            "aggregate_status": aggregate.get("status"),
+            "stale_input_count": aggregate.get("summary", {}).get("stale_input_count"),
+        },
+        "cases": {
+            "healthy": healthy,
+            "modified": modified,
+            "missing": missing,
+            "untracked": untracked,
+            "aggregate": aggregate,
+        },
+        "assertions": assertions,
+        "safety": "Synthetic artifact-health self-test. It writes temporary local files only and sends no requests.",
     }
 
 
@@ -17639,6 +17829,27 @@ def run_command_safety_selftest(args: argparse.Namespace) -> int:
     return 0 if result["status"] == "passed" else 1
 
 
+def run_artifact_health_selftest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, _target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result = build_artifact_health_selftest()
+    result["current_profile_context"] = profile_summary(profile)
+    output_path = artifact_dir / ARTIFACT_HEALTH_SELFTEST_ARTIFACT
+    write_json(output_path, result)
+    print(f"Artifact health self-test: {result['status']}")
+    print(
+        "Cases: "
+        f"assertions={result['summary']['assertions']}, "
+        f"failed={result['summary']['failed']}, "
+        f"stale_inputs={result['summary']['stale_input_count']}"
+    )
+    failed = [item for item in result.get("assertions", []) if not item.get("passed")]
+    if failed:
+        print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
+    print(f"Wrote {output_path}")
+    return 0 if result["status"] == "passed" else 1
+
+
 def run_manifest(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -17688,7 +17899,8 @@ def run_artifact_health(args: argparse.Namespace) -> int:
     print(
         "Parse/required: "
         f"parse_errors={health['summary']['parse_error_count']}, "
-        f"missing_required={health['summary']['missing_required_count']}"
+        f"missing_required={health['summary']['missing_required_count']}, "
+        f"stale_inputs={health['summary'].get('stale_input_count', 0)}"
     )
     for item in health["directories"]:
         statuses = item.get("statuses", {}) or {}
@@ -17749,6 +17961,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             ("self-test-discovery-coverage", "self-test-discovery-coverage"),
             ("self-test-command-safety", "self-test-command-safety"),
             ("self-test-review-blockers", "self-test-review-blockers"),
+            ("self-test-artifact-health", "self-test-artifact-health"),
             ("self-test-transactions", "self-test-transactions"),
         ]:
             command = inferforge_cli_command(
@@ -19107,6 +19320,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a static self-test for review-blocker grouping and rollups",
     )
     review_blockers_selftest.set_defaults(func=run_review_blockers_selftest)
+    artifact_health_selftest = sub.add_parser(
+        "self-test-artifact-health",
+        help="Run a static self-test for artifact-health manifest integrity checks",
+    )
+    artifact_health_selftest.set_defaults(func=run_artifact_health_selftest)
 
     collect_quote = sub.add_parser(
         "collect-quote",

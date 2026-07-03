@@ -267,6 +267,7 @@ python3 scripts/inferforge.py self-test-profile-routing
 python3 scripts/inferforge.py self-test-discovery-coverage
 python3 scripts/inferforge.py self-test-command-safety
 python3 scripts/inferforge.py self-test-review-blockers
+python3 scripts/inferforge.py self-test-artifact-health
 python3 scripts/inferforge.py review-blockers
 python3 scripts/inferforge.py collect-quote --direction buy --wallet EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR --amount-in 1000000
 python3 scripts/inferforge.py collect-orca-baseline
@@ -512,10 +513,12 @@ report and index page.
 
 `artifact-health` writes `.greybox/artifact-health.json`, a local health summary
 over one or more artifact directories. It parses every top-level JSON and JSONL
-artifact, checks the manifest's missing-required list, carries forward key gate
-statuses such as black-box coverage, discovery coverage, verification queue,
-review blockers, response deltas, source-peek requests, and Burp observation
-coverage, and classifies each run as `healthy`, `ready-with-external-blockers`,
+artifact, checks the manifest's missing-required list, verifies that manifest
+SHA256/size entries still match current files and that no new top-level artifact
+is missing from the manifest, carries forward key gate statuses such as
+black-box coverage, discovery coverage, verification queue, review blockers,
+response deltas, source-peek requests, and Burp observation coverage, and
+classifies each run as `healthy`, `ready-with-external-blockers`,
 `needs-human-review`, or `failed`. It is useful after regression runs:
 
 ```bash
@@ -532,11 +535,12 @@ should also fail the job.
 
 `regression-suite` runs the repeatable local regression workflow that is used to
 develop the tool against `infrafi-web`: run static profile-routing, discovery
-coverage, command-safety, review-blocker, and transaction-decoder self-tests,
-refresh static discovery, check that the discovered profile covers every static
-surface or review gate, run deterministic Burp observe/sync for the checked-in
-profile and discovered profile, collect one source-known Orca pool baseline,
-run both audits, write artifact health, and then generate a root-level review-blocker
+coverage, command-safety, review-blocker, artifact-health, and
+transaction-decoder self-tests, refresh static discovery, check that the
+discovered profile covers every static surface or review gate, run deterministic
+Burp observe/sync for the checked-in profile and discovered profile, collect one
+source-known Orca pool baseline, run both audits, write artifact health, and
+then generate a root-level review-blocker
 rollup, `regression-suite.json`, and a refreshed root `artifact-manifest.json`. The
 suite clears only
 generated `probe-results.jsonl` files in the selected regression artifact
