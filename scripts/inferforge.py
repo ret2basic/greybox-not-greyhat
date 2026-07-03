@@ -17711,6 +17711,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             ("self-test-discovery-coverage", "self-test-discovery-coverage"),
             ("self-test-command-safety", "self-test-command-safety"),
             ("self-test-review-blockers", "self-test-review-blockers"),
+            ("self-test-transactions", "self-test-transactions"),
         ]:
             command = inferforge_cli_command(
                 args,

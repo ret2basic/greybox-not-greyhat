@@ -530,11 +530,11 @@ should also fail the job.
 
 `regression-suite` runs the repeatable local regression workflow that is used to
 develop the tool against `infrafi-web`: run static profile-routing, discovery
-coverage, command-safety, and review-blocker self-tests, refresh static
-discovery, check that the discovered profile covers every static surface or
-review gate, run deterministic Burp observe/sync for the checked-in profile and
-discovered profile, collect one source-known Orca pool baseline, run both
-audits, write artifact health, and then generate a root-level review-blocker
+coverage, command-safety, review-blocker, and transaction-decoder self-tests,
+refresh static discovery, check that the discovered profile covers every static
+surface or review gate, run deterministic Burp observe/sync for the checked-in
+profile and discovered profile, collect one source-known Orca pool baseline,
+run both audits, write artifact health, and then generate a root-level review-blocker
 rollup, `regression-suite.json`, and a refreshed root `artifact-manifest.json`. The
 suite clears only
 generated `probe-results.jsonl` files in the selected regression artifact
