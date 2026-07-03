@@ -13578,13 +13578,46 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
     }
 
 
-def discover_artifact_health_dirs(root_dir: Path) -> list[Path]:
-    dirs = set()
+def artifact_dir_from_suite_value(value: Any) -> Path | None:
+    if value is None:
+        return None
+    path = Path(str(value))
+    if path.is_absolute():
+        return path.resolve()
+    return resolve_repo_path(path)
+
+
+def discover_regression_suite_artifact_health_dirs(root_dir: Path) -> list[Path]:
+    suite = load_optional_json(root_dir / "regression-suite.json") or {}
+    artifact_dirs = suite.get("artifact_dirs", {}) or {}
+    dirs: list[Path] = []
+    seen: set[str] = set()
+    for suite_key in ["suite", "default", "discovered"]:
+        path = artifact_dir_from_suite_value(artifact_dirs.get(suite_key))
+        if path and (path / MANIFEST_NAME).exists():
+            resolved = path.resolve()
+            resolved_key = str(resolved)
+            if resolved_key in seen:
+                continue
+            seen.add(resolved_key)
+            dirs.append(resolved)
+    return dirs
+
+
+def discover_manifest_artifact_health_dirs(root_dir: Path) -> list[Path]:
+    dirs: set[Path] = set()
     if (root_dir / MANIFEST_NAME).exists():
         dirs.add(root_dir)
     for manifest_path in sorted(root_dir.glob(f"*/{MANIFEST_NAME}")):
         dirs.add(manifest_path.parent)
     return sorted(dirs, key=lambda item: str(item))
+
+
+def discover_artifact_health_dirs(root_dir: Path) -> list[Path]:
+    regression_dirs = discover_regression_suite_artifact_health_dirs(root_dir)
+    if regression_dirs:
+        return regression_dirs
+    return discover_manifest_artifact_health_dirs(root_dir)
 
 
 def discover_review_blocker_dirs(root_dir: Path) -> list[Path]:
@@ -13818,6 +13851,33 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         )
         derived_refresh_after = build_single_artifact_health(derived_dir)
 
+        suite_root = root / "suite-root"
+        suite_default_dir = suite_root / "regression-default"
+        suite_discovered_dir = suite_root / "regression-discovered"
+        suite_scratch_dir = suite_root / "scratch"
+        for directory in [suite_root, suite_default_dir, suite_discovered_dir, suite_scratch_dir]:
+            directory.mkdir(parents=True)
+            write_json(directory / "ok.json", {"status": "ready"})
+        write_json(
+            suite_root / "regression-suite.json",
+            {
+                "generated_at": utc_now(),
+                "status": "needs-human-review",
+                "artifact_dirs": {
+                    "suite": str(suite_root),
+                    "default": str(suite_default_dir),
+                    "discovered": str(suite_discovered_dir),
+                },
+            },
+        )
+        write_minimal_manifest(suite_root, ["ok.json", "regression-suite.json"])
+        write_minimal_manifest(suite_default_dir, ["ok.json"])
+        write_minimal_manifest(suite_discovered_dir, ["ok.json"])
+        write_minimal_manifest(suite_scratch_dir, ["ok.json"])
+        discovered_suite_dirs = discover_artifact_health_dirs(suite_root)
+        discovered_suite_dir_names = [path.name for path in discovered_suite_dirs]
+        discovered_suite_health = build_artifact_health(discovered_suite_dirs)
+
     def stale_reasons(item: dict[str, Any]) -> set[str]:
         return {str(entry.get("reason")) for entry in item.get("stale_inputs", []) or []}
 
@@ -13937,6 +13997,21 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                 "after_stale_inputs": derived_refresh_after.get("stale_inputs"),
             },
         },
+        {
+            "id": "discover-child-runs-prefers-regression-suite-artifact-dirs",
+            "passed": (
+                discovered_suite_dir_names
+                == ["suite-root", "regression-default", "regression-discovered"]
+                and "scratch" not in discovered_suite_dir_names
+                and discovered_suite_health.get("status") == "healthy"
+            ),
+            "expected": "discover-child-runs checks only root plus regression-suite managed child artifact dirs when regression-suite.json exists",
+            "actual": {
+                "discovered_dirs": discovered_suite_dir_names,
+                "health_status": discovered_suite_health.get("status"),
+                "status_counts": discovered_suite_health.get("summary", {}).get("status_counts"),
+            },
+        },
     ]
     failed = [item for item in assertions if not item["passed"]]
     return {
@@ -13973,6 +14048,10 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "derived_stale_summaries": derived_stale_summaries,
             "derived_refresh_after": derived_refresh_after,
             "derived_refreshed_manifests": derived_refreshed_manifests,
+            "regression_suite_discovery": {
+                "discovered_dirs": discovered_suite_dir_names,
+                "health": discovered_suite_health,
+            },
         },
         "assertions": assertions,
         "safety": "Synthetic artifact-health self-test. It writes temporary local files only and sends no requests.",
@@ -21627,7 +21706,7 @@ def build_parser() -> argparse.ArgumentParser:
     artifact_health.add_argument(
         "--discover-child-runs",
         action="store_true",
-        help="Also check child directories under --artifact-dir that contain artifact-manifest.json.",
+        help="Also check regression-suite managed child artifact dirs, falling back to child dirs with artifact-manifest.json.",
     )
     artifact_health.add_argument(
         "--output",
