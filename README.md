@@ -536,14 +536,17 @@ output lands in the managed artifact directory.
 over one or more artifact directories. It parses every top-level JSON and JSONL
 artifact, checks the manifest's missing-required list, verifies that manifest
 SHA256/size entries still match current files and that no new top-level artifact
-is missing from the manifest, carries forward key gate statuses such as
-black-box coverage, discovery coverage, verification queue, review blockers,
-response deltas, source-peek requests, and Burp observation coverage, and
+is missing from the manifest, detects stale derived outputs such as
+`report.md`, `index.html`, `reproduction-steps.md`, and `review-blockers.md`,
+carries forward key gate statuses such as black-box coverage, discovery
+coverage, verification queue, review blockers, response deltas,
+source-peek requests, and Burp observation coverage, and
 classifies each run as `healthy`, `ready-with-external-blockers`,
 `needs-human-review`, or `failed`. When it writes `artifact-health.json` inside
 a managed artifact directory, it refreshes that directory's manifest so the
-health artifact does not make the next integrity check stale. It is useful after
-regression runs:
+health artifact does not make the next integrity check stale. When stale inputs
+exist, the CLI prints the first few affected files with their reason, newer
+inputs, and suggested refresh command. It is useful after regression runs:
 
 ```bash
 python3 scripts/inferforge.py artifact-health \

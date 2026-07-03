@@ -12937,6 +12937,24 @@ def print_refreshed_manifests(refreshed_manifests: list[dict[str, Any]]) -> None
         print(f"Refreshed {item['manifest']}: {item['status']}")
 
 
+def format_artifact_health_stale_issue(issue: dict[str, Any]) -> str:
+    parts = [
+        f"{issue.get('file') or 'unknown'}",
+        f"reason={issue.get('reason') or 'unknown'}",
+    ]
+    newer_inputs = [str(item) for item in issue.get("newer_inputs", []) or []]
+    if newer_inputs:
+        suffix = ""
+        newer_input_count = issue.get("newer_input_count")
+        if isinstance(newer_input_count, int) and newer_input_count > len(newer_inputs):
+            suffix = f",+{newer_input_count - len(newer_inputs)}"
+        parts.append(f"newer_inputs={','.join(newer_inputs)}{suffix}")
+    next_step = issue.get("next_step")
+    if next_step:
+        parts.append(f"next_step={next_step}")
+    return " ".join(parts)
+
+
 def increment_count(counts: dict[str, int], key: str) -> None:
     counts[key] = counts.get(key, 0) + 1
 
@@ -13559,6 +13577,10 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                 set_mtime_ns(path, derived_baseline_ns + 2_000)
         write_artifact_manifest(derived_dir, "http://127.0.0.1:9997", command="self-test-artifact-health")
         derived_stale = build_single_artifact_health(derived_dir)
+        derived_stale_summaries = [
+            format_artifact_health_stale_issue(issue)
+            for issue in derived_stale.get("stale_inputs", []) or []
+        ]
         for name in ["report.md", "index.html", "reproduction-steps.md", REVIEW_BLOCKERS_MARKDOWN_ARTIFACT]:
             path = derived_dir / name
             path.write_text(f"refreshed {name}\n", encoding="utf-8")
@@ -13671,6 +13693,18 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "actual": derived_stale.get("stale_inputs"),
         },
         {
+            "id": "stale-input-summary-includes-actionable-context",
+            "passed": any(
+                "review-blockers.md" in line
+                and "reason=derived-review-blockers-markdown-stale" in line
+                and "newer_inputs=review-blockers.json" in line
+                and "next_step=Run `python3 scripts/inferforge.py review-blockers`" in line
+                for line in derived_stale_summaries
+            ),
+            "expected": "stale summaries include file, reason, newer inputs, and next step",
+            "actual": derived_stale_summaries,
+        },
+        {
             "id": "derived-artifact-refresh-clears-staleness",
             "passed": (
                 derived_refresh_after.get("status") == "healthy"
@@ -13717,6 +13751,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "report_refresh_after": report_refresh_after,
             "report_refreshed_manifests": report_refreshed_manifests,
             "derived_stale": derived_stale,
+            "derived_stale_summaries": derived_stale_summaries,
             "derived_refresh_after": derived_refresh_after,
             "derived_refreshed_manifests": derived_refreshed_manifests,
         },
@@ -19625,6 +19660,11 @@ def run_artifact_health(args: argparse.Namespace) -> int:
             f"source_peek_requests={statuses.get('source_peek_requests')} "
             f"burp_observation={statuses.get('burp_observation_coverage')}"
         )
+        stale_inputs = item.get("stale_inputs", []) or []
+        for stale_issue in stale_inputs[:3]:
+            print(f"  stale: {format_artifact_health_stale_issue(stale_issue)}")
+        if len(stale_inputs) > 3:
+            print(f"  stale: {len(stale_inputs) - 3} more issue(s); inspect artifact-health.json")
     if not args.no_write:
         print(f"Wrote {output_path}")
         for item in refreshed_manifests:
