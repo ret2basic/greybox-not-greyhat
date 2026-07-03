@@ -11227,6 +11227,118 @@ def build_review_blockers(
     }
 
 
+def build_review_blockers_rollup(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    check_dirs: list[Path],
+    artifact_health: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    blockers: list[dict[str, Any]] = []
+    runs = []
+    missing = []
+    status_counts: dict[str, int] = {}
+    category_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    run_status_counts: dict[str, int] = {}
+
+    for check_dir in check_dirs:
+        path = check_dir / REVIEW_BLOCKERS_ARTIFACT
+        relative_dir = repo_relative_or_absolute(check_dir)
+        if not path.exists():
+            missing.append(relative_dir)
+            increment_count(run_status_counts, "missing-review-blockers")
+            runs.append(
+                {
+                    "artifact_dir": relative_dir,
+                    "status": "missing-review-blockers",
+                    "review_blockers": repo_relative_or_absolute(path),
+                    "summary": {},
+                }
+            )
+            continue
+        doc = load_optional_json(path) or {}
+        run_status = str(doc.get("status") or "unknown")
+        increment_count(run_status_counts, run_status)
+        runs.append(
+            {
+                "artifact_dir": relative_dir,
+                "status": run_status,
+                "review_blockers": repo_relative_or_absolute(path),
+                "summary": doc.get("summary", {}),
+            }
+        )
+        for blocker in doc.get("blockers", []) or []:
+            row = json_clone(blocker)
+            original_id = str(row.get("id") or "blocker")
+            row["id"] = f"RUN-{safe_probe_id(relative_dir)}-{original_id}"
+            row["run_blocker_id"] = original_id
+            row["artifact_dir"] = relative_dir
+            row["source_review_blockers"] = repo_relative_or_absolute(path)
+            row["source"] = f"{relative_dir}/{row.get('source')}"
+            row["artifact_refs"] = [
+                f"{relative_dir}/{ref}" if not str(ref).startswith("/") else str(ref)
+                for ref in row.get("artifact_refs", []) or []
+            ]
+            blockers.append(row)
+
+    for blocker in blockers:
+        increment_count(status_counts, str(blocker.get("status") or "unknown"))
+        increment_count(category_counts, str(blocker.get("category") or "unknown"))
+        increment_count(source_counts, str(blocker.get("artifact_dir") or "unknown"))
+
+    if missing:
+        status = "failed"
+    elif not blockers:
+        status = "ready"
+    elif status_counts.get("failed"):
+        status = "failed"
+    elif status_counts.get("needs-profile-update"):
+        status = "needs-profile-update"
+    elif status_counts.get("needs-human-review"):
+        status = "needs-human-review"
+    elif status_counts.get("ready-with-external-blockers"):
+        status = "ready-with-external-blockers"
+    else:
+        status = sorted(status_counts, key=review_blocker_status_rank)[0]
+
+    blockers.sort(
+        key=lambda item: (
+            review_blocker_status_rank(str(item.get("status") or "")),
+            {"high": 0, "medium": 1, "low": 2}.get(str(item.get("priority") or ""), 9),
+            str(item.get("artifact_dir") or ""),
+            str(item.get("run_blocker_id") or item.get("id") or ""),
+        )
+    )
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": str(artifact_dir),
+        "mode": "rollup",
+        "summary": {
+            "blockers": len(blockers),
+            "runs": len(runs),
+            "missing_review_blockers": missing,
+            "status_counts": status_counts,
+            "category_counts": category_counts,
+            "source_counts": source_counts,
+            "run_status_counts": run_status_counts,
+            "artifact_health": (artifact_health or {}).get("status"),
+        },
+        "runs": runs,
+        "blockers": blockers,
+        "artifact_refs": {
+            "artifact_health": "artifact-health.json",
+            "review_blockers": REVIEW_BLOCKERS_ARTIFACT,
+        },
+        "safety": "Read-only review blocker rollup. It reads child review-blockers artifacts only and does not send HTTP requests, invoke Burp, run Burp Scanner, sign wallets, or submit transactions.",
+    }
+
+
 def markdown_text(value: Any) -> str:
     return str(value).replace("\n", " ").strip()
 
@@ -11256,6 +11368,7 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
         f"- Target: `{review_blockers.get('target')}`",
         f"- Status: `{review_blockers.get('status')}`",
         f"- Blockers: `{summary.get('blockers', 0)}`",
+        f"- Mode: `{review_blockers.get('mode', 'single')}`",
         f"- Status counts: `{json.dumps(status_counts, sort_keys=True)}`",
         f"- Category counts: `{json.dumps(category_counts, sort_keys=True)}`",
         f"- Source counts: `{json.dumps(source_counts, sort_keys=True)}`",
@@ -11272,8 +11385,9 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
     ]
     if actionable:
         for item in actionable:
+            run_prefix = f"[{item.get('artifact_dir')}] " if item.get("artifact_dir") else ""
             lines.append(
-                f"- `{item.get('status')}` `{item.get('id')}`: {markdown_text(item.get('title'))}"
+                f"- `{item.get('status')}` `{item.get('id')}`: {run_prefix}{markdown_text(item.get('title'))}"
             )
             if item.get("next_action"):
                 lines.append(f"  - Next: {markdown_text(item.get('next_action'))}")
@@ -11285,8 +11399,9 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
     if external:
         lines.extend(["", "## External Configuration", ""])
         for item in external:
+            run_prefix = f"[{item.get('artifact_dir')}] " if item.get("artifact_dir") else ""
             lines.append(
-                f"- `{item.get('id')}`: {markdown_text(item.get('title'))}"
+                f"- `{item.get('id')}`: {run_prefix}{markdown_text(item.get('title'))}"
             )
             if item.get("next_action"):
                 lines.append(f"  - Next: {markdown_text(item.get('next_action'))}")
@@ -11303,6 +11418,7 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
                 f"- Category: `{item.get('category')}`",
                 f"- Priority: `{item.get('priority')}`",
                 f"- Source: `{item.get('source')}`",
+                f"- Artifact dir: `{item.get('artifact_dir') or ''}`",
                 f"- Cluster: `{item.get('cluster_id') or ''}`",
                 f"- Title: {markdown_text(item.get('title'))}",
                 f"- Reason: {markdown_text(item.get('reason'))}",
@@ -16715,16 +16831,40 @@ def run_review_blockers(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     write_target_profile_artifact(artifact_dir, profile, target, source_root)
-    review_blockers = build_review_blockers(
-        target=target,
-        profile=profile,
-        artifact_dir=artifact_dir,
-        discovery_coverage=load_optional_json(artifact_dir / DISCOVERY_COVERAGE_ARTIFACT),
-        burp_observation_coverage=load_optional_json(artifact_dir / "burp-observation-coverage.json"),
-        verification_queue=load_optional_json(artifact_dir / "verification-queue.json"),
-        environment_readiness=load_optional_json(artifact_dir / "environment-readiness.json"),
-        artifact_health=load_optional_json(artifact_dir / "artifact-health.json"),
-    )
+    check_dirs: list[Path] = []
+    for item in args.check_dir or []:
+        check_dirs.append(resolve_repo_path(item))
+    if args.discover_child_runs:
+        check_dirs.extend(discover_artifact_health_dirs(artifact_dir))
+    deduped_dirs = []
+    seen_dirs: set[str] = set()
+    for check_dir in check_dirs:
+        resolved = check_dir.resolve()
+        key = str(resolved)
+        if key in seen_dirs:
+            continue
+        seen_dirs.add(key)
+        deduped_dirs.append(resolved)
+
+    if deduped_dirs:
+        review_blockers = build_review_blockers_rollup(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            check_dirs=deduped_dirs,
+            artifact_health=load_optional_json(artifact_dir / "artifact-health.json"),
+        )
+    else:
+        review_blockers = build_review_blockers(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            discovery_coverage=load_optional_json(artifact_dir / DISCOVERY_COVERAGE_ARTIFACT),
+            burp_observation_coverage=load_optional_json(artifact_dir / "burp-observation-coverage.json"),
+            verification_queue=load_optional_json(artifact_dir / "verification-queue.json"),
+            environment_readiness=load_optional_json(artifact_dir / "environment-readiness.json"),
+            artifact_health=load_optional_json(artifact_dir / "artifact-health.json"),
+        )
     output_path = resolve_repo_path(args.output) if args.output else artifact_dir / REVIEW_BLOCKERS_ARTIFACT
     markdown_path = (
         resolve_repo_path(args.markdown_output)
@@ -16739,6 +16879,12 @@ def run_review_blockers(args: argparse.Namespace) -> int:
         f"{review_blockers['summary']['blockers']} total, "
         f"status_counts={json.dumps(review_blockers['summary']['status_counts'], sort_keys=True)}"
     )
+    if review_blockers.get("mode") == "rollup":
+        print(
+            "Runs: "
+            f"{review_blockers['summary']['runs']} checked, "
+            f"run_status_counts={json.dumps(review_blockers['summary']['run_status_counts'], sort_keys=True)}"
+        )
     for blocker in review_blockers.get("blockers", [])[:8]:
         print(
             f"- {blocker.get('id')}: {blocker.get('status')} "
@@ -17015,6 +17161,20 @@ def run_regression_suite(args: argparse.Namespace) -> int:
         extra=health_args,
     )
     run_step("artifact-health", command)
+    if not args.skip_review_blockers and not suite_stopped:
+        review_blocker_args = []
+        for check_dir in health_check_dirs:
+            review_blocker_args.extend(["--check-dir", repo_relative_or_absolute(check_dir)])
+        if args.strict:
+            review_blocker_args.append("--strict")
+        command = inferforge_cli_command(
+            args,
+            profile_path=default_profile_path,
+            artifact_dir=artifact_dir,
+            subcommand="review-blockers",
+            extra=review_blocker_args,
+        )
+        run_step("review-blockers-rollup", command)
     health = load_optional_json(artifact_dir / "artifact-health.json")
     suite_status = regression_suite_status(steps, health, strict=args.strict)
     suite = {
@@ -17040,6 +17200,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             "skip_discover_profile": bool(args.skip_discover_profile),
             "skip_discovery_coverage": bool(args.skip_discovery_coverage),
             "skip_self_tests": bool(args.skip_self_tests),
+            "skip_review_blockers": bool(args.skip_review_blockers),
             "keep_probe_results": bool(args.keep_probe_results),
             "strict": bool(args.strict),
         },
@@ -17961,6 +18122,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Where to write review-blockers.json. Defaults to --artifact-dir/review-blockers.json.",
     )
     review_blockers.add_argument(
+        "--check-dir",
+        action="append",
+        help="Child artifact directory to include in a rollup. Repeat as needed.",
+    )
+    review_blockers.add_argument(
+        "--discover-child-runs",
+        action="store_true",
+        help="Build a rollup from child directories under --artifact-dir that contain artifact-manifest.json.",
+    )
+    review_blockers.add_argument(
         "--markdown-output",
         help="Where to write review-blockers.md. Defaults to --artifact-dir/review-blockers.md.",
     )
@@ -18071,6 +18242,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-discovery-coverage",
         action="store_true",
         help="Skip static discovery coverage checking for the discovered profile.",
+    )
+    regression_suite.add_argument(
+        "--skip-review-blockers",
+        action="store_true",
+        help="Skip root-level review-blockers rollup after artifact health.",
     )
     regression_suite.add_argument(
         "--skip-self-tests",

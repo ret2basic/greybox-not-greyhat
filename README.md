@@ -484,13 +484,18 @@ and artifact health. `audit` and `verification-queue` refresh it automatically.
 The Markdown playbook is useful as the first artifact to inspect after a
 regression run because it keeps the approved-path, source-only review, missing
 profile coverage, external-configuration actions, and gated command templates in
-one list:
+one list. When `--check-dir` is repeated, it builds a root-level rollup across
+multiple artifact directories:
 
 ```bash
 python3 scripts/inferforge.py review-blockers
+python3 scripts/inferforge.py review-blockers \
+  --check-dir .greybox/regression-default \
+  --check-dir .greybox/regression-discovered
 ```
 
-Use `--strict` when any remaining blocker should fail a CI job.
+Use `--discover-child-runs` to roll up child artifact directories under
+`.greybox`, and use `--strict` when any remaining blocker should fail a CI job.
 
 `manifest` writes `.greybox/artifact-manifest.json`, an integrity snapshot with
 SHA256 hashes, sizes, modification timestamps, generated-at timestamps, JSONL row
@@ -523,7 +528,8 @@ develop the tool against `infrafi-web`: run static self-tests, refresh static
 discovery, check that the discovered profile covers every static surface or
 review gate, run deterministic Burp observe/sync for the checked-in profile and
 discovered profile, collect one source-known Orca pool baseline, run both
-audits, and then write `artifact-health.json` plus `regression-suite.json`. The
+audits, write artifact health, and then generate a root-level review-blocker
+rollup plus `regression-suite.json`. The
 suite clears only
 generated `probe-results.jsonl` files in the selected regression artifact
 directories before audit so reruns do not accumulate stale probe rows. It does
@@ -534,10 +540,10 @@ submit transactions.
 python3 scripts/inferforge.py regression-suite --include-external --ws-resource-probes
 ```
 
-Use `--skip-self-tests`, `--skip-discovery-coverage`, `--skip-burp-sync`,
-`--skip-orca-baseline`, `--skip-audit`, or `--skip-discovered` for narrower
-local checks. Use `--strict` when human-review or external-configuration
-blockers should fail the command.
+Use `--skip-self-tests`, `--skip-discovery-coverage`, `--skip-review-blockers`,
+`--skip-burp-sync`, `--skip-orca-baseline`, `--skip-audit`, or
+`--skip-discovered` for narrower local checks. Use `--strict` when human-review
+or external-configuration blockers should fail the command.
 
 `adjudicate` writes `.greybox/adjudication.json` and refreshes
 `.greybox/findings.json` plus `.greybox/hardening-notes.json`. The adjudicator
