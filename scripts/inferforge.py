@@ -20716,6 +20716,27 @@ def run_capabilities(args: argparse.Namespace) -> int:
     output_path = artifact_dir / "burp-capabilities.json"
     write_json(output_path, capabilities)
     print(json.dumps(capabilities, indent=2))
+    target_info = capabilities.get("target", {}) or {}
+    burp_info = capabilities.get("burp", {}) or {}
+    target_ok = target_info.get("reachable") is True
+    mcp_ok = burp_info.get("mcp_port_open") is True
+    proxy_ok = burp_info.get("proxy_8080_open") is True
+    script_ok = burp_info.get("check_script_ok") is True
+    capability_status = "ready" if target_ok and mcp_ok and proxy_ok and script_ok else "limited"
+    print(f"Capabilities: {capability_status}")
+    print(
+        "Target: "
+        f"reachable={target_info.get('reachable')} "
+        f"health_status={target_info.get('health_status')} "
+        f"service={target_info.get('service') or 'unknown'}"
+    )
+    print(
+        "Burp: "
+        f"mcp_port_open={burp_info.get('mcp_port_open')} "
+        f"proxy_8080_open={burp_info.get('proxy_8080_open')} "
+        f"codex_mcp_get_burp_ok={burp_info.get('codex_mcp_get_burp_ok')} "
+        f"check_script_ok={burp_info.get('check_script_ok')}"
+    )
     print_refreshed_manifests(
         refresh_current_artifact_manifest(
             artifact_dir=artifact_dir,
