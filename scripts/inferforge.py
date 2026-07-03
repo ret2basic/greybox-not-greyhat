@@ -15367,6 +15367,27 @@ def generate_report(
         f"- Unsafe command templates: `{command_safety_summary_doc.get('unsafe_template_count', 0)}`",
         "- Reproduction steps: `reproduction-steps.md`",
     ]
+    review_blockers = load_optional_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT) or {}
+    review_blockers_summary = review_blockers.get("summary", {}) or {}
+    review_blocker_lines = [
+        f"- Review blocker status: `{review_blockers.get('status', 'unknown')}`",
+        f"- Blockers: `{review_blockers_summary.get('blockers', 0)}`",
+        f"- Groups: `{review_blockers_summary.get('groups', 0)}`",
+        f"- Status counts: `{json.dumps(review_blockers_summary.get('status_counts', {}), sort_keys=True)}`",
+        f"- Category counts: `{json.dumps(review_blockers_summary.get('category_counts', {}), sort_keys=True)}`",
+    ]
+    for group in (review_blockers.get("groups", []) or [])[:8]:
+        count_suffix = f" ({group.get('count')} blockers)" if group.get("count") else ""
+        line = (
+            f"- `{group.get('status')}` `{group.get('id')}`{count_suffix}: "
+            f"{markdown_text(group.get('title') or group.get('id'))}"
+        )
+        if group.get("next_action"):
+            line += f" Next: {markdown_text(group.get('next_action'))}"
+        review_blocker_lines.append(line)
+        commands = ordered_unique_strings(group.get("commands", []) or [])
+        if commands:
+            review_blocker_lines.append(f"  - Command: `{commands[0]}`")
     review_artifact_lines = [
         f"- `{name}`"
         for name in [*DISCOVERY_ARTIFACTS, *REVIEW_ARTIFACTS]
@@ -15482,6 +15503,10 @@ Burp MCP is installed and reachable on `127.0.0.1:9876`. Codex can send approved
 ## Verification Queue
 
 {chr(10).join(verification_lines)}
+
+## Review Blockers
+
+{chr(10).join(review_blocker_lines)}
 
 ## Discovery And Review Artifacts
 
