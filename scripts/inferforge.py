@@ -19249,6 +19249,7 @@ def run_artifact_health(args: argparse.Namespace) -> int:
             f"discovery={statuses.get('discovery_coverage')} "
             f"review_blockers={statuses.get('review_blockers')} "
             f"verification={statuses.get('verification_queue')} "
+            f"attack_strategy={statuses.get('attack_strategy')} "
             f"response_deltas={statuses.get('response_delta_analysis')} "
             f"source_peek_requests={statuses.get('source_peek_requests')} "
             f"burp_observation={statuses.get('burp_observation_coverage')}"
