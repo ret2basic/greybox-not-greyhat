@@ -7243,6 +7243,47 @@ def apply_probe_ranking(probes: list[Probe], ranking: dict[str, Any]) -> list[Pr
     return [by_id[probe_id] for probe_id in selected_ids if probe_id in by_id]
 
 
+def format_probe_plan_summary(probe: Probe, ranking_item: dict[str, Any] | None = None) -> str:
+    ranking_item = ranking_item or {}
+    parts = [
+        f"#{ranking_item.get('rank', '?')}",
+        f"{probe.id}:",
+        probe.method,
+        inline_summary_text(probe.path, max_chars=140),
+        f"cluster={probe.category}",
+    ]
+    if ranking_item.get("score") is not None:
+        parts.append(f"score={ranking_item.get('score')}")
+    if probe.policy_field:
+        parts.append(f"policy={probe.policy_field}")
+    if probe.risk:
+        parts.append(f"risk={probe.risk}")
+    if probe.external:
+        parts.append("external")
+    reasons = ranking_item.get("reasons", []) or []
+    if reasons:
+        suffix = "" if len(reasons) <= 3 else f",+{len(reasons) - 3}"
+        parts.append("reasons=" + ",".join(str(reason) for reason in reasons[:3]) + suffix)
+    return " ".join(parts)
+
+
+def top_probe_plan_summaries(
+    probes: list[Probe],
+    ranking: dict[str, Any],
+    *,
+    limit: int = 8,
+) -> list[str]:
+    rank_by_id = {
+        str(item.get("probe_id") or ""): item
+        for item in ranking.get("ranked_probes", []) or []
+        if isinstance(item, dict)
+    }
+    return [
+        format_probe_plan_summary(probe, rank_by_id.get(probe.id))
+        for probe in probes[:limit]
+    ]
+
+
 def request_context_from_probe_result(row: dict[str, Any]) -> dict[str, Any]:
     request = row.get("request") or {}
     target = urllib.parse.urlparse(str(row.get("target") or ""))
@@ -15037,6 +15078,11 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Planned " in plan_stdout_text
                 and "Selection mode:" in plan_stdout_text
                 and "Selected clusters:" in plan_stdout_text
+                and "Selected probes:" in plan_stdout
+                and "nextjs_no_write_head" in plan_stdout_text
+                and "HEAD /api/no-write/status" in plan_stdout_text
+                and "score=" in plan_stdout_text
+                and "reasons=" in plan_stdout_text
                 and "No files written (--no-write)." in plan_stdout
                 and not any(
                     output_paths[key]
@@ -20177,6 +20223,13 @@ def run_plan(args: argparse.Namespace) -> int:
     print(f"Selection mode: {selection['mode']}")
     print(f"Selected clusters: {', '.join(selection['selected_cluster_ids']) or '(none)'}")
     if no_write:
+        probe_summaries = top_probe_plan_summaries(probes, ranking)
+        if probe_summaries:
+            print("Selected probes:")
+            for probe_summary in probe_summaries:
+                print(f"- {probe_summary}")
+            if len(probes) > len(probe_summaries):
+                print(f"- ... +{len(probes) - len(probe_summaries)} more selected probe(s)")
         print("No files written (--no-write).")
     else:
         print_refreshed_manifests(

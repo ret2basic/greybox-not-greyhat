@@ -247,8 +247,8 @@ Use `--include-external` only when a bounded set of low-risk M0 quote validation
 probes is acceptable. Omit it for a purely local run; the local run still covers
 missing fields, malformed JSON, wrong primitive types, RPC controls, WS controls,
 and Orca path validation. Use `plan --no-write` to preview endpoint selection,
-probe ranking counts, and WebSocket enablement without writing probe-plan,
-ranking, strategy, or manifest artifacts.
+probe ranking counts, the top selected probes with rank reasons, and WebSocket
+enablement without writing probe-plan, ranking, strategy, or manifest artifacts.
 
 Useful checks:
 
