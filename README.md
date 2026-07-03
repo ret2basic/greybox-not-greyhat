@@ -358,9 +358,11 @@ performs a read-only Burp MCP `tools/list` inventory. The JSON records available
 tool names, required capability coverage for Proxy history, WebSocket history,
 Intercept control, HTTP sending, and Repeater creation, plus disabled Scanner,
 Intruder-style, and Burp configuration/editor state-editing capabilities when
-present. The CLI prints concise `Burp tools:` and `Burp MCP tool inventory:`
-lines for unattended setup checks. Use `--no-write` to preview these checks
-without refreshing capability artifacts.
+present. MCP inventory failure diagnostics are stored as redacted type,
+length, and hash summaries rather than raw exception text. The CLI prints
+concise `Burp tools:` and `Burp MCP tool inventory:` lines for unattended setup
+checks. Use `--no-write` to preview these checks without refreshing capability
+artifacts.
 
 `readiness` writes `.greybox/environment-readiness.json`, combining target
 health, redacted environment configuration state, the last quote collection

@@ -4317,7 +4317,7 @@ def build_burp_mcp_tool_inventory(mcp_url: str, *, timeout: int = 5) -> dict[str
             tools = client.list_tools()
     except Exception as error:
         inventory["status"] = "unavailable"
-        inventory["error"] = str(error)[:500]
+        inventory["error"] = redacted_error_summary(error)
         inventory["mcp_actions"].append(
             mcp_action_audit_record(
                 tool="tools/list",
@@ -14285,6 +14285,36 @@ def burp_sync_error_security_issues(doc: Any, *, file_name: str) -> list[dict[st
     return issues
 
 
+def mcp_tool_inventory_security_issues_in_value(value: Any, *, file_name: str, path: str = "$") -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if key == "mcp_tool_inventory":
+                if not isinstance(child, dict):
+                    issues.append(
+                        {
+                            "file": file_name,
+                            "path": child_path,
+                            "reason": "burp-mcp-tool-inventory-not-object",
+                        }
+                    )
+                    continue
+                issues.extend(
+                    redacted_error_field_security_issues(
+                        child.get("error"),
+                        file_name=file_name,
+                        path=f"{child_path}.error",
+                        reason_prefix="burp-mcp-tool-inventory-error",
+                    )
+                )
+            issues.extend(mcp_tool_inventory_security_issues_in_value(child, file_name=file_name, path=child_path))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            issues.extend(mcp_tool_inventory_security_issues_in_value(child, file_name=file_name, path=f"{path}[{index}]"))
+    return issues
+
+
 def redacted_error_field_security_issues(value: Any, *, file_name: str, path: str, reason_prefix: str) -> list[dict[str, Any]]:
     if value is None or value == "":
         return []
@@ -14305,6 +14335,7 @@ def mcp_action_audit_security_issues(parsed_json_by_name: dict[str, Any]) -> lis
     issues: list[dict[str, Any]] = []
     for file_name, doc in sorted(parsed_json_by_name.items()):
         issues.extend(mcp_action_security_issues_in_value(doc, file_name=file_name))
+        issues.extend(mcp_tool_inventory_security_issues_in_value(doc, file_name=file_name))
         if file_name == "burp-mcp-sync.json":
             issues.extend(burp_sync_error_security_issues(doc, file_name=file_name))
     return issues
@@ -14802,7 +14833,21 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                 ],
             },
         )
-        write_minimal_manifest(mcp_audit_leak_dir, ["burp-mcp-sync.json"])
+        write_json(
+            mcp_audit_leak_dir / "burp-capabilities.json",
+            {
+                "generated_at": utc_now(),
+                "burp": {
+                    "mcp_tool_inventory": {
+                        "status": "unavailable",
+                        "mcp_endpoint": "http://127.0.0.1:9876",
+                        "error": "inventory raw error should-not-appear",
+                        "mcp_actions": [],
+                    }
+                },
+            },
+        )
+        write_minimal_manifest(mcp_audit_leak_dir, ["burp-mcp-sync.json", "burp-capabilities.json"])
 
         healthy = build_single_artifact_health(healthy_dir)
         modified = build_single_artifact_health(modified_dir)
@@ -14975,7 +15020,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "id": "artifact-health-detects-mcp-action-audit-leaks",
             "passed": (
                 mcp_audit_leak.get("status") == "failed"
-                and mcp_audit_leak_rollup.get("summary", {}).get("security_issue_count", 0) >= 6
+                and mcp_audit_leak_rollup.get("summary", {}).get("security_issue_count", 0) >= 7
                 and {
                     "mcp-action-sensitive-argument-not-hashed",
                     "mcp-action-secret-argument-not-redacted",
@@ -14983,13 +15028,14 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                     "mcp-action-error-raw-string",
                     "burp-sync-error-raw-string",
                     "burp-sync-intercept-error-raw-string",
+                    "burp-mcp-tool-inventory-error-raw-string",
                 }.issubset({str(issue.get("reason")) for issue in mcp_audit_leak.get("security_issues", []) or []})
                 and "should-not-appear" not in mcp_audit_leak_text
                 and "Authorization: Bearer" not in mcp_audit_leak_text
                 and "raw response" not in mcp_audit_leak_text
                 and "raw error" not in mcp_audit_leak_text
             ),
-            "expected": "artifact-health fails when MCP action audit records contain raw sensitive arguments, result text, or error strings without echoing the leaked values",
+            "expected": "artifact-health fails when MCP action audit records or MCP inventory errors contain raw sensitive arguments, result text, or error strings without echoing the leaked values",
             "actual": {
                 "status": mcp_audit_leak.get("status"),
                 "security_issues": mcp_audit_leak.get("security_issues"),
@@ -15878,6 +15924,25 @@ def build_no_write_selftest() -> dict[str, Any]:
             "start_scan",
         ]
     )
+
+    class UnavailableMcpSseClient:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "UnavailableMcpSseClient":
+            raise RuntimeError("Authorization: Bearer inventory-secret should-not-appear")
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            return None
+
+    original_mcp_sse_client = globals()["McpSseClient"]
+    try:
+        globals()["McpSseClient"] = UnavailableMcpSseClient
+        unavailable_mcp_tool_inventory = build_burp_mcp_tool_inventory("http://127.0.0.1:9876")
+    finally:
+        globals()["McpSseClient"] = original_mcp_sse_client
+    unavailable_mcp_tool_inventory_text = json.dumps(unavailable_mcp_tool_inventory, sort_keys=True)
+
     class FallbackMcpClient:
         def __init__(self) -> None:
             self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -16224,6 +16289,23 @@ def build_no_write_selftest() -> dict[str, Any]:
             ),
             "expected": "MCP tool inventory marks safe-loop dependencies available and scanner/intruder/state-editing tools disabled when present",
             "actual": mcp_tool_inventory,
+        },
+        {
+            "id": "burp-mcp-tool-inventory-redacts-unavailable-errors",
+            "passed": (
+                unavailable_mcp_tool_inventory.get("status") == "unavailable"
+                and unavailable_mcp_tool_inventory.get("error", {}).get("type") == "RuntimeError"
+                and unavailable_mcp_tool_inventory.get("error", {}).get("message_redacted") is True
+                and isinstance(unavailable_mcp_tool_inventory.get("error", {}).get("message_sha256"), str)
+                and len(unavailable_mcp_tool_inventory.get("mcp_actions", [])) == 1
+                and unavailable_mcp_tool_inventory["mcp_actions"][0].get("status") == "failed"
+                and unavailable_mcp_tool_inventory["mcp_actions"][0].get("error", {}).get("message_redacted") is True
+                and "Authorization: Bearer" not in unavailable_mcp_tool_inventory_text
+                and "inventory-secret" not in unavailable_mcp_tool_inventory_text
+                and "should-not-appear" not in unavailable_mcp_tool_inventory_text
+            ),
+            "expected": "MCP tool inventory failure artifacts keep exception type and hashes without storing raw exception text",
+            "actual": unavailable_mcp_tool_inventory,
         },
         {
             "id": "mcp-history-read-falls-back-from-regex-tool",
