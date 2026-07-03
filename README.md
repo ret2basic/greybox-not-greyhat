@@ -622,8 +622,9 @@ is missing from the manifest, detects stale derived outputs such as
 checks `mcp_actions` audit records for raw sensitive arguments, raw result text,
 or raw exception messages, checks `burp-mcp-sync.json` failure and Intercept
 error fields plus `burp-observation-run.json` blocked errors for redacted error
-summaries, flags persisted default raw Burp MCP history files as security
-hygiene issues,
+summaries, checks probe and warm-up artifacts for raw bodies, unredacted body
+samples, and raw error strings, flags persisted default raw Burp MCP history
+files as security hygiene issues,
 carries forward key gate statuses such as black-box coverage, discovery
 coverage, verification queue, review blockers, response deltas,
 source-peek requests, and Burp observation coverage, and
@@ -670,12 +671,13 @@ line-count summaries rather than raw command stdout; step and preparation
 failure errors use the same redacted type/length/hash shape as Burp MCP error
 artifacts. Probe and warm-up artifacts do not store full response `body_text`;
 they keep response hashes, lengths, truncation flags, and bounded redacted body
-samples for grouping and reproduction context. Target probe lock artifacts store
-blocked errors as type, length, and hash summaries rather than raw exception
-text. It clears only generated `probe-results.jsonl` files in the selected
-regression artifact directories before audit so reruns do not accumulate stale
-probe rows. It does not run Burp Scanner, fuzz broadly, invoke Server Actions,
-sign wallets, or submit transactions.
+samples for grouping and reproduction context, and transport errors are stored
+as type, length, and hash summaries rather than raw exception text. Target probe
+lock artifacts use the same blocked-error shape. It clears only generated
+`probe-results.jsonl` files in the selected regression artifact directories
+before audit so reruns do not accumulate stale probe rows. It does not run Burp
+Scanner, fuzz broadly, invoke Server Actions, sign wallets, or submit
+transactions.
 
 ```bash
 python3 scripts/inferforge.py regression-suite --include-external --ws-resource-probes

@@ -6115,6 +6115,8 @@ def redact_probe_body_samples_for_artifact(value: Any) -> None:
         for key, child in list(value.items()):
             if key == "body_sample" and isinstance(child, str):
                 value[key] = redact_text(child, max_chars=MAX_BODY_SAMPLE_CHARS)
+            elif key == "error" and child not in (None, ""):
+                value[key] = redacted_error_summary(child)
             else:
                 redact_probe_body_samples_for_artifact(child)
     elif isinstance(value, list):
@@ -14576,6 +14578,14 @@ def probe_result_body_text_security_issues_in_value(value: Any, *, file_name: st
                     "reason": "probe-result-body-sample-sensitive-value",
                 }
             )
+        issues.extend(
+            redacted_error_field_security_issues(
+                value.get("error"),
+                file_name=file_name,
+                path=f"{path}.error",
+                reason_prefix="probe-result-error",
+            )
+        )
         for key, child in value.items():
             issues.extend(
                 probe_result_body_text_security_issues_in_value(
@@ -15219,6 +15229,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                     "status": 200,
                     "body_text": "Authorization: Bearer should-not-appear",
                     "body_sample": "Authorization: Bearer should-not-appear",
+                    "error": "Probe transport raw error should-not-appear",
                 }
             )
             + "\n",
@@ -15234,6 +15245,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                         "probe_id": "raw-warmup-body-text",
                         "body_text": "warmup raw body should-not-appear",
                         "body_sample": "token=should-not-appear",
+                        "error": "Warmup raw error should-not-appear",
                     }
                 ],
             },
@@ -15294,9 +15306,11 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                 "probe_id": "sanitize-sample",
                 "body_text": "full body should-not-appear",
                 "body_sample": "Authorization: Bearer should-not-appear",
+                "error": "Probe artifact error should-not-appear",
                 "attempts": [
                     {
                         "body_sample": "token=should-not-appear",
+                        "error": "Nested attempt error should-not-appear",
                     }
                 ],
             }
@@ -15514,12 +15528,13 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                 and {
                     "probe-result-body-text-raw-field",
                     "probe-result-body-sample-sensitive-value",
+                    "probe-result-error-raw-string",
                 }.issubset({str(issue.get("reason")) for issue in probe_body_text_leak.get("security_issues", []) or []})
                 and "should-not-appear" not in probe_body_text_leak_text
                 and "Authorization: Bearer" not in probe_body_text_leak_text
                 and "warmup raw body" not in probe_body_text_leak_text
             ),
-            "expected": "artifact-health fails when probe-results or warmup-results contain raw body_text or unredacted body_sample values without echoing leaked values",
+            "expected": "artifact-health fails when probe-results or warmup-results contain raw body_text, unredacted body_sample values, or raw error strings without echoing leaked values",
             "actual": {
                 "status": probe_body_text_leak.get("status"),
                 "security_issues": probe_body_text_leak.get("security_issues"),
@@ -15533,8 +15548,12 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                 and "should-not-appear" not in sanitized_probe_artifact_sample_text
                 and "Authorization: Bearer [redacted]" in sanitized_probe_artifact_sample_text
                 and "token=[redacted]" in sanitized_probe_artifact_sample_text
+                and isinstance(sanitized_probe_artifact_sample.get("error"), dict)
+                and sanitized_probe_artifact_sample.get("error", {}).get("message_redacted") is True
+                and isinstance(sanitized_probe_artifact_sample.get("attempts", [{}])[0].get("error"), dict)
+                and sanitized_probe_artifact_sample.get("attempts", [{}])[0].get("error", {}).get("message_redacted") is True
             ),
-            "expected": "probe artifact sanitizer removes full body_text and redacts sensitive body_sample values recursively",
+            "expected": "probe artifact sanitizer removes full body_text and redacts sensitive body_sample and error values recursively",
             "actual": sanitized_probe_artifact_sample,
         },
         {
