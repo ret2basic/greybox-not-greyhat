@@ -13761,6 +13761,14 @@ def build_artifact_health_selftest() -> dict[str, Any]:
 
 
 def build_manifest_refresh_selftest() -> dict[str, Any]:
+    def parser_subcommands() -> set[str]:
+        parser = build_parser()
+        for action in parser._actions:
+            choices = getattr(action, "choices", None)
+            if isinstance(choices, dict):
+                return {str(name) for name in choices}
+        return set()
+
     def refresh_expectation(
         command: str,
         function: str,
@@ -13844,6 +13852,10 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("collect-orca-baseline", "run_collect_orca_baseline", min_refreshes=2, min_prints=2),
     ]
 
+    expected_commands = {str(item["command"]) for item in expectations}
+    registered_commands = parser_subcommands()
+    missing_expectations = sorted(registered_commands - expected_commands)
+    stale_expectations = sorted(expected_commands - registered_commands)
     assertions = []
     cases = []
     for expectation in expectations:
@@ -13879,6 +13891,18 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
                 "actual": marker_counts if function else "function-not-found",
             }
         )
+    assertions.append(
+        {
+            "id": "parser-command-manifest-refresh-coverage",
+            "passed": not missing_expectations and not stale_expectations,
+            "expected": "every parser subcommand has a manifest-refresh self-test expectation",
+            "actual": {
+                "registered_commands": sorted(registered_commands),
+                "missing_expectations": missing_expectations,
+                "stale_expectations": stale_expectations,
+            },
+        }
+    )
 
     mode_counts: dict[str, int] = {}
     for item in expectations:
@@ -13892,6 +13916,9 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
             "assertions": len(assertions),
             "failed": len(failed),
             "mode_counts": mode_counts,
+            "registered_commands": len(registered_commands),
+            "missing_expectations": missing_expectations,
+            "stale_expectations": stale_expectations,
         },
         "cases": cases,
         "assertions": assertions,
