@@ -11047,6 +11047,7 @@ def build_verification_queue(
     adjudication: dict[str, Any] | None,
     environment_readiness: dict[str, Any] | None,
     artifact_dir: Path | None = None,
+    attack_strategy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     cmd = lambda subcommand: verification_command(clusters, artifact_dir, subcommand)
@@ -11140,6 +11141,93 @@ def build_verification_queue(
         ],
         safety="Read-only artifact refresh. Use burp-sync --observe separately when observation traffic is needed.",
     )
+
+    attack_strategy_status = str((attack_strategy or {}).get("status") or "")
+    attack_strategy_summary = (attack_strategy or {}).get("summary", {}) or {}
+    uncovered_strategy_clusters = [
+        str(item)
+        for item in attack_strategy_summary.get("strategy_uncovered_clusters", []) or []
+        if item
+    ]
+    if attack_strategy_status == "needs-strategy-review":
+        extra: dict[str, Any] = {
+            "attack_strategy_status": attack_strategy_status,
+            "strategy_uncovered_clusters": uncovered_strategy_clusters,
+            "strategy_coverage": [
+                item
+                for item in (attack_strategy or {}).get("strategy_coverage", []) or []
+                if not item.get("strategy_ids") and not item.get("exempt")
+            ],
+        }
+        if len(uncovered_strategy_clusters) == 1:
+            extra["cluster_id"] = uncovered_strategy_clusters[0]
+        add_item(
+            "REVIEW-attack-strategy-coverage",
+            "Review uncovered attack strategy coverage",
+            "manual-review",
+            "high",
+            (
+                "Attack strategy coverage is missing a specific strategy for: "
+                + (", ".join(uncovered_strategy_clusters) or "one or more clusters")
+            ),
+            commands=[cmd("plan")],
+            evidence_refs=[
+                "attack-strategy.json",
+                "endpoint-clusters.json",
+                STRATEGY_REGISTRY_ARTIFACT,
+                TARGET_PROFILE_ARTIFACT,
+            ],
+            prerequisites=[
+                "Map each uncovered cluster to an existing specific strategy or add a bounded strategy before treating coverage as complete.",
+                "Keep new probes low-volume and tied to observed or source-discovered endpoints.",
+            ],
+            safety="Strategy review only. Do not add broad crawling, destructive fuzzing, wallet signing, or transaction submission.",
+            extra=extra,
+        )
+    elif attack_strategy_status == "needs-external-evidence":
+        waiting_actions = [
+            action
+            for action in (attack_strategy or {}).get("next_development_actions", []) or []
+            if str(action.get("status") or "").startswith("waiting-")
+            or str(action.get("status") or "") in {"blocked", "blocked-external"}
+        ]
+        waiting_action_ids = {str(action.get("id") or "") for action in waiting_actions}
+        commands = []
+        if "NEXT-transaction-intent-corpus" in waiting_action_ids:
+            transaction_payload_path = shlex.quote(
+                verification_artifact_path(artifact_dir, "transaction-payloads.json")
+            )
+            commands.extend(
+                [
+                    cmd(f"collect-quote --direction buy --wallet {PLACEHOLDER_REAL_WALLET} --amount-in 1000000"),
+                    cmd(f"decode-transactions --input {transaction_payload_path}"),
+                ]
+            )
+        commands.append(cmd("audit --include-external --ws-resource-probes"))
+        add_item(
+            "RESOLVE-attack-strategy-external-evidence",
+            "Resolve attack strategy external evidence",
+            "blocked-external",
+            "medium",
+            "Attack strategy is waiting on external evidence before the reusable strategy loop is fully covered.",
+            commands=commands,
+            evidence_refs=[
+                "attack-strategy.json",
+                "evidence-gaps.json",
+                "environment-readiness.json",
+                "transaction-intent.json",
+            ],
+            prerequisites=[
+                f"{action.get('id')}: {action.get('title')} ({action.get('status')})"
+                for action in waiting_actions[:6]
+            ]
+            or ["Provide the external evidence requested by attack-strategy.json."],
+            safety="External evidence collection only. Do not print secrets, sign wallets, submit transactions, or enumerate upstream resources.",
+            extra={
+                "attack_strategy_status": attack_strategy_status,
+                "waiting_action_ids": sorted(waiting_action_ids),
+            },
+        )
 
     for cluster in (evidence_appendix or {}).get("clusters", []):
         cluster_id = str(cluster.get("cluster_id", "unknown"))
@@ -11268,6 +11356,7 @@ def build_verification_queue(
             "coverage": (blackbox_coverage or {}).get("status"),
             "adjudication": (adjudication or {}).get("status"),
             "readiness": (environment_readiness or {}).get("status"),
+            "attack_strategy": (attack_strategy or {}).get("status"),
             "command_safety": command_safety,
         },
         "items": items,
@@ -11277,6 +11366,7 @@ def build_verification_queue(
             "adjudication": "adjudication.json",
             "coverage": "blackbox-coverage.json",
             "readiness": "environment-readiness.json",
+            "attack_strategy": "attack-strategy.json",
         },
         "safety": "Queue generation is read-only. Commands are bounded reproductions and must stay in target scope.",
     }
@@ -16075,6 +16165,7 @@ def run_audit(args: argparse.Namespace) -> int:
         adjudication,
         environment_readiness,
         artifact_dir,
+        attack_strategy=attack_strategy,
     )
     verification_queue_path = artifact_dir / "verification-queue.json"
     reproduction_steps_path = artifact_dir / "reproduction-steps.md"
@@ -17808,11 +17899,96 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         [],
         [{"method": "GET", "path": "/opaque", "status": 200, "source": "self-test"}],
     )
+    external_attack_strategy = build_attack_strategy(
+        {
+            "clusters": [
+                {
+                    "id": "quote",
+                    "kind": "quote",
+                    "strategy_set": "quote-transaction-decoder",
+                }
+            ]
+        },
+        [],
+        [{"method": "POST", "path": "/bridge/quote", "status": 400, "source": "self-test"}],
+    )
+    strategy_review_queue = build_verification_queue(
+        "http://127.0.0.1:9998",
+        {"clusters": unknown_attack_strategy.get("strategy_coverage", [])},
+        {"clusters": []},
+        {"gaps": []},
+        {"status": "covered"},
+        {"status": "no-reportable-findings", "external_blockers": [], "decisions": []},
+        {"status": "ready"},
+        queue_artifact_dir,
+        attack_strategy=unknown_attack_strategy,
+    )
+    strategy_review_item = next(
+        (
+            item
+            for item in strategy_review_queue.get("items", [])
+            if item.get("id") == "REVIEW-attack-strategy-coverage"
+        ),
+        None,
+    )
+    strategy_review_blockers = build_review_blockers(
+        target="http://127.0.0.1:9998",
+        profile=rewrite_profile,
+        artifact_dir=queue_artifact_dir,
+        verification_queue=strategy_review_queue,
+    )
+    strategy_external_queue = build_verification_queue(
+        "http://127.0.0.1:9998",
+        {"clusters": [{"id": "quote", "kind": "quote", "strategy_set": "quote-transaction-decoder"}]},
+        {"clusters": []},
+        {"gaps": []},
+        {"status": "covered"},
+        {"status": "no-reportable-findings", "external_blockers": [], "decisions": []},
+        {"status": "ready"},
+        queue_artifact_dir,
+        attack_strategy=external_attack_strategy,
+    )
+    strategy_external_item = next(
+        (
+            item
+            for item in strategy_external_queue.get("items", [])
+            if item.get("id") == "RESOLVE-attack-strategy-external-evidence"
+        ),
+        None,
+    )
+    strategy_external_blockers = build_review_blockers(
+        target="http://127.0.0.1:9998",
+        profile=rewrite_profile,
+        artifact_dir=queue_artifact_dir,
+        verification_queue=strategy_external_queue,
+    )
     attack_strategy_status_passed = (
         rewrite_attack_strategy.get("status") == "ready-for-regression"
         and "strategy-fixed-upstream-rewrite" in rewrite_strategy_route_coverage.get("strategy_ids", [])
         and unknown_attack_strategy.get("status") == "needs-strategy-review"
         and unknown_attack_strategy.get("summary", {}).get("strategy_uncovered_clusters") == ["opaque-service"]
+        and external_attack_strategy.get("status") == "needs-external-evidence"
+        and strategy_review_item is not None
+        and strategy_review_item.get("status") == "manual-review"
+        and strategy_review_item.get("strategy_uncovered_clusters") == ["opaque-service"]
+        and strategy_review_queue.get("status") == "needs-human-review"
+        and strategy_review_queue.get("summary", {}).get("attack_strategy") == "needs-strategy-review"
+        and strategy_review_blockers.get("status") == "needs-human-review"
+        and any(
+            blocker.get("id") == "QUEUE-REVIEW-attack-strategy-coverage"
+            for blocker in strategy_review_blockers.get("blockers", [])
+        )
+        and strategy_external_item is not None
+        and strategy_external_item.get("status") == "blocked-external"
+        and "NEXT-transaction-intent-corpus" in strategy_external_item.get("waiting_action_ids", [])
+        and any("collect-quote" in command for command in strategy_external_item.get("commands", []))
+        and strategy_external_queue.get("status") == "ready-with-external-blockers"
+        and strategy_external_queue.get("summary", {}).get("attack_strategy") == "needs-external-evidence"
+        and strategy_external_blockers.get("status") == "ready-with-external-blockers"
+        and any(
+            blocker.get("id") == "QUEUE-RESOLVE-attack-strategy-external-evidence"
+            for blocker in strategy_external_blockers.get("blockers", [])
+        )
     )
 
     probe_paths = {probe.path for probe in probes}
@@ -17903,6 +18079,22 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "rewrite_route_coverage": rewrite_strategy_route_coverage,
             "unknown_status": unknown_attack_strategy.get("status"),
             "unknown_summary": unknown_attack_strategy.get("summary", {}),
+            "external_status": external_attack_strategy.get("status"),
+            "external_summary": external_attack_strategy.get("summary", {}),
+            "strategy_review_queue": {
+                "status": strategy_review_queue.get("status"),
+                "summary": strategy_review_queue.get("summary", {}),
+                "item": strategy_review_item,
+                "blockers_status": strategy_review_blockers.get("status"),
+                "blocker_ids": [item.get("id") for item in strategy_review_blockers.get("blockers", [])],
+            },
+            "strategy_external_queue": {
+                "status": strategy_external_queue.get("status"),
+                "summary": strategy_external_queue.get("summary", {}),
+                "item": strategy_external_item,
+                "blockers_status": strategy_external_blockers.get("status"),
+                "blocker_ids": [item.get("id") for item in strategy_external_blockers.get("blockers", [])],
+            },
         },
         "active_observation_validation": {
             "status": "passed" if unsafe_observation_validation_passed else "failed",
@@ -18672,6 +18864,7 @@ def run_verification_queue(args: argparse.Namespace) -> int:
         load_optional_json(artifact_dir / "adjudication.json"),
         load_optional_json(artifact_dir / "environment-readiness.json"),
         artifact_dir,
+        attack_strategy=load_optional_json(artifact_dir / "attack-strategy.json"),
     )
     verification_queue_path = artifact_dir / "verification-queue.json"
     reproduction_steps_path = artifact_dir / "reproduction-steps.md"
