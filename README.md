@@ -375,14 +375,17 @@ intent-policy checks work, but it is not a substitute for a real M0 quote corpus
 
 `burp-sync` is the preferred automatic Burp loop. It can force Proxy Intercept
 off, optionally run the deterministic `burp-observe` flow, read matching Burp
-Proxy HTTP history directly through Burp MCP, save the raw MCP output to
-`.greybox/burp-mcp-history-latest.txt`, import normalized observations, refresh
-traffic clustering, write `.greybox/burp-mcp-sync.json`, and refresh the managed
-artifact manifest. The sync artifact includes `mcp_actions`, a compact audit log
-of Burp MCP tool calls with sensitive request bodies, regex values, tokens, and
-secrets hashed or redacted; MCP exception messages are summarized by type,
-length, and SHA-256 instead of stored as raw text. Top-level `burp-sync` failure
-metadata and Intercept-disable errors use the same redacted error shape.
+Proxy HTTP history directly through Burp MCP, import normalized observations,
+refresh traffic clustering, write `.greybox/burp-mcp-sync.json`, and refresh the
+managed artifact manifest. By default, raw MCP history is imported in memory and
+is not persisted; the sync artifact records raw history byte counts and SHA-256
+hashes instead. Use `--raw-output`, `--websocket-raw-output`, or
+`--keep-raw-history` only when an explicit offline raw-history file is needed.
+The sync artifact includes `mcp_actions`, a compact audit log of Burp MCP tool
+calls with sensitive request bodies, regex values, tokens, and secrets hashed or
+redacted; MCP exception messages are summarized by type, length, and SHA-256
+instead of stored as raw text. Top-level `burp-sync` failure metadata and
+Intercept-disable errors use the same redacted error shape.
 `burp-sync` first performs a read-only `tools/list` inventory when available,
 prefers the regex history tools, and directly selects the non-regex
 HTTP/WebSocket history tools when a Burp MCP version does not list the regex
@@ -618,7 +621,8 @@ is missing from the manifest, detects stale derived outputs such as
 `report.md`, `index.html`, `reproduction-steps.md`, and `review-blockers.md`,
 checks `mcp_actions` audit records for raw sensitive arguments, raw result text,
 or raw exception messages, checks `burp-mcp-sync.json` failure and Intercept
-error fields for redacted error summaries,
+error fields for redacted error summaries, flags persisted default raw Burp MCP
+history files as security hygiene issues,
 carries forward key gate statuses such as black-box coverage, discovery
 coverage, verification queue, review blockers, response deltas,
 source-peek requests, and Burp observation coverage, and
@@ -718,6 +722,11 @@ Pipe raw MCP output directly when convenient:
 ```bash
 python3 scripts/inferforge.py import-burp-history --replace --input -
 ```
+
+If you intentionally persist raw MCP history for offline debugging, keep it out
+of shared artifacts. `artifact-health` treats the default raw history filenames
+as security hygiene issues because they can contain request headers, cookies, and
+full response bodies.
 
 Artifacts are written to:
 

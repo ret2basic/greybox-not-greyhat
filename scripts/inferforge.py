@@ -72,6 +72,10 @@ ARTIFACT_HEALTH_SELFTEST_ARTIFACT = "artifact-health-selftest.json"
 MANIFEST_REFRESH_SELFTEST_ARTIFACT = "manifest-refresh-selftest.json"
 NO_WRITE_SELFTEST_ARTIFACT = "no-write-selftest.json"
 BURP_SYNC_FAILURE_SELFTEST_ARTIFACT = "burp-sync-failure-selftest.json"
+RAW_BURP_HISTORY_ARTIFACTS = {
+    "burp-mcp-history-latest.txt",
+    "burp-mcp-websocket-history-latest.txt",
+}
 REQUIRED_ARTIFACTS = [
     "index.html",
     "report.md",
@@ -4116,6 +4120,28 @@ def target_probe_lock_blocked_payload(*, target: str, error: Any, safety: str) -
         "target": target,
         "error": redacted_error_summary(error),
         "safety": safety,
+    }
+
+
+def remove_raw_history_artifact(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "file": path.name,
+            "status": "not-present",
+        }
+    try:
+        size = path.stat().st_size
+        path.unlink()
+    except OSError as error:
+        return {
+            "file": path.name,
+            "status": "failed",
+            "error": redacted_error_summary(error),
+        }
+    return {
+        "file": path.name,
+        "status": "removed",
+        "bytes": size,
     }
 
 
@@ -14712,6 +14738,14 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
             jsonl_errors.extend(errors)
             if path.name == "probe-results.jsonl":
                 security_issues.extend(probe_result_jsonl_security_issues(path))
+        elif path.name in RAW_BURP_HISTORY_ARTIFACTS:
+            security_issues.append(
+                {
+                    "file": path.name,
+                    "path": "$",
+                    "reason": "burp-raw-history-persisted",
+                }
+            )
 
     if json_errors:
         checks.append(
@@ -15082,6 +15116,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         regression_output_leak_dir = root / "regression-output-leak"
         probe_body_text_leak_dir = root / "probe-body-text-leak"
         target_lock_error_leak_dir = root / "target-lock-error-leak"
+        raw_history_leak_dir = root / "raw-history-leak"
         refresh_dir = root / "refresh"
         derived_dir = root / "derived"
         for directory in [healthy_dir, modified_dir, missing_dir, untracked_dir]:
@@ -15208,6 +15243,13 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         )
         write_minimal_manifest(target_lock_error_leak_dir, ["target-probe-lock.json"])
 
+        raw_history_leak_dir.mkdir(parents=True)
+        (raw_history_leak_dir / "burp-mcp-history-latest.txt").write_text(
+            "Authorization: Bearer should-not-appear\n",
+            encoding="utf-8",
+        )
+        write_minimal_manifest(raw_history_leak_dir, ["burp-mcp-history-latest.txt"])
+
         healthy = build_single_artifact_health(healthy_dir)
         modified = build_single_artifact_health(modified_dir)
         missing = build_single_artifact_health(missing_dir)
@@ -15221,6 +15263,8 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         probe_body_text_leak_text = json.dumps(probe_body_text_leak, sort_keys=True)
         target_lock_error_leak = build_single_artifact_health(target_lock_error_leak_dir)
         target_lock_error_leak_text = json.dumps(target_lock_error_leak, sort_keys=True)
+        raw_history_leak = build_single_artifact_health(raw_history_leak_dir)
+        raw_history_leak_text = json.dumps(raw_history_leak, sort_keys=True)
         sanitized_probe_artifact_sample = sanitize_probe_result_for_artifact(
             {
                 "probe_id": "sanitize-sample",
@@ -15486,6 +15530,22 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "artifact-health-detects-raw-burp-history-artifacts",
+            "passed": (
+                raw_history_leak.get("status") == "failed"
+                and {
+                    "burp-raw-history-persisted",
+                }.issubset({str(issue.get("reason")) for issue in raw_history_leak.get("security_issues", []) or []})
+                and "should-not-appear" not in raw_history_leak_text
+                and "Authorization: Bearer" not in raw_history_leak_text
+            ),
+            "expected": "artifact-health fails when default raw Burp MCP history artifacts are present without echoing their contents",
+            "actual": {
+                "status": raw_history_leak.get("status"),
+                "security_issues": raw_history_leak.get("security_issues"),
+            },
+        },
+        {
             "id": "artifact-health-output-refreshes-manifest",
             "passed": (
                 refresh_stale_before.get("status") == "failed"
@@ -15628,6 +15688,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "regression_output_leak": regression_output_leak,
             "probe_body_text_leak": probe_body_text_leak,
             "target_lock_error_leak": target_lock_error_leak,
+            "raw_history_leak": raw_history_leak,
             "aggregate": aggregate,
             "refresh_stale_before": refresh_stale_before,
             "refreshed_health": refreshed_health,
@@ -16994,7 +17055,25 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
             if name == "set_proxy_intercept_state":
                 return {"content": [{"type": "text", "text": "intercept disabled"}]}
             if name == "get_proxy_http_history_regex":
-                return {"content": [{"type": "text", "text": "[]"}]}
+                raw_history = json.dumps(
+                    [
+                        {
+                            "request": (
+                                "GET /health HTTP/1.1\r\n"
+                                "Host: 127.0.0.1:9997\r\n"
+                                "Authorization: Bearer burp-sync-secret\r\n"
+                                "\r\n"
+                            ),
+                            "response": (
+                                "HTTP/1.1 200 OK\r\n"
+                                "Content-Type: application/json\r\n"
+                                "\r\n"
+                                '{"ok":true}'
+                            ),
+                        }
+                    ]
+                )
+                return {"content": [{"type": "text", "text": raw_history}]}
             raise RuntimeError(f"unexpected MCP tool {name}")
 
     def redacted_error_ok(value: Any, expected_type: str) -> bool:
@@ -17085,12 +17164,19 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
         sync_path = case_dir / "burp-mcp-sync.json"
         sync_doc = json.loads(sync_path.read_text(encoding="utf-8")) if sync_path.exists() else {}
         health = build_single_artifact_health(case_dir)
+        default_raw_path = case_dir / "burp-mcp-history-latest.txt"
+        http_history = sync_doc.get("http_history", {}) if isinstance(sync_doc.get("http_history"), dict) else {}
         return {
             "case_id": case_id,
             "return_code": return_code,
             "stdout": stdout.splitlines(),
             "sync": sync_doc,
             "sync_exists": sync_path.exists(),
+            "raw_output": http_history.get("raw_output"),
+            "raw_persisted": http_history.get("raw_persisted"),
+            "raw_file_exists": default_raw_path.exists(),
+            "raw_bytes": http_history.get("bytes"),
+            "raw_sha256": http_history.get("sha256"),
             "artifact_health_status": health.get("status"),
             "security_issues": health.get("security_issues", []),
             "leaked_files": artifact_text_leaks(case_dir) if case_dir.exists() else [],
@@ -17117,6 +17203,12 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
                 make_profile("/health"),
                 mcp_client_cls=SuccessfulHistoryMcpSseClient,
                 import_failure=True,
+            ),
+            "history_success": run_case(
+                root,
+                "history-success",
+                make_profile("/health"),
+                mcp_client_cls=SuccessfulHistoryMcpSseClient,
             ),
         }
 
@@ -17163,6 +17255,23 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
             ),
             "expected": "history import failures redact top-level errors after successful MCP history capture",
             "actual": cases["history_import"],
+        },
+        {
+            "id": "successful-burp-sync-does-not-persist-raw-history-by-default",
+            "passed": (
+                cases["history_success"]["return_code"] == 0
+                and cases["history_success"]["sync"].get("status") == "synced"
+                and cases["history_success"]["raw_persisted"] is False
+                and cases["history_success"]["raw_output"] is None
+                and cases["history_success"]["raw_file_exists"] is False
+                and isinstance(cases["history_success"]["raw_bytes"], int)
+                and isinstance(cases["history_success"]["raw_sha256"], str)
+                and not cases["history_success"]["security_issues"]
+                and not cases["history_success"]["leaked_files"]
+                and not cases["history_success"]["stdout_leaked"]
+            ),
+            "expected": "successful burp-sync imports raw MCP history in memory, records bytes/hash, and does not persist raw history by default",
+            "actual": cases["history_success"],
         },
     ]
     failed = [item for item in assertions if not item["passed"]]
@@ -21998,12 +22107,19 @@ def run_burp_sync(args: argparse.Namespace) -> int:
         observation_plan,
         include_ws_upgrade=args.ws_upgrade or observed_ws_upgrade,
     )
+    persist_http_raw_history = bool(args.keep_raw_history or args.raw_output)
+    persist_websocket_raw_history = bool(args.keep_raw_history or args.websocket_raw_output)
     raw_path = resolve_repo_path(args.raw_output) if args.raw_output else artifact_dir / "burp-mcp-history-latest.txt"
     ws_raw_path = (
         resolve_repo_path(args.websocket_raw_output)
         if args.websocket_raw_output
         else artifact_dir / "burp-mcp-websocket-history-latest.txt"
     )
+    raw_cleanup = []
+    if not persist_http_raw_history:
+        raw_cleanup.append(remove_raw_history_artifact(raw_path))
+    if not persist_websocket_raw_history:
+        raw_cleanup.append(remove_raw_history_artifact(ws_raw_path))
 
     sync_artifact: dict[str, Any] = {
         "generated_at": utc_now(),
@@ -22036,7 +22152,9 @@ def run_burp_sync(args: argparse.Namespace) -> int:
             "fallback_reason": None,
             "selection_reason": None,
             "filter_mode": "burp-mcp-regex",
-            "raw_output": str(raw_path),
+            "raw_output": str(raw_path) if persist_http_raw_history else None,
+            "raw_persisted": persist_http_raw_history,
+            "raw_retention": "persisted-explicitly" if persist_http_raw_history else "not-persisted",
         },
         "websocket_history": None,
         "intercept": {
@@ -22045,9 +22163,11 @@ def run_burp_sync(args: argparse.Namespace) -> int:
             "error": None,
         },
         "mcp_actions": [],
+        "raw_history_cleanup": raw_cleanup,
         "observe_before_sync": bool(args.observe),
         "safety": [
             "Uses Burp MCP only for Proxy Intercept state and history retrieval.",
+            "Raw MCP history is imported in memory and is not persisted unless --raw-output, --websocket-raw-output, or --keep-raw-history is set.",
             "Does not run Burp Scanner, sign wallets, submit Solana transactions, or fuzz broadly.",
         ],
     }
@@ -22115,6 +22235,7 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                 available_tools=available_mcp_tools,
             )
             raw_text = str(http_read["raw_text"])
+            raw_text_bytes = raw_text.encode("utf-8")
             sync_artifact["http_history"].update(
                 {
                     "tool": http_read["tool"],
@@ -22122,10 +22243,13 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                     "fallback_reason": http_read["fallback_reason"],
                     "selection_reason": http_read.get("selection_reason"),
                     "filter_mode": "post-import-target-filter" if http_read["fallback_used"] else "burp-mcp-regex",
+                    "bytes": len(raw_text_bytes),
+                    "sha256": hashlib.sha256(raw_text_bytes).hexdigest(),
                 }
             )
-            raw_path.parent.mkdir(parents=True, exist_ok=True)
-            raw_path.write_text(raw_text, encoding="utf-8")
+            if persist_http_raw_history:
+                raw_path.parent.mkdir(parents=True, exist_ok=True)
+                raw_path.write_text(raw_text, encoding="utf-8")
 
             if args.websocket_history:
                 ws_read = call_mcp_history_tool_with_inventory(
@@ -22138,8 +22262,10 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                     available_tools=available_mcp_tools,
                 )
                 ws_raw_text = str(ws_read["raw_text"])
-                ws_raw_path.parent.mkdir(parents=True, exist_ok=True)
-                ws_raw_path.write_text(ws_raw_text, encoding="utf-8")
+                ws_raw_text_bytes = ws_raw_text.encode("utf-8")
+                if persist_websocket_raw_history:
+                    ws_raw_path.parent.mkdir(parents=True, exist_ok=True)
+                    ws_raw_path.write_text(ws_raw_text, encoding="utf-8")
                 sync_artifact["websocket_history"] = {
                     "requested_tool": "get_proxy_websocket_history_regex",
                     "fallback_tool": "get_proxy_websocket_history",
@@ -22150,8 +22276,11 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                     "fallback_reason": ws_read["fallback_reason"],
                     "selection_reason": ws_read.get("selection_reason"),
                     "filter_mode": "post-import-target-filter" if ws_read["fallback_used"] else "burp-mcp-regex",
-                    "raw_output": str(ws_raw_path),
-                    "bytes": len(ws_raw_text.encode("utf-8")),
+                    "raw_output": str(ws_raw_path) if persist_websocket_raw_history else None,
+                    "raw_persisted": persist_websocket_raw_history,
+                    "raw_retention": "persisted-explicitly" if persist_websocket_raw_history else "not-persisted",
+                    "bytes": len(ws_raw_text_bytes),
+                    "sha256": hashlib.sha256(ws_raw_text_bytes).hexdigest(),
                 }
 
     except Exception as error:
@@ -22191,53 +22320,69 @@ def run_burp_sync(args: argparse.Namespace) -> int:
         sync_artifact["status"] = "failed-import"
         sync_artifact["error"] = redacted_error_summary(error)
         sync_artifact["error_context"] = "history-import"
-        sync_artifact["http_history"]["bytes"] = len(raw_text.encode("utf-8"))
+        raw_text_bytes = raw_text.encode("utf-8")
+        sync_artifact["http_history"]["bytes"] = len(raw_text_bytes)
+        sync_artifact["http_history"]["sha256"] = hashlib.sha256(raw_text_bytes).hexdigest()
         sync_path = artifact_dir / "burp-mcp-sync.json"
         write_json(sync_path, sync_artifact)
         print(f"Burp MCP history import failed: {type(error).__name__}")
+        output_paths = [
+            *target_profile_artifact_paths(artifact_dir),
+            sync_path,
+        ]
+        if persist_http_raw_history:
+            output_paths.append(raw_path)
         print_refreshed_manifests(
             refresh_current_artifact_manifest(
                 artifact_dir=artifact_dir,
                 target=target,
                 command="burp-sync",
-                output_paths=[
-                    *target_profile_artifact_paths(artifact_dir),
-                    raw_path,
-                    sync_path,
-                ],
+                output_paths=output_paths,
             )
         )
         return 1
     sync_artifact["status"] = "synced"
-    sync_artifact["http_history"]["bytes"] = len(raw_text.encode("utf-8"))
+    raw_text_bytes = raw_text.encode("utf-8")
+    sync_artifact["http_history"]["bytes"] = len(raw_text_bytes)
+    sync_artifact["http_history"]["sha256"] = hashlib.sha256(raw_text_bytes).hexdigest()
     sync_artifact["import"] = import_summary
     sync_path = artifact_dir / "burp-mcp-sync.json"
     write_json(sync_path, sync_artifact)
 
     print(f"Burp MCP sync: synced via {args.mcp_url}")
-    print(f"Raw HTTP history: {raw_path}")
+    if persist_http_raw_history:
+        print(f"Raw HTTP history: {raw_path}")
+    else:
+        print(
+            "Raw HTTP history: not persisted "
+            f"bytes={sync_artifact['http_history']['bytes']} "
+            f"sha256={sync_artifact['http_history']['sha256']}"
+        )
     print(f"Imported {import_summary['imported_observations']} observations")
     print(f"Stored {import_summary['burp_history_items']} total observations in {import_summary['history_path']}")
     selection = import_summary["selection"]
     print(f"Observed clusters: {', '.join(selection['observed_cluster_ids']) or '(none)'}")
     print(f"Source-assisted selected clusters: {', '.join(selection['selected_cluster_ids']) or '(none)'}")
+    output_paths = [
+        *target_profile_artifact_paths(artifact_dir),
+        artifact_dir / "burp-history-observations.jsonl",
+        artifact_dir / "burp-transaction-candidates.json",
+        artifact_dir / "endpoint-clusters.json",
+        artifact_dir / "traffic-index.json",
+        artifact_dir / "transaction-intent.json",
+        artifact_dir / "collection-summary.json",
+        sync_path,
+    ]
+    if persist_http_raw_history:
+        output_paths.append(raw_path)
+    if args.websocket_history and persist_websocket_raw_history:
+        output_paths.append(ws_raw_path)
     print_refreshed_manifests(
         refresh_current_artifact_manifest(
             artifact_dir=artifact_dir,
             target=target,
             command="burp-sync",
-            output_paths=[
-                *target_profile_artifact_paths(artifact_dir),
-                raw_path,
-                ws_raw_path,
-                artifact_dir / "burp-history-observations.jsonl",
-                artifact_dir / "burp-transaction-candidates.json",
-                artifact_dir / "endpoint-clusters.json",
-                artifact_dir / "traffic-index.json",
-                artifact_dir / "transaction-intent.json",
-                artifact_dir / "collection-summary.json",
-                sync_path,
-            ],
+            output_paths=output_paths,
         )
     )
     return 0
@@ -24700,16 +24845,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     burp_sync.add_argument(
         "--raw-output",
-        help="Where to save raw MCP HTTP history text. Defaults to .greybox/burp-mcp-history-latest.txt",
+        help="Persist raw MCP HTTP history text to this path. By default raw history is imported in memory and not persisted.",
+    )
+    burp_sync.add_argument(
+        "--keep-raw-history",
+        action="store_true",
+        help="Persist raw MCP history to the default .greybox/burp-mcp-*-latest.txt files. Intended only for explicit offline debugging.",
     )
     burp_sync.add_argument(
         "--websocket-history",
         action="store_true",
-        help="Also save raw Burp MCP WebSocket history text when the tool is available",
+        help="Also read Burp MCP WebSocket history when the tool is available",
     )
     burp_sync.add_argument(
         "--websocket-raw-output",
-        help="Where to save raw MCP WebSocket history text. Defaults to .greybox/burp-mcp-websocket-history-latest.txt",
+        help="Persist raw MCP WebSocket history text to this path. By default raw WebSocket history is summarized but not persisted.",
     )
     burp_sync.add_argument(
         "--replace",
