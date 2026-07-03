@@ -11744,7 +11744,7 @@ def format_review_candidate_cli_lines(candidate: dict[str, Any]) -> list[str]:
     if command_templates:
         lines.append("  command_templates:")
         for command in command_templates[:4]:
-            lines.append(f"    - {inline_summary_text(command, max_chars=240)}")
+            lines.append(f"    - {inline_summary_text(command, max_chars=500)}")
         if len(command_templates) > 4:
             lines.append(f"    - ... +{len(command_templates) - 4} more commands")
     return lines
@@ -14670,13 +14670,6 @@ def build_no_write_selftest() -> dict[str, Any]:
                         "expected_statuses": [200, 204, 400, 403, 404, 405, 502],
                         "cluster": "no-write",
                     },
-                    "command_templates": [
-                        (
-                            "python3 scripts/inferforge.py promote-observation-candidate "
-                            "--candidate-id review_no_write_candidate "
-                            f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH}"
-                        )
-                    ],
                     "safety": "Synthetic no-write candidate.",
                 }
             ],
@@ -14791,6 +14784,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "promote_to_burp_observation_plan: id=burp_observe_no_write_reviewed_path" in review_candidates_stdout_text
                 and f"path={PLACEHOLDER_APPROVED_CONCRETE_PATH}" in review_candidates_stdout_text
                 and "command_templates:" in review_candidates_stdout_text
+                and "promote-observation-candidate" in review_candidates_stdout_text
                 and "No files written (--no-write)." in review_candidates_stdout
                 and not any(
                     output_paths[key]
@@ -21117,8 +21111,9 @@ def run_review_candidates(args: argparse.Namespace) -> int:
         "safety": "Review candidates are inert templates. Listing them does not send HTTP traffic or modify the profile.",
     }
     output_path = artifact_dir / "review-observation-candidates.json"
+    display_candidates = contextualize_review_candidates(candidates, build_clusters(profile, source_root), artifact_dir)
     print(f"Review observation candidates: {len(candidates)}")
-    for candidate in candidates:
+    for candidate in display_candidates:
         for line in format_review_candidate_cli_lines(candidate):
             print(line)
     if no_write:
