@@ -513,8 +513,9 @@ report and index page. Standalone local refresh commands that rewrite existing
 top-level artifacts, such as `coverage`, `burp-observation-coverage`,
 `response-deltas`, `source-peek-requests`, `evidence-chain`,
 `evidence-appendix`, `verification-queue`, `review-blockers`, `gate`,
-`adjudicate`, and `artifact-health`, also refresh the manifest when their output
-lands in the managed artifact directory.
+`adjudicate`, `artifact-health`, `profile`, `plan`, `review-candidates`,
+`discover-profile`, and the static `self-test-*` commands, also refresh the
+manifest when their output lands in the managed artifact directory.
 
 `artifact-health` writes `.greybox/artifact-health.json`, a local health summary
 over one or more artifact directories. It parses every top-level JSON and JSONL

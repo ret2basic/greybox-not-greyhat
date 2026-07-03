@@ -16126,7 +16126,7 @@ def build_profile_routing_selftest_profile() -> dict[str, Any]:
 
 
 def run_profile_routing_selftest(args: argparse.Namespace) -> int:
-    profile, artifact_dir, _target, source_root = resolve_run_context(args)
+    profile, artifact_dir, current_target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     test_profile = build_profile_routing_selftest_profile()
     target = test_profile["default_target"]
@@ -17404,6 +17404,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
     print(f"Profile routing self-test: {artifact['status']}")
     print(f"Probes: {len(probes)}, warmups: {len(warmups)}, observations: {len(observation_plan)}")
     print(f"Wrote {artifact_dir / 'profile-routing-selftest.json'}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=current_target,
+            command="self-test-profile-routing",
+            output_paths=[artifact_dir / "profile-routing-selftest.json"],
+        )
+    )
     return 0 if passed else 1
 
 
@@ -17577,6 +17585,22 @@ def run_plan(args: argparse.Namespace) -> int:
     print(f"WebSocket probes: {'enabled' if ws_enabled else 'disabled'}")
     print(f"Selection mode: {selection['mode']}")
     print(f"Selected clusters: {', '.join(selection['selected_cluster_ids']) or '(none)'}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="plan",
+            output_paths=[
+                artifact_dir / TARGET_PROFILE_ARTIFACT,
+                artifact_dir / STRATEGY_REGISTRY_ARTIFACT,
+                artifact_dir / PROFILE_VALIDATION_ARTIFACT,
+                artifact_dir / "endpoint-clusters.json",
+                artifact_dir / "probe-ranking.json",
+                artifact_dir / "probe-plan.json",
+                artifact_dir / "attack-strategy.json",
+            ],
+        )
+    )
     return 0
 
 
@@ -17746,6 +17770,14 @@ def run_discovery_coverage_selftest(args: argparse.Namespace) -> int:
     if failed:
         print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
     print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=resolve_target(args, profile),
+            command="self-test-discovery-coverage",
+            output_paths=[output_path],
+        )
+    )
     return 0 if result["status"] == "passed" else 1
 
 
@@ -18090,6 +18122,14 @@ def run_review_blockers_selftest(args: argparse.Namespace) -> int:
     if failed:
         print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
     print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=resolve_target(args, profile),
+            command="self-test-review-blockers",
+            output_paths=[output_path],
+        )
+    )
     return 0 if result["status"] == "passed" else 1
 
 
@@ -18111,6 +18151,14 @@ def run_command_safety_selftest(args: argparse.Namespace) -> int:
     if failed:
         print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
     print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=resolve_target(args, profile),
+            command="self-test-command-safety",
+            output_paths=[output_path],
+        )
+    )
     return 0 if result["status"] == "passed" else 1
 
 
@@ -18132,6 +18180,14 @@ def run_artifact_health_selftest(args: argparse.Namespace) -> int:
     if failed:
         print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
     print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=resolve_target(args, profile),
+            command="self-test-artifact-health",
+            output_paths=[output_path],
+        )
+    )
     return 0 if result["status"] == "passed" else 1
 
 
@@ -18511,6 +18567,19 @@ def run_profile(args: argparse.Namespace) -> int:
     print(f"Wrote {artifact_dir / STRATEGY_REGISTRY_ARTIFACT}")
     print(f"Wrote {artifact_dir / PROFILE_VALIDATION_ARTIFACT}")
     print(f"Wrote {artifact_dir / 'endpoint-clusters.json'}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="profile",
+            output_paths=[
+                artifact_dir / TARGET_PROFILE_ARTIFACT,
+                artifact_dir / STRATEGY_REGISTRY_ARTIFACT,
+                artifact_dir / PROFILE_VALIDATION_ARTIFACT,
+                artifact_dir / "endpoint-clusters.json",
+            ],
+        )
+    )
     return 0
 
 
@@ -18528,7 +18597,8 @@ def run_review_candidates(args: argparse.Namespace) -> int:
         "candidates": candidates,
         "safety": "Review candidates are inert templates. Listing them does not send HTTP traffic or modify the profile.",
     }
-    write_json(artifact_dir / "review-observation-candidates.json", artifact)
+    output_path = artifact_dir / "review-observation-candidates.json"
+    write_json(output_path, artifact)
     print(f"Review observation candidates: {len(candidates)}")
     for candidate in candidates:
         print(
@@ -18539,7 +18609,20 @@ def run_review_candidates(args: argparse.Namespace) -> int:
         )
         if candidate.get("example_path"):
             print(f"  example_path={candidate.get('example_path')}")
-    print(f"Wrote {artifact_dir / 'review-observation-candidates.json'}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="review-candidates",
+            output_paths=[
+                artifact_dir / TARGET_PROFILE_ARTIFACT,
+                artifact_dir / STRATEGY_REGISTRY_ARTIFACT,
+                artifact_dir / PROFILE_VALIDATION_ARTIFACT,
+                output_path,
+            ],
+        )
+    )
     return 0
 
 
@@ -18634,6 +18717,18 @@ def run_discover_profile(args: argparse.Namespace) -> int:
     print(f"Wrote {artifact_dir / ROUTE_INVENTORY_ARTIFACT}")
     print(f"Wrote {output_path}")
     print(f"Wrote {artifact_dir / 'discovered-profile-validation.json'}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="discover-profile",
+            output_paths=[
+                artifact_dir / ROUTE_INVENTORY_ARTIFACT,
+                output_path,
+                artifact_dir / "discovered-profile-validation.json",
+            ],
+        )
+    )
     if route_inventory.get("status") != "discovered":
         return 1
     return 0 if validation["status"] != "failed" else 1
@@ -18775,9 +18870,23 @@ def run_transaction_decoder_selftest(args: argparse.Namespace) -> int:
         wallet=args.wallet,
         amount_in=args.amount_in,
     )
-    write_json(artifact_dir / "transaction-decoder-selftest.json", result)
+    output_path = artifact_dir / "transaction-decoder-selftest.json"
+    write_json(output_path, result)
     print(f"Transaction decoder self-test: {result['status']}")
-    print(f"Wrote {artifact_dir / 'transaction-decoder-selftest.json'}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="self-test-transactions",
+            output_paths=[
+                artifact_dir / TARGET_PROFILE_ARTIFACT,
+                artifact_dir / STRATEGY_REGISTRY_ARTIFACT,
+                artifact_dir / PROFILE_VALIDATION_ARTIFACT,
+                output_path,
+            ],
+        )
+    )
     return 0 if result["status"] == "passed" else 1
 
 
