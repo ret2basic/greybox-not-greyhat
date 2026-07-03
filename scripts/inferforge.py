@@ -12398,8 +12398,17 @@ def build_review_blockers_selftest() -> dict[str, Any]:
         root = Path(temp_dir)
         default_dir = root / "default"
         discovered_dir = root / "discovered"
+        manifest_only_dir = root / "manifest-only"
         write_json(default_dir / REVIEW_BLOCKERS_ARTIFACT, default_blockers)
         write_json(discovered_dir / REVIEW_BLOCKERS_ARTIFACT, discovered_blockers)
+        write_json(
+            manifest_only_dir / MANIFEST_NAME,
+            {
+                "generated_at": utc_now(),
+                "status": "complete",
+                "summary": {"artifact_count": 0, "missing_required": []},
+            },
+        )
         rollup = build_review_blockers_rollup(
             target=target,
             profile=profile,
@@ -12441,6 +12450,28 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             REVIEW_BLOCKERS_MARKDOWN_ARTIFACT: (no_write_output_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT).exists(),
             MANIFEST_NAME: (no_write_output_dir / MANIFEST_NAME).exists(),
         }
+        discover_no_write_args = parser.parse_args(
+            [
+                "--profile",
+                str(profile_path),
+                "--artifact-dir",
+                str(root),
+                "--target",
+                target,
+                "--source-root",
+                str(root),
+                "review-blockers",
+                "--discover-child-runs",
+                "--no-write",
+            ]
+        )
+        discover_stdout_buffer = io.StringIO()
+        with contextlib.redirect_stdout(discover_stdout_buffer):
+            discover_no_write_return_code = discover_no_write_args.func(discover_no_write_args)
+        discover_no_write_stdout = discover_stdout_buffer.getvalue()
+        discovered_review_blocker_dirs = [
+            path.name for path in discover_review_blocker_dirs(root)
+        ]
 
     single_route_group = review_blocker_group_by_cluster(discovered_blockers, "route-api-proxy-path") or {}
     rollup_route_group = review_blocker_group_by_cluster(rollup, "route-api-proxy-path") or {}
@@ -12579,6 +12610,21 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "outputs_exist": no_write_outputs_exist,
             },
         },
+        {
+            "id": "discover-child-runs-uses-review-blocker-artifacts",
+            "passed": (
+                discover_no_write_return_code == 0
+                and discovered_review_blocker_dirs == ["default", "discovered"]
+                and "Runs: 2 checked" in discover_no_write_stdout
+                and "missing-review-blockers" not in discover_no_write_stdout
+            ),
+            "expected": "review-blockers --discover-child-runs discovers only child directories with review-blockers.json",
+            "actual": {
+                "return_code": discover_no_write_return_code,
+                "discovered_dirs": discovered_review_blocker_dirs,
+                "stdout": discover_no_write_stdout.splitlines(),
+            },
+        },
     ]
     failed = [item for item in assertions if not item["passed"]]
     return {
@@ -12618,6 +12664,11 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "return_code": no_write_return_code,
                 "stdout": no_write_stdout.splitlines(),
                 "outputs_exist": no_write_outputs_exist,
+            },
+            "discover_child_runs_no_write": {
+                "return_code": discover_no_write_return_code,
+                "discovered_dirs": discovered_review_blocker_dirs,
+                "stdout": discover_no_write_stdout.splitlines(),
             },
         },
         "assertions": assertions,
@@ -13534,6 +13585,13 @@ def discover_artifact_health_dirs(root_dir: Path) -> list[Path]:
     for manifest_path in sorted(root_dir.glob(f"*/{MANIFEST_NAME}")):
         dirs.add(manifest_path.parent)
     return sorted(dirs, key=lambda item: str(item))
+
+
+def discover_review_blocker_dirs(root_dir: Path) -> list[Path]:
+    return sorted(
+        {path.parent for path in root_dir.glob(f"*/{REVIEW_BLOCKERS_ARTIFACT}")},
+        key=lambda item: str(item),
+    )
 
 
 def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
@@ -19771,7 +19829,7 @@ def run_review_blockers(args: argparse.Namespace) -> int:
     for item in args.check_dir or []:
         check_dirs.append(resolve_repo_path(item))
     if args.discover_child_runs:
-        check_dirs.extend(discover_artifact_health_dirs(artifact_dir))
+        check_dirs.extend(discover_review_blocker_dirs(artifact_dir))
     deduped_dirs = []
     seen_dirs: set[str] = set()
     for check_dir in check_dirs:
@@ -19837,7 +19895,10 @@ def run_review_blockers(args: argparse.Namespace) -> int:
         for group_summary in top_review_blocker_group_summaries(review_blockers, limit=8):
             print(f"- {group_summary}")
         if len(groups) > 8:
-            print(f"- {len(groups) - 8} more group(s) in {output_path}")
+            if no_write:
+                print(f"- {len(groups) - 8} more group(s); rerun without --no-write to write the full blocker artifact")
+            else:
+                print(f"- {len(groups) - 8} more group(s) in {output_path}")
     else:
         print("Blockers:")
         for blocker in review_blockers.get("blockers", [])[:8]:
@@ -21504,7 +21565,7 @@ def build_parser() -> argparse.ArgumentParser:
     review_blockers.add_argument(
         "--discover-child-runs",
         action="store_true",
-        help="Build a rollup from child directories under --artifact-dir that contain artifact-manifest.json.",
+        help="Build a rollup from child directories under --artifact-dir that contain review-blockers.json.",
     )
     review_blockers.add_argument(
         "--markdown-output",
