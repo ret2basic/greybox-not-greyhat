@@ -245,6 +245,7 @@ python3 scripts/inferforge.py evidence-appendix
 python3 scripts/inferforge.py verification-queue
 python3 scripts/inferforge.py manifest
 python3 scripts/inferforge.py artifact-health --discover-child-runs
+python3 scripts/inferforge.py regression-suite --include-external --ws-resource-probes
 python3 scripts/inferforge.py adjudicate
 python3 scripts/inferforge.py audit --no-ws
 python3 scripts/inferforge.py audit --ws-resource-probes
@@ -467,6 +468,24 @@ By default the command returns non-zero only for failed or missing artifact
 sets. Use `--strict` in CI when human-review or external-configuration blockers
 should also fail the job.
 
+`regression-suite` runs the repeatable local regression workflow that is used to
+develop the tool against `infrafi-web`: refresh static discovery, run
+deterministic Burp observe/sync for the checked-in profile and discovered
+profile, collect one source-known Orca pool baseline, run both audits, and then
+write `artifact-health.json` plus `regression-suite.json`. The suite clears only
+generated `probe-results.jsonl` files in the selected regression artifact
+directories before audit so reruns do not accumulate stale probe rows. It does
+not run Burp Scanner, fuzz broadly, invoke Server Actions, sign wallets, or
+submit transactions.
+
+```bash
+python3 scripts/inferforge.py regression-suite --include-external --ws-resource-probes
+```
+
+Use `--skip-burp-sync`, `--skip-orca-baseline`, `--skip-audit`, or
+`--skip-discovered` for narrower local checks. Use `--strict` when
+human-review or external-configuration blockers should fail the command.
+
 `adjudicate` writes `.greybox/adjudication.json` and refreshes
 `.greybox/findings.json` plus `.greybox/hardening-notes.json`. The adjudicator
 enforces the reportability contract: only `valid-finding` items whose finding
@@ -529,6 +548,7 @@ Key outputs:
 .greybox/index.html
 .greybox/artifact-manifest.json
 .greybox/artifact-health.json
+.greybox/regression-suite.json
 .greybox/target-profile.json
 .greybox/strategy-registry.json
 .greybox/profile-validation.json

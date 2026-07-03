@@ -114,6 +114,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     "collection-summary.json",
     "environment-readiness.json",
     "artifact-health.json",
+    "regression-suite.json",
     "orca-baseline.json",
     "profile-routing-selftest.json",
     "transaction-intent-policy.json",
@@ -122,6 +123,7 @@ INDEX_ARTIFACT_ORDER = [
     "report.md",
     MANIFEST_NAME,
     "artifact-health.json",
+    "regression-suite.json",
     TARGET_PROFILE_ARTIFACT,
     STRATEGY_REGISTRY_ARTIFACT,
     PROFILE_VALIDATION_ARTIFACT,
@@ -10623,6 +10625,141 @@ def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
     }
 
 
+def inferforge_cli_command(
+    args: argparse.Namespace,
+    *,
+    profile_path: Path,
+    artifact_dir: Path,
+    subcommand: str,
+    extra: list[str] | None = None,
+) -> list[str]:
+    profile = load_target_profile(args.profile)
+    target = resolve_target(args, profile)
+    source_root = resolve_source_root(args, profile)
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--profile",
+        repo_relative_or_absolute(profile_path),
+        "--artifact-dir",
+        repo_relative_or_absolute(artifact_dir),
+        "--target",
+        target,
+        "--source-root",
+        repo_relative_or_absolute(source_root),
+        "--node",
+        args.node,
+        subcommand,
+    ]
+    command.extend(extra or [])
+    return command
+
+
+def run_regression_step(label: str, command: list[str], *, timeout: int) -> dict[str, Any]:
+    started = time.monotonic()
+    doc: dict[str, Any] = {
+        "label": label,
+        "command": shlex.join(command),
+        "started_at": utc_now(),
+    }
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(ROOT),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        duration_ms = int((time.monotonic() - started) * 1000)
+        output = error.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        doc.update(
+            {
+                "status": "timeout",
+                "returncode": None,
+                "duration_ms": duration_ms,
+                "output_tail": str(output)[-12000:],
+                "error": f"Timed out after {timeout} seconds.",
+                "finished_at": utc_now(),
+            }
+        )
+        return doc
+    except OSError as error:
+        duration_ms = int((time.monotonic() - started) * 1000)
+        doc.update(
+            {
+                "status": "failed-to-start",
+                "returncode": None,
+                "duration_ms": duration_ms,
+                "output_tail": "",
+                "error": str(error),
+                "finished_at": utc_now(),
+            }
+        )
+        return doc
+
+    duration_ms = int((time.monotonic() - started) * 1000)
+    doc.update(
+        {
+            "status": "passed" if proc.returncode == 0 else "failed",
+            "returncode": proc.returncode,
+            "duration_ms": duration_ms,
+            "output_tail": proc.stdout[-12000:],
+            "finished_at": utc_now(),
+        }
+    )
+    return doc
+
+
+def regression_step_failed(step: dict[str, Any]) -> bool:
+    return step.get("status") != "passed" or step.get("returncode") not in {0}
+
+
+def remove_stale_probe_results(artifact_dir: Path) -> dict[str, Any]:
+    path = artifact_dir / "probe-results.jsonl"
+    if not path.exists():
+        return {
+            "artifact_dir": repo_relative_or_absolute(artifact_dir),
+            "file": "probe-results.jsonl",
+            "status": "not-present",
+        }
+    rows = 0
+    try:
+        rows = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+        path.unlink()
+    except OSError as error:
+        return {
+            "artifact_dir": repo_relative_or_absolute(artifact_dir),
+            "file": "probe-results.jsonl",
+            "status": "failed",
+            "rows": rows,
+            "error": str(error),
+        }
+    return {
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "file": "probe-results.jsonl",
+        "status": "removed",
+        "rows": rows,
+    }
+
+
+def regression_suite_status(steps: list[dict[str, Any]], health: dict[str, Any] | None, *, strict: bool) -> str:
+    if any(regression_step_failed(step) for step in steps):
+        return "failed"
+    if not health:
+        return "failed"
+    health_status = health.get("status")
+    if health_status == "failed":
+        return "failed"
+    if strict and health_status != "healthy":
+        return "failed"
+    return str(health_status or "unknown")
+
+
 def decode_base64_candidate(value: str) -> bytes | None:
     normalized = "".join(value.strip().split())
     if len(normalized) < 80:
@@ -15304,6 +15441,202 @@ def run_artifact_health(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_regression_suite(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    default_profile_path = resolve_repo_path(args.profile)
+    default_artifact_dir = resolve_repo_path(args.default_artifact_dir)
+    discovered_artifact_dir = resolve_repo_path(args.discovered_artifact_dir)
+    discovered_profile_path = artifact_dir / DISCOVERED_PROFILE_ARTIFACT
+    steps: list[dict[str, Any]] = []
+    preparation: list[dict[str, Any]] = []
+    suite_stopped = False
+
+    def run_step(label: str, command: list[str]) -> bool:
+        nonlocal suite_stopped
+        print(f"[suite] {label}: {shlex.join(command)}")
+        step = run_regression_step(label, command, timeout=args.step_timeout)
+        steps.append(step)
+        print(
+            f"[suite] {label}: {step['status']} "
+            f"returncode={step.get('returncode')} duration_ms={step.get('duration_ms')}"
+        )
+        if regression_step_failed(step) and args.stop_on_failure:
+            suite_stopped = True
+            return False
+        return True
+
+    if not args.keep_probe_results and not args.skip_audit:
+        preparation.append(remove_stale_probe_results(default_artifact_dir))
+        if not args.skip_discovered:
+            preparation.append(remove_stale_probe_results(discovered_artifact_dir))
+
+    if not args.skip_discover_profile and not args.skip_discovered:
+        command = inferforge_cli_command(
+            args,
+            profile_path=default_profile_path,
+            artifact_dir=artifact_dir,
+            subcommand="discover-profile",
+        )
+        if not run_step("discover-profile", command):
+            return_code_health = None
+            suite = {
+                "generated_at": utc_now(),
+                "status": "failed",
+                "target": target,
+                "source_root": repo_relative_or_absolute(source_root),
+                "profile": profile_summary(profile),
+                "preparation": preparation,
+                "steps": steps,
+                "artifact_health": return_code_health,
+                "safety": "Regression suite stopped on failure. No wallet signing, transaction submission, Burp Scanner, or broad fuzzing is performed.",
+            }
+            write_json(artifact_dir / "regression-suite.json", suite)
+            print(f"Regression suite: {suite['status']}")
+            print(f"Wrote {artifact_dir / 'regression-suite.json'}")
+            return 1
+
+    if not args.skip_burp_sync and not suite_stopped:
+        burp_args = [
+            "--mcp-url",
+            args.mcp_url,
+            "--proxy",
+            args.proxy,
+            "--observe",
+            "--ws-upgrade",
+            "--replace",
+            "--count",
+            str(args.burp_count),
+        ]
+        if args.allow_nonlocal_target:
+            burp_args.append("--allow-nonlocal-target")
+        command = inferforge_cli_command(
+            args,
+            profile_path=default_profile_path,
+            artifact_dir=default_artifact_dir,
+            subcommand="burp-sync",
+            extra=burp_args,
+        )
+        run_step("default-burp-sync", command)
+
+        if not args.skip_discovered and not suite_stopped:
+            command = inferforge_cli_command(
+                args,
+                profile_path=discovered_profile_path,
+                artifact_dir=discovered_artifact_dir,
+                subcommand="burp-sync",
+                extra=burp_args,
+            )
+            run_step("discovered-burp-sync", command)
+
+    if not args.skip_orca_baseline and not suite_stopped:
+        command = inferforge_cli_command(
+            args,
+            profile_path=default_profile_path,
+            artifact_dir=default_artifact_dir,
+            subcommand="collect-orca-baseline",
+        )
+        run_step("default-orca-baseline", command)
+
+        if not args.skip_discovered and not suite_stopped:
+            command = inferforge_cli_command(
+                args,
+                profile_path=discovered_profile_path,
+                artifact_dir=discovered_artifact_dir,
+                subcommand="collect-orca-baseline",
+            )
+            run_step("discovered-orca-baseline", command)
+
+    if not args.skip_audit and not suite_stopped:
+        audit_args = []
+        if args.include_external:
+            audit_args.append("--include-external")
+        if args.ws_resource_probes:
+            audit_args.append("--ws-resource-probes")
+        command = inferforge_cli_command(
+            args,
+            profile_path=default_profile_path,
+            artifact_dir=default_artifact_dir,
+            subcommand="audit",
+            extra=audit_args,
+        )
+        run_step("default-audit", command)
+
+        if not args.skip_discovered and not suite_stopped:
+            command = inferforge_cli_command(
+                args,
+                profile_path=discovered_profile_path,
+                artifact_dir=discovered_artifact_dir,
+                subcommand="audit",
+                extra=audit_args,
+            )
+            run_step("discovered-audit", command)
+
+    health_check_dirs = [default_artifact_dir]
+    if not args.skip_discovered:
+        health_check_dirs.append(discovered_artifact_dir)
+    health_args = []
+    for check_dir in health_check_dirs:
+        health_args.extend(["--check-dir", repo_relative_or_absolute(check_dir)])
+    if args.strict:
+        health_args.append("--strict")
+    command = inferforge_cli_command(
+        args,
+        profile_path=default_profile_path,
+        artifact_dir=artifact_dir,
+        subcommand="artifact-health",
+        extra=health_args,
+    )
+    run_step("artifact-health", command)
+    health = load_optional_json(artifact_dir / "artifact-health.json")
+    suite_status = regression_suite_status(steps, health, strict=args.strict)
+    suite = {
+        "generated_at": utc_now(),
+        "status": suite_status,
+        "target": target,
+        "source_root": repo_relative_or_absolute(source_root),
+        "profile": profile_summary(profile),
+        "artifact_dirs": {
+            "suite": repo_relative_or_absolute(artifact_dir),
+            "default": repo_relative_or_absolute(default_artifact_dir),
+            "discovered": None if args.skip_discovered else repo_relative_or_absolute(discovered_artifact_dir),
+            "discovered_profile": None if args.skip_discovered else repo_relative_or_absolute(discovered_profile_path),
+        },
+        "options": {
+            "include_external": bool(args.include_external),
+            "ws_resource_probes": bool(args.ws_resource_probes),
+            "burp_count": args.burp_count,
+            "skip_discovered": bool(args.skip_discovered),
+            "skip_burp_sync": bool(args.skip_burp_sync),
+            "skip_orca_baseline": bool(args.skip_orca_baseline),
+            "skip_audit": bool(args.skip_audit),
+            "skip_discover_profile": bool(args.skip_discover_profile),
+            "keep_probe_results": bool(args.keep_probe_results),
+            "strict": bool(args.strict),
+        },
+        "preparation": preparation,
+        "steps": steps,
+        "artifact_health": {
+            "status": None if not health else health.get("status"),
+            "summary": None if not health else health.get("summary"),
+            "artifact": "artifact-health.json",
+        },
+        "safety": [
+            "Runs the existing deterministic low-volume InferForge regression commands.",
+            "Does not run Burp Scanner, sign wallets, submit Solana transactions, invoke Server Actions, or fuzz broadly.",
+            "Clears only generated probe-results.jsonl in the selected regression artifact directories unless --keep-probe-results is set.",
+        ],
+    }
+    write_json(artifact_dir / "regression-suite.json", suite)
+    print(f"Regression suite: {suite_status}")
+    print(f"Wrote {artifact_dir / 'regression-suite.json'}")
+    if suite_status == "failed":
+        return 1
+    if args.strict and suite_status != "healthy":
+        return 1
+    return 0
+
+
 def run_profile(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -16211,6 +16544,99 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless every checked artifact directory is healthy with no human review or external blockers.",
     )
     artifact_health.set_defaults(func=run_artifact_health)
+
+    regression_suite = sub.add_parser(
+        "regression-suite",
+        help="Run the default and discovered-profile regression workflow and summarize artifact health",
+    )
+    regression_suite.add_argument(
+        "--default-artifact-dir",
+        default=str(DEFAULT_ARTIFACT_DIR / "regression-default"),
+        help="Artifact directory for the checked-in default profile regression.",
+    )
+    regression_suite.add_argument(
+        "--discovered-artifact-dir",
+        default=str(DEFAULT_ARTIFACT_DIR / "regression-discovered"),
+        help="Artifact directory for the statically discovered profile regression.",
+    )
+    regression_suite.add_argument(
+        "--mcp-url",
+        default="http://127.0.0.1:9876",
+        help="Burp MCP SSE URL used by burp-sync steps.",
+    )
+    regression_suite.add_argument(
+        "--proxy",
+        default="http://127.0.0.1:8080",
+        help="Burp Proxy URL used by burp-sync --observe steps.",
+    )
+    regression_suite.add_argument(
+        "--burp-count",
+        type=positive_int,
+        default=80,
+        help="Maximum Burp history items to request for each burp-sync step.",
+    )
+    regression_suite.add_argument(
+        "--include-external",
+        action="store_true",
+        help="Pass --include-external to audit steps for bounded external validation probes.",
+    )
+    regression_suite.add_argument(
+        "--ws-resource-probes",
+        action="store_true",
+        help="Pass --ws-resource-probes to audit steps for bounded WebSocket connection-limit validation.",
+    )
+    regression_suite.add_argument(
+        "--allow-nonlocal-target",
+        action="store_true",
+        help="Allow burp-sync --observe traffic to non-loopback targets.",
+    )
+    regression_suite.add_argument(
+        "--skip-discovered",
+        action="store_true",
+        help="Only run the checked-in default profile regression.",
+    )
+    regression_suite.add_argument(
+        "--skip-discover-profile",
+        action="store_true",
+        help="Reuse the existing discovered profile instead of refreshing it first.",
+    )
+    regression_suite.add_argument(
+        "--skip-burp-sync",
+        action="store_true",
+        help="Skip Burp observe/sync steps and rely on existing Burp history artifacts.",
+    )
+    regression_suite.add_argument(
+        "--skip-orca-baseline",
+        action="store_true",
+        help="Skip single-address Orca baseline collection.",
+    )
+    regression_suite.add_argument(
+        "--skip-audit",
+        action="store_true",
+        help="Skip active audit probe steps and only refresh discovery/Burp/history health as requested.",
+    )
+    regression_suite.add_argument(
+        "--keep-probe-results",
+        action="store_true",
+        help="Do not remove existing probe-results.jsonl before audit steps.",
+    )
+    regression_suite.add_argument(
+        "--stop-on-failure",
+        action="store_true",
+        help="Stop scheduling subsequent active regression steps after the first failed step.",
+    )
+    regression_suite.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless artifact health is fully healthy with no human-review or external blockers.",
+    )
+    regression_suite.add_argument(
+        "--step-timeout",
+        type=positive_int,
+        default=300,
+        help="Timeout in seconds for each scheduled regression subcommand.",
+    )
+    regression_suite.set_defaults(func=run_regression_suite)
 
     adjudicate = sub.add_parser(
         "adjudicate",
