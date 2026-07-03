@@ -11180,8 +11180,15 @@ def review_blocker_priority_rank(priority: str) -> int:
 
 
 def review_blocker_group_key(blocker: dict[str, Any]) -> str:
+    explicit_key = str(blocker.get("group_key") or "")
+    if explicit_key:
+        return explicit_key
     category = str(blocker.get("category") or "unknown")
     status = str(blocker.get("status") or "unknown")
+    source_name = Path(str(blocker.get("source") or "")).name
+    blocker_id = str(blocker.get("run_blocker_id") or blocker.get("id") or "")
+    if source_name == "environment-readiness.json" and blocker_id.startswith("READINESS-"):
+        return f"{category}:{status}:source:environment-readiness"
     cluster_id = str(blocker.get("cluster_id") or "")
     if cluster_id:
         return f"{category}:{status}:cluster:{cluster_id}"
@@ -11305,6 +11312,7 @@ def build_review_blockers(
         commands: list[str] | None = None,
         review_candidates: list[dict[str, Any]] | None = None,
         evidence: dict[str, Any] | None = None,
+        group_key: str | None = None,
     ) -> None:
         key = f"{source}:{blocker_id}"
         if key in seen:
@@ -11324,6 +11332,8 @@ def build_review_blockers(
             "commands": commands or [],
             "review_candidates": review_candidates or [],
         }
+        if group_key:
+            row["group_key"] = group_key
         if evidence:
             row["evidence"] = evidence
         blockers.append(row)
@@ -11477,6 +11487,11 @@ def build_review_blockers(
             next_action="; ".join(str(item) for item in (environment_readiness or {}).get("next_steps", [])[:3]) or None,
             artifact_refs=["environment-readiness.json"],
             evidence={"check": check},
+            group_key=(
+                f"{'external-blocker' if check_status == 'blocked' else 'environment-failure'}:"
+                f"{'ready-with-external-blockers' if check_status == 'blocked' else 'failed'}:"
+                "source:environment-readiness"
+            ),
         )
 
     for directory in (artifact_health or {}).get("directories", []) or []:
@@ -11817,7 +11832,12 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "id": "m0-orchestration-key-configured",
                 "status": "blocked",
                 "evidence": {"status": "placeholder", "source": ".env.local"},
-            }
+            },
+            {
+                "id": "m0-preview-wallet-configured",
+                "status": "blocked",
+                "evidence": {"status": "missing", "source": "environment"},
+            },
         ],
     }
     source_peek_requests = {
@@ -11877,6 +11897,14 @@ def build_review_blockers_selftest() -> dict[str, Any]:
     single_route_group = review_blocker_group_by_cluster(discovered_blockers, "route-api-proxy-path") or {}
     rollup_route_group = review_blocker_group_by_cluster(rollup, "route-api-proxy-path") or {}
     rollup_quote_group = review_blocker_group_by_cluster(rollup, "quote") or {}
+    rollup_readiness_group = next(
+        (
+            item
+            for item in rollup.get("groups", []) or []
+            if item.get("key") == "external-blocker:ready-with-external-blockers:source:environment-readiness"
+        ),
+        {},
+    )
     assertions = [
         {
             "id": "default-status-external-only",
@@ -11921,6 +11949,12 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             "actual": rollup_quote_group.get("count"),
         },
         {
+            "id": "rollup-readiness-group-merges-checks-and-runs",
+            "passed": rollup_readiness_group.get("count") == 4,
+            "expected": 4,
+            "actual": rollup_readiness_group.get("count"),
+        },
+        {
             "id": "markdown-group-sources-rendered",
             "passed": "source-peek-requests.json" in markdown and "Source artifacts:" in markdown,
             "expected": "source-peek-requests.json in markdown group context",
@@ -11957,6 +11991,7 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "summary": rollup.get("summary"),
                 "route_group": rollup_route_group,
                 "quote_group": rollup_quote_group,
+                "readiness_group": rollup_readiness_group,
             },
         },
         "assertions": assertions,
