@@ -14624,6 +14624,71 @@ def artifact_sample_jsonl_security_issues(path: Path) -> list[dict[str, Any]]:
     return issues
 
 
+def artifact_warning_value_security_issues(value: Any, *, file_name: str, path: str) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    if isinstance(value, str):
+        if contains_unredacted_secret_text(value):
+            issues.append(
+                {
+                    "file": file_name,
+                    "path": path,
+                    "reason": "artifact-warning-sensitive-value",
+                }
+            )
+    elif isinstance(value, dict):
+        for key, child in value.items():
+            issues.extend(
+                artifact_warning_value_security_issues(
+                    child,
+                    file_name=file_name,
+                    path=f"{path}.{key}",
+                )
+            )
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            issues.extend(
+                artifact_warning_value_security_issues(
+                    child,
+                    file_name=file_name,
+                    path=f"{path}[{index}]",
+                )
+            )
+    return issues
+
+
+def artifact_warning_security_issues_in_value(value: Any, *, file_name: str, path: str = "$") -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        warnings = value.get("warnings")
+        if isinstance(warnings, list):
+            for index, warning in enumerate(warnings):
+                issues.extend(
+                    artifact_warning_value_security_issues(
+                        warning,
+                        file_name=file_name,
+                        path=f"{path}.warnings[{index}]",
+                    )
+                )
+        for key, child in value.items():
+            issues.extend(
+                artifact_warning_security_issues_in_value(
+                    child,
+                    file_name=file_name,
+                    path=f"{path}.{key}",
+                )
+            )
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            issues.extend(
+                artifact_warning_security_issues_in_value(
+                    child,
+                    file_name=file_name,
+                    path=f"{path}[{index}]",
+                )
+            )
+    return issues
+
+
 def probe_result_body_text_security_issues_in_value(value: Any, *, file_name: str, path: str = "$") -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     if isinstance(value, dict):
@@ -14763,6 +14828,7 @@ def mcp_action_audit_security_issues(parsed_json_by_name: dict[str, Any]) -> lis
             else ("body_sample", "response_sample")
         )
         issues.extend(artifact_sample_security_issues_in_value(doc, file_name=file_name, field_names=sample_fields))
+        issues.extend(artifact_warning_security_issues_in_value(doc, file_name=file_name))
         if file_name == "burp-mcp-sync.json":
             issues.extend(burp_sync_error_security_issues(doc, file_name=file_name))
         if file_name == "burp-observation-run.json":
@@ -14778,6 +14844,15 @@ def mcp_action_audit_security_issues(parsed_json_by_name: dict[str, Any]) -> lis
                     file_name=file_name,
                     path="$.error",
                     reason_prefix="target-probe-lock-error",
+                )
+            )
+        if file_name == "transaction-decoder-selftest.json":
+            issues.extend(
+                redacted_error_field_security_issues(
+                    doc.get("error"),
+                    file_name=file_name,
+                    path="$.error",
+                    reason_prefix="transaction-decoder-selftest-error",
                 )
             )
     return issues
@@ -15250,6 +15325,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         raw_history_leak_dir = root / "raw-history-leak"
         observation_error_leak_dir = root / "observation-error-leak"
         sample_field_leak_dir = root / "sample-field-leak"
+        warning_error_leak_dir = root / "warning-error-leak"
         refresh_dir = root / "refresh"
         derived_dir = root / "derived"
         for directory in [healthy_dir, modified_dir, missing_dir, untracked_dir]:
@@ -15454,6 +15530,33 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             ["burp-history-observations.jsonl", "evidence-appendix.json", "quote-collection.json"],
         )
 
+        warning_error_leak_dir.mkdir(parents=True)
+        write_json(
+            warning_error_leak_dir / "transaction-decoder-selftest.json",
+            {
+                "generated_at": utc_now(),
+                "status": "failed",
+                "error": "Decoder raw error Authorization: Bearer should-not-appear",
+            },
+        )
+        write_json(
+            warning_error_leak_dir / "transaction-intent.json",
+            {
+                "generated_at": utc_now(),
+                "transactions": [
+                    {
+                        "id": "TX-warning-leak",
+                        "warnings": ["token=should-not-appear"],
+                    }
+                ],
+                "warnings": ["api_key=should-not-appear"],
+            },
+        )
+        write_minimal_manifest(
+            warning_error_leak_dir,
+            ["transaction-decoder-selftest.json", "transaction-intent.json"],
+        )
+
         healthy = build_single_artifact_health(healthy_dir)
         modified = build_single_artifact_health(modified_dir)
         missing = build_single_artifact_health(missing_dir)
@@ -15473,6 +15576,8 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         observation_error_leak_text = json.dumps(observation_error_leak, sort_keys=True)
         sample_field_leak = build_single_artifact_health(sample_field_leak_dir)
         sample_field_leak_text = json.dumps(sample_field_leak, sort_keys=True)
+        warning_error_leak = build_single_artifact_health(warning_error_leak_dir)
+        warning_error_leak_text = json.dumps(warning_error_leak, sort_keys=True)
         sanitized_probe_artifact_sample = sanitize_probe_result_for_artifact(
             {
                 "probe_id": "sanitize-sample",
@@ -15506,6 +15611,11 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             source="self-test",
         )
         normalized_burp_history_sample_text = json.dumps(normalized_burp_history_sample, sort_keys=True)
+        decoder_fallback_reason_sample = redacted_decoder_fallback_reason(
+            "solana-web3.js decoder failed.",
+            "Authorization: Bearer should-not-appear",
+        )
+        decoder_fallback_reason_sample_text = json.dumps(decoder_fallback_reason_sample, sort_keys=True)
         aggregate = build_artifact_health([healthy_dir, modified_dir, missing_dir, untracked_dir])
         refresh_health = build_artifact_health([refresh_dir])
         refresh_output = refresh_dir / "artifact-health.json"
@@ -15778,6 +15888,37 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "actual": normalized_burp_history_sample,
         },
         {
+            "id": "artifact-health-detects-warning-and-transaction-decoder-error-leaks",
+            "passed": (
+                warning_error_leak.get("status") == "failed"
+                and {
+                    "artifact-warning-sensitive-value",
+                    "transaction-decoder-selftest-error-raw-string",
+                }.issubset({str(issue.get("reason")) for issue in warning_error_leak.get("security_issues", []) or []})
+                and "should-not-appear" not in warning_error_leak_text
+                and "Authorization: Bearer" not in warning_error_leak_text
+                and "token=" not in warning_error_leak_text
+                and "api_key=" not in warning_error_leak_text
+            ),
+            "expected": "artifact-health fails when transaction decoder errors or artifact warnings contain raw sensitive text without echoing leaked values",
+            "actual": {
+                "status": warning_error_leak.get("status"),
+                "security_issues": warning_error_leak.get("security_issues"),
+            },
+        },
+        {
+            "id": "decoder-fallback-reason-redacts-error-text",
+            "passed": (
+                decoder_fallback_reason_sample.get("summary") == "solana-web3.js decoder failed."
+                and "should-not-appear" not in decoder_fallback_reason_sample_text
+                and "Authorization: Bearer" not in decoder_fallback_reason_sample_text
+                and isinstance(decoder_fallback_reason_sample.get("error"), dict)
+                and decoder_fallback_reason_sample.get("error", {}).get("message_redacted") is True
+            ),
+            "expected": "decoder fallback reasons keep a readable summary and redact command output text",
+            "actual": decoder_fallback_reason_sample,
+        },
+        {
             "id": "artifact-health-detects-target-lock-error-leaks",
             "passed": (
                 target_lock_error_leak.get("status") == "failed"
@@ -15974,6 +16115,8 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "target_lock_error_leak": target_lock_error_leak,
             "raw_history_leak": raw_history_leak,
             "observation_error_leak": observation_error_leak,
+            "sample_field_leak": sample_field_leak,
+            "warning_error_leak": warning_error_leak,
             "aggregate": aggregate,
             "refresh_stale_before": refresh_stale_before,
             "refreshed_health": refreshed_health,
@@ -18082,7 +18225,14 @@ def collect_transaction_candidates(
     return candidates
 
 
-def fallback_decode_transactions(candidates: list[dict[str, Any]], reason: str) -> dict[str, Any]:
+def redacted_decoder_fallback_reason(summary: str, error: Any | None = None) -> dict[str, Any]:
+    reason: dict[str, Any] = {"summary": summary}
+    if error not in (None, ""):
+        reason["error"] = redacted_error_summary(error)
+    return reason
+
+
+def fallback_decode_transactions(candidates: list[dict[str, Any]], reason: Any) -> dict[str, Any]:
     transactions = []
     for candidate in candidates:
         decoded = decode_base64_candidate(candidate["base64"])
@@ -18119,7 +18269,13 @@ def node_decode_transactions(
     if not node_path.exists():
         fallback = command_result(["node", "-v"])
         if not fallback["ok"]:
-            return fallback_decode_transactions(candidates, f"Node not found at {node}")
+            return fallback_decode_transactions(
+                candidates,
+                redacted_decoder_fallback_reason(
+                    "Node executable was not available for transaction decoding.",
+                    f"Node not found at {node}; node -v output: {fallback.get('output')}",
+                ),
+            )
         node = "node"
 
     script = """
@@ -18215,7 +18371,13 @@ console.log(JSON.stringify({
 """
 
     if not source_root.is_dir():
-        return fallback_decode_transactions(candidates, f"Source root not found: {source_root}")
+        return fallback_decode_transactions(
+            candidates,
+            redacted_decoder_fallback_reason(
+                "Source root was not available for transaction decoding.",
+                f"Source root not found: {source_root}",
+            ),
+        )
 
     proc = subprocess.run(
         [node, "--input-type=module", "--eval", script],
@@ -18231,7 +18393,7 @@ console.log(JSON.stringify({
     if proc.returncode != 0:
         return fallback_decode_transactions(
             candidates,
-            f"solana-web3.js decoder failed: {proc.stdout[-1000:]}",
+            redacted_decoder_fallback_reason("solana-web3.js decoder failed.", proc.stdout),
         )
 
     try:
@@ -18239,7 +18401,7 @@ console.log(JSON.stringify({
     except json.JSONDecodeError:
         return fallback_decode_transactions(
             candidates,
-            f"solana-web3.js decoder returned non-JSON output: {proc.stdout[-1000:]}",
+            redacted_decoder_fallback_reason("solana-web3.js decoder returned non-JSON output.", proc.stdout),
         )
 
 
@@ -18607,15 +18769,20 @@ def generate_synthetic_transaction_payload(
     if not node_path.exists():
         fallback = command_result(["node", "-v"])
         if not fallback["ok"]:
-            return {"ok": False, "error": f"Node not found at {node}"}
+            return {
+                "ok": False,
+                "error": redacted_error_summary(
+                    f"Node not found at {node}; node -v output: {fallback.get('output')}"
+                ),
+            }
         node = "node"
 
     expected = expected_mints_for_direction(direction)
     if expected is None:
-        return {"ok": False, "error": "direction must be buy or sell"}
+        return {"ok": False, "error": redacted_error_summary("direction must be buy or sell")}
 
     if not source_root.is_dir():
-        return {"ok": False, "error": f"Source root not found: {source_root}"}
+        return {"ok": False, "error": redacted_error_summary(f"Source root not found: {source_root}")}
 
     script = """
 import fs from 'node:fs'
@@ -18667,10 +18834,10 @@ console.log(JSON.stringify({
     )
 
     if proc.returncode != 0:
-        return {"ok": False, "error": proc.stdout[-1000:]}
+        return {"ok": False, "error": redacted_error_summary(proc.stdout)}
     parsed = parse_json_object(proc.stdout)
     if not parsed or not isinstance(parsed.get("base64"), str):
-        return {"ok": False, "error": f"unexpected self-test output: {proc.stdout[-1000:]}"}
+        return {"ok": False, "error": redacted_error_summary(f"unexpected self-test output: {proc.stdout}")}
     parsed["ok"] = True
     return parsed
 
