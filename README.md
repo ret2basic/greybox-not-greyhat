@@ -265,6 +265,7 @@ python3 scripts/inferforge.py decode-transactions
 python3 scripts/inferforge.py self-test-transactions
 python3 scripts/inferforge.py self-test-profile-routing
 python3 scripts/inferforge.py self-test-discovery-coverage
+python3 scripts/inferforge.py self-test-command-safety
 python3 scripts/inferforge.py self-test-review-blockers
 python3 scripts/inferforge.py review-blockers
 python3 scripts/inferforge.py collect-quote --direction buy --wallet EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR --amount-in 1000000
@@ -614,6 +615,7 @@ Key outputs:
 .greybox/review-blockers.json
 .greybox/review-blockers.md
 .greybox/discovery-coverage-selftest.json
+.greybox/command-safety-selftest.json
 .greybox/review-blockers-selftest.json
 .greybox/target-profile.json
 .greybox/strategy-registry.json

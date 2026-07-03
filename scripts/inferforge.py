@@ -51,6 +51,7 @@ MAX_REQUEST_CONTEXTS_PER_ENDPOINT = 6
 REDACTED_VALUE = "[redacted]"
 BASE64_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{80,}={0,2})(?![A-Za-z0-9+/=])")
 PLACEHOLDER_ENV_RE = re.compile(r"^YOUR_[A-Z0-9_]+_HERE$", re.IGNORECASE)
+COMMAND_PLACEHOLDER_RE = re.compile(r"REPLACE_WITH_[A-Z0-9_]+")
 MANIFEST_NAME = "artifact-manifest.json"
 TARGET_PROFILE_ARTIFACT = "target-profile.json"
 STRATEGY_REGISTRY_ARTIFACT = "strategy-registry.json"
@@ -62,6 +63,7 @@ DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
 REVIEW_BLOCKERS_MARKDOWN_ARTIFACT = "review-blockers.md"
 REVIEW_BLOCKERS_SELFTEST_ARTIFACT = "review-blockers-selftest.json"
+COMMAND_SAFETY_SELFTEST_ARTIFACT = "command-safety-selftest.json"
 REQUIRED_ARTIFACTS = [
     "index.html",
     "report.md",
@@ -127,6 +129,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     "profile-routing-selftest.json",
     DISCOVERY_COVERAGE_SELFTEST_ARTIFACT,
     REVIEW_BLOCKERS_SELFTEST_ARTIFACT,
+    COMMAND_SAFETY_SELFTEST_ARTIFACT,
     "transaction-intent-policy.json",
 ]
 INDEX_ARTIFACT_ORDER = [
@@ -139,6 +142,7 @@ INDEX_ARTIFACT_ORDER = [
     DISCOVERY_COVERAGE_ARTIFACT,
     DISCOVERY_COVERAGE_SELFTEST_ARTIFACT,
     REVIEW_BLOCKERS_SELFTEST_ARTIFACT,
+    COMMAND_SAFETY_SELFTEST_ARTIFACT,
     TARGET_PROFILE_ARTIFACT,
     STRATEGY_REGISTRY_ARTIFACT,
     PROFILE_VALIDATION_ARTIFACT,
@@ -10396,15 +10400,18 @@ def normalize_manual_placeholder_command(command: str) -> str:
 
 def classify_verification_command(command: str, *, source: str, item_status: str | None = None) -> dict[str, Any]:
     normalized = normalize_manual_placeholder_command(str(command))
-    placeholders = [
-        token
-        for token in [
-            PLACEHOLDER_REAL_WALLET,
-            PLACEHOLDER_APPROVED_POOL_ADDRESS,
-            PLACEHOLDER_APPROVED_CONCRETE_PATH,
-        ]
-        if token in normalized
+    known_placeholders = [
+        PLACEHOLDER_REAL_WALLET,
+        PLACEHOLDER_APPROVED_POOL_ADDRESS,
+        PLACEHOLDER_APPROVED_CONCRETE_PATH,
     ]
+    placeholders = sorted(
+        {
+            token
+            for token in [*known_placeholders, *COMMAND_PLACEHOLDER_RE.findall(normalized)]
+            if token in normalized
+        }
+    )
     shell_angle_tokens = [
         token
         for token in ["<", ">"]
@@ -10412,7 +10419,7 @@ def classify_verification_command(command: str, *, source: str, item_status: str
     ]
     unsafe_shell_operators = [
         token
-        for token in ["&&", "||", ";", "`", "$("]
+        for token in ["&&", "||", ";", "`", "$(", "|", "\n", "\r"]
         if token in normalized
     ]
     issues = []
@@ -10479,6 +10486,228 @@ def command_safety_summary(command_refs: list[dict[str, Any]]) -> dict[str, Any]
         "placeholder_counts": placeholder_counts,
         "issue_counts": issue_counts,
         "unsafe_template_count": classification_counts.get("unsafe-template", 0),
+    }
+
+
+def build_command_safety_selftest() -> dict[str, Any]:
+    cases = [
+        {
+            "id": "ready-command",
+            "command": "python3 scripts/inferforge.py audit --no-ws",
+            "item_status": "ready",
+            "expected_classification": "ready",
+            "expected_runnable": True,
+            "expected_requires_manual_input": False,
+            "expected_blocked_external": False,
+        },
+        {
+            "id": "known-placeholder",
+            "command": f"python3 scripts/inferforge.py collect-quote --wallet {PLACEHOLDER_REAL_WALLET}",
+            "item_status": "ready",
+            "expected_classification": "manual-template",
+            "expected_placeholders": [PLACEHOLDER_REAL_WALLET],
+        },
+        {
+            "id": "generic-placeholder",
+            "command": "python3 scripts/inferforge.py collect --token REPLACE_WITH_API_TOKEN",
+            "item_status": "ready",
+            "expected_classification": "manual-template",
+            "expected_placeholders": ["REPLACE_WITH_API_TOKEN"],
+        },
+        {
+            "id": "review-gated-command",
+            "command": "python3 scripts/inferforge.py burp-sync --observe",
+            "item_status": "manual-review",
+            "expected_classification": "review-gated",
+            "expected_runnable": False,
+            "expected_requires_manual_input": True,
+        },
+        {
+            "id": "external-blocked-command",
+            "command": "python3 scripts/inferforge.py decode-transactions --input .greybox/transaction-payloads.json",
+            "item_status": "blocked-external",
+            "expected_classification": "review-gated",
+            "expected_runnable": False,
+            "expected_requires_manual_input": False,
+            "expected_blocked_external": True,
+        },
+        {
+            "id": "angle-placeholder-unsafe",
+            "command": "python3 scripts/inferforge.py promote-observation-candidate --path <approved-path>",
+            "item_status": "ready",
+            "expected_classification": "unsafe-template",
+            "expected_issues": ["shell-angle-placeholder-or-redirection"],
+        },
+        {
+            "id": "control-operator-unsafe",
+            "command": "python3 scripts/inferforge.py audit; rm -rf .greybox",
+            "item_status": "ready",
+            "expected_classification": "unsafe-template",
+            "expected_issues": ["shell-control-operator"],
+        },
+        {
+            "id": "pipe-operator-unsafe",
+            "command": "python3 scripts/inferforge.py audit | tee report.log",
+            "item_status": "ready",
+            "expected_classification": "unsafe-template",
+            "expected_issues": ["shell-control-operator"],
+        },
+        {
+            "id": "newline-operator-unsafe",
+            "command": "python3 scripts/inferforge.py audit\npython3 scripts/inferforge.py manifest",
+            "item_status": "ready",
+            "expected_classification": "unsafe-template",
+            "expected_issues": ["shell-control-operator"],
+        },
+    ]
+
+    results = []
+    assertions = []
+    for case in cases:
+        result = classify_verification_command(
+            str(case["command"]),
+            source=f"command-safety-selftest:{case['id']}",
+            item_status=str(case.get("item_status") or ""),
+        )
+        results.append({**case, "result": result})
+        assertions.append(
+            {
+                "id": f"{case['id']}:classification",
+                "passed": result.get("classification") == case.get("expected_classification"),
+                "expected": case.get("expected_classification"),
+                "actual": result.get("classification"),
+            }
+        )
+        for key, result_key in [
+            ("expected_runnable", "runnable"),
+            ("expected_requires_manual_input", "requires_manual_input"),
+            ("expected_blocked_external", "blocked_external"),
+        ]:
+            if key in case:
+                assertions.append(
+                    {
+                        "id": f"{case['id']}:{result_key}",
+                        "passed": result.get(result_key) == case.get(key),
+                        "expected": case.get(key),
+                        "actual": result.get(result_key),
+                    }
+                )
+        for placeholder in case.get("expected_placeholders", []) or []:
+            assertions.append(
+                {
+                    "id": f"{case['id']}:placeholder:{placeholder}",
+                    "passed": placeholder in (result.get("placeholders", []) or []),
+                    "expected": placeholder,
+                    "actual": result.get("placeholders", []),
+                }
+            )
+        for issue in case.get("expected_issues", []) or []:
+            assertions.append(
+                {
+                    "id": f"{case['id']}:issue:{issue}",
+                    "passed": issue in (result.get("issues", []) or []),
+                    "expected": issue,
+                    "actual": result.get("issues", []),
+                }
+            )
+
+    summary = command_safety_summary([item["result"] for item in results])
+    queue_items = [
+        {
+            "id": "READY",
+            "status": "ready",
+            "commands": ["python3 scripts/inferforge.py coverage"],
+        },
+        {
+            "id": "MANUAL",
+            "status": "manual-review",
+            "commands": [
+                f"python3 scripts/inferforge.py collect-quote --wallet {PLACEHOLDER_REAL_WALLET}",
+                "python3 scripts/inferforge.py burp-sync --observe",
+            ],
+            "review_candidates": [
+                {
+                    "id": "candidate",
+                    "command_templates": [
+                        f"python3 scripts/inferforge.py promote-observation-candidate --path {PLACEHOLDER_APPROVED_CONCRETE_PATH}",
+                        "python3 scripts/inferforge.py audit --include-external",
+                    ],
+                }
+            ],
+        },
+        {
+            "id": "UNSAFE",
+            "status": "ready",
+            "commands": ["python3 scripts/inferforge.py audit && python3 scripts/inferforge.py manifest"],
+        },
+        {
+            "id": "EXTERNAL",
+            "status": "blocked-external",
+            "commands": ["python3 scripts/inferforge.py decode-transactions --input .greybox/transaction-payloads.json"],
+        },
+    ]
+    queue_summary = annotate_verification_queue_commands(queue_items)
+    queue_counts = queue_summary.get("classification_counts", {})
+    queue_assertions = [
+        {
+            "id": "queue-ready-count",
+            "passed": queue_counts.get("ready") == 1,
+            "expected": 1,
+            "actual": queue_counts.get("ready"),
+        },
+        {
+            "id": "queue-manual-template-count",
+            "passed": queue_counts.get("manual-template") == 2,
+            "expected": 2,
+            "actual": queue_counts.get("manual-template"),
+        },
+        {
+            "id": "queue-review-gated-count",
+            "passed": queue_counts.get("review-gated") == 3,
+            "expected": 3,
+            "actual": queue_counts.get("review-gated"),
+        },
+        {
+            "id": "queue-unsafe-template-count",
+            "passed": queue_summary.get("unsafe_template_count") == 1,
+            "expected": 1,
+            "actual": queue_summary.get("unsafe_template_count"),
+        },
+        {
+            "id": "queue-blocked-external-count",
+            "passed": queue_summary.get("blocked_external") == 1,
+            "expected": 1,
+            "actual": queue_summary.get("blocked_external"),
+        },
+        {
+            "id": "queue-requires-manual-input-count",
+            "passed": queue_summary.get("requires_manual_input") == 5,
+            "expected": 5,
+            "actual": queue_summary.get("requires_manual_input"),
+        },
+    ]
+    assertions.extend(queue_assertions)
+    failed = [item for item in assertions if not item["passed"]]
+    return {
+        "generated_at": utc_now(),
+        "status": "failed" if failed else "passed",
+        "summary": {
+            "cases": len(cases),
+            "assertions": len(assertions),
+            "failed": len(failed),
+            "classification_counts": summary.get("classification_counts", {}),
+            "placeholder_counts": summary.get("placeholder_counts", {}),
+            "issue_counts": summary.get("issue_counts", {}),
+            "queue_classification_counts": queue_counts,
+            "queue_unsafe_template_count": queue_summary.get("unsafe_template_count"),
+        },
+        "cases": results,
+        "queue": {
+            "summary": queue_summary,
+            "items": queue_items,
+        },
+        "assertions": assertions,
+        "safety": "Synthetic command-safety self-test. It classifies inert strings only and executes no generated commands.",
     }
 
 
@@ -17240,6 +17469,27 @@ def run_review_blockers_selftest(args: argparse.Namespace) -> int:
     return 0 if result["status"] == "passed" else 1
 
 
+def run_command_safety_selftest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, _target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result = build_command_safety_selftest()
+    result["current_profile_context"] = profile_summary(profile)
+    output_path = artifact_dir / COMMAND_SAFETY_SELFTEST_ARTIFACT
+    write_json(output_path, result)
+    print(f"Command safety self-test: {result['status']}")
+    print(
+        "Cases: "
+        f"{result['summary']['cases']} cases, "
+        f"assertions={result['summary']['assertions']}, "
+        f"classifications={json.dumps(result['summary']['classification_counts'], sort_keys=True)}"
+    )
+    failed = [item for item in result.get("assertions", []) if not item.get("passed")]
+    if failed:
+        print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
+    print(f"Wrote {output_path}")
+    return 0 if result["status"] == "passed" else 1
+
+
 def run_manifest(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -17347,6 +17597,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
     if not args.skip_self_tests:
         for label, subcommand in [
             ("self-test-discovery-coverage", "self-test-discovery-coverage"),
+            ("self-test-command-safety", "self-test-command-safety"),
             ("self-test-review-blockers", "self-test-review-blockers"),
         ]:
             command = inferforge_cli_command(
@@ -18693,6 +18944,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a static self-test for discovery-coverage classification and gates",
     )
     discovery_coverage_selftest.set_defaults(func=run_discovery_coverage_selftest)
+
+    command_safety_selftest = sub.add_parser(
+        "self-test-command-safety",
+        help="Run a static self-test for verification command safety classification",
+    )
+    command_safety_selftest.set_defaults(func=run_command_safety_selftest)
 
     review_blockers_selftest = sub.add_parser(
         "self-test-review-blockers",
