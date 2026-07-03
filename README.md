@@ -621,10 +621,10 @@ is missing from the manifest, detects stale derived outputs such as
 `report.md`, `index.html`, `reproduction-steps.md`, and `review-blockers.md`,
 checks `mcp_actions` audit records for raw sensitive arguments, raw result text,
 or raw exception messages, checks `burp-mcp-sync.json` failure and Intercept
-error fields plus `burp-observation-run.json` blocked errors for redacted error
-summaries, checks probe and warm-up artifacts for raw bodies, unredacted body
-samples, and raw error strings, flags persisted default raw Burp MCP history
-files as security hygiene issues,
+error fields plus `burp-observation-run.json` top-level/nested errors for
+redacted error summaries, checks probe, warm-up, and Burp observation artifacts
+for raw bodies, unredacted body samples, and raw error strings, flags persisted
+default raw Burp MCP history files as security hygiene issues,
 carries forward key gate statuses such as black-box coverage, discovery
 coverage, verification queue, review blockers, response deltas,
 source-peek requests, and Burp observation coverage, and

@@ -14625,6 +14625,51 @@ def probe_result_jsonl_security_issues(path: Path) -> list[dict[str, Any]]:
     return issues
 
 
+def burp_observation_run_security_issues_in_value(
+    value: Any,
+    *,
+    file_name: str,
+    path: str = "$",
+) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        issues.extend(
+            redacted_error_field_security_issues(
+                value.get("error"),
+                file_name=file_name,
+                path=f"{path}.error",
+                reason_prefix="burp-observation-run-error",
+            )
+        )
+        body_sample = value.get("body_sample")
+        if isinstance(body_sample, str) and contains_unredacted_secret_text(body_sample):
+            issues.append(
+                {
+                    "file": file_name,
+                    "path": f"{path}.body_sample",
+                    "reason": "burp-observation-run-body-sample-sensitive-value",
+                }
+            )
+        for key, child in value.items():
+            issues.extend(
+                burp_observation_run_security_issues_in_value(
+                    child,
+                    file_name=file_name,
+                    path=f"{path}.{key}",
+                )
+            )
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            issues.extend(
+                burp_observation_run_security_issues_in_value(
+                    child,
+                    file_name=file_name,
+                    path=f"{path}[{index}]",
+                )
+            )
+    return issues
+
+
 def redacted_error_field_security_issues(value: Any, *, file_name: str, path: str, reason_prefix: str) -> list[dict[str, Any]]:
     if value is None or value == "":
         return []
@@ -14649,14 +14694,7 @@ def mcp_action_audit_security_issues(parsed_json_by_name: dict[str, Any]) -> lis
         if file_name == "burp-mcp-sync.json":
             issues.extend(burp_sync_error_security_issues(doc, file_name=file_name))
         if file_name == "burp-observation-run.json":
-            issues.extend(
-                redacted_error_field_security_issues(
-                    doc.get("error"),
-                    file_name=file_name,
-                    path="$.error",
-                    reason_prefix="burp-observation-run-error",
-                )
-            )
+            issues.extend(burp_observation_run_security_issues_in_value(doc, file_name=file_name))
         if file_name == "regression-suite.json":
             issues.extend(regression_suite_output_security_issues(doc, file_name=file_name))
         if file_name == "warmup-results.json":
@@ -15279,7 +15317,17 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                 "generated_at": utc_now(),
                 "status": "blocked-profile-validation",
                 "error": "Observation profile raw error should-not-appear",
-                "requests": [],
+                "requests": [
+                    {
+                        "id": "observe-request-raw-error",
+                        "error": "Observation request raw error should-not-appear",
+                        "body_sample": "Authorization: Bearer should-not-appear",
+                    }
+                ],
+                "websocket_upgrade": {
+                    "id": "observe-ws-raw-error",
+                    "error": "Observation websocket raw error should-not-appear",
+                },
             },
         )
         write_minimal_manifest(observation_error_leak_dir, ["burp-observation-run.json"])
@@ -15594,11 +15642,15 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                 observation_error_leak.get("status") == "failed"
                 and {
                     "burp-observation-run-error-raw-string",
+                    "burp-observation-run-body-sample-sensitive-value",
                 }.issubset({str(issue.get("reason")) for issue in observation_error_leak.get("security_issues", []) or []})
                 and "should-not-appear" not in observation_error_leak_text
                 and "Observation profile raw error" not in observation_error_leak_text
+                and "Observation request raw error" not in observation_error_leak_text
+                and "Observation websocket raw error" not in observation_error_leak_text
+                and "Authorization: Bearer" not in observation_error_leak_text
             ),
-            "expected": "artifact-health fails when burp-observation-run artifacts contain raw error strings without echoing leaked values",
+            "expected": "artifact-health fails when burp-observation-run artifacts contain raw error strings or unredacted body samples without echoing leaked values",
             "actual": {
                 "status": observation_error_leak.get("status"),
                 "security_issues": observation_error_leak.get("security_issues"),
@@ -20324,6 +20376,7 @@ def run_burp_observe(args: argparse.Namespace) -> int:
         },
     }
     output_path = artifact_dir / "burp-observation-run.json"
+    redact_probe_body_samples_for_artifact(artifact)
     write_json(output_path, artifact)
 
     print(f"Burp proxy open: {proxy_open}")
