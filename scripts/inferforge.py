@@ -4236,6 +4236,89 @@ def call_mcp_tool_with_audit_or_fallback(
         ) from fallback_error
 
 
+def list_mcp_tools_with_audit(client: Any, audit_artifact: dict[str, Any]) -> list[str]:
+    try:
+        tools = client.list_tools()
+    except Exception as error:
+        append_mcp_action_audit(
+            audit_artifact,
+            tool="tools/list",
+            arguments={},
+            status="failed",
+            error=error,
+        )
+        raise
+
+    names = sorted_unique_strings([
+        str(tool.get("name"))
+        for tool in tools
+        if isinstance(tool, dict) and tool.get("name") is not None
+    ])
+    append_mcp_action_audit(
+        audit_artifact,
+        tool="tools/list",
+        arguments={},
+        status="succeeded",
+        result_text=json.dumps({"tools": names}, sort_keys=True),
+    )
+    return names
+
+
+def call_mcp_history_tool_with_inventory(
+    client: Any,
+    audit_artifact: dict[str, Any],
+    *,
+    primary_tool: str,
+    primary_arguments: dict[str, Any] | None,
+    fallback_tool: str,
+    fallback_arguments: dict[str, Any] | None,
+    available_tools: list[str] | None,
+) -> dict[str, Any]:
+    if available_tools is None:
+        history_read = call_mcp_tool_with_audit_or_fallback(
+            client,
+            audit_artifact,
+            primary_tool=primary_tool,
+            primary_arguments=primary_arguments,
+            fallback_tool=fallback_tool,
+            fallback_arguments=fallback_arguments,
+        )
+        history_read["selection_reason"] = "tools-list-unavailable"
+        return history_read
+
+    available_set = set(available_tools)
+    if primary_tool in available_set:
+        history_read = call_mcp_tool_with_audit_or_fallback(
+            client,
+            audit_artifact,
+            primary_tool=primary_tool,
+            primary_arguments=primary_arguments,
+            fallback_tool=fallback_tool,
+            fallback_arguments=fallback_arguments,
+        )
+        history_read["selection_reason"] = f"{primary_tool} listed by tools/list"
+        return history_read
+
+    if fallback_tool in available_set:
+        result, raw_text = call_mcp_tool_with_audit(
+            client,
+            audit_artifact,
+            tool=fallback_tool,
+            arguments=fallback_arguments,
+        )
+        return {
+            "tool": fallback_tool,
+            "arguments": fallback_arguments or {},
+            "result": result,
+            "raw_text": raw_text,
+            "fallback_used": True,
+            "fallback_reason": f"{primary_tool} not listed by tools/list; using {fallback_tool} fallback",
+            "selection_reason": "tools-list-primary-missing",
+        }
+
+    raise RuntimeError(f"Neither {primary_tool} nor {fallback_tool} is listed by Burp MCP tools/list")
+
+
 BURP_MCP_REQUIRED_CAPABILITY_TOOLS = {
     "proxy-http-history": ["get_proxy_http_history_regex", "get_proxy_http_history"],
     "proxy-websocket-history": ["get_proxy_websocket_history_regex", "get_proxy_websocket_history"],
@@ -15970,6 +16053,29 @@ def build_no_write_selftest() -> dict[str, Any]:
         fallback_arguments={"count": 10, "offset": 0},
     )
     fallback_action_text = json.dumps(fallback_audit_artifact.get("mcp_actions", []), sort_keys=True)
+
+    class PlainOnlyMcpClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+            self.calls.append((name, arguments or {}))
+            if name == "get_proxy_http_history":
+                return {"content": [{"type": "text", "text": "[]"}]}
+            raise RuntimeError(f"unexpected tool {name}")
+
+    plain_only_client = PlainOnlyMcpClient()
+    plain_only_audit_artifact: dict[str, Any] = {"mcp_actions": []}
+    plain_only_history_read = call_mcp_history_tool_with_inventory(
+        plain_only_client,
+        plain_only_audit_artifact,
+        primary_tool="get_proxy_http_history_regex",
+        primary_arguments={"count": 10, "offset": 0, "regex": "Authorization: Bearer test"},
+        fallback_tool="get_proxy_http_history",
+        fallback_arguments={"count": 10, "offset": 0},
+        available_tools=["get_proxy_http_history"],
+    )
+    plain_only_action_text = json.dumps(plain_only_audit_artifact.get("mcp_actions", []), sort_keys=True)
     assertions = [
         {
             "id": "review-candidates-no-write-skips-artifacts",
@@ -16335,6 +16441,26 @@ def build_no_write_selftest() -> dict[str, Any]:
                 "read": fallback_history_read,
                 "called_tools": [name for name, _arguments in fallback_client.calls],
                 "actions": fallback_audit_artifact.get("mcp_actions", []),
+            },
+        },
+        {
+            "id": "mcp-history-read-uses-listed-plain-tool-without-regex-attempt",
+            "passed": (
+                plain_only_history_read.get("tool") == "get_proxy_http_history"
+                and plain_only_history_read.get("fallback_used") is True
+                and plain_only_history_read.get("selection_reason") == "tools-list-primary-missing"
+                and "not listed by tools/list" in str(plain_only_history_read.get("fallback_reason"))
+                and [name for name, _arguments in plain_only_client.calls] == ["get_proxy_http_history"]
+                and len(plain_only_audit_artifact.get("mcp_actions", [])) == 1
+                and plain_only_audit_artifact["mcp_actions"][0].get("status") == "succeeded"
+                and "regex" not in plain_only_audit_artifact["mcp_actions"][0].get("arguments", {})
+                and "Authorization: Bearer test" not in plain_only_action_text
+            ),
+            "expected": "MCP history reads use the listed non-regex history tool directly when tools/list shows the regex tool is unavailable",
+            "actual": {
+                "read": plain_only_history_read,
+                "called_tools": [name for name, _arguments in plain_only_client.calls],
+                "actions": plain_only_audit_artifact.get("mcp_actions", []),
             },
         },
     ]
@@ -21407,6 +21533,21 @@ def run_burp_sync(args: argparse.Namespace) -> int:
         "profile": profile_summary(profile),
         "target": target,
         "mcp_url": args.mcp_url,
+        "mcp_tool_inventory": {
+            "status": "not-checked",
+            "mcp_endpoint": args.mcp_url,
+            "tool_count": 0,
+            "tools": [],
+            "required_capabilities": {},
+            "required_summary": {
+                "available": 0,
+                "missing": len(BURP_MCP_REQUIRED_CAPABILITY_TOOLS),
+                "total": len(BURP_MCP_REQUIRED_CAPABILITY_TOOLS),
+            },
+            "disabled_capabilities": {},
+            "mcp_actions": [],
+            "safety": "Tool inventory is read-only when available; history sync still avoids Scanner, Intruder, fuzzing, signing, and transaction submission.",
+        },
         "history_regex": history_regex,
         "http_history": {
             "requested_tool": "get_proxy_http_history_regex",
@@ -21416,6 +21557,7 @@ def run_burp_sync(args: argparse.Namespace) -> int:
             "offset": args.offset,
             "fallback_used": False,
             "fallback_reason": None,
+            "selection_reason": None,
             "filter_mode": "burp-mcp-regex",
             "raw_output": str(raw_path),
         },
@@ -21459,13 +21601,41 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                     sync_artifact["intercept"]["error"] = redacted_error_summary(error)
                     raise
 
-            http_read = call_mcp_tool_with_audit_or_fallback(
+            available_mcp_tools: list[str] | None = None
+            try:
+                available_mcp_tools = list_mcp_tools_with_audit(client, sync_artifact)
+                listed_inventory = {
+                    "status": "listed",
+                    "mcp_endpoint": args.mcp_url,
+                    "safety": "Read-only MCP tools/list inventory inside burp-sync. It does not call Burp Scanner, send HTTP requests, fuzz, sign wallets, or submit transactions.",
+                }
+                listed_inventory.update(summarize_burp_mcp_tool_inventory(available_mcp_tools))
+                sync_artifact["mcp_tool_inventory"] = listed_inventory
+            except Exception as error:
+                sync_artifact["mcp_tool_inventory"] = {
+                    "status": "unavailable",
+                    "mcp_endpoint": args.mcp_url,
+                    "tool_count": 0,
+                    "tools": [],
+                    "required_capabilities": {},
+                    "required_summary": {
+                        "available": 0,
+                        "missing": len(BURP_MCP_REQUIRED_CAPABILITY_TOOLS),
+                        "total": len(BURP_MCP_REQUIRED_CAPABILITY_TOOLS),
+                    },
+                    "disabled_capabilities": {},
+                    "error": redacted_error_summary(error),
+                    "safety": "tools/list failed; burp-sync kept the older regex-then-fallback history read path.",
+                }
+
+            http_read = call_mcp_history_tool_with_inventory(
                 client,
                 sync_artifact,
                 primary_tool="get_proxy_http_history_regex",
                 primary_arguments={"count": args.count, "offset": args.offset, "regex": history_regex},
                 fallback_tool="get_proxy_http_history",
                 fallback_arguments={"count": args.count, "offset": args.offset},
+                available_tools=available_mcp_tools,
             )
             raw_text = str(http_read["raw_text"])
             sync_artifact["http_history"].update(
@@ -21473,6 +21643,7 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                     "tool": http_read["tool"],
                     "fallback_used": http_read["fallback_used"],
                     "fallback_reason": http_read["fallback_reason"],
+                    "selection_reason": http_read.get("selection_reason"),
                     "filter_mode": "post-import-target-filter" if http_read["fallback_used"] else "burp-mcp-regex",
                 }
             )
@@ -21480,13 +21651,14 @@ def run_burp_sync(args: argparse.Namespace) -> int:
             raw_path.write_text(raw_text, encoding="utf-8")
 
             if args.websocket_history:
-                ws_read = call_mcp_tool_with_audit_or_fallback(
+                ws_read = call_mcp_history_tool_with_inventory(
                     client,
                     sync_artifact,
                     primary_tool="get_proxy_websocket_history_regex",
                     primary_arguments={"count": args.count, "offset": args.offset, "regex": history_regex},
                     fallback_tool="get_proxy_websocket_history",
                     fallback_arguments={"count": args.count, "offset": args.offset},
+                    available_tools=available_mcp_tools,
                 )
                 ws_raw_text = str(ws_read["raw_text"])
                 ws_raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -21499,6 +21671,7 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                     "offset": args.offset,
                     "fallback_used": ws_read["fallback_used"],
                     "fallback_reason": ws_read["fallback_reason"],
+                    "selection_reason": ws_read.get("selection_reason"),
                     "filter_mode": "post-import-target-filter" if ws_read["fallback_used"] else "burp-mcp-regex",
                     "raw_output": str(ws_raw_path),
                     "bytes": len(ws_raw_text.encode("utf-8")),

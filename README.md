@@ -383,10 +383,12 @@ of Burp MCP tool calls with sensitive request bodies, regex values, tokens, and
 secrets hashed or redacted; MCP exception messages are summarized by type,
 length, and SHA-256 instead of stored as raw text. Top-level `burp-sync` failure
 metadata and Intercept-disable errors use the same redacted error shape.
-`burp-sync` prefers the regex history tools and falls back to the non-regex
-HTTP/WebSocket history tools when a Burp MCP version does not expose or cannot
-run the regex variant; fallback imports still apply the local target/profile
-filters before writing normalized
+`burp-sync` first performs a read-only `tools/list` inventory when available,
+prefers the regex history tools, and directly selects the non-regex
+HTTP/WebSocket history tools when a Burp MCP version does not list the regex
+variant. If inventory is unavailable or a listed regex tool still fails, it uses
+the older audited regex-then-fallback path. Fallback imports still apply the
+local target/profile filters before writing normalized
 observations:
 
 ```bash
