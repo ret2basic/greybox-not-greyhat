@@ -11671,6 +11671,20 @@ def top_review_blocker_group_summaries(review_blockers: dict[str, Any] | None, *
     return [format_review_blocker_group_summary(group) for group in groups[:limit]]
 
 
+def review_blocker_group_command_templates(group: dict[str, Any]) -> list[str]:
+    candidates = group.get("review_candidates", []) or []
+    return ordered_unique_strings(
+        [
+            *(group.get("commands", []) or []),
+            *[
+                command
+                for candidate in candidates
+                for command in candidate.get("command_templates", []) or []
+            ],
+        ]
+    )
+
+
 def compact_review_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {}
     for field in ["id", "cluster", "type", "status", "method", "path_template", "example_path"]:
@@ -12760,10 +12774,13 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             "passed": (
                 no_write_return_code == 0
                 and "Review blockers: needs-human-review" in no_write_stdout
+                and "command_templates:" in no_write_stdout
+                and "promote-observation-candidate" in no_write_stdout
+                and "burp-sync --observe" in no_write_stdout
                 and "No files written (--no-write)." in no_write_stdout
                 and not any(no_write_outputs_exist.values())
             ),
-            "expected": "review-blockers --no-write prints summary without writing output artifacts or manifests",
+            "expected": "review-blockers --no-write prints actionable group commands without writing output artifacts or manifests",
             "actual": {
                 "return_code": no_write_return_code,
                 "stdout": no_write_stdout.splitlines(),
@@ -12886,16 +12903,7 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
                 lines.append(f"    - `{candidate.get('id')}`{suffix}")
             if len(candidates) > 4:
                 lines.append(f"    - ... +{len(candidates) - 4} more candidates")
-        commands = ordered_unique_strings(
-            [
-                *(item.get("commands", []) or []),
-                *[
-                    command
-                    for candidate in candidates
-                    for command in candidate.get("command_templates", []) or []
-                ],
-            ]
-        )
+        commands = review_blocker_group_command_templates(item)
         if commands:
             lines.append("  - Command templates:")
             lines.append("    ```bash")
@@ -20553,8 +20561,16 @@ def run_review_blockers(args: argparse.Namespace) -> int:
     groups = review_blockers.get("groups", []) or []
     if groups:
         print("Groups:")
-        for group_summary in top_review_blocker_group_summaries(review_blockers, limit=8):
-            print(f"- {group_summary}")
+        for group in groups[:8]:
+            print(f"- {format_review_blocker_group_summary(group)}")
+            if no_write:
+                commands = review_blocker_group_command_templates(group)
+                if commands:
+                    print("  command_templates:")
+                    for command in commands[:3]:
+                        print(f"    - {inline_summary_text(command, max_chars=500)}")
+                    if len(commands) > 3:
+                        print(f"    - ... +{len(commands) - 3} more commands")
         if len(groups) > 8:
             if no_write:
                 print(f"- {len(groups) - 8} more group(s); rerun without --no-write to write the full blocker artifact")

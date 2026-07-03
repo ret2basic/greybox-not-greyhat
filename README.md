@@ -529,7 +529,9 @@ per-run evidence while the playbook shows de-duplicated next actions. Grouped
 human-review blockers preserve compact review-candidate path templates and
 command templates so the next manual approval step is visible without opening
 every individual blocker. The CLI prints the grouped blocker summaries first,
-including count, cluster, candidate ids, and next action. When `--check-dir` is
+including count, cluster, candidate ids, and next action. In `--no-write` mode,
+top groups with queued commands also print compact command templates so the
+approval step can be previewed without writing artifacts. When `--check-dir` is
 repeated, it builds a root-level rollup across multiple artifact directories:
 
 ```bash
