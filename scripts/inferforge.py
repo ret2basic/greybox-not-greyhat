@@ -10720,6 +10720,22 @@ def command_safety_summary(command_refs: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
+def format_command_safety_summary(summary: dict[str, Any]) -> str:
+    classification_counts = summary.get("classification_counts", {}) or {}
+    placeholder_counts = summary.get("placeholder_counts", {}) or {}
+    parts = [
+        f"commands={summary.get('commands', 0)}",
+        f"runnable={summary.get('runnable', 0)}",
+        f"manual={summary.get('requires_manual_input', 0)}",
+        f"external={summary.get('blocked_external', 0)}",
+        f"unsafe={summary.get('unsafe_template_count', 0)}",
+        f"classifications={json.dumps(classification_counts, sort_keys=True)}",
+    ]
+    if placeholder_counts:
+        parts.append(f"placeholders={json.dumps(placeholder_counts, sort_keys=True)}")
+    return " ".join(parts)
+
+
 def verification_queue_exit_code(verification_queue: dict[str, Any]) -> int:
     if verification_queue.get("status") == "invalid-command-templates":
         return 2
@@ -10885,6 +10901,7 @@ def build_command_safety_selftest() -> dict[str, Any]:
     ]
     queue_summary = annotate_verification_queue_commands(queue_items)
     queue_counts = queue_summary.get("classification_counts", {})
+    queue_safety_text = format_command_safety_summary(queue_summary)
     exit_code_cases = [
         {
             "id": "exit-code-ready",
@@ -10944,6 +10961,20 @@ def build_command_safety_selftest() -> dict[str, Any]:
             "expected": 5,
             "actual": queue_summary.get("requires_manual_input"),
         },
+        {
+            "id": "queue-summary-text-is-actionable",
+            "passed": (
+                "commands=7" in queue_safety_text
+                and "runnable=1" in queue_safety_text
+                and "manual=5" in queue_safety_text
+                and "external=1" in queue_safety_text
+                and "unsafe=1" in queue_safety_text
+                and f'"{PLACEHOLDER_APPROVED_CONCRETE_PATH}": 1' in queue_safety_text
+                and f'"{PLACEHOLDER_REAL_WALLET}": 1' in queue_safety_text
+            ),
+            "expected": "summary text includes runnable/manual/external/unsafe counts and placeholders",
+            "actual": queue_safety_text,
+        },
     ]
     for case in exit_code_cases:
         actual = verification_queue_exit_code({"status": case["status"]})
@@ -10974,6 +11005,7 @@ def build_command_safety_selftest() -> dict[str, Any]:
         "cases": results,
         "queue": {
             "summary": queue_summary,
+            "summary_text": queue_safety_text,
             "items": queue_items,
             "exit_code_cases": exit_code_cases,
         },
@@ -11442,10 +11474,7 @@ def write_reproduction_steps(artifact_dir: Path, verification_queue: dict[str, A
         f"- Target: `{verification_queue.get('target')}`",
         f"- Queue status: `{verification_queue.get('status')}`",
         f"- Items: `{verification_queue.get('summary', {}).get('items', 0)}`",
-        f"- Command safety: `{json.dumps(command_safety.get('classification_counts', {}), sort_keys=True)}`",
-        f"- Runnable commands: `{command_safety.get('runnable', 0)}`",
-        f"- Manual-template commands: `{command_safety.get('classification_counts', {}).get('manual-template', 0)}`",
-        f"- Unsafe command templates: `{command_safety.get('unsafe_template_count', 0)}`",
+        f"- Command safety: `{format_command_safety_summary(command_safety)}`",
         "",
         "## Safety",
         "",
@@ -11476,7 +11505,7 @@ def write_reproduction_steps(artifact_dir: Path, verification_queue: dict[str, A
         if commands:
             command_summary = (item.get("command_safety", {}) or {}).get("summary", {})
             if command_summary:
-                lines.append(f"- Command safety: `{json.dumps(command_summary.get('classification_counts', {}), sort_keys=True)}`")
+                lines.append(f"- Command safety: `{format_command_safety_summary(command_summary)}`")
             lines.append("")
             lines.append("Commands:")
             lines.append("")
@@ -11510,7 +11539,7 @@ def write_reproduction_steps(artifact_dir: Path, verification_queue: dict[str, A
                 if candidate.get("command_templates"):
                     command_summary = (candidate.get("command_safety", {}) or {}).get("summary", {})
                     if command_summary:
-                        lines.append(f"  - Command safety: `{json.dumps(command_summary.get('classification_counts', {}), sort_keys=True)}`")
+                        lines.append(f"  - Command safety: `{format_command_safety_summary(command_summary)}`")
                     lines.append("  - Command templates:")
                     for command in candidate.get("command_templates", []):
                         lines.append(f"    - `{command}`")
@@ -15674,15 +15703,11 @@ def generate_report(
     ]
     verification_summary = (verification_queue or {}).get("summary", {})
     command_safety_summary_doc = verification_summary.get("command_safety", {}) or {}
-    command_safety_counts = command_safety_summary_doc.get("classification_counts", {}) or {}
     verification_lines = [
         f"- Queue status: `{(verification_queue or {}).get('status', 'unknown')}`",
         f"- Queue items: `{verification_summary.get('items', 0)}`",
         f"- Status counts: `{json.dumps(verification_summary.get('status_counts', {}), sort_keys=True)}`",
-        f"- Command safety: `{json.dumps(command_safety_counts, sort_keys=True)}`",
-        f"- Runnable commands: `{command_safety_summary_doc.get('runnable', 0)}`",
-        f"- Manual-template commands: `{command_safety_counts.get('manual-template', 0)}`",
-        f"- Unsafe command templates: `{command_safety_summary_doc.get('unsafe_template_count', 0)}`",
+        f"- Command safety: `{format_command_safety_summary(command_safety_summary_doc)}`",
         "- Reproduction steps: `reproduction-steps.md`",
     ]
     review_blockers = load_optional_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT) or {}
@@ -16641,7 +16666,7 @@ def run_audit(args: argparse.Namespace) -> int:
     print(f"Verification queue: {verification_queue['status']}")
     print(
         "Command safety: "
-        f"{json.dumps(verification_queue['summary'].get('command_safety', {}).get('classification_counts', {}), sort_keys=True)}"
+        f"{format_command_safety_summary(verification_queue['summary'].get('command_safety', {}) or {})}"
     )
     print(f"Artifact manifest: {artifact_manifest['status']}")
     for row in unexpected:
@@ -19420,7 +19445,7 @@ def run_verification_queue(args: argparse.Namespace) -> int:
     )
     print(
         "Command safety: "
-        f"{json.dumps(verification_queue['summary'].get('command_safety', {}).get('classification_counts', {}), sort_keys=True)}"
+        f"{format_command_safety_summary(verification_queue['summary'].get('command_safety', {}) or {})}"
     )
     print(f"Wrote {verification_queue_path}")
     print(f"Wrote {reproduction_steps_path}")
