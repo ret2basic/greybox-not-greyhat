@@ -59,6 +59,7 @@ ROUTE_INVENTORY_ARTIFACT = "route-inventory.json"
 DISCOVERED_PROFILE_ARTIFACT = "discovered-profile.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
+REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
 REQUIRED_ARTIFACTS = [
     "index.html",
     "report.md",
@@ -119,6 +120,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     "artifact-health.json",
     "regression-suite.json",
     "orca-baseline.json",
+    REVIEW_BLOCKERS_ARTIFACT,
     "profile-routing-selftest.json",
     DISCOVERY_COVERAGE_SELFTEST_ARTIFACT,
     "transaction-intent-policy.json",
@@ -128,6 +130,7 @@ INDEX_ARTIFACT_ORDER = [
     MANIFEST_NAME,
     "artifact-health.json",
     "regression-suite.json",
+    REVIEW_BLOCKERS_ARTIFACT,
     DISCOVERY_COVERAGE_ARTIFACT,
     DISCOVERY_COVERAGE_SELFTEST_ARTIFACT,
     TARGET_PROFILE_ARTIFACT,
@@ -10959,6 +10962,268 @@ def write_reproduction_steps(artifact_dir: Path, verification_queue: dict[str, A
     (artifact_dir / "reproduction-steps.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
+def review_blocker_status_rank(status: str) -> int:
+    return {
+        "failed": 0,
+        "needs-profile-update": 1,
+        "needs-human-review": 2,
+        "ready-with-external-blockers": 3,
+        "ready": 4,
+    }.get(status, 9)
+
+
+def build_review_blockers(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    discovery_coverage: dict[str, Any] | None = None,
+    burp_observation_coverage: dict[str, Any] | None = None,
+    verification_queue: dict[str, Any] | None = None,
+    environment_readiness: dict[str, Any] | None = None,
+    artifact_health: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    blockers: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_blocker(
+        *,
+        blocker_id: str,
+        source: str,
+        category: str,
+        status: str,
+        title: str,
+        reason: str,
+        next_action: str | None = None,
+        priority: str = "medium",
+        cluster_id: str | None = None,
+        artifact_refs: list[str] | None = None,
+        commands: list[str] | None = None,
+        review_candidates: list[dict[str, Any]] | None = None,
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        key = f"{source}:{blocker_id}"
+        if key in seen:
+            return
+        seen.add(key)
+        row: dict[str, Any] = {
+            "id": blocker_id,
+            "source": source,
+            "category": category,
+            "status": status,
+            "priority": priority,
+            "title": title,
+            "reason": reason,
+            "next_action": next_action,
+            "cluster_id": cluster_id,
+            "artifact_refs": artifact_refs or [],
+            "commands": commands or [],
+            "review_candidates": review_candidates or [],
+        }
+        if evidence:
+            row["evidence"] = evidence
+        blockers.append(row)
+
+    for surface in (discovery_coverage or {}).get("surfaces", []) or []:
+        surface_status = str(surface.get("status") or "")
+        if surface_status not in {"review-gated", "source-only-context", "uncovered"}:
+            continue
+        category = "profile-update" if surface_status == "uncovered" else "human-review"
+        status = "needs-profile-update" if surface_status == "uncovered" else "needs-human-review"
+        add_blocker(
+            blocker_id=f"DISCOVERY-{surface.get('id')}",
+            source=DISCOVERY_COVERAGE_ARTIFACT,
+            category=category,
+            status=status,
+            priority="high" if surface_status == "uncovered" else "medium",
+            title=f"Static discovery surface {surface_status}: {surface.get('path') or surface.get('id')}",
+            reason=f"Discovery coverage marked this `{surface.get('type')}` surface as `{surface_status}`.",
+            next_action=surface.get("next_action"),
+            cluster_id=surface.get("declared_cluster_id") or (surface.get("profile_cluster_ids") or [None])[0],
+            artifact_refs=[DISCOVERY_COVERAGE_ARTIFACT, ROUTE_INVENTORY_ARTIFACT, TARGET_PROFILE_ARTIFACT],
+            review_candidates=surface.get("review_candidates", []),
+            evidence={
+                "type": surface.get("type"),
+                "path": surface.get("path"),
+                "methods": surface.get("methods", []),
+                "source_refs": surface.get("source_refs", []),
+                "profile_cluster_ids": surface.get("profile_cluster_ids", []),
+            },
+        )
+
+    for cluster in (burp_observation_coverage or {}).get("clusters", []) or []:
+        cluster_status = str(cluster.get("status") or "")
+        if cluster_status not in {
+            "needs-reviewed-observation-promotion",
+            "needs-manual-browser-flow",
+            "observe-run-unexpected",
+        }:
+            continue
+        add_blocker(
+            blocker_id=f"BURP-{cluster.get('cluster_id')}-{cluster_status}",
+            source="burp-observation-coverage.json",
+            category="human-review",
+            status="needs-human-review",
+            priority=str(cluster.get("priority") or "medium"),
+            title=f"Burp observation coverage requires review for {cluster.get('cluster_id')}",
+            reason=f"Burp observation coverage status is `{cluster_status}`.",
+            next_action=cluster.get("next_action"),
+            cluster_id=cluster.get("cluster_id"),
+            artifact_refs=["burp-observation-coverage.json", "burp-history-observations.jsonl", "burp-observation-run.json"],
+            review_candidates=[
+                {"id": candidate_id}
+                for candidate_id in cluster.get("review_candidate_ids", []) or []
+            ],
+            evidence={
+                "active_observation_count": cluster.get("active_observation_count"),
+                "evidence_gaps": cluster.get("evidence_gaps", []),
+            },
+        )
+
+    for item in (verification_queue or {}).get("items", []) or []:
+        item_status = str(item.get("status") or "")
+        if item_status not in {"manual-review", "blocked", "blocked-external"}:
+            continue
+        if item_status == "blocked-external":
+            category = "external-blocker"
+            status = "ready-with-external-blockers"
+        elif item_status == "blocked":
+            category = "blocked"
+            status = "failed"
+        else:
+            category = "human-review"
+            status = "needs-human-review"
+        add_blocker(
+            blocker_id=f"QUEUE-{item.get('id')}",
+            source="verification-queue.json",
+            category=category,
+            status=status,
+            priority=str(item.get("priority") or "medium"),
+            title=str(item.get("title") or item.get("id")),
+            reason=str(item.get("reason") or f"Verification queue item status is `{item_status}`."),
+            next_action="Review prerequisites and replace any REPLACE_WITH_* placeholders before running queued commands.",
+            cluster_id=item.get("cluster_id"),
+            artifact_refs=item.get("evidence_refs", []) or ["verification-queue.json"],
+            commands=item.get("commands", []),
+            review_candidates=item.get("review_candidates", []),
+            evidence={
+                "queue_status": item_status,
+                "prerequisites": item.get("prerequisites", []),
+                "command_safety": item.get("command_safety", {}),
+            },
+        )
+
+    command_safety = (verification_queue or {}).get("summary", {}).get("command_safety", {}) or {}
+    if int(command_safety.get("unsafe_template_count") or 0):
+        add_blocker(
+            blocker_id="QUEUE-unsafe-command-templates",
+            source="verification-queue.json",
+            category="unsafe-template",
+            status="failed",
+            priority="high",
+            title="Verification queue contains unsafe command templates",
+            reason="One or more command templates contain shell-sensitive placeholder or control-operator syntax.",
+            next_action="Fix the command template generator before running or sharing reproduction commands.",
+            artifact_refs=["verification-queue.json", "reproduction-steps.md"],
+            evidence={"command_safety": command_safety},
+        )
+
+    for check in (environment_readiness or {}).get("checks", []) or []:
+        check_status = str(check.get("status") or "")
+        if check_status not in {"blocked", "failed"}:
+            continue
+        add_blocker(
+            blocker_id=f"READINESS-{check.get('id')}",
+            source="environment-readiness.json",
+            category="external-blocker" if check_status == "blocked" else "environment-failure",
+            status="ready-with-external-blockers" if check_status == "blocked" else "failed",
+            priority="high",
+            title=f"Environment readiness check {check.get('id')} is {check_status}",
+            reason=f"Readiness check `{check.get('id')}` returned `{check_status}`.",
+            next_action="; ".join(str(item) for item in (environment_readiness or {}).get("next_steps", [])[:3]) or None,
+            artifact_refs=["environment-readiness.json"],
+            evidence={"check": check},
+        )
+
+    for directory in (artifact_health or {}).get("directories", []) or []:
+        directory_status = str(directory.get("status") or "")
+        if directory_status not in {"failed", "needs-human-review", "ready-with-external-blockers"}:
+            continue
+        add_blocker(
+            blocker_id=f"HEALTH-{safe_probe_id(str(directory.get('artifact_dir') or 'artifact-dir'))}",
+            source="artifact-health.json",
+            category="artifact-health",
+            status=directory_status,
+            priority="high" if directory_status == "failed" else "medium",
+            title=f"Artifact health for {directory.get('artifact_dir')} is {directory_status}",
+            reason="Artifact health summarized a non-ready state for this artifact directory.",
+            next_action="Inspect the directory checks and source status summaries.",
+            artifact_refs=["artifact-health.json", MANIFEST_NAME],
+            evidence={
+                "artifact_dir": directory.get("artifact_dir"),
+                "checks": directory.get("checks", []),
+                "statuses": directory.get("statuses", {}),
+            },
+        )
+
+    status_counts: dict[str, int] = {}
+    category_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    for blocker in blockers:
+        increment_count(status_counts, str(blocker.get("status") or "unknown"))
+        increment_count(category_counts, str(blocker.get("category") or "unknown"))
+        increment_count(source_counts, str(blocker.get("source") or "unknown"))
+
+    if not blockers:
+        status = "ready"
+    elif status_counts.get("failed"):
+        status = "failed"
+    elif status_counts.get("needs-profile-update"):
+        status = "needs-profile-update"
+    elif status_counts.get("needs-human-review"):
+        status = "needs-human-review"
+    elif status_counts.get("ready-with-external-blockers"):
+        status = "ready-with-external-blockers"
+    else:
+        status = sorted(status_counts, key=review_blocker_status_rank)[0]
+
+    blockers.sort(
+        key=lambda item: (
+            review_blocker_status_rank(str(item.get("status") or "")),
+            {"high": 0, "medium": 1, "low": 2}.get(str(item.get("priority") or ""), 9),
+            str(item.get("id") or ""),
+        )
+    )
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": str(artifact_dir),
+        "summary": {
+            "blockers": len(blockers),
+            "status_counts": status_counts,
+            "category_counts": category_counts,
+            "source_counts": source_counts,
+            "discovery_coverage": (discovery_coverage or {}).get("status"),
+            "burp_observation_coverage": (burp_observation_coverage or {}).get("status"),
+            "verification_queue": (verification_queue or {}).get("status"),
+            "environment_readiness": (environment_readiness or {}).get("status"),
+            "artifact_health": (artifact_health or {}).get("status"),
+        },
+        "blockers": blockers,
+        "artifact_refs": {
+            "discovery_coverage": DISCOVERY_COVERAGE_ARTIFACT,
+            "burp_observation_coverage": "burp-observation-coverage.json",
+            "verification_queue": "verification-queue.json",
+            "environment_readiness": "environment-readiness.json",
+            "artifact_health": "artifact-health.json",
+        },
+        "safety": "Read-only review blocker summary. It does not send HTTP requests, invoke Burp, run Burp Scanner, sign wallets, or submit transactions.",
+    }
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -11029,6 +11294,7 @@ def build_artifact_manifest(
         "response-delta-analysis.json",
         "source-peek-requests.json",
         "verification-queue.json",
+        REVIEW_BLOCKERS_ARTIFACT,
         "adjudication.json",
         "environment-readiness.json",
         PROFILE_VALIDATION_ARTIFACT,
@@ -11088,13 +11354,14 @@ def build_artifact_manifest(
     discovery_coverage_status = (status_sources.get(DISCOVERY_COVERAGE_ARTIFACT) or {}).get("status")
     adjudication_status = (status_sources.get("adjudication.json") or {}).get("status")
     verification_status = (status_sources.get("verification-queue.json") or {}).get("status")
+    review_blockers_status = (status_sources.get(REVIEW_BLOCKERS_ARTIFACT) or {}).get("status")
     profile_validation_status = (status_sources.get(PROFILE_VALIDATION_ARTIFACT) or {}).get("status")
     burp_observation_status = (status_sources.get("burp-observation-coverage.json") or {}).get("status")
     response_delta_status = (status_sources.get("response-delta-analysis.json") or {}).get("status")
     source_peek_request_status = (status_sources.get("source-peek-requests.json") or {}).get("status")
     external_blocked = any(
         status in {"covered-with-external-blocker", "no-reportable-findings-with-external-blocker", "ready-with-external-blockers", "waiting-for-external-configuration"}
-        for status in [coverage_status, adjudication_status, verification_status, readiness_status]
+        for status in [coverage_status, adjudication_status, verification_status, review_blockers_status, readiness_status]
     )
     if missing_required:
         manifest_status = "incomplete"
@@ -11120,6 +11387,7 @@ def build_artifact_manifest(
             "discovery_coverage": discovery_coverage_status,
             "adjudication": adjudication_status,
             "verification_queue": verification_status,
+            "review_blockers": review_blockers_status,
             "readiness": readiness_status,
             "profile_validation": profile_validation_status,
             "burp_observation_coverage": burp_observation_status,
@@ -11164,6 +11432,7 @@ def artifact_statuses_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         "discovery_coverage": summary.get("discovery_coverage"),
         "adjudication": summary.get("adjudication"),
         "verification_queue": summary.get("verification_queue"),
+        "review_blockers": summary.get("review_blockers"),
         "readiness": summary.get("readiness"),
         "profile_validation": summary.get("profile_validation"),
         "burp_observation_coverage": summary.get("burp_observation_coverage"),
@@ -11211,6 +11480,7 @@ def artifact_health_status(checks: list[dict[str, Any]], statuses: dict[str, Any
         return "failed"
     if (
         statuses.get("verification_queue") == "needs-human-review"
+        or statuses.get("review_blockers") == "needs-human-review"
         or statuses.get("discovery_coverage") == "needs-human-review"
         or statuses.get("burp_observation_coverage") == "needs-human-review"
         or statuses.get("source_peek_requests") == "answered-with-manual-review"
@@ -11400,6 +11670,16 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
                     "id": "verification-queue",
                     "status": "failed",
                     "message": "Verification queue generated unsafe command templates.",
+                }
+            )
+
+        review_blockers_status = str(statuses.get("review_blockers") or "")
+        if review_blockers_status in {"failed", "needs-profile-update"}:
+            checks.append(
+                {
+                    "id": "review-blockers",
+                    "status": "failed",
+                    "message": f"Review blockers status is {review_blockers_status}.",
                 }
             )
 
@@ -14020,6 +14300,16 @@ def run_audit(args: argparse.Namespace) -> int:
     )
     write_json(artifact_dir / "verification-queue.json", verification_queue)
     write_reproduction_steps(artifact_dir, verification_queue)
+    review_blockers = build_review_blockers(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        discovery_coverage=load_optional_json(artifact_dir / DISCOVERY_COVERAGE_ARTIFACT),
+        burp_observation_coverage=burp_observation_coverage,
+        verification_queue=verification_queue,
+        environment_readiness=environment_readiness,
+    )
+    write_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT, review_blockers)
     write_json(artifact_dir / "burp-capabilities.json", capabilities)
     write_json(
         artifact_dir / "config.json",
@@ -16272,6 +16562,16 @@ def run_verification_queue(args: argparse.Namespace) -> int:
     )
     write_json(artifact_dir / "verification-queue.json", verification_queue)
     write_reproduction_steps(artifact_dir, verification_queue)
+    review_blockers = build_review_blockers(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        discovery_coverage=load_optional_json(artifact_dir / DISCOVERY_COVERAGE_ARTIFACT),
+        burp_observation_coverage=load_optional_json(artifact_dir / "burp-observation-coverage.json"),
+        verification_queue=verification_queue,
+        environment_readiness=load_optional_json(artifact_dir / "environment-readiness.json"),
+    )
+    write_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT, review_blockers)
     print(f"Verification queue: {verification_queue['status']}")
     print(
         "Items: "
@@ -16284,9 +16584,45 @@ def run_verification_queue(args: argparse.Namespace) -> int:
     )
     print(f"Wrote {artifact_dir / 'verification-queue.json'}")
     print(f"Wrote {artifact_dir / 'reproduction-steps.md'}")
+    print(f"Wrote {artifact_dir / REVIEW_BLOCKERS_ARTIFACT}")
     if verification_queue["status"] == "invalid-command-templates":
         return 2
     return 0 if verification_queue["status"] != "needs-human-review" else 1
+
+
+def run_review_blockers(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    review_blockers = build_review_blockers(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        discovery_coverage=load_optional_json(artifact_dir / DISCOVERY_COVERAGE_ARTIFACT),
+        burp_observation_coverage=load_optional_json(artifact_dir / "burp-observation-coverage.json"),
+        verification_queue=load_optional_json(artifact_dir / "verification-queue.json"),
+        environment_readiness=load_optional_json(artifact_dir / "environment-readiness.json"),
+        artifact_health=load_optional_json(artifact_dir / "artifact-health.json"),
+    )
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / REVIEW_BLOCKERS_ARTIFACT
+    write_json(output_path, review_blockers)
+    print(f"Review blockers: {review_blockers['status']}")
+    print(
+        "Blockers: "
+        f"{review_blockers['summary']['blockers']} total, "
+        f"status_counts={json.dumps(review_blockers['summary']['status_counts'], sort_keys=True)}"
+    )
+    for blocker in review_blockers.get("blockers", [])[:8]:
+        print(
+            f"- {blocker.get('id')}: {blocker.get('status')} "
+            f"source={blocker.get('source')} title={blocker.get('title')}"
+        )
+    print(f"Wrote {output_path}")
+    if review_blockers["status"] == "failed":
+        return 1
+    if args.strict and review_blockers["status"] != "ready":
+        return 1
+    return 0
 
 
 def run_manifest(args: argparse.Namespace) -> int:
@@ -16347,6 +16683,7 @@ def run_artifact_health(args: argparse.Namespace) -> int:
             f"manifest={statuses.get('manifest')} "
             f"coverage={statuses.get('coverage')} "
             f"discovery={statuses.get('discovery_coverage')} "
+            f"review_blockers={statuses.get('review_blockers')} "
             f"verification={statuses.get('verification_queue')} "
             f"response_deltas={statuses.get('response_delta_analysis')} "
             f"source_peek_requests={statuses.get('source_peek_requests')} "
@@ -17486,6 +17823,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recompute verification queue and reproduction steps from current artifacts",
     )
     verification_queue.set_defaults(func=run_verification_queue)
+
+    review_blockers = sub.add_parser(
+        "review-blockers",
+        help="Summarize human-review, profile-update, and external blockers from current artifacts",
+    )
+    review_blockers.add_argument(
+        "--output",
+        help="Where to write review-blockers.json. Defaults to --artifact-dir/review-blockers.json.",
+    )
+    review_blockers.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless no review, profile-update, or external blockers remain.",
+    )
+    review_blockers.set_defaults(func=run_review_blockers)
 
     manifest = sub.add_parser(
         "manifest",

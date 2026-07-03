@@ -265,6 +265,7 @@ python3 scripts/inferforge.py decode-transactions
 python3 scripts/inferforge.py self-test-transactions
 python3 scripts/inferforge.py self-test-profile-routing
 python3 scripts/inferforge.py self-test-discovery-coverage
+python3 scripts/inferforge.py review-blockers
 python3 scripts/inferforge.py collect-quote --direction buy --wallet EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR --amount-in 1000000
 python3 scripts/inferforge.py collect-orca-baseline
 ```
@@ -475,6 +476,20 @@ as `ready`, `manual-template` when they still contain `REPLACE_WITH_*`,
 control operators are present. `verification-queue` returns a non-zero status if
 unsafe command templates are generated.
 
+`review-blockers` writes `.greybox/review-blockers.json`, a read-only summary of
+the human-review, profile-update, and external blockers currently spread across
+discovery coverage, Burp observation coverage, verification queue, environment
+readiness, and artifact health. `audit` and `verification-queue` refresh it
+automatically. The command is useful as the first artifact to inspect after a
+regression run because it keeps the approved-path, source-only review, missing
+profile coverage, and external-configuration actions in one list:
+
+```bash
+python3 scripts/inferforge.py review-blockers
+```
+
+Use `--strict` when any remaining blocker should fail a CI job.
+
 `manifest` writes `.greybox/artifact-manifest.json`, an integrity snapshot with
 SHA256 hashes, sizes, modification timestamps, generated-at timestamps, JSONL row
 counts, key status summaries, and missing-required-artifact checks. `audit`
@@ -485,8 +500,8 @@ report and index page.
 over one or more artifact directories. It parses every top-level JSON and JSONL
 artifact, checks the manifest's missing-required list, carries forward key gate
 statuses such as black-box coverage, discovery coverage, verification queue,
-response deltas, source-peek requests, and Burp observation coverage, and
-classifies each run as `healthy`, `ready-with-external-blockers`,
+review blockers, response deltas, source-peek requests, and Burp observation
+coverage, and classifies each run as `healthy`, `ready-with-external-blockers`,
 `needs-human-review`, or `failed`. It is useful after regression runs:
 
 ```bash
@@ -585,6 +600,7 @@ Key outputs:
 .greybox/artifact-manifest.json
 .greybox/artifact-health.json
 .greybox/regression-suite.json
+.greybox/review-blockers.json
 .greybox/discovery-coverage-selftest.json
 .greybox/target-profile.json
 .greybox/strategy-registry.json
