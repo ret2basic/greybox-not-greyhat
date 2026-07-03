@@ -8,6 +8,7 @@ workbench, while this script records repeatable local probes and source peeks.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 from email.utils import parsedate_to_datetime
 import hashlib
@@ -13867,6 +13868,19 @@ def build_artifact_health_selftest() -> dict[str, Any]:
 
 
 def build_manifest_refresh_selftest() -> dict[str, Any]:
+    compound_statement_types = (
+        ast.If,
+        ast.For,
+        ast.While,
+        ast.With,
+        ast.AsyncWith,
+        ast.Try,
+        ast.Match,
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+    )
+
     def parser_subcommands() -> set[str]:
         parser = build_parser()
         for action in parser._actions:
@@ -13892,6 +13906,152 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
             },
         }
 
+    def called_name(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return None
+
+    def statement_has_call(statement: ast.AST, name: str) -> bool:
+        return any(
+            isinstance(node, ast.Call) and called_name(node.func) == name
+            for node in ast.walk(statement)
+        )
+
+    def statement_writes_regression_suite(statement: ast.AST) -> bool:
+        for node in ast.walk(statement):
+            if not isinstance(node, ast.Call) or called_name(node.func) != "write_json":
+                continue
+            if node.args and any(
+                isinstance(child, ast.Constant) and child.value == "regression-suite.json"
+                for child in ast.walk(node.args[0])
+            ):
+                return True
+        return False
+
+    def is_return_one(statement: ast.AST) -> bool:
+        return (
+            isinstance(statement, ast.Return)
+            and isinstance(statement.value, ast.Constant)
+            and statement.value.value == 1
+        )
+
+    def regression_suite_return_manifest_checks() -> list[dict[str, Any]]:
+        function = globals().get("run_regression_suite")
+        if not function:
+            return [
+                {
+                    "path": "run_regression_suite",
+                    "passed": False,
+                    "reason": "function-not-found",
+                }
+            ]
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        function_def = next((node for node in tree.body if isinstance(node, ast.FunctionDef)), None)
+        if not function_def:
+            return [
+                {
+                    "path": "run_regression_suite",
+                    "passed": False,
+                    "reason": "function-def-not-found",
+                }
+            ]
+
+        checks: list[dict[str, Any]] = []
+
+        def walk_block(
+            block: list[ast.stmt],
+            *,
+            path: str,
+            suite_written: bool,
+            manifest_after_suite_write: bool,
+        ) -> None:
+            current_suite_written = suite_written
+            current_manifest_after_suite_write = manifest_after_suite_write
+            for index, statement in enumerate(block):
+                statement_path = f"{path}/{type(statement).__name__}:{index}"
+                if not isinstance(statement, compound_statement_types):
+                    if statement_writes_regression_suite(statement):
+                        current_suite_written = True
+                        current_manifest_after_suite_write = False
+                    if statement_has_call(statement, "write_artifact_manifest") and current_suite_written:
+                        current_manifest_after_suite_write = True
+                    if is_return_one(statement):
+                        checks.append(
+                            {
+                                "path": statement_path,
+                                "passed": (
+                                    current_manifest_after_suite_write
+                                    if current_suite_written
+                                    else False
+                                ),
+                                "suite_written": current_suite_written,
+                                "manifest_after_suite_write": current_manifest_after_suite_write,
+                            }
+                        )
+
+                if isinstance(statement, (ast.If, ast.For, ast.While, ast.With, ast.AsyncWith)):
+                    walk_block(
+                        statement.body,
+                        path=f"{statement_path}/body",
+                        suite_written=current_suite_written,
+                        manifest_after_suite_write=current_manifest_after_suite_write,
+                    )
+                    orelse = getattr(statement, "orelse", [])
+                    if orelse:
+                        walk_block(
+                            orelse,
+                            path=f"{statement_path}/orelse",
+                            suite_written=current_suite_written,
+                            manifest_after_suite_write=current_manifest_after_suite_write,
+                        )
+                elif isinstance(statement, ast.Try):
+                    walk_block(
+                        statement.body,
+                        path=f"{statement_path}/body",
+                        suite_written=current_suite_written,
+                        manifest_after_suite_write=current_manifest_after_suite_write,
+                    )
+                    for handler_index, handler in enumerate(statement.handlers):
+                        walk_block(
+                            handler.body,
+                            path=f"{statement_path}/handler:{handler_index}",
+                            suite_written=current_suite_written,
+                            manifest_after_suite_write=current_manifest_after_suite_write,
+                        )
+                    if statement.orelse:
+                        walk_block(
+                            statement.orelse,
+                            path=f"{statement_path}/orelse",
+                            suite_written=current_suite_written,
+                            manifest_after_suite_write=current_manifest_after_suite_write,
+                        )
+                    if statement.finalbody:
+                        walk_block(
+                            statement.finalbody,
+                            path=f"{statement_path}/finally",
+                            suite_written=current_suite_written,
+                            manifest_after_suite_write=current_manifest_after_suite_write,
+                        )
+                elif isinstance(statement, ast.Match):
+                    for case_index, match_case in enumerate(statement.cases):
+                        walk_block(
+                            match_case.body,
+                            path=f"{statement_path}/case:{case_index}",
+                            suite_written=current_suite_written,
+                            manifest_after_suite_write=current_manifest_after_suite_write,
+                        )
+
+        walk_block(
+            function_def.body,
+            path="run_regression_suite",
+            suite_written=False,
+            manifest_after_suite_write=False,
+        )
+        return checks
+
     expectations = [
         {
             "command": "audit",
@@ -13909,7 +14069,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
             "command": "regression-suite",
             "function": "run_regression_suite",
             "mode": "final-manifest",
-            "markers": {"write_artifact_manifest(": 1},
+            "markers": {"write_artifact_manifest(": 3},
         },
         {
             "command": "artifact-health",
@@ -14007,6 +14167,24 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
                 "missing_expectations": missing_expectations,
                 "stale_expectations": stale_expectations,
             },
+        }
+    )
+    regression_return_checks = regression_suite_return_manifest_checks()
+    cases.append(
+        {
+            "command": "regression-suite",
+            "function": "run_regression_suite",
+            "mode": "return-path-manifest-refresh",
+            "return_checks": regression_return_checks,
+        }
+    )
+    assertions.append(
+        {
+            "id": "regression-suite-return-paths-refresh-manifest",
+            "passed": bool(regression_return_checks)
+            and all(item.get("passed") for item in regression_return_checks),
+            "expected": "every run_regression_suite return 1 path follows a regression-suite.json write with write_artifact_manifest",
+            "actual": regression_return_checks,
         }
     )
 
@@ -19890,8 +20068,11 @@ def run_regression_suite(args: argparse.Namespace) -> int:
                     "safety": "Regression suite stopped on failure. No wallet signing, transaction submission, Burp Scanner, or broad fuzzing is performed.",
                 }
                 write_json(artifact_dir / "regression-suite.json", suite)
+                artifact_manifest = write_artifact_manifest(artifact_dir, target, command="regression-suite")
                 print(f"Regression suite: {suite['status']}")
                 print(f"Wrote {artifact_dir / 'regression-suite.json'}")
+                print(f"Artifact manifest: {artifact_manifest['status']}")
+                print(f"Wrote {artifact_dir / MANIFEST_NAME}")
                 return 1
 
     if not args.skip_discover_profile and not args.skip_discovered:
@@ -19915,8 +20096,11 @@ def run_regression_suite(args: argparse.Namespace) -> int:
                 "safety": "Regression suite stopped on failure. No wallet signing, transaction submission, Burp Scanner, or broad fuzzing is performed.",
             }
             write_json(artifact_dir / "regression-suite.json", suite)
+            artifact_manifest = write_artifact_manifest(artifact_dir, target, command="regression-suite")
             print(f"Regression suite: {suite['status']}")
             print(f"Wrote {artifact_dir / 'regression-suite.json'}")
+            print(f"Artifact manifest: {artifact_manifest['status']}")
+            print(f"Wrote {artifact_dir / MANIFEST_NAME}")
             return 1
 
     if not args.skip_burp_sync and not suite_stopped:
