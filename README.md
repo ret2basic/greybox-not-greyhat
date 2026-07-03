@@ -507,8 +507,9 @@ one list. The JSON also includes grouped blockers so repeated runs can preserve
 per-run evidence while the playbook shows de-duplicated next actions. Grouped
 human-review blockers preserve compact review-candidate path templates and
 command templates so the next manual approval step is visible without opening
-every individual blocker. When `--check-dir` is repeated, it builds a root-level
-rollup across multiple artifact directories:
+every individual blocker. The CLI prints the grouped blocker summaries first,
+including count, cluster, candidate ids, and next action. When `--check-dir` is
+repeated, it builds a root-level rollup across multiple artifact directories:
 
 ```bash
 python3 scripts/inferforge.py review-blockers

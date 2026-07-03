@@ -11613,6 +11613,37 @@ def ordered_unique_strings(values: list[Any]) -> list[str]:
     return rows
 
 
+def inline_summary_text(value: Any, *, max_chars: int = 180) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def format_review_blocker_group_summary(group: dict[str, Any]) -> str:
+    parts = [
+        f"{group.get('id') or 'GROUP-unknown'}:",
+        str(group.get("status") or "unknown"),
+        f"count={group.get('count', 0)}",
+        f"category={group.get('category') or 'unknown'}",
+    ]
+    if group.get("priority"):
+        parts.append(f"priority={group.get('priority')}")
+    if group.get("cluster_id"):
+        parts.append(f"cluster={group.get('cluster_id')}")
+    candidate_ids = [str(item) for item in group.get("review_candidate_ids", []) or []]
+    if candidate_ids:
+        suffix = "" if len(candidate_ids) <= 3 else f",+{len(candidate_ids) - 3}"
+        parts.append(f"candidates={','.join(candidate_ids[:3])}{suffix}")
+    title = inline_summary_text(group.get("title") or group.get("reason") or "")
+    if title:
+        parts.append(f"title={title}")
+    next_action = inline_summary_text(group.get("next_action") or "")
+    if next_action:
+        parts.append(f"next={next_action}")
+    return " ".join(parts)
+
+
 def compact_review_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {}
     for field in ["id", "cluster", "type", "status", "method", "path_template", "example_path"]:
@@ -12382,6 +12413,7 @@ def build_review_blockers_selftest() -> dict[str, Any]:
         ),
         {},
     )
+    rollup_route_group_summary = format_review_blocker_group_summary(rollup_route_group)
     assertions = [
         {
             "id": "default-status-external-only",
@@ -12469,6 +12501,18 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "placeholder": "REPLACE_WITH_APPROVED_CONCRETE_LOCAL_PATH" in markdown,
             },
         },
+        {
+            "id": "group-summary-is-actionable",
+            "passed": (
+                "needs-human-review" in rollup_route_group_summary
+                and "count=5" in rollup_route_group_summary
+                and "cluster=route-api-proxy-path" in rollup_route_group_summary
+                and "review_observe_route_api_proxy_path_approved_path" in rollup_route_group_summary
+                and "Review one concrete local read-only path" in rollup_route_group_summary
+            ),
+            "expected": "group summary includes status, count, cluster, candidate id, and next action",
+            "actual": rollup_route_group_summary,
+        },
     ]
     failed = [item for item in assertions if not item["passed"]]
     return {
@@ -12499,6 +12543,7 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "status": rollup.get("status"),
                 "summary": rollup.get("summary"),
                 "route_group": rollup_route_group,
+                "route_group_summary": rollup_route_group_summary,
                 "quote_group": rollup_quote_group,
                 "readiness_group": rollup_readiness_group,
             },
@@ -19533,11 +19578,20 @@ def run_review_blockers(args: argparse.Namespace) -> int:
             f"{review_blockers['summary']['runs']} checked, "
             f"run_status_counts={json.dumps(review_blockers['summary']['run_status_counts'], sort_keys=True)}"
         )
-    for blocker in review_blockers.get("blockers", [])[:8]:
-        print(
-            f"- {blocker.get('id')}: {blocker.get('status')} "
-            f"source={blocker.get('source')} title={blocker.get('title')}"
-        )
+    groups = review_blockers.get("groups", []) or []
+    if groups:
+        print("Groups:")
+        for group in groups[:8]:
+            print(f"- {format_review_blocker_group_summary(group)}")
+        if len(groups) > 8:
+            print(f"- {len(groups) - 8} more group(s) in {output_path}")
+    else:
+        print("Blockers:")
+        for blocker in review_blockers.get("blockers", [])[:8]:
+            print(
+                f"- {blocker.get('id')}: {blocker.get('status')} "
+                f"source={blocker.get('source')} title={blocker.get('title')}"
+            )
     print(f"Wrote {output_path}")
     print(f"Wrote {markdown_path}")
     for item in refreshed_manifests:
