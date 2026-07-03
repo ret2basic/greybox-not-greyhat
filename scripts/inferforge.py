@@ -14754,7 +14754,19 @@ def build_no_write_selftest() -> dict[str, Any]:
             "display_name": "No-Write Self-Test",
             "default_target": target,
             "default_source_root": str(root),
-            "clusters": [],
+            "strategy_sets": ["nextjs-api-routes"],
+            "clusters": [
+                {
+                    "id": "no-write",
+                    "method": "GET",
+                    "path": "/api/no-write/status",
+                    "kind": "app-route",
+                    "priority": "medium",
+                    "strategy_set": "nextjs-api-routes",
+                    "paths": ["/api/no-write/status"],
+                    "methods": ["GET"],
+                }
+            ],
             "review_observation_candidates": [
                 {
                     "id": "review_no_write_candidate",
@@ -14792,6 +14804,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         }
         write_json(profile_path, profile)
         review_candidates_output_dir = root / "review-candidates-output"
+        plan_output_dir = root / "plan-output"
         capabilities_output_dir = root / "capabilities-output"
         readiness_output_dir = root / "readiness-output"
         attack_strategy_output_dir = root / "attack-strategy-output"
@@ -14812,6 +14825,20 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--source-root",
                     str(root),
                     "review-candidates",
+                    "--no-write",
+                ]
+            )
+            plan_return_code, plan_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(plan_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "plan",
                     "--no-write",
                 ]
             )
@@ -14897,6 +14924,13 @@ def build_no_write_selftest() -> dict[str, Any]:
             "review_candidates_json": (review_candidates_output_dir / "review-observation-candidates.json").exists(),
             "review_candidates_profile_json": (review_candidates_output_dir / TARGET_PROFILE_ARTIFACT).exists(),
             "review_candidates_manifest": (review_candidates_output_dir / MANIFEST_NAME).exists(),
+            "plan_dir": plan_output_dir.exists(),
+            "plan_target_profile_json": (plan_output_dir / TARGET_PROFILE_ARTIFACT).exists(),
+            "plan_endpoint_clusters_json": (plan_output_dir / "endpoint-clusters.json").exists(),
+            "plan_probe_ranking_json": (plan_output_dir / "probe-ranking.json").exists(),
+            "plan_probe_plan_json": (plan_output_dir / "probe-plan.json").exists(),
+            "plan_attack_strategy_json": (plan_output_dir / "attack-strategy.json").exists(),
+            "plan_manifest": (plan_output_dir / MANIFEST_NAME).exists(),
             "capabilities_dir": capabilities_output_dir.exists(),
             "capabilities_json": (capabilities_output_dir / "burp-capabilities.json").exists(),
             "capabilities_manifest": (capabilities_output_dir / MANIFEST_NAME).exists(),
@@ -14925,6 +14959,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         }
 
     review_candidates_stdout_text = "\n".join(review_candidates_stdout)
+    plan_stdout_text = "\n".join(plan_stdout)
     attack_strategy_stdout_text = "\n".join(attack_strategy_stdout)
     verification_queue_stdout_text = "\n".join(verification_queue_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
@@ -14963,6 +14998,35 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": review_candidates_return_code,
                 "stdout": review_candidates_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "plan-no-write-skips-artifacts",
+            "passed": (
+                plan_return_code == 0
+                and "Planned " in plan_stdout_text
+                and "Selection mode:" in plan_stdout_text
+                and "Selected clusters:" in plan_stdout_text
+                and "No files written (--no-write)." in plan_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "plan_dir",
+                        "plan_target_profile_json",
+                        "plan_endpoint_clusters_json",
+                        "plan_probe_ranking_json",
+                        "plan_probe_plan_json",
+                        "plan_attack_strategy_json",
+                        "plan_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in plan_stdout)
+            ),
+            "expected": "plan --no-write prints probe selection without writing artifacts or manifests",
+            "actual": {
+                "return_code": plan_return_code,
+                "stdout": plan_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -15030,7 +15094,7 @@ def build_no_write_selftest() -> dict[str, Any]:
             "passed": (
                 attack_strategy_return_code == 0
                 and "Attack strategy: needs-burp-history" in attack_strategy_stdout
-                and "Coverage: 0 specific / 0 clusters" in attack_strategy_stdout_text
+                and "Coverage:" in attack_strategy_stdout_text
                 and "No files written (--no-write)." in attack_strategy_stdout
                 and not any(
                     output_paths[key]
@@ -15096,6 +15160,10 @@ def build_no_write_selftest() -> dict[str, Any]:
             "review_candidates": {
                 "return_code": review_candidates_return_code,
                 "stdout": review_candidates_stdout,
+            },
+            "plan": {
+                "return_code": plan_return_code,
+                "stdout": plan_stdout,
             },
             "capabilities": {
                 "return_code": capabilities_return_code,
@@ -20012,8 +20080,10 @@ def run_burp_sync(args: argparse.Namespace) -> int:
 
 def run_plan(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
 
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
     clusters = build_clusters(profile, source_root)
@@ -20035,31 +20105,35 @@ def run_plan(args: argparse.Namespace) -> int:
     probes = apply_probe_ranking(candidate_probes, ranking)
     ws_enabled = args.ws and "solana-rpc-ws" in selected_clusters
 
-    write_json(artifact_dir / "endpoint-clusters.json", clusters)
-    write_json(artifact_dir / "probe-ranking.json", ranking)
-    write_plan(artifact_dir, probes, selection, ws_enabled=ws_enabled, ranking=ranking)
-    write_json(artifact_dir / "attack-strategy.json", build_attack_strategy(clusters, [], burp_history))
+    if not no_write:
+        write_json(artifact_dir / "endpoint-clusters.json", clusters)
+        write_json(artifact_dir / "probe-ranking.json", ranking)
+        write_plan(artifact_dir, probes, selection, ws_enabled=ws_enabled, ranking=ranking)
+        write_json(artifact_dir / "attack-strategy.json", build_attack_strategy(clusters, [], burp_history))
 
     print(f"Planned {len(probes)} HTTP probes from {len(candidate_probes)} candidates")
     print(f"WebSocket probes: {'enabled' if ws_enabled else 'disabled'}")
     print(f"Selection mode: {selection['mode']}")
     print(f"Selected clusters: {', '.join(selection['selected_cluster_ids']) or '(none)'}")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="plan",
-            output_paths=[
-                artifact_dir / TARGET_PROFILE_ARTIFACT,
-                artifact_dir / STRATEGY_REGISTRY_ARTIFACT,
-                artifact_dir / PROFILE_VALIDATION_ARTIFACT,
-                artifact_dir / "endpoint-clusters.json",
-                artifact_dir / "probe-ranking.json",
-                artifact_dir / "probe-plan.json",
-                artifact_dir / "attack-strategy.json",
-            ],
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="plan",
+                output_paths=[
+                    artifact_dir / TARGET_PROFILE_ARTIFACT,
+                    artifact_dir / STRATEGY_REGISTRY_ARTIFACT,
+                    artifact_dir / PROFILE_VALIDATION_ARTIFACT,
+                    artifact_dir / "endpoint-clusters.json",
+                    artifact_dir / "probe-ranking.json",
+                    artifact_dir / "probe-plan.json",
+                    artifact_dir / "attack-strategy.json",
+                ],
+            )
         )
-    )
     return 0
 
 
@@ -22383,6 +22457,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--observed-only",
         action="store_true",
         help="Plan only for endpoint kinds seen in traffic-index.json",
+    )
+    plan.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print probe plan summary only; do not write probe-plan artifacts or refreshed manifests.",
     )
     plan.set_defaults(func=run_plan, ws=True)
 

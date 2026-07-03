@@ -246,7 +246,9 @@ want Burp Proxy history attached to the same artifact directory.
 Use `--include-external` only when a bounded set of low-risk M0 quote validation
 probes is acceptable. Omit it for a purely local run; the local run still covers
 missing fields, malformed JSON, wrong primitive types, RPC controls, WS controls,
-and Orca path validation.
+and Orca path validation. Use `plan --no-write` to preview endpoint selection,
+probe ranking counts, and WebSocket enablement without writing probe-plan,
+ranking, strategy, or manifest artifacts.
 
 Useful checks:
 
@@ -258,6 +260,7 @@ python3 scripts/inferforge.py burp-sync --observe --ws-upgrade --replace
 python3 scripts/inferforge.py burp-observe --ws-upgrade
 python3 scripts/inferforge.py import-burp-history --input .greybox/burp-mcp-history.txt
 python3 scripts/inferforge.py plan --include-external
+python3 scripts/inferforge.py plan --include-external --no-write
 python3 scripts/inferforge.py plan --include-external --max-probes 12
 python3 scripts/inferforge.py capabilities
 python3 scripts/inferforge.py capabilities --no-write
