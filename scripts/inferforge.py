@@ -70,6 +70,7 @@ REVIEW_BLOCKERS_SELFTEST_ARTIFACT = "review-blockers-selftest.json"
 COMMAND_SAFETY_SELFTEST_ARTIFACT = "command-safety-selftest.json"
 ARTIFACT_HEALTH_SELFTEST_ARTIFACT = "artifact-health-selftest.json"
 MANIFEST_REFRESH_SELFTEST_ARTIFACT = "manifest-refresh-selftest.json"
+NO_WRITE_SELFTEST_ARTIFACT = "no-write-selftest.json"
 REQUIRED_ARTIFACTS = [
     "index.html",
     "report.md",
@@ -138,6 +139,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     COMMAND_SAFETY_SELFTEST_ARTIFACT,
     ARTIFACT_HEALTH_SELFTEST_ARTIFACT,
     MANIFEST_REFRESH_SELFTEST_ARTIFACT,
+    NO_WRITE_SELFTEST_ARTIFACT,
     "transaction-intent-policy.json",
 ]
 REPORT_FRESHNESS_INPUTS = [
@@ -193,6 +195,7 @@ INDEX_ARTIFACT_ORDER = [
     COMMAND_SAFETY_SELFTEST_ARTIFACT,
     ARTIFACT_HEALTH_SELFTEST_ARTIFACT,
     MANIFEST_REFRESH_SELFTEST_ARTIFACT,
+    NO_WRITE_SELFTEST_ARTIFACT,
     TARGET_PROFILE_ARTIFACT,
     STRATEGY_REGISTRY_ARTIFACT,
     PROFILE_VALIDATION_ARTIFACT,
@@ -14348,6 +14351,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("self-test-review-blockers", "run_review_blockers_selftest"),
         refresh_expectation("self-test-artifact-health", "run_artifact_health_selftest"),
         refresh_expectation("self-test-manifest-refresh", "run_manifest_refresh_selftest"),
+        refresh_expectation("self-test-no-write", "run_no_write_selftest"),
         refresh_expectation("self-test-transactions", "run_transaction_decoder_selftest"),
         refresh_expectation("collect-quote", "run_collect_quote", min_refreshes=2, min_prints=2),
         refresh_expectation("collect-orca-baseline", "run_collect_orca_baseline", min_refreshes=2, min_prints=2),
@@ -14442,6 +14446,163 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         "cases": cases,
         "assertions": assertions,
         "safety": "Static source self-test. It reads local InferForge command functions only and sends no requests.",
+    }
+
+
+def build_no_write_selftest() -> dict[str, Any]:
+    target = "http://127.0.0.1:9997"
+
+    def stub_capabilities(target_url: str, artifact_dir: Path, profile: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {
+            "generated_at": utc_now(),
+            "target": {
+                "base_url": target_url,
+                "health_path": "/health",
+                "health_status": 200,
+                "reachable": True,
+                "service": "no-write-selftest",
+                "m0_key_present": False,
+            },
+            "burp": {
+                "mcp_endpoint": "http://127.0.0.1:9876",
+                "mcp_port_open": True,
+                "proxy_8080_open": True,
+                "proxy_8081_open": False,
+                "codex_mcp_get_burp_ok": True,
+                "check_script_ok": True,
+                "approval_sensitive_tools": {
+                    "observed_get_proxy_http_history": "stubbed",
+                    "observed_send_http1_request": "stubbed",
+                    "observed_create_repeater_tab": "stubbed",
+                    "observed_set_proxy_intercept_state": "stubbed",
+                },
+            },
+            "artifacts": {"directory": str(artifact_dir)},
+        }
+
+    def run_cli(argv: list[str]) -> tuple[int, list[str]]:
+        parser = build_parser()
+        parsed_args = parser.parse_args(argv)
+        stdout_buffer = io.StringIO()
+        with contextlib.redirect_stdout(stdout_buffer):
+            return_code = parsed_args.func(parsed_args)
+        return return_code, stdout_buffer.getvalue().splitlines()
+
+    with tempfile.TemporaryDirectory(prefix="inferforge-no-write-selftest-") as temp_dir:
+        root = Path(temp_dir)
+        profile_path = root / "profile.json"
+        profile = {
+            "schema_version": 1,
+            "name": "no-write-selftest",
+            "display_name": "No-Write Self-Test",
+            "default_target": target,
+            "default_source_root": str(root),
+            "clusters": [],
+        }
+        write_json(profile_path, profile)
+        capabilities_output_dir = root / "capabilities-output"
+        readiness_output_dir = root / "readiness-output"
+
+        original_build_capabilities = globals()["build_capabilities"]
+        try:
+            globals()["build_capabilities"] = stub_capabilities
+            capabilities_return_code, capabilities_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(capabilities_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "capabilities",
+                    "--no-write",
+                ]
+            )
+            readiness_return_code, readiness_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(readiness_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "readiness",
+                    "--no-write",
+                ]
+            )
+        finally:
+            globals()["build_capabilities"] = original_build_capabilities
+
+        output_paths = {
+            "capabilities_dir": capabilities_output_dir.exists(),
+            "capabilities_json": (capabilities_output_dir / "burp-capabilities.json").exists(),
+            "capabilities_manifest": (capabilities_output_dir / MANIFEST_NAME).exists(),
+            "readiness_dir": readiness_output_dir.exists(),
+            "readiness_capabilities_json": (readiness_output_dir / "burp-capabilities.json").exists(),
+            "readiness_json": (readiness_output_dir / "environment-readiness.json").exists(),
+            "readiness_manifest": (readiness_output_dir / MANIFEST_NAME).exists(),
+        }
+
+    assertions = [
+        {
+            "id": "capabilities-no-write-skips-artifacts",
+            "passed": (
+                capabilities_return_code == 0
+                and "Capabilities: ready" in capabilities_stdout
+                and "No files written (--no-write)." in capabilities_stdout
+                and not any(output_paths[key] for key in ["capabilities_dir", "capabilities_json", "capabilities_manifest"])
+                and not any(line.startswith("Refreshed ") for line in capabilities_stdout)
+            ),
+            "expected": "capabilities --no-write prints checks without writing artifacts or manifests",
+            "actual": {
+                "return_code": capabilities_return_code,
+                "stdout": capabilities_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "readiness-no-write-skips-artifacts",
+            "passed": (
+                readiness_return_code == 1
+                and "Readiness: waiting-for-external-configuration" in readiness_stdout
+                and "No files written (--no-write)." in readiness_stdout
+                and not any(output_paths[key] for key in ["readiness_dir", "readiness_capabilities_json", "readiness_json", "readiness_manifest"])
+                and not any(line.startswith("Refreshed ") for line in readiness_stdout)
+            ),
+            "expected": "readiness --no-write prints checks without writing artifacts or manifests",
+            "actual": {
+                "return_code": readiness_return_code,
+                "stdout": readiness_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+    ]
+    failed = [item for item in assertions if not item["passed"]]
+    return {
+        "generated_at": utc_now(),
+        "status": "failed" if failed else "passed",
+        "target": target,
+        "summary": {
+            "assertions": len(assertions),
+            "failed": len(failed),
+        },
+        "cases": {
+            "capabilities": {
+                "return_code": capabilities_return_code,
+                "stdout": capabilities_stdout,
+            },
+            "readiness": {
+                "return_code": readiness_return_code,
+                "stdout": readiness_stdout,
+            },
+            "outputs_exist": output_paths,
+        },
+        "assertions": assertions,
+        "safety": "Synthetic no-write self-test. It monkeypatches capability checks, writes only temporary local input files, and sends no requests.",
     }
 
 
@@ -20161,6 +20322,34 @@ def run_manifest_refresh_selftest(args: argparse.Namespace) -> int:
     return 0 if result["status"] == "passed" else 1
 
 
+def run_no_write_selftest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result = build_no_write_selftest()
+    result["current_profile_context"] = profile_summary(profile)
+    output_path = artifact_dir / NO_WRITE_SELFTEST_ARTIFACT
+    write_json(output_path, result)
+    print(f"No-write self-test: {result['status']}")
+    print(
+        "Cases: "
+        f"assertions={result['summary']['assertions']}, "
+        f"failed={result['summary']['failed']}"
+    )
+    failed = [item for item in result.get("assertions", []) if not item.get("passed")]
+    if failed:
+        print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="self-test-no-write",
+            output_paths=[output_path],
+        )
+    )
+    return 0 if result["status"] == "passed" else 1
+
+
 def run_manifest(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -20291,6 +20480,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             ("self-test-review-blockers", "self-test-review-blockers"),
             ("self-test-artifact-health", "self-test-artifact-health"),
             ("self-test-manifest-refresh", "self-test-manifest-refresh"),
+            ("self-test-no-write", "self-test-no-write"),
             ("self-test-transactions", "self-test-transactions"),
         ]:
             command = inferforge_cli_command(
@@ -20833,11 +21023,14 @@ def run_adjudicate(args: argparse.Namespace) -> int:
 
 def run_capabilities(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     capabilities = build_capabilities(target, artifact_dir, profile)
     output_path = artifact_dir / "burp-capabilities.json"
-    write_json(output_path, capabilities)
+    if not no_write:
+        write_json(output_path, capabilities)
     print(json.dumps(capabilities, indent=2))
     target_info = capabilities.get("target", {}) or {}
     burp_info = capabilities.get("burp", {}) or {}
@@ -20860,24 +21053,29 @@ def run_capabilities(args: argparse.Namespace) -> int:
         f"codex_mcp_get_burp_ok={burp_info.get('codex_mcp_get_burp_ok')} "
         f"check_script_ok={burp_info.get('check_script_ok')}"
     )
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="capabilities",
-            output_paths=[
-                *target_profile_artifact_paths(artifact_dir),
-                output_path,
-            ],
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="capabilities",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    output_path,
+                ],
+            )
         )
-    )
     return 0 if capabilities["target"]["reachable"] and capabilities["burp"]["mcp_port_open"] else 1
 
 
 def run_readiness(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     capabilities = build_capabilities(target, artifact_dir, profile)
     quote_path = artifact_dir / "quote-collection.json"
     quote_collection = json.loads(read_text(quote_path)) if quote_path.exists() else None
@@ -20893,8 +21091,9 @@ def run_readiness(args: argparse.Namespace) -> int:
     )
     capabilities_path = artifact_dir / "burp-capabilities.json"
     readiness_path = artifact_dir / "environment-readiness.json"
-    write_json(capabilities_path, capabilities)
-    write_json(readiness_path, readiness)
+    if not no_write:
+        write_json(capabilities_path, capabilities)
+        write_json(readiness_path, readiness)
     print(json.dumps(readiness, indent=2))
     check_status_counts: dict[str, int] = {}
     for check in readiness.get("checks", []) or []:
@@ -20914,18 +21113,21 @@ def run_readiness(args: argparse.Namespace) -> int:
             print(f"- {len(next_steps) - 3} more step(s) in {readiness_path}")
     else:
         print("Next steps: none")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="readiness",
-            output_paths=[
-                *target_profile_artifact_paths(artifact_dir),
-                capabilities_path,
-                readiness_path,
-            ],
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="readiness",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    capabilities_path,
+                    readiness_path,
+                ],
+            )
         )
-    )
     return 0 if readiness["status"] == "ready" else 1
 
 
@@ -21883,11 +22085,21 @@ def build_parser() -> argparse.ArgumentParser:
     adjudicate.set_defaults(func=run_adjudicate)
 
     capabilities = sub.add_parser("capabilities", help="Check target and Burp MCP readiness")
+    capabilities.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print capability checks only; do not write burp-capabilities.json or refreshed manifests.",
+    )
     capabilities.set_defaults(func=run_capabilities)
 
     readiness = sub.add_parser(
         "readiness",
         help="Check external dependency readiness without printing secret values",
+    )
+    readiness.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print readiness checks only; do not write capability/readiness artifacts or refreshed manifests.",
     )
     readiness.set_defaults(func=run_readiness)
 
@@ -21945,6 +22157,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a static self-test for artifact writer manifest refresh coverage",
     )
     manifest_refresh_selftest.set_defaults(func=run_manifest_refresh_selftest)
+
+    no_write_selftest = sub.add_parser(
+        "self-test-no-write",
+        help="Run a synthetic self-test for --no-write command behavior",
+    )
+    no_write_selftest.set_defaults(func=run_no_write_selftest)
 
     collect_quote = sub.add_parser(
         "collect-quote",

@@ -246,7 +246,9 @@ python3 scripts/inferforge.py import-burp-history --input .greybox/burp-mcp-hist
 python3 scripts/inferforge.py plan --include-external
 python3 scripts/inferforge.py plan --include-external --max-probes 12
 python3 scripts/inferforge.py capabilities
+python3 scripts/inferforge.py capabilities --no-write
 python3 scripts/inferforge.py readiness
+python3 scripts/inferforge.py readiness --no-write
 python3 scripts/inferforge.py gate
 python3 scripts/inferforge.py coverage
 python3 scripts/inferforge.py burp-observation-coverage
@@ -269,6 +271,7 @@ python3 scripts/inferforge.py self-test-command-safety
 python3 scripts/inferforge.py self-test-review-blockers
 python3 scripts/inferforge.py self-test-artifact-health
 python3 scripts/inferforge.py self-test-manifest-refresh
+python3 scripts/inferforge.py self-test-no-write
 python3 scripts/inferforge.py review-blockers
 python3 scripts/inferforge.py collect-quote --direction buy --wallet EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR --amount-in 1000000
 python3 scripts/inferforge.py collect-orca-baseline
@@ -671,7 +674,9 @@ Key outputs:
 .greybox/discovery-coverage-selftest.json
 .greybox/command-safety-selftest.json
 .greybox/review-blockers-selftest.json
+.greybox/artifact-health-selftest.json
 .greybox/manifest-refresh-selftest.json
+.greybox/no-write-selftest.json
 .greybox/target-profile.json
 .greybox/strategy-registry.json
 .greybox/profile-validation.json
