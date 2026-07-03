@@ -14404,15 +14404,38 @@ def mcp_tool_inventory_security_issues_in_value(value: Any, *, file_name: str, p
 def regression_suite_output_security_issues(doc: Any, *, file_name: str) -> list[dict[str, Any]]:
     if not isinstance(doc, dict):
         return []
+    issues: list[dict[str, Any]] = []
+
+    preparation = doc.get("preparation")
+    if isinstance(preparation, list):
+        for index, item in enumerate(preparation):
+            if not isinstance(item, dict):
+                continue
+            issues.extend(
+                redacted_error_field_security_issues(
+                    item.get("error"),
+                    file_name=file_name,
+                    path=f"$.preparation[{index}].error",
+                    reason_prefix="regression-preparation-error",
+                )
+            )
+
     steps = doc.get("steps")
     if not isinstance(steps, list):
-        return []
+        return issues
 
-    issues: list[dict[str, Any]] = []
     for index, step in enumerate(steps):
         step_path = f"$.steps[{index}]"
         if not isinstance(step, dict):
             continue
+        issues.extend(
+            redacted_error_field_security_issues(
+                step.get("error"),
+                file_name=file_name,
+                path=f"{step_path}.error",
+                reason_prefix="regression-step-error",
+            )
+        )
         for raw_key in ["output_tail", "stdout", "stderr"]:
             if raw_key in step and step.get(raw_key):
                 issues.append(
@@ -15006,12 +15029,19 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             {
                 "generated_at": utc_now(),
                 "status": "failed",
+                "preparation": [
+                    {
+                        "status": "failed",
+                        "error": "preparation raw error should-not-appear",
+                    }
+                ],
                 "steps": [
                     {
                         "label": "raw-output-step",
                         "status": "failed",
                         "returncode": 1,
                         "output_tail": "Authorization: Bearer should-not-appear",
+                        "error": "step raw error should-not-appear",
                     }
                 ],
             },
@@ -15217,12 +15247,16 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "id": "artifact-health-detects-regression-step-output-leaks",
             "passed": (
                 regression_output_leak.get("status") == "failed"
-                and "regression-step-output-raw-field"
-                in {str(issue.get("reason")) for issue in regression_output_leak.get("security_issues", []) or []}
+                and {
+                    "regression-step-output-raw-field",
+                    "regression-step-error-raw-string",
+                    "regression-preparation-error-raw-string",
+                }.issubset({str(issue.get("reason")) for issue in regression_output_leak.get("security_issues", []) or []})
                 and "should-not-appear" not in regression_output_leak_text
                 and "Authorization: Bearer" not in regression_output_leak_text
+                and "raw error" not in regression_output_leak_text
             ),
-            "expected": "artifact-health fails when regression-suite step records contain raw command output without echoing the leaked value",
+            "expected": "artifact-health fails when regression-suite step/preparation records contain raw output or error text without echoing leaked values",
             "actual": {
                 "status": regression_output_leak.get("status"),
                 "security_issues": regression_output_leak.get("security_issues"),
@@ -17047,7 +17081,7 @@ def remove_stale_probe_results(artifact_dir: Path) -> dict[str, Any]:
             "file": "probe-results.jsonl",
             "status": "failed",
             "rows": rows,
-            "error": str(error),
+            "error": redacted_error_summary(error),
         }
     return {
         "artifact_dir": repo_relative_or_absolute(artifact_dir),
