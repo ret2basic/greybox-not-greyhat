@@ -609,6 +609,8 @@ artifact, checks the manifest's missing-required list, verifies that manifest
 SHA256/size entries still match current files and that no new top-level artifact
 is missing from the manifest, detects stale derived outputs such as
 `report.md`, `index.html`, `reproduction-steps.md`, and `review-blockers.md`,
+checks `mcp_actions` audit records for raw sensitive arguments, raw result text,
+or raw exception messages,
 carries forward key gate statuses such as black-box coverage, discovery
 coverage, verification queue, review blockers, response deltas,
 source-peek requests, and Burp observation coverage, and

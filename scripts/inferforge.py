@@ -14138,6 +14138,138 @@ def derived_artifact_freshness_issues(artifact_dir: Path) -> list[dict[str, Any]
     return issues
 
 
+MCP_AUDIT_HASHED_ARGUMENT_KEYS = {"content", "body", "request", "raw", "raw_request", "raw_response", "regex"}
+MCP_AUDIT_SECRET_MARKERS = ["authorization", "cookie", "password", "secret", "token", "api_key", "api-key", "apikey"]
+
+
+def mcp_action_security_issues_in_value(value: Any, *, file_name: str, path: str = "$") -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if key == "mcp_actions":
+                if not isinstance(child, list):
+                    issues.append(
+                        {
+                            "file": file_name,
+                            "path": child_path,
+                            "reason": "mcp-actions-not-list",
+                        }
+                    )
+                    continue
+                for index, action in enumerate(child):
+                    action_path = f"{child_path}[{index}]"
+                    if not isinstance(action, dict):
+                        issues.append(
+                            {
+                                "file": file_name,
+                                "path": action_path,
+                                "reason": "mcp-action-not-object",
+                            }
+                        )
+                        continue
+                    issues.extend(mcp_single_action_audit_security_issues(action, file_name=file_name, path=action_path))
+                continue
+            issues.extend(mcp_action_security_issues_in_value(child, file_name=file_name, path=child_path))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            issues.extend(mcp_action_security_issues_in_value(child, file_name=file_name, path=f"{path}[{index}]"))
+    return issues
+
+
+def mcp_single_action_audit_security_issues(action: dict[str, Any], *, file_name: str, path: str) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    arguments = action.get("arguments")
+    if arguments is not None and not isinstance(arguments, dict):
+        issues.append({"file": file_name, "path": f"{path}.arguments", "reason": "mcp-action-arguments-not-object"})
+    elif isinstance(arguments, dict):
+        issues.extend(mcp_action_argument_security_issues(arguments, file_name=file_name, path=f"{path}.arguments"))
+
+    result = action.get("result")
+    if isinstance(result, str):
+        issues.append({"file": file_name, "path": f"{path}.result", "reason": "mcp-action-result-raw-string"})
+    elif isinstance(result, dict):
+        for raw_key in ["text", "body", "content", "raw", "raw_response"]:
+            if raw_key in result:
+                issues.append(
+                    {
+                        "file": file_name,
+                        "path": f"{path}.result.{raw_key}",
+                        "reason": "mcp-action-result-raw-field",
+                    }
+                )
+
+    error = action.get("error")
+    if isinstance(error, str):
+        issues.append({"file": file_name, "path": f"{path}.error", "reason": "mcp-action-error-raw-string"})
+    elif isinstance(error, dict):
+        for raw_key in ["message", "text", "body", "raw"]:
+            if raw_key in error:
+                issues.append(
+                    {
+                        "file": file_name,
+                        "path": f"{path}.error.{raw_key}",
+                        "reason": "mcp-action-error-raw-field",
+                    }
+                )
+        if error and error.get("message_redacted") is not True:
+            issues.append(
+                {
+                    "file": file_name,
+                    "path": f"{path}.error",
+                    "reason": "mcp-action-error-not-redacted",
+                }
+            )
+    return issues
+
+
+def mcp_action_argument_security_issues(arguments: dict[str, Any], *, file_name: str, path: str) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    for key, value in arguments.items():
+        lowered = str(key).lower()
+        argument_path = f"{path}.{key}"
+        if any(marker in lowered for marker in MCP_AUDIT_SECRET_MARKERS) and value != "[redacted]":
+            issues.append(
+                {
+                    "file": file_name,
+                    "path": argument_path,
+                    "reason": "mcp-action-secret-argument-not-redacted",
+                }
+            )
+            continue
+        if lowered in MCP_AUDIT_HASHED_ARGUMENT_KEYS:
+            if not (
+                isinstance(value, dict)
+                and isinstance(value.get("bytes"), int)
+                and isinstance(value.get("sha256"), str)
+                and len(str(value.get("sha256"))) == 64
+            ):
+                issues.append(
+                    {
+                        "file": file_name,
+                        "path": argument_path,
+                        "reason": "mcp-action-sensitive-argument-not-hashed",
+                    }
+                )
+            continue
+        if isinstance(value, dict):
+            issues.extend(mcp_action_argument_security_issues(value, file_name=file_name, path=argument_path))
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                if isinstance(item, dict):
+                    issues.extend(
+                        mcp_action_argument_security_issues(item, file_name=file_name, path=f"{argument_path}[{index}]")
+                    )
+    return issues
+
+
+def mcp_action_audit_security_issues(parsed_json_by_name: dict[str, Any]) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    for file_name, doc in sorted(parsed_json_by_name.items()):
+        issues.extend(mcp_action_security_issues_in_value(doc, file_name=file_name))
+    return issues
+
+
 def artifact_health_status(checks: list[dict[str, Any]], statuses: dict[str, Any]) -> str:
     if any(check.get("status") == "failed" for check in checks):
         return "failed"
@@ -14174,6 +14306,8 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
     jsonl_rows: dict[str, int] = {}
     manifest: dict[str, Any] | None = None
     stale_inputs: list[dict[str, Any]] = []
+    parsed_json_by_name: dict[str, Any] = {}
+    security_issues: list[dict[str, Any]] = []
 
     if not artifact_dir.exists():
         checks.append(
@@ -14197,6 +14331,7 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
             "statuses": {},
             "missing_required": [],
             "stale_inputs": stale_inputs,
+            "security_issues": security_issues,
             "safety": "Read-only artifact health analysis. No requests are sent.",
         }
 
@@ -14209,6 +14344,7 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
             if error:
                 json_errors.append(error)
                 continue
+            parsed_json_by_name[path.name] = parsed
             if path.name == MANIFEST_NAME:
                 manifest = parsed
         elif path.suffix == ".jsonl":
@@ -14248,6 +14384,25 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
                 "id": "jsonl-parse",
                 "status": "passed",
                 "message": f"{len(jsonl_files)} JSONL artifact(s) parsed.",
+            }
+        )
+
+    security_issues = mcp_action_audit_security_issues(parsed_json_by_name)
+    if security_issues:
+        checks.append(
+            {
+                "id": "mcp-action-audit-hygiene",
+                "status": "failed",
+                "message": f"{len(security_issues)} MCP action audit hygiene issue(s) found.",
+                "security_issues": security_issues[:20],
+            }
+        )
+    else:
+        checks.append(
+            {
+                "id": "mcp-action-audit-hygiene",
+                "status": "passed",
+                "message": "MCP action audit records do not expose raw sensitive argument, result, or error text.",
             }
         )
 
@@ -14376,6 +14531,7 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
         "statuses": statuses,
         "missing_required": missing_required,
         "stale_inputs": stale_inputs,
+        "security_issues": security_issues,
         "parse": {
             "json_files": len(json_files),
             "jsonl_files": len(jsonl_files),
@@ -14446,6 +14602,7 @@ def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
     parse_error_count = 0
     missing_required_count = 0
     stale_input_count = 0
+    security_issue_count = 0
 
     for item in directories:
         status = str(item.get("status") or "unknown")
@@ -14461,6 +14618,7 @@ def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
         parse_error_count += len(parse_doc.get("jsonl_errors", []) or [])
         missing_required_count += len(item.get("missing_required", []) or [])
         stale_input_count += len(item.get("stale_inputs", []) or [])
+        security_issue_count += len(item.get("security_issues", []) or [])
 
     if not directories:
         status = "no-artifact-dirs"
@@ -14485,6 +14643,7 @@ def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
             "parse_error_count": parse_error_count,
             "missing_required_count": missing_required_count,
             "stale_input_count": stale_input_count,
+            "security_issue_count": security_issue_count,
         },
         "directories": directories,
         "safety": "Local artifact health analysis only. It does not send HTTP requests, call Burp, fuzz, sign wallets, submit transactions, or invoke Server Actions.",
@@ -14559,6 +14718,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         modified_dir = root / "modified"
         missing_dir = root / "missing"
         untracked_dir = root / "untracked"
+        mcp_audit_leak_dir = root / "mcp-audit-leak"
         refresh_dir = root / "refresh"
         derived_dir = root / "derived"
         for directory in [healthy_dir, modified_dir, missing_dir, untracked_dir]:
@@ -14581,11 +14741,34 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         write_json(modified_dir / "ok.json", {"status": "changed"})
         (missing_dir / "ok.json").unlink()
         write_json(untracked_dir / "extra.json", {"status": "new"})
+        mcp_audit_leak_dir.mkdir(parents=True)
+        write_json(
+            mcp_audit_leak_dir / "burp-mcp-sync.json",
+            {
+                "status": "failed",
+                "mcp_actions": [
+                    {
+                        "tool": "get_proxy_http_history_regex",
+                        "status": "failed",
+                        "arguments": {
+                            "regex": "Authorization: Bearer should-not-appear",
+                            "api_key": "should-not-appear",
+                        },
+                        "result": {"text": "raw response should-not-appear"},
+                        "error": "raw error should-not-appear",
+                    }
+                ],
+            },
+        )
+        write_minimal_manifest(mcp_audit_leak_dir, ["burp-mcp-sync.json"])
 
         healthy = build_single_artifact_health(healthy_dir)
         modified = build_single_artifact_health(modified_dir)
         missing = build_single_artifact_health(missing_dir)
         untracked = build_single_artifact_health(untracked_dir)
+        mcp_audit_leak = build_single_artifact_health(mcp_audit_leak_dir)
+        mcp_audit_leak_rollup = build_artifact_health([mcp_audit_leak_dir])
+        mcp_audit_leak_text = json.dumps(mcp_audit_leak, sort_keys=True)
         aggregate = build_artifact_health([healthy_dir, modified_dir, missing_dir, untracked_dir])
         refresh_health = build_artifact_health([refresh_dir])
         refresh_output = refresh_dir / "artifact-health.json"
@@ -14747,6 +14930,29 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "actual": aggregate.get("summary", {}).get("stale_input_count"),
         },
         {
+            "id": "artifact-health-detects-mcp-action-audit-leaks",
+            "passed": (
+                mcp_audit_leak.get("status") == "failed"
+                and mcp_audit_leak_rollup.get("summary", {}).get("security_issue_count", 0) >= 4
+                and {
+                    "mcp-action-sensitive-argument-not-hashed",
+                    "mcp-action-secret-argument-not-redacted",
+                    "mcp-action-result-raw-field",
+                    "mcp-action-error-raw-string",
+                }.issubset({str(issue.get("reason")) for issue in mcp_audit_leak.get("security_issues", []) or []})
+                and "should-not-appear" not in mcp_audit_leak_text
+                and "Authorization: Bearer" not in mcp_audit_leak_text
+                and "raw response" not in mcp_audit_leak_text
+                and "raw error" not in mcp_audit_leak_text
+            ),
+            "expected": "artifact-health fails when MCP action audit records contain raw sensitive arguments, result text, or error strings without echoing the leaked values",
+            "actual": {
+                "status": mcp_audit_leak.get("status"),
+                "security_issues": mcp_audit_leak.get("security_issues"),
+                "rollup_summary": mcp_audit_leak_rollup.get("summary"),
+            },
+        },
+        {
             "id": "artifact-health-output-refreshes-manifest",
             "passed": (
                 refresh_stale_before.get("status") == "failed"
@@ -14871,6 +15077,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "failed": len(failed),
             "aggregate_status": aggregate.get("status"),
             "stale_input_count": aggregate.get("summary", {}).get("stale_input_count"),
+            "security_issue_count": mcp_audit_leak_rollup.get("summary", {}).get("security_issue_count"),
             "manifest_refreshes": (
                 len(refreshed_manifests)
                 + len(review_blockers_refreshed_manifests)
@@ -14883,6 +15090,8 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "modified": modified,
             "missing": missing,
             "untracked": untracked,
+            "mcp_audit_leak": mcp_audit_leak,
+            "mcp_audit_leak_rollup": mcp_audit_leak_rollup,
             "aggregate": aggregate,
             "refresh_stale_before": refresh_stale_before,
             "refreshed_health": refreshed_health,
@@ -21860,7 +22069,8 @@ def run_artifact_health_selftest(args: argparse.Namespace) -> int:
         "Cases: "
         f"assertions={result['summary']['assertions']}, "
         f"failed={result['summary']['failed']}, "
-        f"stale_inputs={result['summary']['stale_input_count']}"
+        f"stale_inputs={result['summary']['stale_input_count']}, "
+        f"security_issues={result['summary'].get('security_issue_count', 0)}"
     )
     failed = [item for item in result.get("assertions", []) if not item.get("passed")]
     if failed:
@@ -21994,7 +22204,8 @@ def run_artifact_health(args: argparse.Namespace) -> int:
         "Parse/required: "
         f"parse_errors={health['summary']['parse_error_count']}, "
         f"missing_required={health['summary']['missing_required_count']}, "
-        f"stale_inputs={health['summary'].get('stale_input_count', 0)}"
+        f"stale_inputs={health['summary'].get('stale_input_count', 0)}, "
+        f"security_issues={health['summary'].get('security_issue_count', 0)}"
     )
     for item in health["directories"]:
         statuses = item.get("statuses", {}) or {}
@@ -22015,6 +22226,15 @@ def run_artifact_health(args: argparse.Namespace) -> int:
             print(f"  stale: {format_artifact_health_stale_issue(stale_issue)}")
         if len(stale_inputs) > 3:
             print(f"  stale: {len(stale_inputs) - 3} more issue(s); inspect artifact-health.json")
+        security_issues = item.get("security_issues", []) or []
+        for security_issue in security_issues[:3]:
+            print(
+                "  security: "
+                f"{security_issue.get('file')} {security_issue.get('path')} "
+                f"reason={security_issue.get('reason')}"
+            )
+        if len(security_issues) > 3:
+            print(f"  security: {len(security_issues) - 3} more issue(s); inspect artifact-health.json")
     if not args.no_write:
         print(f"Wrote {output_path}")
         for item in refreshed_manifests:
