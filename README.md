@@ -519,7 +519,10 @@ is missing from the manifest, carries forward key gate statuses such as
 black-box coverage, discovery coverage, verification queue, review blockers,
 response deltas, source-peek requests, and Burp observation coverage, and
 classifies each run as `healthy`, `ready-with-external-blockers`,
-`needs-human-review`, or `failed`. It is useful after regression runs:
+`needs-human-review`, or `failed`. When it writes `artifact-health.json` inside
+a managed artifact directory, it refreshes that directory's manifest so the
+health artifact does not make the next integrity check stale. It is useful after
+regression runs:
 
 ```bash
 python3 scripts/inferforge.py artifact-health \

@@ -12404,6 +12404,35 @@ def write_artifact_manifest(artifact_dir: Path, target: str, *, command: str) ->
     return manifest
 
 
+def refresh_artifact_health_output_manifests(
+    *,
+    output_path: Path,
+    artifact_dir: Path,
+    check_dirs: list[Path],
+    target: str,
+) -> list[dict[str, Any]]:
+    output_parent = output_path.resolve().parent
+    candidates = [artifact_dir.resolve(), *[path.resolve() for path in check_dirs]]
+    refreshed = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if output_parent != candidate or not candidate.exists():
+            continue
+        manifest = write_artifact_manifest(candidate, target, command="artifact-health")
+        refreshed.append(
+            {
+                "artifact_dir": str(candidate),
+                "manifest": str(candidate / MANIFEST_NAME),
+                "status": manifest.get("status"),
+            }
+        )
+    return refreshed
+
+
 def increment_count(counts: dict[str, int], key: str) -> None:
     counts[key] = counts.get(key, 0) + 1
 
@@ -12831,6 +12860,35 @@ def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
     }
 
 
+def write_artifact_health_artifact(
+    *,
+    health: dict[str, Any],
+    output_path: Path,
+    artifact_dir: Path,
+    check_dirs: list[Path],
+    target: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    write_json(output_path, health)
+    refreshed_manifests = refresh_artifact_health_output_manifests(
+        output_path=output_path,
+        artifact_dir=artifact_dir,
+        check_dirs=check_dirs,
+        target=target,
+    )
+    if not refreshed_manifests:
+        return health, refreshed_manifests
+
+    refreshed_health = build_artifact_health(check_dirs)
+    write_json(output_path, refreshed_health)
+    refreshed_manifests = refresh_artifact_health_output_manifests(
+        output_path=output_path,
+        artifact_dir=artifact_dir,
+        check_dirs=check_dirs,
+        target=target,
+    )
+    return refreshed_health, refreshed_manifests
+
+
 def build_artifact_health_selftest() -> dict[str, Any]:
     def manifest_row(path: Path) -> dict[str, Any]:
         stat = path.stat()
@@ -12853,16 +12911,30 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             },
         )
 
+    def write_sample_artifact(path: Path) -> None:
+        if path.suffix == ".json":
+            write_json(path, {"generated_at": utc_now(), "status": "ready", "summary": {}})
+        elif path.suffix == ".jsonl":
+            path.write_text('{"status":"ready"}\n', encoding="utf-8")
+        else:
+            path.write_text("ready\n", encoding="utf-8")
+
     with tempfile.TemporaryDirectory(prefix="inferforge-artifact-health-selftest-") as temp_dir:
         root = Path(temp_dir)
         healthy_dir = root / "healthy"
         modified_dir = root / "modified"
         missing_dir = root / "missing"
         untracked_dir = root / "untracked"
+        refresh_dir = root / "refresh"
         for directory in [healthy_dir, modified_dir, missing_dir, untracked_dir]:
             directory.mkdir(parents=True)
             write_json(directory / "ok.json", {"status": "ready"})
             write_minimal_manifest(directory, ["ok.json"])
+
+        refresh_dir.mkdir(parents=True)
+        for name in REQUIRED_ARTIFACTS:
+            write_sample_artifact(refresh_dir / name)
+        write_artifact_manifest(refresh_dir, "http://127.0.0.1:9997", command="self-test-artifact-health")
 
         write_json(modified_dir / "ok.json", {"status": "changed"})
         (missing_dir / "ok.json").unlink()
@@ -12873,6 +12945,18 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         missing = build_single_artifact_health(missing_dir)
         untracked = build_single_artifact_health(untracked_dir)
         aggregate = build_artifact_health([healthy_dir, modified_dir, missing_dir, untracked_dir])
+        refresh_health = build_artifact_health([refresh_dir])
+        refresh_output = refresh_dir / "artifact-health.json"
+        write_json(refresh_output, refresh_health)
+        refresh_stale_before = build_single_artifact_health(refresh_dir)
+        refreshed_health, refreshed_manifests = write_artifact_health_artifact(
+            health=refresh_health,
+            output_path=refresh_output,
+            artifact_dir=refresh_dir,
+            check_dirs=[refresh_dir],
+            target="http://127.0.0.1:9997",
+        )
+        refresh_after = build_single_artifact_health(refresh_dir)
 
     def stale_reasons(item: dict[str, Any]) -> set[str]:
         return {str(entry.get("reason")) for entry in item.get("stale_inputs", []) or []}
@@ -12908,6 +12992,24 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "expected": 3,
             "actual": aggregate.get("summary", {}).get("stale_input_count"),
         },
+        {
+            "id": "artifact-health-output-refreshes-manifest",
+            "passed": (
+                refresh_stale_before.get("status") == "failed"
+                and refresh_after.get("status") == "healthy"
+                and refreshed_health.get("status") == "healthy"
+                and len(refreshed_manifests) == 1
+                and not refresh_after.get("stale_inputs")
+            ),
+            "expected": "writing artifact-health.json then refreshing manifest returns to healthy",
+            "actual": {
+                "before_status": refresh_stale_before.get("status"),
+                "refreshed_health_status": refreshed_health.get("status"),
+                "after_status": refresh_after.get("status"),
+                "refreshed_manifests": refreshed_manifests,
+                "after_stale_inputs": refresh_after.get("stale_inputs"),
+            },
+        },
     ]
     failed = [item for item in assertions if not item["passed"]]
     return {
@@ -12918,6 +13020,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "failed": len(failed),
             "aggregate_status": aggregate.get("status"),
             "stale_input_count": aggregate.get("summary", {}).get("stale_input_count"),
+            "manifest_refreshes": len(refreshed_manifests),
         },
         "cases": {
             "healthy": healthy,
@@ -12925,6 +13028,10 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "missing": missing,
             "untracked": untracked,
             "aggregate": aggregate,
+            "refresh_stale_before": refresh_stale_before,
+            "refreshed_health": refreshed_health,
+            "refresh_after": refresh_after,
+            "refreshed_manifests": refreshed_manifests,
         },
         "assertions": assertions,
         "safety": "Synthetic artifact-health self-test. It writes temporary local files only and sends no requests.",
@@ -17867,6 +17974,8 @@ def run_manifest(args: argparse.Namespace) -> int:
 
 def run_artifact_health(args: argparse.Namespace) -> int:
     artifact_dir = Path(args.artifact_dir).resolve()
+    profile = load_target_profile(args.profile)
+    target = resolve_target(args, profile)
     check_dirs: list[Path] = []
     for item in args.check_dir or []:
         check_dirs.append(resolve_repo_path(item))
@@ -17887,8 +17996,15 @@ def run_artifact_health(args: argparse.Namespace) -> int:
 
     health = build_artifact_health(deduped_dirs)
     output_path = resolve_repo_path(args.output) if args.output else artifact_dir / "artifact-health.json"
+    refreshed_manifests = []
     if not args.no_write:
-        write_json(output_path, health)
+        health, refreshed_manifests = write_artifact_health_artifact(
+            health=health,
+            output_path=output_path,
+            artifact_dir=artifact_dir,
+            check_dirs=deduped_dirs,
+            target=target,
+        )
 
     print(f"Artifact health: {health['status']}")
     print(
@@ -17917,6 +18033,8 @@ def run_artifact_health(args: argparse.Namespace) -> int:
         )
     if not args.no_write:
         print(f"Wrote {output_path}")
+        for item in refreshed_manifests:
+            print(f"Refreshed {item['manifest']}: {item['status']}")
 
     if health["status"] in {"failed", "no-artifact-dirs"}:
         return 1
