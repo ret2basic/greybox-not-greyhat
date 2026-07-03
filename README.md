@@ -122,9 +122,9 @@ Profiles separate endpoint discovery from concrete probe paths:
   `.greybox/review-observation-candidates.json`; use `--no-write` to print an
   approval-focused summary without writing artifacts. The dry-run output shows
   path templates, source refs, fixed upstreams, approval requirements,
-  promotion placeholders, and generated command templates so the human review
-  step can approve one concrete local read-only path without opening the JSON
-  artifact. After review, use
+  promotion placeholders, command safety totals, and labeled generated command
+  templates so the human review step can approve one concrete local read-only
+  path without opening the JSON artifact. After review, use
   `promote-observation-candidate` to write a separate reviewed profile.
   Promotion is a profile edit only; it does not send HTTP traffic.
 - Generic `nextjs-api-routes` clusters with concrete probe paths receive only

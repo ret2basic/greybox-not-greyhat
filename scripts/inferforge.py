@@ -11830,6 +11830,18 @@ def review_candidate_rewrite_summaries(candidate: dict[str, Any], *, limit: int 
     return [*summaries[:limit], f"... +{len(summaries) - limit} more rewrites"]
 
 
+def review_candidate_command_refs(candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    commands = ordered_unique_strings(candidate.get("command_templates", []) or [])
+    return [
+        classify_verification_command(
+            command,
+            source=f"{candidate.get('id') or 'review-candidate'}:command_templates[{index}]",
+            item_status="manual-review",
+        )
+        for index, command in enumerate(commands, start=1)
+    ]
+
+
 def format_review_candidate_cli_lines(candidate: dict[str, Any]) -> list[str]:
     compact = compact_review_candidate(candidate)
     lines = [
@@ -11875,9 +11887,18 @@ def format_review_candidate_cli_lines(candidate: dict[str, Any]) -> list[str]:
 
     command_templates = compact.get("command_templates", []) or []
     if command_templates:
+        command_refs = review_candidate_command_refs(compact)
+        command_refs_by_command = {
+            str(ref.get("command") or ""): ref
+            for ref in command_refs
+        }
+        command_safety = command_safety_summary(command_refs)
+        lines.append(f"  command_safety={format_command_safety_summary(command_safety)}")
         lines.append("  command_templates:")
         for command in command_templates[:4]:
-            lines.append(f"    - {inline_summary_text(command, max_chars=500)}")
+            ref = command_refs_by_command.get(str(command))
+            label = f"{format_command_ref_label(ref)} " if ref else ""
+            lines.append(f"    - {label}{inline_summary_text(command, max_chars=500)}")
         if len(command_templates) > 4:
             lines.append(f"    - ... +{len(command_templates) - 4} more commands")
     return lines
@@ -15081,7 +15102,10 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Choose one known safe read-only path." in review_candidates_stdout_text
                 and "promote_to_burp_observation_plan: id=burp_observe_no_write_reviewed_path" in review_candidates_stdout_text
                 and f"path={PLACEHOLDER_APPROVED_CONCRETE_PATH}" in review_candidates_stdout_text
+                and "command_safety=commands=4" in review_candidates_stdout_text
                 and "command_templates:" in review_candidates_stdout_text
+                and "[manual-template]" in review_candidates_stdout_text
+                and "[review-gated]" in review_candidates_stdout_text
                 and "promote-observation-candidate" in review_candidates_stdout_text
                 and "--no-write" in review_candidates_stdout_text
                 and "No files written (--no-write)." in review_candidates_stdout
