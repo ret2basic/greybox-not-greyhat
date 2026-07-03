@@ -7695,6 +7695,26 @@ def build_attack_strategy(
     }
 
 
+def is_waiting_attack_strategy_action(action: dict[str, Any]) -> bool:
+    status = str(action.get("status") or "")
+    return status.startswith("waiting-") or status in {"blocked", "blocked-external"}
+
+
+def waiting_attack_strategy_actions(attack_strategy: dict[str, Any] | None) -> list[dict[str, Any]]:
+    return [
+        action
+        for action in (attack_strategy or {}).get("next_development_actions", []) or []
+        if isinstance(action, dict) and is_waiting_attack_strategy_action(action)
+    ]
+
+
+def format_attack_strategy_waiting_action(action: dict[str, Any]) -> str:
+    action_id = str(action.get("id") or "unknown-action")
+    status = str(action.get("status") or "unknown")
+    title = str(action.get("title") or "Untitled action")
+    return f"{action_id}: {status} - {title}"
+
+
 def discovered_server_actions_from_source_peeks(source_peeks: dict[str, Any] | None) -> list[dict[str, Any]]:
     endpoint_resolver = (source_peeks or {}).get("endpoint_resolver") or {}
     actions = endpoint_resolver.get("discovered_server_actions") or []
@@ -11230,12 +11250,7 @@ def build_verification_queue(
             extra=extra,
         )
     elif attack_strategy_status == "needs-external-evidence":
-        waiting_actions = [
-            action
-            for action in (attack_strategy or {}).get("next_development_actions", []) or []
-            if str(action.get("status") or "").startswith("waiting-")
-            or str(action.get("status") or "") in {"blocked", "blocked-external"}
-        ]
+        waiting_actions = waiting_attack_strategy_actions(attack_strategy)
         waiting_action_ids = {str(action.get("id") or "") for action in waiting_actions}
         commands = []
         if "NEXT-transaction-intent-corpus" in waiting_action_ids:
@@ -18290,6 +18305,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         [],
         [{"method": "POST", "path": "/bridge/quote", "status": 400, "source": "self-test"}],
     )
+    external_waiting_summaries = [
+        format_attack_strategy_waiting_action(action)
+        for action in waiting_attack_strategy_actions(external_attack_strategy)
+    ]
     strategy_review_queue = build_verification_queue(
         "http://127.0.0.1:9998",
         {"clusters": unknown_attack_strategy.get("strategy_coverage", [])},
@@ -18346,6 +18365,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and unknown_attack_strategy.get("status") == "needs-strategy-review"
         and unknown_attack_strategy.get("summary", {}).get("strategy_uncovered_clusters") == ["opaque-service"]
         and external_attack_strategy.get("status") == "needs-external-evidence"
+        and any(
+            "NEXT-transaction-intent-corpus: waiting-for-real-quote-response - Feed real quote transaction payloads"
+            in line
+            for line in external_waiting_summaries
+        )
         and strategy_review_item is not None
         and strategy_review_item.get("status") == "manual-review"
         and strategy_review_item.get("strategy_uncovered_clusters") == ["opaque-service"]
@@ -18459,6 +18483,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "unknown_summary": unknown_attack_strategy.get("summary", {}),
             "external_status": external_attack_strategy.get("status"),
             "external_summary": external_attack_strategy.get("summary", {}),
+            "external_waiting_summaries": external_waiting_summaries,
             "strategy_review_queue": {
                 "status": strategy_review_queue.get("status"),
                 "summary": strategy_review_queue.get("summary", {}),
@@ -18886,6 +18911,11 @@ def run_attack_strategy(args: argparse.Namespace) -> int:
     uncovered = attack_strategy["summary"].get("strategy_uncovered_clusters", [])
     if uncovered:
         print(f"Uncovered clusters: {', '.join(str(item) for item in uncovered)}")
+    waiting_actions = waiting_attack_strategy_actions(attack_strategy)
+    for action in waiting_actions[:3]:
+        print(f"Waiting action: {format_attack_strategy_waiting_action(action)}")
+    if len(waiting_actions) > 3:
+        print(f"Waiting action: {len(waiting_actions) - 3} more in attack-strategy.json")
     print(f"Wrote {output_path}")
     print_refreshed_manifests(
         refresh_current_artifact_manifest(
