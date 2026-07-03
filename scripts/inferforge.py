@@ -61,6 +61,7 @@ DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
 REVIEW_BLOCKERS_MARKDOWN_ARTIFACT = "review-blockers.md"
+REVIEW_BLOCKERS_SELFTEST_ARTIFACT = "review-blockers-selftest.json"
 REQUIRED_ARTIFACTS = [
     "index.html",
     "report.md",
@@ -125,6 +126,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     REVIEW_BLOCKERS_MARKDOWN_ARTIFACT,
     "profile-routing-selftest.json",
     DISCOVERY_COVERAGE_SELFTEST_ARTIFACT,
+    REVIEW_BLOCKERS_SELFTEST_ARTIFACT,
     "transaction-intent-policy.json",
 ]
 INDEX_ARTIFACT_ORDER = [
@@ -136,6 +138,7 @@ INDEX_ARTIFACT_ORDER = [
     REVIEW_BLOCKERS_MARKDOWN_ARTIFACT,
     DISCOVERY_COVERAGE_ARTIFACT,
     DISCOVERY_COVERAGE_SELFTEST_ARTIFACT,
+    REVIEW_BLOCKERS_SELFTEST_ARTIFACT,
     TARGET_PROFILE_ARTIFACT,
     STRATEGY_REGISTRY_ARTIFACT,
     PROFILE_VALIDATION_ARTIFACT,
@@ -4310,11 +4313,12 @@ def run_ws_upgrade_observation_through_proxy(
         }
     ws_url = urllib.parse.urlunparse(("ws", parsed.netloc, ws_path, "", "", ""))
     script = """
+import fs from 'node:fs'
 import { WebSocket } from 'ws'
 import proxyAgentPkg from 'https-proxy-agent'
 
 const { HttpsProxyAgent } = proxyAgentPkg
-const input = JSON.parse(process.argv[2])
+const input = JSON.parse(fs.readFileSync(0, 'utf8'))
 const agent = new HttpsProxyAgent(input.proxy)
 const started = Date.now()
 let opened = false
@@ -4371,40 +4375,24 @@ ws.on('error', (error) => {
             "status": None,
             "error": f"Source root not found: {source_root}",
         }
-    with tempfile.NamedTemporaryFile(
-        "w",
-        suffix=".mjs",
-        prefix=".inferforge-burp-ws-observe-",
-        dir=str(source_root),
-        delete=False,
-        encoding="utf-8",
-    ) as script_handle:
-        script_handle.write(script)
-        script_path = script_handle.name
 
-    try:
-        proc = subprocess.run(
-            [
-                node,
-                script_path,
-                json.dumps(
-                    {
-                        "url": ws_url,
-                        "proxy": proxy,
-                        "origin": origin_for(target),
-                        "subscribeMethod": subscribe_method,
-                    }
-                ),
-            ],
-            cwd=str(source_root),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=15,
-            check=False,
-        )
-    finally:
-        Path(script_path).unlink(missing_ok=True)
+    proc = subprocess.run(
+        [node, "--input-type=module", "--eval", script],
+        cwd=str(source_root),
+        input=json.dumps(
+            {
+                "url": ws_url,
+                "proxy": proxy,
+                "origin": origin_for(target),
+                "subscribeMethod": subscribe_method,
+            }
+        ),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=15,
+        check=False,
+    )
 
     parsed_output = parse_json_object(proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "")
     if parsed_output:
@@ -5762,29 +5750,15 @@ results.push(await one('ws_disallowed_origin', 'https://evil.example', null))
 console.log(JSON.stringify(results))
 """
 
-    with tempfile.NamedTemporaryFile(
-        "w",
-        suffix=".mjs",
-        prefix=".inferforge-ws-",
-        dir=str(script_root),
-        delete=False,
-        encoding="utf-8",
-    ) as handle:
-        handle.write(script)
-        script_path = handle.name
-
-    try:
-        proc = subprocess.run(
-            [node, script_path],
-            cwd=str(script_root),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=15,
-            check=False,
-        )
-    finally:
-        Path(script_path).unlink(missing_ok=True)
+    proc = subprocess.run(
+        [node, "--input-type=module", "--eval", script],
+        cwd=str(script_root),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=15,
+        check=False,
+    )
 
     output = proc.stdout.strip().splitlines()
     raw_json = output[-1] if output else "[]"
@@ -5809,7 +5783,13 @@ console.log(JSON.stringify(results))
     for item in raw_results:
         probe_id = item["name"]
         status = item.get("status")
-        expected_statuses = [403] if probe_id == "ws_disallowed_origin" else [1008]
+        expected_statuses = [403] if probe_id == "ws_disallowed_origin" else [1008, 1006]
+        expected = status in expected_statuses
+        expectation_result = "status"
+        review_note = None
+        if probe_id != "ws_disallowed_origin" and status == 1006:
+            expectation_result = "policy-close-without-close-frame"
+            review_note = "The server closed the WebSocket without a policy close frame; the message was still blocked."
         results.append(
             {
                 "ts": utc_now(),
@@ -5825,7 +5805,8 @@ console.log(JSON.stringify(results))
                 "risk": "safe-websocket-validation",
                 "expected_statuses": expected_statuses,
                 "status": status,
-                "expected": status in expected_statuses,
+                "expected": expected,
+                "expectation_result": expectation_result,
                 "duration_ms": None,
                 "error": item.get("error"),
                 "body_sample": item.get("body_sample", ""),
@@ -5833,7 +5814,8 @@ console.log(JSON.stringify(results))
                 "body_sha256": None,
                 "body_truncated": False,
                 "body_length": len(item.get("body_sample", "")),
-                "interesting": status not in expected_statuses,
+                "interesting": (not expected) or review_note is not None,
+                "review_note": review_note,
             }
         )
     return results
@@ -5958,29 +5940,15 @@ console.log(JSON.stringify({{
 }}))
 """
 
-    with tempfile.NamedTemporaryFile(
-        "w",
-        suffix=".mjs",
-        prefix=".inferforge-ws-resource-",
-        dir=str(script_root),
-        delete=False,
-        encoding="utf-8",
-    ) as handle:
-        handle.write(script)
-        script_path = handle.name
-
-    try:
-        proc = subprocess.run(
-            [node, script_path],
-            cwd=str(script_root),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=10,
-            check=False,
-        )
-    finally:
-        Path(script_path).unlink(missing_ok=True)
+    proc = subprocess.run(
+        [node, "--input-type=module", "--eval", script],
+        cwd=str(script_root),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=10,
+        check=False,
+    )
 
     output = proc.stdout.strip().splitlines()
     raw_json = output[-1] if output else "{}"
@@ -11462,6 +11430,249 @@ def build_review_blockers_rollup(
     }
 
 
+def review_blocker_group_by_cluster(doc: dict[str, Any], cluster_id: str) -> dict[str, Any] | None:
+    for group in doc.get("groups", []) or []:
+        if group.get("cluster_id") == cluster_id:
+            return group
+    return None
+
+
+def build_review_blockers_selftest() -> dict[str, Any]:
+    target = "http://127.0.0.1:9997"
+    profile = {
+        "schema_version": 1,
+        "name": "review-blockers-selftest",
+        "display_name": "Review Blockers Self-Test",
+        "clusters": [
+            {
+                "id": "route-api-proxy-path",
+                "method": "GET",
+                "path": "/api/proxy/{path*}",
+                "kind": "fixed-upstream-proxy",
+                "priority": "medium",
+                "strategy_set": "fixed-upstream-proxy",
+            },
+            {
+                "id": "quote",
+                "method": "POST",
+                "path": "/api/quote",
+                "kind": "orchestration-proxy",
+                "priority": "high",
+                "strategy_set": "quote-transaction-decoder",
+            },
+        ],
+    }
+    review_candidate = {
+        "id": "review_observe_route_api_proxy_path_approved_path",
+        "type": "burp-http-observation",
+        "status": "review-only",
+        "method": "GET",
+        "path_template": "/api/proxy/{path*}",
+        "cluster": "route-api-proxy-path",
+    }
+    discovery_coverage = {
+        "status": "needs-human-review",
+        "surfaces": [
+            {
+                "id": "rewrite:route_api_proxy_path:0",
+                "type": "rewrite",
+                "path": "/api/proxy/{path*}",
+                "methods": ["ANY"],
+                "status": "review-gated",
+                "declared_cluster_id": "route-api-proxy-path",
+                "profile_cluster_ids": ["route-api-proxy-path"],
+                "source_refs": ["next.config.ts"],
+                "next_action": "Promote one approved concrete local read-only observation path.",
+                "review_candidates": [review_candidate],
+            }
+        ],
+    }
+    burp_observation_coverage = {
+        "status": "needs-human-review",
+        "clusters": [
+            {
+                "cluster_id": "route-api-proxy-path",
+                "status": "needs-reviewed-observation-promotion",
+                "priority": "medium",
+                "next_action": "Review one concrete local read-only path, then run burp-sync --observe.",
+                "review_candidate_ids": [review_candidate["id"]],
+                "active_observation_count": 0,
+                "evidence_gaps": ["GAP-route-api-proxy-path-burp-observation"],
+            }
+        ],
+    }
+    external_queue = {
+        "status": "ready-with-external-blockers",
+        "summary": {"command_safety": {"unsafe_template_count": 0}},
+        "items": [
+            {
+                "id": "RESOLVE-GAP-quote-transaction-corpus",
+                "title": "No real quote transaction payload corpus",
+                "status": "blocked-external",
+                "priority": "high",
+                "reason": "A successful quote response with a transaction candidate is required.",
+                "cluster_id": "quote",
+                "commands": [],
+                "evidence_refs": ["evidence-gaps.json", "environment-readiness.json"],
+                "prerequisites": ["Set M0 configuration."],
+            }
+        ],
+    }
+    discovered_queue = json_clone(external_queue)
+    discovered_queue["status"] = "needs-human-review"
+    discovered_queue["items"].extend(
+        [
+            {
+                "id": "REPLAY-route-api-proxy-path",
+                "title": "Replay representative evidence for route-api-proxy-path",
+                "status": "manual-review",
+                "priority": "medium",
+                "reason": "Cluster coverage is `covered-with-open-items` with 0 probe rows.",
+                "cluster_id": "route-api-proxy-path",
+                "commands": [],
+                "evidence_refs": ["verification-queue.json"],
+                "prerequisites": [],
+            },
+            {
+                "id": "RESOLVE-GAP-route-api-proxy-path-burp-observation",
+                "title": "Browser-flow observation missing",
+                "status": "manual-review",
+                "priority": "low",
+                "reason": "A reviewed concrete local observation path is required.",
+                "cluster_id": "route-api-proxy-path",
+                "commands": [],
+                "evidence_refs": ["evidence-gaps.json", "environment-readiness.json"],
+                "prerequisites": ["Approve one local read-only path."],
+                "review_candidates": [review_candidate],
+            },
+        ]
+    )
+    environment_readiness = {
+        "status": "waiting-for-external-configuration",
+        "next_steps": ["Set a real M0_ORCHESTRATION_API_KEY and restart the target server."],
+        "checks": [
+            {
+                "id": "m0-orchestration-key-configured",
+                "status": "blocked",
+                "evidence": {"status": "placeholder", "source": ".env.local"},
+            }
+        ],
+    }
+
+    default_blockers = build_review_blockers(
+        target=target,
+        profile=profile,
+        artifact_dir=Path(".greybox/selftest-default"),
+        verification_queue=external_queue,
+        environment_readiness=environment_readiness,
+    )
+    discovered_blockers = build_review_blockers(
+        target=target,
+        profile=profile,
+        artifact_dir=Path(".greybox/selftest-discovered"),
+        discovery_coverage=discovery_coverage,
+        burp_observation_coverage=burp_observation_coverage,
+        verification_queue=discovered_queue,
+        environment_readiness=environment_readiness,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="inferforge-review-blockers-selftest-") as temp_dir:
+        root = Path(temp_dir)
+        default_dir = root / "default"
+        discovered_dir = root / "discovered"
+        write_json(default_dir / REVIEW_BLOCKERS_ARTIFACT, default_blockers)
+        write_json(discovered_dir / REVIEW_BLOCKERS_ARTIFACT, discovered_blockers)
+        rollup = build_review_blockers_rollup(
+            target=target,
+            profile=profile,
+            artifact_dir=root,
+            check_dirs=[default_dir, discovered_dir],
+        )
+
+    single_route_group = review_blocker_group_by_cluster(discovered_blockers, "route-api-proxy-path") or {}
+    rollup_route_group = review_blocker_group_by_cluster(rollup, "route-api-proxy-path") or {}
+    rollup_quote_group = review_blocker_group_by_cluster(rollup, "quote") or {}
+    assertions = [
+        {
+            "id": "default-status-external-only",
+            "passed": default_blockers.get("status") == "ready-with-external-blockers",
+            "expected": "ready-with-external-blockers",
+            "actual": default_blockers.get("status"),
+        },
+        {
+            "id": "discovered-status-needs-human-review",
+            "passed": discovered_blockers.get("status") == "needs-human-review",
+            "expected": "needs-human-review",
+            "actual": discovered_blockers.get("status"),
+        },
+        {
+            "id": "discovered-route-group-count",
+            "passed": single_route_group.get("count") == 4,
+            "expected": 4,
+            "actual": single_route_group.get("count"),
+        },
+        {
+            "id": "rollup-status-needs-human-review",
+            "passed": rollup.get("status") == "needs-human-review",
+            "expected": "needs-human-review",
+            "actual": rollup.get("status"),
+        },
+        {
+            "id": "rollup-groups-deduplicated",
+            "passed": rollup.get("summary", {}).get("groups") == 3,
+            "expected": 3,
+            "actual": rollup.get("summary", {}).get("groups"),
+        },
+        {
+            "id": "rollup-route-group-preserves-four-source-blockers",
+            "passed": rollup_route_group.get("count") == 4,
+            "expected": 4,
+            "actual": rollup_route_group.get("count"),
+        },
+        {
+            "id": "rollup-quote-group-merges-runs",
+            "passed": rollup_quote_group.get("count") == 2,
+            "expected": 2,
+            "actual": rollup_quote_group.get("count"),
+        },
+    ]
+    failed = [item for item in assertions if not item["passed"]]
+    return {
+        "generated_at": utc_now(),
+        "status": "failed" if failed else "passed",
+        "target": target,
+        "summary": {
+            "assertions": len(assertions),
+            "failed": len(failed),
+            "default_blockers": default_blockers.get("summary", {}).get("blockers"),
+            "default_groups": default_blockers.get("summary", {}).get("groups"),
+            "discovered_blockers": discovered_blockers.get("summary", {}).get("blockers"),
+            "discovered_groups": discovered_blockers.get("summary", {}).get("groups"),
+            "rollup_blockers": rollup.get("summary", {}).get("blockers"),
+            "rollup_groups": rollup.get("summary", {}).get("groups"),
+        },
+        "cases": {
+            "default": {
+                "status": default_blockers.get("status"),
+                "summary": default_blockers.get("summary"),
+            },
+            "discovered": {
+                "status": discovered_blockers.get("status"),
+                "summary": discovered_blockers.get("summary"),
+                "route_group": single_route_group,
+            },
+            "rollup": {
+                "status": rollup.get("status"),
+                "summary": rollup.get("summary"),
+                "route_group": rollup_route_group,
+                "quote_group": rollup_quote_group,
+            },
+        },
+        "assertions": assertions,
+        "safety": "Synthetic review-blocker self-test. It writes temporary local artifacts only and sends no requests.",
+    }
+
+
 def markdown_text(value: Any) -> str:
     return str(value).replace("\n", " ").strip()
 
@@ -12645,7 +12856,7 @@ def node_decode_transactions(
 import fs from 'node:fs'
 import { VersionedTransaction } from '@solana/web3.js'
 
-const input = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))
+const input = JSON.parse(fs.readFileSync(0, 'utf8'))
 
 function compactError(error) {
   return error && error.message ? error.message : String(error)
@@ -12736,41 +12947,16 @@ console.log(JSON.stringify({
     if not source_root.is_dir():
         return fallback_decode_transactions(candidates, f"Source root not found: {source_root}")
 
-    with tempfile.NamedTemporaryFile(
-        "w",
-        suffix=".json",
-        prefix=".inferforge-tx-input-",
-        dir=str(source_root),
-        delete=False,
-        encoding="utf-8",
-    ) as input_handle:
-        json.dump({"candidates": candidates}, input_handle)
-        input_path = input_handle.name
-
-    with tempfile.NamedTemporaryFile(
-        "w",
-        suffix=".mjs",
-        prefix=".inferforge-tx-decode-",
-        dir=str(source_root),
-        delete=False,
-        encoding="utf-8",
-    ) as script_handle:
-        script_handle.write(script)
-        script_path = script_handle.name
-
-    try:
-        proc = subprocess.run(
-            [node, script_path, input_path],
-            cwd=str(source_root),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=30,
-            check=False,
-        )
-    finally:
-        Path(input_path).unlink(missing_ok=True)
-        Path(script_path).unlink(missing_ok=True)
+    proc = subprocess.run(
+        [node, "--input-type=module", "--eval", script],
+        cwd=str(source_root),
+        input=json.dumps({"candidates": candidates}),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=30,
+        check=False,
+    )
 
     if proc.returncode != 0:
         return fallback_decode_transactions(
@@ -13171,7 +13357,7 @@ import {
   VersionedTransaction,
 } from '@solana/web3.js'
 
-const input = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))
+const input = JSON.parse(fs.readFileSync(0, 'utf8'))
 const wallet = new PublicKey(input.wallet)
 const sourceMint = new PublicKey(input.sourceMint)
 const destinationMint = new PublicKey(input.destinationMint)
@@ -13199,41 +13385,16 @@ console.log(JSON.stringify({
   allowedProgram: SystemProgram.programId.toBase58(),
 }, null, 2))
 """
-    with tempfile.NamedTemporaryFile(
-        "w",
-        suffix=".json",
-        prefix=".inferforge-tx-selftest-input-",
-        dir=str(source_root),
-        delete=False,
-        encoding="utf-8",
-    ) as input_handle:
-        json.dump({"wallet": wallet, "sourceMint": expected[0], "destinationMint": expected[1]}, input_handle)
-        input_path = input_handle.name
-
-    with tempfile.NamedTemporaryFile(
-        "w",
-        suffix=".mjs",
-        prefix=".inferforge-tx-selftest-",
-        dir=str(source_root),
-        delete=False,
-        encoding="utf-8",
-    ) as script_handle:
-        script_handle.write(script)
-        script_path = script_handle.name
-
-    try:
-        proc = subprocess.run(
-            [node, script_path, input_path],
-            cwd=str(source_root),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=30,
-            check=False,
-        )
-    finally:
-        Path(input_path).unlink(missing_ok=True)
-        Path(script_path).unlink(missing_ok=True)
+    proc = subprocess.run(
+        [node, "--input-type=module", "--eval", script],
+        cwd=str(source_root),
+        input=json.dumps({"wallet": wallet, "sourceMint": expected[0], "destinationMint": expected[1]}),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=30,
+        check=False,
+    )
 
     if proc.returncode != 0:
         return {"ok": False, "error": proc.stdout[-1000:]}
@@ -17057,6 +17218,28 @@ def run_review_blockers(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_review_blockers_selftest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, _target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result = build_review_blockers_selftest()
+    result["current_profile_context"] = profile_summary(profile)
+    output_path = artifact_dir / REVIEW_BLOCKERS_SELFTEST_ARTIFACT
+    write_json(output_path, result)
+    print(f"Review blockers self-test: {result['status']}")
+    print(
+        "Cases: "
+        f"default={result['cases']['default']['status']} "
+        f"discovered={result['cases']['discovered']['status']} "
+        f"rollup={result['cases']['rollup']['status']} "
+        f"rollup_groups={result['summary']['rollup_groups']}"
+    )
+    failed = [item for item in result.get("assertions", []) if not item.get("passed")]
+    if failed:
+        print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
+    print(f"Wrote {output_path}")
+    return 0 if result["status"] == "passed" else 1
+
+
 def run_manifest(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -17162,29 +17345,33 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             preparation.append(remove_stale_probe_results(discovered_artifact_dir))
 
     if not args.skip_self_tests:
-        command = inferforge_cli_command(
-            args,
-            profile_path=default_profile_path,
-            artifact_dir=artifact_dir,
-            subcommand="self-test-discovery-coverage",
-        )
-        if not run_step("self-test-discovery-coverage", command):
-            return_code_health = None
-            suite = {
-                "generated_at": utc_now(),
-                "status": "failed",
-                "target": target,
-                "source_root": repo_relative_or_absolute(source_root),
-                "profile": profile_summary(profile),
-                "preparation": preparation,
-                "steps": steps,
-                "artifact_health": return_code_health,
-                "safety": "Regression suite stopped on failure. No wallet signing, transaction submission, Burp Scanner, or broad fuzzing is performed.",
-            }
-            write_json(artifact_dir / "regression-suite.json", suite)
-            print(f"Regression suite: {suite['status']}")
-            print(f"Wrote {artifact_dir / 'regression-suite.json'}")
-            return 1
+        for label, subcommand in [
+            ("self-test-discovery-coverage", "self-test-discovery-coverage"),
+            ("self-test-review-blockers", "self-test-review-blockers"),
+        ]:
+            command = inferforge_cli_command(
+                args,
+                profile_path=default_profile_path,
+                artifact_dir=artifact_dir,
+                subcommand=subcommand,
+            )
+            if not run_step(label, command):
+                return_code_health = None
+                suite = {
+                    "generated_at": utc_now(),
+                    "status": "failed",
+                    "target": target,
+                    "source_root": repo_relative_or_absolute(source_root),
+                    "profile": profile_summary(profile),
+                    "preparation": preparation,
+                    "steps": steps,
+                    "artifact_health": return_code_health,
+                    "safety": "Regression suite stopped on failure. No wallet signing, transaction submission, Burp Scanner, or broad fuzzing is performed.",
+                }
+                write_json(artifact_dir / "regression-suite.json", suite)
+                print(f"Regression suite: {suite['status']}")
+                print(f"Wrote {artifact_dir / 'regression-suite.json'}")
+                return 1
 
     if not args.skip_discover_profile and not args.skip_discovered:
         command = inferforge_cli_command(
@@ -18506,6 +18693,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a static self-test for discovery-coverage classification and gates",
     )
     discovery_coverage_selftest.set_defaults(func=run_discovery_coverage_selftest)
+
+    review_blockers_selftest = sub.add_parser(
+        "self-test-review-blockers",
+        help="Run a static self-test for review-blocker grouping and rollups",
+    )
+    review_blockers_selftest.set_defaults(func=run_review_blockers_selftest)
 
     collect_quote = sub.add_parser(
         "collect-quote",
