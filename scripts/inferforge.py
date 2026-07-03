@@ -12660,11 +12660,11 @@ def build_artifact_manifest(
     source_peek_request_status = (status_sources.get("source-peek-requests.json") or {}).get("status")
     attack_strategy_status = (status_sources.get("attack-strategy.json") or {}).get("status")
     external_blocked = any(
-        status in {"covered-with-external-blocker", "no-reportable-findings-with-external-blocker", "ready-with-external-blockers", "waiting-for-external-configuration"}
-        for status in [coverage_status, adjudication_status, verification_status, review_blockers_status, readiness_status]
+        status in {"covered-with-external-blocker", "no-reportable-findings-with-external-blocker", "ready-with-external-blockers", "waiting-for-external-configuration", "needs-external-evidence"}
+        for status in [coverage_status, adjudication_status, verification_status, review_blockers_status, readiness_status, attack_strategy_status]
     )
     human_review_required = any(
-        status in {"needs-human-review", "answered-with-manual-review", "covered-with-evidence-gaps"}
+        status in {"needs-human-review", "answered-with-manual-review", "covered-with-evidence-gaps", "needs-strategy-review"}
         for status in [
             coverage_status,
             discovery_coverage_status,
@@ -12672,6 +12672,7 @@ def build_artifact_manifest(
             review_blockers_status,
             burp_observation_status,
             source_peek_request_status,
+            attack_strategy_status,
         ]
     )
     if missing_required:
@@ -12819,6 +12820,7 @@ def artifact_statuses_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         "burp_observation_coverage": summary.get("burp_observation_coverage"),
         "response_delta_analysis": summary.get("response_delta_analysis"),
         "source_peek_requests": summary.get("source_peek_requests"),
+        "attack_strategy": summary.get("attack_strategy"),
     }
 
 
