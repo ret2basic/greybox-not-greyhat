@@ -113,6 +113,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     "burp-transaction-candidates.json",
     "collection-summary.json",
     "environment-readiness.json",
+    "artifact-health.json",
     "orca-baseline.json",
     "profile-routing-selftest.json",
     "transaction-intent-policy.json",
@@ -120,6 +121,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
 INDEX_ARTIFACT_ORDER = [
     "report.md",
     MANIFEST_NAME,
+    "artifact-health.json",
     TARGET_PROFILE_ARTIFACT,
     STRATEGY_REGISTRY_ARTIFACT,
     PROFILE_VALIDATION_ARTIFACT,
@@ -10304,6 +10306,323 @@ def write_artifact_manifest(artifact_dir: Path, target: str, *, command: str) ->
     return manifest
 
 
+def increment_count(counts: dict[str, int], key: str) -> None:
+    counts[key] = counts.get(key, 0) + 1
+
+
+def artifact_statuses_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    summary = manifest.get("summary", {}) or {}
+    return {
+        "manifest": manifest.get("status"),
+        "coverage": summary.get("coverage"),
+        "adjudication": summary.get("adjudication"),
+        "verification_queue": summary.get("verification_queue"),
+        "readiness": summary.get("readiness"),
+        "profile_validation": summary.get("profile_validation"),
+        "burp_observation_coverage": summary.get("burp_observation_coverage"),
+        "response_delta_analysis": summary.get("response_delta_analysis"),
+        "source_peek_requests": summary.get("source_peek_requests"),
+    }
+
+
+def parse_artifact_json(path: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), None
+    except Exception as error:
+        return None, {
+            "file": path.name,
+            "kind": "json",
+            "error": str(error),
+        }
+
+
+def parse_artifact_jsonl(path: Path) -> tuple[int, list[dict[str, Any]]]:
+    rows = 0
+    errors = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        rows += 1
+        try:
+            json.loads(line)
+        except Exception as error:
+            errors.append(
+                {
+                    "file": path.name,
+                    "line": lineno,
+                    "kind": "jsonl",
+                    "error": str(error),
+                }
+            )
+            if len(errors) >= 10:
+                break
+    return rows, errors
+
+
+def artifact_health_status(checks: list[dict[str, Any]], statuses: dict[str, Any]) -> str:
+    if any(check.get("status") == "failed" for check in checks):
+        return "failed"
+    if (
+        statuses.get("verification_queue") == "needs-human-review"
+        or statuses.get("burp_observation_coverage") == "needs-human-review"
+        or statuses.get("source_peek_requests") == "answered-with-manual-review"
+        or statuses.get("coverage") == "covered-with-evidence-gaps"
+    ):
+        return "needs-human-review"
+    if any(
+        status in {
+            "complete-with-external-blocker",
+            "covered-with-external-blocker",
+            "ready-with-external-blockers",
+            "no-reportable-findings-with-external-blocker",
+            "indexed-with-external-blocker",
+            "waiting-for-external-configuration",
+        }
+        for status in statuses.values()
+    ):
+        return "ready-with-external-blockers"
+    return "healthy"
+
+
+def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    json_files = []
+    jsonl_files = []
+    json_errors = []
+    jsonl_errors = []
+    jsonl_rows: dict[str, int] = {}
+    manifest: dict[str, Any] | None = None
+
+    if not artifact_dir.exists():
+        checks.append(
+            {
+                "id": "artifact-dir-exists",
+                "status": "failed",
+                "message": "Artifact directory does not exist.",
+            }
+        )
+        return {
+            "artifact_dir": str(artifact_dir),
+            "status": "failed",
+            "checks": checks,
+            "parse": {
+                "json_files": 0,
+                "jsonl_files": 0,
+                "json_errors": json_errors,
+                "jsonl_errors": jsonl_errors,
+                "jsonl_rows": jsonl_rows,
+            },
+            "statuses": {},
+            "missing_required": [],
+            "safety": "Read-only artifact health analysis. No requests are sent.",
+        }
+
+    for path in sorted(artifact_dir.iterdir(), key=lambda item: item.name):
+        if not path.is_file():
+            continue
+        if path.suffix == ".json":
+            json_files.append(path.name)
+            parsed, error = parse_artifact_json(path)
+            if error:
+                json_errors.append(error)
+                continue
+            if path.name == MANIFEST_NAME:
+                manifest = parsed
+        elif path.suffix == ".jsonl":
+            jsonl_files.append(path.name)
+            rows, errors = parse_artifact_jsonl(path)
+            jsonl_rows[path.name] = rows
+            jsonl_errors.extend(errors)
+
+    if json_errors:
+        checks.append(
+            {
+                "id": "json-parse",
+                "status": "failed",
+                "message": f"{len(json_errors)} JSON artifact(s) failed to parse.",
+            }
+        )
+    else:
+        checks.append(
+            {
+                "id": "json-parse",
+                "status": "passed",
+                "message": f"{len(json_files)} JSON artifact(s) parsed.",
+            }
+        )
+
+    if jsonl_errors:
+        checks.append(
+            {
+                "id": "jsonl-parse",
+                "status": "failed",
+                "message": f"{len(jsonl_errors)} JSONL parse error(s) found.",
+            }
+        )
+    else:
+        checks.append(
+            {
+                "id": "jsonl-parse",
+                "status": "passed",
+                "message": f"{len(jsonl_files)} JSONL artifact(s) parsed.",
+            }
+        )
+
+    if manifest is None:
+        checks.append(
+            {
+                "id": "manifest-present",
+                "status": "failed",
+                "message": f"{MANIFEST_NAME} is missing or invalid.",
+            }
+        )
+        statuses = {}
+        missing_required = []
+    else:
+        checks.append(
+            {
+                "id": "manifest-present",
+                "status": "passed",
+                "message": f"{MANIFEST_NAME} parsed.",
+            }
+        )
+        statuses = artifact_statuses_from_manifest(manifest)
+        missing_required = list((manifest.get("summary", {}) or {}).get("missing_required", []) or [])
+        if missing_required:
+            checks.append(
+                {
+                    "id": "required-artifacts",
+                    "status": "failed",
+                    "message": f"{len(missing_required)} required artifact(s) missing.",
+                    "missing_required": missing_required,
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "id": "required-artifacts",
+                    "status": "passed",
+                    "message": "No required artifacts are missing.",
+                }
+            )
+
+        profile_validation = statuses.get("profile_validation")
+        if profile_validation == "failed":
+            checks.append(
+                {
+                    "id": "profile-validation",
+                    "status": "failed",
+                    "message": "Profile validation failed.",
+                }
+            )
+
+        response_delta_status = statuses.get("response_delta_analysis")
+        if response_delta_status in {"review-needed", "no-probe-results"}:
+            checks.append(
+                {
+                    "id": "response-delta-analysis",
+                    "status": "failed",
+                    "message": f"Response delta status is {response_delta_status}.",
+                }
+            )
+
+        coverage_status = str(statuses.get("coverage") or "")
+        if coverage_status.startswith("failed"):
+            checks.append(
+                {
+                    "id": "coverage",
+                    "status": "failed",
+                    "message": f"Coverage status is {coverage_status}.",
+                }
+            )
+
+        if statuses.get("verification_queue") == "invalid-command-templates":
+            checks.append(
+                {
+                    "id": "verification-queue",
+                    "status": "failed",
+                    "message": "Verification queue generated unsafe command templates.",
+                }
+            )
+
+    status = artifact_health_status(checks, statuses)
+    return {
+        "artifact_dir": str(artifact_dir),
+        "status": status,
+        "checks": checks,
+        "statuses": statuses,
+        "missing_required": missing_required,
+        "parse": {
+            "json_files": len(json_files),
+            "jsonl_files": len(jsonl_files),
+            "json_errors": json_errors,
+            "jsonl_errors": jsonl_errors,
+            "jsonl_rows": jsonl_rows,
+        },
+        "safety": "Read-only artifact health analysis. No requests are sent.",
+    }
+
+
+def discover_artifact_health_dirs(root_dir: Path) -> list[Path]:
+    dirs = set()
+    if (root_dir / MANIFEST_NAME).exists():
+        dirs.add(root_dir)
+    for manifest_path in sorted(root_dir.glob(f"*/{MANIFEST_NAME}")):
+        dirs.add(manifest_path.parent)
+    return sorted(dirs, key=lambda item: str(item))
+
+
+def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
+    directories = [build_single_artifact_health(path.resolve()) for path in artifact_dirs]
+    status_counts: dict[str, int] = {}
+    failed_dirs = []
+    human_review_dirs = []
+    external_blocker_dirs = []
+    parse_error_count = 0
+    missing_required_count = 0
+
+    for item in directories:
+        status = str(item.get("status") or "unknown")
+        increment_count(status_counts, status)
+        if status == "failed":
+            failed_dirs.append(item["artifact_dir"])
+        elif status == "needs-human-review":
+            human_review_dirs.append(item["artifact_dir"])
+        elif status == "ready-with-external-blockers":
+            external_blocker_dirs.append(item["artifact_dir"])
+        parse_doc = item.get("parse", {}) or {}
+        parse_error_count += len(parse_doc.get("json_errors", []) or [])
+        parse_error_count += len(parse_doc.get("jsonl_errors", []) or [])
+        missing_required_count += len(item.get("missing_required", []) or [])
+
+    if not directories:
+        status = "no-artifact-dirs"
+    elif failed_dirs:
+        status = "failed"
+    elif human_review_dirs:
+        status = "needs-human-review"
+    elif external_blocker_dirs:
+        status = "ready-with-external-blockers"
+    else:
+        status = "healthy"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "summary": {
+            "artifact_dirs": len(directories),
+            "status_counts": status_counts,
+            "failed_dirs": failed_dirs,
+            "human_review_dirs": human_review_dirs,
+            "external_blocker_dirs": external_blocker_dirs,
+            "parse_error_count": parse_error_count,
+            "missing_required_count": missing_required_count,
+        },
+        "directories": directories,
+        "safety": "Local artifact health analysis only. It does not send HTTP requests, call Burp, fuzz, sign wallets, submit transactions, or invoke Server Actions.",
+    }
+
+
 def decode_base64_candidate(value: str) -> bytes | None:
     normalized = "".join(value.strip().split())
     if len(normalized) < 80:
@@ -14928,6 +15247,63 @@ def run_manifest(args: argparse.Namespace) -> int:
     return 0 if manifest["status"] != "incomplete" else 1
 
 
+def run_artifact_health(args: argparse.Namespace) -> int:
+    artifact_dir = Path(args.artifact_dir).resolve()
+    check_dirs: list[Path] = []
+    for item in args.check_dir or []:
+        check_dirs.append(resolve_repo_path(item))
+    if args.discover_child_runs:
+        check_dirs.extend(discover_artifact_health_dirs(artifact_dir))
+    if not check_dirs:
+        check_dirs.append(artifact_dir)
+
+    deduped_dirs = []
+    seen = set()
+    for path in check_dirs:
+        resolved = path.resolve()
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_dirs.append(resolved)
+
+    health = build_artifact_health(deduped_dirs)
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / "artifact-health.json"
+    if not args.no_write:
+        write_json(output_path, health)
+
+    print(f"Artifact health: {health['status']}")
+    print(
+        "Directories: "
+        f"{health['summary']['artifact_dirs']} checked, "
+        f"status_counts={json.dumps(health['summary']['status_counts'], sort_keys=True)}"
+    )
+    print(
+        "Parse/required: "
+        f"parse_errors={health['summary']['parse_error_count']}, "
+        f"missing_required={health['summary']['missing_required_count']}"
+    )
+    for item in health["directories"]:
+        statuses = item.get("statuses", {}) or {}
+        print(
+            f"- {item['artifact_dir']}: {item['status']} "
+            f"manifest={statuses.get('manifest')} "
+            f"coverage={statuses.get('coverage')} "
+            f"verification={statuses.get('verification_queue')} "
+            f"response_deltas={statuses.get('response_delta_analysis')} "
+            f"source_peek_requests={statuses.get('source_peek_requests')} "
+            f"burp_observation={statuses.get('burp_observation_coverage')}"
+        )
+    if not args.no_write:
+        print(f"Wrote {output_path}")
+
+    if health["status"] in {"failed", "no-artifact-dirs"}:
+        return 1
+    if args.strict and health["status"] != "healthy":
+        return 1
+    return 0
+
+
 def run_profile(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -15805,6 +16181,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Command label to store in artifact-manifest.json",
     )
     manifest.set_defaults(func=run_manifest)
+
+    artifact_health = sub.add_parser(
+        "artifact-health",
+        help="Validate artifact manifests plus JSON/JSONL parse health across one or more artifact directories",
+    )
+    artifact_health.add_argument(
+        "--check-dir",
+        action="append",
+        help="Artifact directory to check. Repeat as needed. Defaults to --artifact-dir.",
+    )
+    artifact_health.add_argument(
+        "--discover-child-runs",
+        action="store_true",
+        help="Also check child directories under --artifact-dir that contain artifact-manifest.json.",
+    )
+    artifact_health.add_argument(
+        "--output",
+        help="Where to write artifact-health.json. Defaults to --artifact-dir/artifact-health.json.",
+    )
+    artifact_health.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print health only; do not write artifact-health.json.",
+    )
+    artifact_health.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless every checked artifact directory is healthy with no human review or external blockers.",
+    )
+    artifact_health.set_defaults(func=run_artifact_health)
 
     adjudicate = sub.add_parser(
         "adjudicate",

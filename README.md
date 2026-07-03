@@ -244,6 +244,7 @@ python3 scripts/inferforge.py evidence-chain
 python3 scripts/inferforge.py evidence-appendix
 python3 scripts/inferforge.py verification-queue
 python3 scripts/inferforge.py manifest
+python3 scripts/inferforge.py artifact-health --discover-child-runs
 python3 scripts/inferforge.py adjudicate
 python3 scripts/inferforge.py audit --no-ws
 python3 scripts/inferforge.py audit --ws-resource-probes
@@ -446,6 +447,26 @@ counts, key status summaries, and missing-required-artifact checks. `audit`
 generates this manifest as its final write so the manifest covers the rendered
 report and index page.
 
+`artifact-health` writes `.greybox/artifact-health.json`, a local health summary
+over one or more artifact directories. It parses every top-level JSON and JSONL
+artifact, checks the manifest's missing-required list, carries forward key gate
+statuses such as coverage, verification queue, response deltas, source-peek
+requests, and Burp observation coverage, and classifies each run as `healthy`,
+`ready-with-external-blockers`, `needs-human-review`, or `failed`. It is useful
+after regression runs:
+
+```bash
+python3 scripts/inferforge.py artifact-health \
+  --check-dir .greybox/regression-default \
+  --check-dir .greybox/regression-discovered
+
+python3 scripts/inferforge.py artifact-health --discover-child-runs
+```
+
+By default the command returns non-zero only for failed or missing artifact
+sets. Use `--strict` in CI when human-review or external-configuration blockers
+should also fail the job.
+
 `adjudicate` writes `.greybox/adjudication.json` and refreshes
 `.greybox/findings.json` plus `.greybox/hardening-notes.json`. The adjudicator
 enforces the reportability contract: only `valid-finding` items whose finding
@@ -507,6 +528,7 @@ Key outputs:
 ```text
 .greybox/index.html
 .greybox/artifact-manifest.json
+.greybox/artifact-health.json
 .greybox/target-profile.json
 .greybox/strategy-registry.json
 .greybox/profile-validation.json
