@@ -3779,7 +3779,7 @@ def normalize_burp_history_items(
                 "content_type": response_headers.get("content-type"),
                 "request_user_agent": request["user_agent"],
                 "request_context": request_context,
-                "response_sample": response_body[:500],
+                "response_sample": redact_text(response_body, max_chars=500),
                 "notes": item.get("notes", ""),
             }
         )
@@ -6113,7 +6113,7 @@ def run_http_probes(
 def redact_probe_body_samples_for_artifact(value: Any) -> None:
     if isinstance(value, dict):
         for key, child in list(value.items()):
-            if key == "body_sample" and isinstance(child, str):
+            if key in {"body_sample", "response_sample"} and isinstance(child, str):
                 value[key] = redact_text(child, max_chars=MAX_BODY_SAMPLE_CHARS)
             elif key == "error" and child not in (None, ""):
                 value[key] = redacted_error_summary(child)
@@ -6135,6 +6135,12 @@ def sanitize_probe_result_for_artifact(row: dict[str, Any]) -> dict[str, Any]:
 
 def sanitize_probe_results_for_artifact(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [sanitize_probe_result_for_artifact(row) for row in rows]
+
+
+def sanitize_artifact_samples(value: Any) -> Any:
+    sanitized = json_clone(value)
+    redact_probe_body_samples_for_artifact(sanitized)
+    return sanitized
 
 
 def run_audit_warmup(
@@ -14558,6 +14564,66 @@ def regression_suite_output_security_issues(doc: Any, *, file_name: str) -> list
     return issues
 
 
+def artifact_sample_security_issues_in_value(
+    value: Any,
+    *,
+    file_name: str,
+    path: str = "$",
+    field_names: tuple[str, ...] = ("body_sample", "response_sample"),
+) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        for key in field_names:
+            sample = value.get(key)
+            if isinstance(sample, str) and contains_unredacted_secret_text(sample):
+                issues.append(
+                    {
+                        "file": file_name,
+                        "path": f"{path}.{key}",
+                        "reason": f"artifact-{key.replace('_', '-')}-sensitive-value",
+                    }
+                )
+        for key, child in value.items():
+            issues.extend(
+                artifact_sample_security_issues_in_value(
+                    child,
+                    file_name=file_name,
+                    path=f"{path}.{key}",
+                    field_names=field_names,
+                )
+            )
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            issues.extend(
+                artifact_sample_security_issues_in_value(
+                    child,
+                    file_name=file_name,
+                    path=f"{path}[{index}]",
+                    field_names=field_names,
+                )
+            )
+    return issues
+
+
+def artifact_sample_jsonl_security_issues(path: Path) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        issues.extend(
+            artifact_sample_security_issues_in_value(
+                row,
+                file_name=path.name,
+                path=f"$[{lineno}]",
+            )
+        )
+    return issues
+
+
 def probe_result_body_text_security_issues_in_value(value: Any, *, file_name: str, path: str = "$") -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     if isinstance(value, dict):
@@ -14691,6 +14757,12 @@ def mcp_action_audit_security_issues(parsed_json_by_name: dict[str, Any]) -> lis
     for file_name, doc in sorted(parsed_json_by_name.items()):
         issues.extend(mcp_action_security_issues_in_value(doc, file_name=file_name))
         issues.extend(mcp_tool_inventory_security_issues_in_value(doc, file_name=file_name))
+        sample_fields = (
+            ("response_sample",)
+            if file_name in {"burp-observation-run.json", "warmup-results.json"}
+            else ("body_sample", "response_sample")
+        )
+        issues.extend(artifact_sample_security_issues_in_value(doc, file_name=file_name, field_names=sample_fields))
         if file_name == "burp-mcp-sync.json":
             issues.extend(burp_sync_error_security_issues(doc, file_name=file_name))
         if file_name == "burp-observation-run.json":
@@ -14795,6 +14867,8 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
             jsonl_errors.extend(errors)
             if path.name == "probe-results.jsonl":
                 security_issues.extend(probe_result_jsonl_security_issues(path))
+            else:
+                security_issues.extend(artifact_sample_jsonl_security_issues(path))
         elif path.name in RAW_BURP_HISTORY_ARTIFACTS:
             security_issues.append(
                 {
@@ -14853,7 +14927,7 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
             {
                 "id": "artifact-security-hygiene",
                 "status": "passed",
-                "message": "Audited artifacts do not expose raw sensitive command output, MCP arguments, results, or error text.",
+                "message": "Audited artifacts do not expose raw sensitive command output, MCP arguments, results, errors, or sample text.",
             }
         )
 
@@ -15175,6 +15249,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         target_lock_error_leak_dir = root / "target-lock-error-leak"
         raw_history_leak_dir = root / "raw-history-leak"
         observation_error_leak_dir = root / "observation-error-leak"
+        sample_field_leak_dir = root / "sample-field-leak"
         refresh_dir = root / "refresh"
         derived_dir = root / "derived"
         for directory in [healthy_dir, modified_dir, missing_dir, untracked_dir]:
@@ -15332,6 +15407,53 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         )
         write_minimal_manifest(observation_error_leak_dir, ["burp-observation-run.json"])
 
+        sample_field_leak_dir.mkdir(parents=True)
+        (sample_field_leak_dir / "burp-history-observations.jsonl").write_text(
+            json.dumps(
+                {
+                    "method": "GET",
+                    "path": "/reflected",
+                    "host": "127.0.0.1:9997",
+                    "status": 200,
+                    "response_sample": "Authorization: Bearer should-not-appear",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        write_json(
+            sample_field_leak_dir / "evidence-appendix.json",
+            {
+                "generated_at": utc_now(),
+                "status": "indexed",
+                "clusters": [
+                    {
+                        "cluster_id": "sample-leak",
+                        "burp_evidence": [
+                            {
+                                "artifact": "burp-history-observations.jsonl",
+                                "response_sample": "token=should-not-appear",
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        write_json(
+            sample_field_leak_dir / "quote-collection.json",
+            {
+                "generated_at": utc_now(),
+                "response": {
+                    "status": 500,
+                    "body_sample": "api_key=should-not-appear",
+                },
+            },
+        )
+        write_minimal_manifest(
+            sample_field_leak_dir,
+            ["burp-history-observations.jsonl", "evidence-appendix.json", "quote-collection.json"],
+        )
+
         healthy = build_single_artifact_health(healthy_dir)
         modified = build_single_artifact_health(modified_dir)
         missing = build_single_artifact_health(missing_dir)
@@ -15349,21 +15471,41 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         raw_history_leak_text = json.dumps(raw_history_leak, sort_keys=True)
         observation_error_leak = build_single_artifact_health(observation_error_leak_dir)
         observation_error_leak_text = json.dumps(observation_error_leak, sort_keys=True)
+        sample_field_leak = build_single_artifact_health(sample_field_leak_dir)
+        sample_field_leak_text = json.dumps(sample_field_leak, sort_keys=True)
         sanitized_probe_artifact_sample = sanitize_probe_result_for_artifact(
             {
                 "probe_id": "sanitize-sample",
                 "body_text": "full body should-not-appear",
                 "body_sample": "Authorization: Bearer should-not-appear",
+                "response_sample": "api_key=should-not-appear",
                 "error": "Probe artifact error should-not-appear",
                 "attempts": [
                     {
                         "body_sample": "token=should-not-appear",
+                        "response_sample": "secret=should-not-appear",
                         "error": "Nested attempt error should-not-appear",
                     }
                 ],
             }
         )
         sanitized_probe_artifact_sample_text = json.dumps(sanitized_probe_artifact_sample, sort_keys=True)
+        normalized_burp_history_sample = normalize_burp_history_items(
+            [
+                {
+                    "request": "GET /reflected HTTP/1.1\r\nHost: 127.0.0.1:9997\r\n\r\n",
+                    "response": (
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "\r\n"
+                        "Authorization: Bearer should-not-appear"
+                    ),
+                }
+            ],
+            target_netloc="127.0.0.1:9997",
+            source="self-test",
+        )
+        normalized_burp_history_sample_text = json.dumps(normalized_burp_history_sample, sort_keys=True)
         aggregate = build_artifact_health([healthy_dir, modified_dir, missing_dir, untracked_dir])
         refresh_health = build_artifact_health([refresh_dir])
         refresh_output = refresh_dir / "artifact-health.json"
@@ -15596,13 +15738,44 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                 and "should-not-appear" not in sanitized_probe_artifact_sample_text
                 and "Authorization: Bearer [redacted]" in sanitized_probe_artifact_sample_text
                 and "token=[redacted]" in sanitized_probe_artifact_sample_text
+                and "api_key=[redacted]" in sanitized_probe_artifact_sample_text
+                and "secret=[redacted]" in sanitized_probe_artifact_sample_text
                 and isinstance(sanitized_probe_artifact_sample.get("error"), dict)
                 and sanitized_probe_artifact_sample.get("error", {}).get("message_redacted") is True
                 and isinstance(sanitized_probe_artifact_sample.get("attempts", [{}])[0].get("error"), dict)
                 and sanitized_probe_artifact_sample.get("attempts", [{}])[0].get("error", {}).get("message_redacted") is True
             ),
-            "expected": "probe artifact sanitizer removes full body_text and redacts sensitive body_sample and error values recursively",
+            "expected": "probe artifact sanitizer removes full body_text and redacts sensitive body/response samples and error values recursively",
             "actual": sanitized_probe_artifact_sample,
+        },
+        {
+            "id": "artifact-health-detects-sample-field-leaks",
+            "passed": (
+                sample_field_leak.get("status") == "failed"
+                and {
+                    "artifact-body-sample-sensitive-value",
+                    "artifact-response-sample-sensitive-value",
+                }.issubset({str(issue.get("reason")) for issue in sample_field_leak.get("security_issues", []) or []})
+                and "should-not-appear" not in sample_field_leak_text
+                and "Authorization: Bearer" not in sample_field_leak_text
+                and "token=" not in sample_field_leak_text
+                and "api_key=" not in sample_field_leak_text
+            ),
+            "expected": "artifact-health fails when response_sample or derived body_sample artifacts contain unredacted sensitive text without echoing leaked values",
+            "actual": {
+                "status": sample_field_leak.get("status"),
+                "security_issues": sample_field_leak.get("security_issues"),
+            },
+        },
+        {
+            "id": "burp-history-normalization-redacts-response-sample",
+            "passed": (
+                len(normalized_burp_history_sample) == 1
+                and "should-not-appear" not in normalized_burp_history_sample_text
+                and "Authorization: Bearer [redacted]" in normalized_burp_history_sample_text
+            ),
+            "expected": "Burp history normalization redacts sensitive response_sample text before artifact persistence",
+            "actual": normalized_burp_history_sample,
         },
         {
             "id": "artifact-health-detects-target-lock-error-leaks",
@@ -19489,8 +19662,9 @@ def generate_index_html(
     def e(value: Any) -> str:
         return html.escape(str(value))
 
+    display_results = sanitize_probe_results_for_artifact(results)
     rows = []
-    for row in results:
+    for row in display_results:
         state = "ok" if row["expected"] else "unexpected"
         rows.append(
             "<tr>"
@@ -19950,9 +20124,9 @@ def run_audit(args: argparse.Namespace) -> int:
 
     append_jsonl(artifact_dir / "probe-results.jsonl", sanitize_probe_results_for_artifact(results))
     response_delta_analysis = build_response_delta_analysis(clusters, results)
-    write_json(artifact_dir / "response-delta-analysis.json", response_delta_analysis)
+    write_json(artifact_dir / "response-delta-analysis.json", sanitize_artifact_samples(response_delta_analysis))
     traffic_index = build_traffic_index(results, burp_history)
-    write_json(artifact_dir / "traffic-index.json", traffic_index)
+    write_json(artifact_dir / "traffic-index.json", sanitize_artifact_samples(traffic_index))
     source_peeks = build_source_peeks(source_root, profile, traffic_index.get("endpoints", []))
     write_json(artifact_dir / "source-peek-results.json", source_peeks)
     transaction_intent = build_transaction_intent(
@@ -19977,7 +20151,7 @@ def run_audit(args: argparse.Namespace) -> int:
     )
     write_json(artifact_dir / "transaction-decoder-selftest.json", transaction_decoder_selftest)
     rpc_method_policy = build_rpc_method_policy(source_root, results)
-    write_json(artifact_dir / "rpc-method-policy.json", rpc_method_policy)
+    write_json(artifact_dir / "rpc-method-policy.json", sanitize_artifact_samples(rpc_method_policy))
     orca_baseline_path = artifact_dir / "orca-baseline.json"
     orca_baseline = json.loads(read_text(orca_baseline_path)) if orca_baseline_path.exists() else None
     quote_collection_path = artifact_dir / "quote-collection.json"
@@ -20045,7 +20219,7 @@ def run_audit(args: argparse.Namespace) -> int:
         environment_readiness,
         transaction_decoder_selftest,
     )
-    write_json(artifact_dir / "blackbox-coverage.json", blackbox_coverage)
+    write_json(artifact_dir / "blackbox-coverage.json", sanitize_artifact_samples(blackbox_coverage))
     evidence_chain = build_evidence_chain(
         clusters,
         results,
@@ -20058,7 +20232,7 @@ def run_audit(args: argparse.Namespace) -> int:
         transaction_intent,
         transaction_decoder_selftest,
     )
-    write_json(artifact_dir / "evidence-chain.json", evidence_chain)
+    write_json(artifact_dir / "evidence-chain.json", sanitize_artifact_samples(evidence_chain))
     adjudication = build_adjudication(
         suspicions,
         finding_gate,
@@ -20080,7 +20254,7 @@ def run_audit(args: argparse.Namespace) -> int:
         adjudication,
         environment_readiness,
     )
-    write_json(artifact_dir / "evidence-appendix.json", evidence_appendix)
+    write_json(artifact_dir / "evidence-appendix.json", sanitize_artifact_samples(evidence_appendix))
     verification_queue = build_verification_queue(
         target,
         clusters,
@@ -20195,7 +20369,7 @@ def run_collect(args: argparse.Namespace) -> int:
     )
 
     write_json(artifact_dir / "endpoint-clusters.json", clusters)
-    write_json(artifact_dir / "traffic-index.json", traffic_index)
+    write_json(artifact_dir / "traffic-index.json", sanitize_artifact_samples(traffic_index))
     write_json(
         artifact_dir / "collection-summary.json",
         {
@@ -20462,7 +20636,7 @@ def import_burp_history_inputs(
         source_assisted=not observed_only,
     )
     write_json(artifact_dir / "endpoint-clusters.json", clusters)
-    write_json(artifact_dir / "traffic-index.json", traffic_index)
+    write_json(artifact_dir / "traffic-index.json", sanitize_artifact_samples(traffic_index))
     transaction_intent = build_transaction_intent(
         artifact_dir,
         load_jsonl(artifact_dir / "probe-results.jsonl"),
@@ -22826,7 +23000,7 @@ def run_response_deltas(args: argparse.Namespace) -> int:
         load_jsonl(artifact_dir / "probe-results.jsonl"),
     )
     output_path = artifact_dir / "response-delta-analysis.json"
-    write_json(output_path, response_delta_analysis)
+    write_json(output_path, sanitize_artifact_samples(response_delta_analysis))
     print(f"Response delta analysis: {response_delta_analysis['status']}")
     print(
         "Deltas: "
@@ -22920,7 +23094,7 @@ def run_source_peek_requests(args: argparse.Namespace) -> int:
             load_jsonl(artifact_dir / "burp-history-observations.jsonl"),
         )
         traffic_index_path = artifact_dir / "traffic-index.json"
-        write_json(traffic_index_path, traffic_index)
+        write_json(traffic_index_path, sanitize_artifact_samples(traffic_index))
         output_paths.append(traffic_index_path)
     source_peeks = load_optional_json(artifact_dir / "source-peek-results.json")
     suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
@@ -24592,7 +24766,7 @@ def run_collect_quote(args: argparse.Namespace) -> int:
         },
         "diagnosis": diagnosis,
     }
-    write_json(artifact_dir / "quote-collection.json", quote_collection)
+    write_json(artifact_dir / "quote-collection.json", sanitize_artifact_samples(quote_collection))
 
     extra_inputs = [output_path] if saved_payload else []
     transaction_intent = build_transaction_intent(
@@ -24726,7 +24900,7 @@ def run_collect_orca_baseline(args: argparse.Namespace) -> int:
             )
         )
         return 2
-    write_json(artifact_dir / "orca-baseline.json", baseline)
+    write_json(artifact_dir / "orca-baseline.json", sanitize_artifact_samples(baseline))
 
     results = load_jsonl(artifact_dir / "probe-results.jsonl")
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
