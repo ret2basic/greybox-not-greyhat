@@ -293,6 +293,7 @@ python3 scripts/inferforge.py self-test-review-blockers
 python3 scripts/inferforge.py self-test-artifact-health
 python3 scripts/inferforge.py self-test-manifest-refresh
 python3 scripts/inferforge.py self-test-no-write
+python3 scripts/inferforge.py self-test-burp-sync-failures
 python3 scripts/inferforge.py review-blockers
 python3 scripts/inferforge.py collect-quote --direction buy --wallet EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR --amount-in 1000000
 python3 scripts/inferforge.py collect-orca-baseline
@@ -648,14 +649,14 @@ should also fail the job.
 `regression-suite` runs the repeatable local regression workflow that is used to
 develop the tool against `infrafi-web`: run static profile-routing, discovery
 coverage, command-safety, review-blocker, artifact-health, and
-manifest-refresh, and transaction-decoder self-tests, refresh static discovery,
-check that the discovered profile covers every static surface or review gate,
-run deterministic Burp observe/sync for the checked-in profile and discovered
-profile, collect one source-known Orca pool baseline, run both audits, write
-artifact health, and then generate a root-level review-blocker
-rollup, `regression-suite.json`, and a refreshed root `artifact-manifest.json`. The
-suite also prints the top grouped review blockers at the end so unattended runs
-surface the next action directly. It clears only
+manifest-refresh, no-write, Burp sync failure, and transaction-decoder
+self-tests, refresh static discovery, check that the discovered profile covers
+every static surface or review gate, run deterministic Burp observe/sync for
+the checked-in profile and discovered profile, collect one source-known Orca
+pool baseline, run both audits, write artifact health, and then generate a
+root-level review-blocker rollup, `regression-suite.json`, and a refreshed root
+`artifact-manifest.json`. The suite also prints the top grouped review blockers
+at the end so unattended runs surface the next action directly. It clears only
 generated `probe-results.jsonl` files in the selected regression artifact
 directories before audit so reruns do not accumulate stale probe rows. It does
 not run Burp Scanner, fuzz broadly, invoke Server Actions, sign wallets, or
@@ -741,6 +742,7 @@ Key outputs:
 .greybox/artifact-health-selftest.json
 .greybox/manifest-refresh-selftest.json
 .greybox/no-write-selftest.json
+.greybox/burp-sync-failure-selftest.json
 .greybox/target-profile.json
 .greybox/strategy-registry.json
 .greybox/profile-validation.json

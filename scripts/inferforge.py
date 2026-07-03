@@ -71,6 +71,7 @@ COMMAND_SAFETY_SELFTEST_ARTIFACT = "command-safety-selftest.json"
 ARTIFACT_HEALTH_SELFTEST_ARTIFACT = "artifact-health-selftest.json"
 MANIFEST_REFRESH_SELFTEST_ARTIFACT = "manifest-refresh-selftest.json"
 NO_WRITE_SELFTEST_ARTIFACT = "no-write-selftest.json"
+BURP_SYNC_FAILURE_SELFTEST_ARTIFACT = "burp-sync-failure-selftest.json"
 REQUIRED_ARTIFACTS = [
     "index.html",
     "report.md",
@@ -140,6 +141,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     ARTIFACT_HEALTH_SELFTEST_ARTIFACT,
     MANIFEST_REFRESH_SELFTEST_ARTIFACT,
     NO_WRITE_SELFTEST_ARTIFACT,
+    BURP_SYNC_FAILURE_SELFTEST_ARTIFACT,
     "transaction-intent-policy.json",
 ]
 REPORT_FRESHNESS_INPUTS = [
@@ -196,6 +198,7 @@ INDEX_ARTIFACT_ORDER = [
     ARTIFACT_HEALTH_SELFTEST_ARTIFACT,
     MANIFEST_REFRESH_SELFTEST_ARTIFACT,
     NO_WRITE_SELFTEST_ARTIFACT,
+    BURP_SYNC_FAILURE_SELFTEST_ARTIFACT,
     TARGET_PROFILE_ARTIFACT,
     STRATEGY_REGISTRY_ARTIFACT,
     PROFILE_VALIDATION_ARTIFACT,
@@ -15457,6 +15460,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("self-test-artifact-health", "run_artifact_health_selftest"),
         refresh_expectation("self-test-manifest-refresh", "run_manifest_refresh_selftest"),
         refresh_expectation("self-test-no-write", "run_no_write_selftest"),
+        refresh_expectation("self-test-burp-sync-failures", "run_burp_sync_failure_selftest"),
         refresh_expectation("self-test-transactions", "run_transaction_decoder_selftest"),
         refresh_expectation("collect-quote", "run_collect_quote", min_refreshes=2, min_prints=2),
         refresh_expectation("collect-orca-baseline", "run_collect_orca_baseline", min_refreshes=2, min_prints=2),
@@ -16372,6 +16376,260 @@ def build_no_write_selftest() -> dict[str, Any]:
         },
         "assertions": assertions,
         "safety": "Synthetic no-write self-test. It monkeypatches capability checks, writes only temporary local input files, and sends no requests.",
+    }
+
+
+def build_burp_sync_failure_selftest() -> dict[str, Any]:
+    target = "http://127.0.0.1:9997"
+    sentinel = "Authorization: Bearer burp-sync-secret should-not-appear"
+
+    def make_profile(path: str) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "name": "burp-sync-failure-selftest",
+            "display_name": "Burp Sync Failure Self-Test",
+            "default_target": target,
+            "default_source_root": "",
+            "strategy_sets": ["nextjs-api-routes"],
+            "probe_targets": {"health": {"path": "/health"}},
+            "clusters": [
+                {
+                    "id": "health",
+                    "method": "GET",
+                    "path": "/health",
+                    "kind": "health",
+                    "priority": "low",
+                    "strategy_set": "nextjs-api-routes",
+                    "match": {"paths": ["/health"]},
+                    "source_refs": ["health.ts"],
+                }
+            ],
+            "burp_observation_plan": [
+                {
+                    "id": "burp_observe_health",
+                    "method": "GET",
+                    "path": path,
+                    "headers": {"User-Agent": "InferForge-Burp-Observe/0.1"},
+                    "expected_statuses": [200],
+                    "cluster": "health",
+                }
+            ],
+        }
+
+    class FailingHistoryMcpSseClient:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "FailingHistoryMcpSseClient":
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            return None
+
+        def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+            if name == "set_proxy_intercept_state":
+                return {"content": [{"type": "text", "text": "intercept disabled"}]}
+            if name in {"get_proxy_http_history_regex", "get_proxy_http_history"}:
+                raise RuntimeError(sentinel)
+            raise RuntimeError(f"unexpected MCP tool {name}")
+
+    class SuccessfulHistoryMcpSseClient:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "SuccessfulHistoryMcpSseClient":
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            return None
+
+        def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+            if name == "set_proxy_intercept_state":
+                return {"content": [{"type": "text", "text": "intercept disabled"}]}
+            if name == "get_proxy_http_history_regex":
+                return {"content": [{"type": "text", "text": "[]"}]}
+            raise RuntimeError(f"unexpected MCP tool {name}")
+
+    def redacted_error_ok(value: Any, expected_type: str) -> bool:
+        return (
+            isinstance(value, dict)
+            and value.get("type") == expected_type
+            and value.get("message_redacted") is True
+            and isinstance(value.get("message_sha256"), str)
+            and isinstance(value.get("message_bytes"), int)
+        )
+
+    def mcp_action_errors_redacted(actions: Any) -> bool:
+        if not isinstance(actions, list):
+            return False
+        for action in actions:
+            if not isinstance(action, dict):
+                return False
+            error = action.get("error")
+            if error is None:
+                continue
+            if not isinstance(error, dict):
+                return False
+            if not redacted_error_ok(error, str(error.get("type") or "")):
+                return False
+        return True
+
+    def artifact_text_leaks(artifact_dir: Path) -> list[str]:
+        leaks = []
+        for path in sorted(artifact_dir.iterdir(), key=lambda item: item.name):
+            if not path.is_file() or path.suffix not in {".json", ".jsonl", ".txt", ".md"}:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if sentinel in text or "burp-sync-secret" in text or "should-not-appear" in text:
+                leaks.append(path.name)
+        return leaks
+
+    def run_case(
+        root: Path,
+        case_id: str,
+        profile: dict[str, Any],
+        *,
+        mcp_client_cls: type[Any] | None = None,
+        import_failure: bool = False,
+    ) -> dict[str, Any]:
+        case_dir = root / case_id
+        profile_path = root / f"{case_id}-profile.json"
+        source_root = root / "source"
+        source_root.mkdir(parents=True, exist_ok=True)
+        write_json(profile_path, profile)
+        parser = build_parser()
+        parsed_args = parser.parse_args(
+            [
+                "--profile",
+                str(profile_path),
+                "--artifact-dir",
+                str(case_dir),
+                "--target",
+                target,
+                "--source-root",
+                str(source_root),
+                "burp-sync",
+                "--mcp-url",
+                "http://127.0.0.1:9876",
+                "--count",
+                "1",
+                "--replace",
+            ]
+        )
+        original_mcp_sse_client = globals()["McpSseClient"]
+        original_import_burp_history_inputs = globals()["import_burp_history_inputs"]
+
+        def failing_import(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError(sentinel)
+
+        try:
+            if mcp_client_cls is not None:
+                globals()["McpSseClient"] = mcp_client_cls
+            if import_failure:
+                globals()["import_burp_history_inputs"] = failing_import
+            stdout_buffer = io.StringIO()
+            with contextlib.redirect_stdout(stdout_buffer):
+                return_code = parsed_args.func(parsed_args)
+            stdout = stdout_buffer.getvalue()
+        finally:
+            globals()["McpSseClient"] = original_mcp_sse_client
+            globals()["import_burp_history_inputs"] = original_import_burp_history_inputs
+
+        sync_path = case_dir / "burp-mcp-sync.json"
+        sync_doc = json.loads(sync_path.read_text(encoding="utf-8")) if sync_path.exists() else {}
+        health = build_single_artifact_health(case_dir)
+        return {
+            "case_id": case_id,
+            "return_code": return_code,
+            "stdout": stdout.splitlines(),
+            "sync": sync_doc,
+            "sync_exists": sync_path.exists(),
+            "artifact_health_status": health.get("status"),
+            "security_issues": health.get("security_issues", []),
+            "leaked_files": artifact_text_leaks(case_dir) if case_dir.exists() else [],
+            "stdout_leaked": sentinel in stdout or "burp-sync-secret" in stdout or "should-not-appear" in stdout,
+        }
+
+    with tempfile.TemporaryDirectory(prefix="inferforge-burp-sync-failure-selftest-") as temp_dir:
+        root = Path(temp_dir)
+        cases = {
+            "profile_validation": run_case(
+                root,
+                "profile-validation",
+                make_profile(PLACEHOLDER_APPROVED_CONCRETE_PATH),
+            ),
+            "mcp_history_read": run_case(
+                root,
+                "mcp-history-read",
+                make_profile("/health"),
+                mcp_client_cls=FailingHistoryMcpSseClient,
+            ),
+            "history_import": run_case(
+                root,
+                "history-import",
+                make_profile("/health"),
+                mcp_client_cls=SuccessfulHistoryMcpSseClient,
+                import_failure=True,
+            ),
+        }
+
+    assertions = [
+        {
+            "id": "profile-validation-failure-redacts-error",
+            "passed": (
+                cases["profile_validation"]["return_code"] == 2
+                and cases["profile_validation"]["sync"].get("status") == "blocked-profile-validation"
+                and cases["profile_validation"]["sync"].get("error_context") == "profile-validation"
+                and redacted_error_ok(cases["profile_validation"]["sync"].get("error"), "ValueError")
+                and not cases["profile_validation"]["security_issues"]
+                and not cases["profile_validation"]["leaked_files"]
+                and not cases["profile_validation"]["stdout_leaked"]
+            ),
+            "expected": "profile validation failures write a redacted burp-mcp-sync error without raw leakage",
+            "actual": cases["profile_validation"],
+        },
+        {
+            "id": "mcp-history-read-failure-redacts-errors",
+            "passed": (
+                cases["mcp_history_read"]["return_code"] == 1
+                and cases["mcp_history_read"]["sync"].get("status") == "failed"
+                and cases["mcp_history_read"]["sync"].get("error_context") == "mcp-history-read"
+                and redacted_error_ok(cases["mcp_history_read"]["sync"].get("error"), "RuntimeError")
+                and mcp_action_errors_redacted(cases["mcp_history_read"]["sync"].get("mcp_actions"))
+                and not cases["mcp_history_read"]["security_issues"]
+                and not cases["mcp_history_read"]["leaked_files"]
+                and not cases["mcp_history_read"]["stdout_leaked"]
+            ),
+            "expected": "MCP history read failures redact top-level and action errors without raw MCP text",
+            "actual": cases["mcp_history_read"],
+        },
+        {
+            "id": "history-import-failure-redacts-error",
+            "passed": (
+                cases["history_import"]["return_code"] == 1
+                and cases["history_import"]["sync"].get("status") == "failed-import"
+                and cases["history_import"]["sync"].get("error_context") == "history-import"
+                and redacted_error_ok(cases["history_import"]["sync"].get("error"), "RuntimeError")
+                and not cases["history_import"]["security_issues"]
+                and not cases["history_import"]["leaked_files"]
+                and not cases["history_import"]["stdout_leaked"]
+            ),
+            "expected": "history import failures redact top-level errors after successful MCP history capture",
+            "actual": cases["history_import"],
+        },
+    ]
+    failed = [item for item in assertions if not item["passed"]]
+    return {
+        "generated_at": utc_now(),
+        "status": "failed" if failed else "passed",
+        "summary": {
+            "cases": len(cases),
+            "assertions": len(assertions),
+            "failed": len(failed),
+        },
+        "cases": cases,
+        "assertions": assertions,
+        "safety": "Synthetic burp-sync failure self-test. It monkeypatches Burp MCP and history import, writes only temporary local files, and sends no requests.",
     }
 
 
@@ -22274,6 +22532,35 @@ def run_no_write_selftest(args: argparse.Namespace) -> int:
     return 0 if result["status"] == "passed" else 1
 
 
+def run_burp_sync_failure_selftest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result = build_burp_sync_failure_selftest()
+    result["current_profile_context"] = profile_summary(profile)
+    output_path = artifact_dir / BURP_SYNC_FAILURE_SELFTEST_ARTIFACT
+    write_json(output_path, result)
+    print(f"Burp sync failure self-test: {result['status']}")
+    print(
+        "Cases: "
+        f"cases={result['summary']['cases']}, "
+        f"assertions={result['summary']['assertions']}, "
+        f"failed={result['summary']['failed']}"
+    )
+    failed = [item for item in result.get("assertions", []) if not item.get("passed")]
+    if failed:
+        print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="self-test-burp-sync-failures",
+            output_paths=[output_path],
+        )
+    )
+    return 0 if result["status"] == "passed" else 1
+
+
 def run_manifest(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -22415,6 +22702,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             ("self-test-artifact-health", "self-test-artifact-health"),
             ("self-test-manifest-refresh", "self-test-manifest-refresh"),
             ("self-test-no-write", "self-test-no-write"),
+            ("self-test-burp-sync-failures", "self-test-burp-sync-failures"),
             ("self-test-transactions", "self-test-transactions"),
         ]:
             command = inferforge_cli_command(
@@ -24196,6 +24484,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a synthetic self-test for --no-write command behavior",
     )
     no_write_selftest.set_defaults(func=run_no_write_selftest)
+
+    burp_sync_failure_selftest = sub.add_parser(
+        "self-test-burp-sync-failures",
+        help="Run a synthetic self-test for redacted burp-sync failure artifacts",
+    )
+    burp_sync_failure_selftest.set_defaults(func=run_burp_sync_failure_selftest)
 
     collect_quote = sub.add_parser(
         "collect-quote",
