@@ -371,6 +371,26 @@ candidate must be promoted first. It does not send requests; use
 `burp-sync --observe --ws-upgrade --replace` for deterministic low-volume Burp
 traffic after the profile is reviewed.
 
+`discovery-coverage` writes `.greybox/discovery-coverage.json`. It compares the
+static `route-inventory.json` surfaces against the current target profile,
+active Burp observation plan, imported Burp history, probe results, review-only
+observation candidates, and source-only contexts such as middleware, Server
+Actions, redirects, and header policies. This catches drift where static
+discovery finds a new route, rewrite, or custom-server entrypoint that the
+profile does not yet represent. The command does not send requests; it reads
+local source/profile/artifacts only. For discovered profiles, review-gated
+rewrite proxies normally produce `needs-human-review` until one approved
+concrete local path is promoted:
+
+```bash
+python3 scripts/inferforge.py \
+  --profile .greybox/discovered-profile.json \
+  discovery-coverage
+```
+
+Use `--strict` in CI when review-gated or source-only surfaces should fail the
+job instead of returning a successful `needs-human-review` status.
+
 `response-deltas` writes `.greybox/response-delta-analysis.json`, a read-only
 black-box evidence index over `probe-results.jsonl`. It groups probe rows by
 cluster and endpoint, records status-code, response-hash, body-shape,
@@ -451,10 +471,10 @@ report and index page.
 `artifact-health` writes `.greybox/artifact-health.json`, a local health summary
 over one or more artifact directories. It parses every top-level JSON and JSONL
 artifact, checks the manifest's missing-required list, carries forward key gate
-statuses such as coverage, verification queue, response deltas, source-peek
-requests, and Burp observation coverage, and classifies each run as `healthy`,
-`ready-with-external-blockers`, `needs-human-review`, or `failed`. It is useful
-after regression runs:
+statuses such as black-box coverage, discovery coverage, verification queue,
+response deltas, source-peek requests, and Burp observation coverage, and
+classifies each run as `healthy`, `ready-with-external-blockers`,
+`needs-human-review`, or `failed`. It is useful after regression runs:
 
 ```bash
 python3 scripts/inferforge.py artifact-health \
@@ -469,10 +489,11 @@ sets. Use `--strict` in CI when human-review or external-configuration blockers
 should also fail the job.
 
 `regression-suite` runs the repeatable local regression workflow that is used to
-develop the tool against `infrafi-web`: refresh static discovery, run
-deterministic Burp observe/sync for the checked-in profile and discovered
-profile, collect one source-known Orca pool baseline, run both audits, and then
-write `artifact-health.json` plus `regression-suite.json`. The suite clears only
+develop the tool against `infrafi-web`: refresh static discovery, check that the
+discovered profile covers every static surface or review gate, run deterministic
+Burp observe/sync for the checked-in profile and discovered profile, collect one
+source-known Orca pool baseline, run both audits, and then write
+`artifact-health.json` plus `regression-suite.json`. The suite clears only
 generated `probe-results.jsonl` files in the selected regression artifact
 directories before audit so reruns do not accumulate stale probe rows. It does
 not run Burp Scanner, fuzz broadly, invoke Server Actions, sign wallets, or
@@ -482,9 +503,9 @@ submit transactions.
 python3 scripts/inferforge.py regression-suite --include-external --ws-resource-probes
 ```
 
-Use `--skip-burp-sync`, `--skip-orca-baseline`, `--skip-audit`, or
-`--skip-discovered` for narrower local checks. Use `--strict` when
-human-review or external-configuration blockers should fail the command.
+Use `--skip-discovery-coverage`, `--skip-burp-sync`, `--skip-orca-baseline`,
+`--skip-audit`, or `--skip-discovered` for narrower local checks. Use `--strict`
+when human-review or external-configuration blockers should fail the command.
 
 `adjudicate` writes `.greybox/adjudication.json` and refreshes
 `.greybox/findings.json` plus `.greybox/hardening-notes.json`. The adjudicator
@@ -555,6 +576,7 @@ Key outputs:
 .greybox/route-inventory.json
 .greybox/discovered-profile.json
 .greybox/discovered-profile-validation.json
+.greybox/discovery-coverage.json
 .greybox/review-observation-candidates.json
 .greybox/reviewed-profile.json
 .greybox/reviewed-profile-validation.json

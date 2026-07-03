@@ -57,6 +57,7 @@ STRATEGY_REGISTRY_ARTIFACT = "strategy-registry.json"
 PROFILE_VALIDATION_ARTIFACT = "profile-validation.json"
 ROUTE_INVENTORY_ARTIFACT = "route-inventory.json"
 DISCOVERED_PROFILE_ARTIFACT = "discovered-profile.json"
+DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 REQUIRED_ARTIFACTS = [
     "index.html",
     "report.md",
@@ -102,6 +103,7 @@ DISCOVERY_ARTIFACTS = [
     ROUTE_INVENTORY_ARTIFACT,
     DISCOVERED_PROFILE_ARTIFACT,
     "discovered-profile-validation.json",
+    DISCOVERY_COVERAGE_ARTIFACT,
 ]
 KNOWN_OPTIONAL_ARTIFACTS = [
     *DISCOVERY_ARTIFACTS,
@@ -124,6 +126,7 @@ INDEX_ARTIFACT_ORDER = [
     MANIFEST_NAME,
     "artifact-health.json",
     "regression-suite.json",
+    DISCOVERY_COVERAGE_ARTIFACT,
     TARGET_PROFILE_ARTIFACT,
     STRATEGY_REGISTRY_ARTIFACT,
     PROFILE_VALIDATION_ARTIFACT,
@@ -8340,6 +8343,409 @@ def build_burp_observation_coverage(
     }
 
 
+DISCOVERY_SURFACE_SOURCES = [
+    ("route", "routes"),
+    ("rewrite", "rewrites"),
+    ("custom-server-entrypoint", "custom_server_entrypoints"),
+    ("middleware", "middleware"),
+    ("server-action", "server_actions"),
+    ("redirect", "redirects"),
+    ("header", "headers"),
+]
+SOURCE_ONLY_DISCOVERY_SURFACE_TYPES = {"middleware", "server-action", "redirect", "header"}
+DISCOVERY_ANY_METHOD_MATCH_CANDIDATES = ["GET", "HEAD", "POST", "OPTIONS", "WS"]
+
+
+def discovery_surface_source_refs(item: dict[str, Any]) -> list[str]:
+    refs = []
+    for key in ["repo_file", "file"]:
+        value = str(item.get(key) or "")
+        if value and value not in refs:
+            refs.append(value)
+    for value in item.get("source_refs", []) or []:
+        ref = str(value)
+        if ref and ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def discovery_surface_methods(surface_type: str, item: dict[str, Any]) -> list[str]:
+    raw_methods = item.get("methods")
+    if isinstance(raw_methods, list):
+        methods = [str(method).upper() for method in raw_methods if str(method or "").strip()]
+    else:
+        method = str(item.get("method") or "").upper()
+        methods = [method] if method else []
+    if not methods and surface_type == "custom-server-entrypoint" and "websocket" in str(item.get("kind") or ""):
+        methods = ["WS"]
+    if not methods and surface_type in {"rewrite", "redirect", "header"}:
+        methods = ["ANY"]
+    return sorted(dict.fromkeys(methods))
+
+
+def discovery_surface_path_candidates(item: dict[str, Any]) -> list[str]:
+    candidates = []
+
+    def add(value: Any) -> None:
+        text = str(value or "")
+        if text.startswith("/") and text not in candidates:
+            candidates.append(text)
+
+    add(item.get("path"))
+    match = item.get("match") or {}
+    for key in ["paths", "path_patterns"]:
+        for value in match.get(key, []) or []:
+            add(value)
+    if not candidates:
+        for prefix in match.get("path_prefixes", []) or []:
+            prefix_text = str(prefix or "")
+            if prefix_text.startswith("/"):
+                add(prefix_text.rstrip("/") + "/__inferforge_path__")
+    add(item.get("source_path"))
+    return candidates
+
+
+def normalize_discovery_surface(surface_type: str, key: str, item: dict[str, Any], index: int) -> dict[str, Any]:
+    raw_id = item.get("id") or item.get("cluster_id") or item.get("path") or item.get("file") or f"{key}-{index}"
+    path = str(item.get("path") or item.get("source_path") or "")
+    surface_id = f"{surface_type}:{safe_probe_id(str(raw_id))}:{index}"
+    return {
+        "id": surface_id,
+        "type": surface_type,
+        "inventory_key": key,
+        "index": index,
+        "cluster_id": item.get("cluster_id"),
+        "path": path or None,
+        "methods": discovery_surface_methods(surface_type, item),
+        "kind": item.get("kind"),
+        "strategy_set": item.get("strategy_set"),
+        "source_refs": discovery_surface_source_refs(item),
+        "match": json_clone(item.get("match") or {}),
+        "line_patterns": json_clone(item.get("line_patterns") or {}),
+        "route_policy": json_clone(item.get("route_policy") or {}),
+        "action_names": list(item.get("action_names") or []),
+        "safety": item.get("safety"),
+        "path_candidates": discovery_surface_path_candidates(item),
+    }
+
+
+def normalize_discovery_surfaces(route_inventory: dict[str, Any]) -> list[dict[str, Any]]:
+    surfaces = []
+    for surface_type, key in DISCOVERY_SURFACE_SOURCES:
+        for index, item in enumerate(route_inventory.get(key, []) or []):
+            if isinstance(item, dict):
+                surfaces.append(normalize_discovery_surface(surface_type, key, item, index))
+    return surfaces
+
+
+def discovery_surface_match_methods(surface: dict[str, Any]) -> list[str]:
+    methods = list(surface.get("methods") or [])
+    if not methods or "ANY" in methods:
+        return DISCOVERY_ANY_METHOD_MATCH_CANDIDATES
+    return methods
+
+
+def discovery_surface_matches_path(surface: dict[str, Any], method: str, path: str) -> bool:
+    normalized_method = str(method or "").upper()
+    surface_methods = {str(item).upper() for item in surface.get("methods", []) or []}
+    if surface_methods and "ANY" not in surface_methods and normalized_method not in surface_methods:
+        return False
+    normalized_path = str(path or "").split("?", 1)[0]
+    if not normalized_path.startswith("/"):
+        return False
+
+    match = surface.get("match") or {}
+    paths = [str(item) for item in match.get("paths", []) or []]
+    path_patterns = [str(item) for item in match.get("path_patterns", []) or []]
+    path_prefixes = [str(item) for item in match.get("path_prefixes", []) or []]
+    if not (paths or path_patterns or path_prefixes):
+        candidate_path = str(surface.get("path") or "")
+        if candidate_path:
+            path_patterns = [candidate_path] if "{" in candidate_path else []
+            paths = [] if "{" in candidate_path else [candidate_path]
+
+    if normalized_path in paths:
+        return True
+    if any(normalized_path.startswith(prefix) for prefix in path_prefixes):
+        return True
+    return any(path_pattern_matches(pattern, normalized_path) for pattern in path_patterns if pattern)
+
+
+def discovery_cluster_ids_for_surface(surface: dict[str, Any], clusters: dict[str, Any]) -> list[str]:
+    cluster_ids: list[str] = []
+    for cluster in clusters.get("clusters", []) or []:
+        cluster_id = str(cluster.get("id") or "")
+        if not cluster_id:
+            continue
+        matched = False
+        for method in discovery_surface_match_methods(surface):
+            for path in surface.get("path_candidates", []) or []:
+                if cluster_matches_endpoint(cluster, method, path):
+                    matched = True
+                    break
+            if matched:
+                break
+        if matched and cluster_id not in cluster_ids:
+            cluster_ids.append(cluster_id)
+    return sorted(cluster_ids)
+
+
+def discovery_active_observations_for_surface(surface: dict[str, Any], active_plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    observations = []
+    for item in active_plan:
+        method = str(item.get("method") or "").upper()
+        path = str(item.get("path") or "")
+        if not method or not path:
+            continue
+        if not discovery_surface_matches_path(surface, method, path):
+            continue
+        observations.append(
+            {
+                "id": item.get("id"),
+                "method": method,
+                "path": path,
+                "cluster": item.get("cluster"),
+                "expected_statuses": item.get("expected_statuses", []),
+            }
+        )
+    return observations
+
+
+def discovery_probe_results_for_surface(surface: dict[str, Any], results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    matches = []
+    for row in results:
+        method = str(row.get("method") or (row.get("request") or {}).get("method") or "").upper()
+        path = str(row.get("path") or (row.get("request") or {}).get("path") or "")
+        if not method or not path or not discovery_surface_matches_path(surface, method, path):
+            continue
+        matches.append(
+            {
+                "probe_id": row.get("probe_id"),
+                "method": method,
+                "path": path,
+                "cluster": row.get("category"),
+                "status": row.get("status"),
+                "expected": row.get("expected"),
+            }
+        )
+        if len(matches) >= 8:
+            break
+    return matches
+
+
+def discovery_burp_history_for_surface(surface: dict[str, Any], burp_history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    matches = []
+    for row in burp_history:
+        method = str(row.get("method") or "").upper()
+        path = str(row.get("path") or (row.get("request_context") or {}).get("path") or "")
+        if not method or not path or not discovery_surface_matches_path(surface, method, path):
+            continue
+        matches.append(
+            {
+                "method": method,
+                "path": path,
+                "status": row.get("status"),
+                "source": row.get("source"),
+            }
+        )
+        if len(matches) >= 8:
+            break
+    return matches
+
+
+def discovery_review_candidates_for_surface(
+    surface: dict[str, Any],
+    review_candidates: list[dict[str, Any]],
+    matching_cluster_ids: list[str],
+) -> list[dict[str, Any]]:
+    surface_cluster_id = str(surface.get("cluster_id") or "")
+    candidates = []
+    for candidate in review_candidates:
+        candidate_cluster = str(candidate.get("cluster") or "")
+        candidate_method = str(candidate.get("method") or "GET").upper()
+        path_template = str(candidate.get("path_template") or "")
+        cluster_matches = bool(
+            candidate_cluster
+            and (
+                candidate_cluster == surface_cluster_id
+                or candidate_cluster in matching_cluster_ids
+            )
+        )
+        path_matches = bool(
+            path_template
+            and any(
+                path_pattern_matches(path_template, path)
+                or ("{" in path and path_pattern_matches(path, path_template))
+                for path in surface.get("path_candidates", []) or []
+            )
+        )
+        if not cluster_matches and not path_matches:
+            continue
+        if path_template and not any(
+            path_pattern_matches(path_template, path)
+            or ("{" in path and path_pattern_matches(path, path_template))
+            for path in surface.get("path_candidates", []) or []
+        ):
+            continue
+        candidates.append(
+            {
+                "id": candidate.get("id"),
+                "type": candidate.get("type"),
+                "status": candidate.get("status"),
+                "method": candidate_method,
+                "path_template": path_template or None,
+                "cluster": candidate_cluster or None,
+            }
+        )
+    return candidates
+
+
+def source_only_discovery_next_action(surface: dict[str, Any]) -> str:
+    surface_type = surface.get("type")
+    if surface_type == "middleware":
+        return "Review this Next.js middleware/proxy as cross-cutting source context; it is not executed by automated probes."
+    if surface_type == "server-action":
+        return "Review the Server Action source manually; InferForge does not invoke Server Actions or submit forms automatically."
+    if surface_type in {"redirect", "header"}:
+        return "Review this Next.js route policy as source context and confirm affected paths are represented by route clusters where relevant."
+    return "Review this source-only discovery surface manually."
+
+
+def build_discovery_coverage(
+    target: str,
+    profile: dict[str, Any],
+    source_root: Path,
+    route_inventory: dict[str, Any],
+    clusters: dict[str, Any],
+    *,
+    route_inventory_path: Path | None = None,
+    burp_history: list[dict[str, Any]] | None = None,
+    probe_results: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    active_plan_error = None
+    try:
+        active_plan = build_burp_observation_plan(target, profile)
+    except ValueError as error:
+        active_plan = []
+        active_plan_error = str(error)
+
+    ws_profile = websocket_observation_config(profile)
+    if ws_profile is not None:
+        active_plan.append(
+            {
+                "id": ws_profile.get("id") or "burp_observe_ws_upgrade",
+                "method": "WS",
+                "path": ws_profile.get("path"),
+                "expected_statuses": ws_profile.get("expected_statuses", [101]),
+                "cluster": ws_profile.get("cluster") or "solana-rpc-ws",
+            }
+        )
+
+    review_candidates = collect_review_observation_candidates(profile)
+    surfaces = normalize_discovery_surfaces(route_inventory)
+    rows = []
+    status_counts: dict[str, int] = {}
+
+    for surface in surfaces:
+        matching_cluster_ids = discovery_cluster_ids_for_surface(surface, clusters)
+        active_observations = discovery_active_observations_for_surface(surface, active_plan)
+        probe_matches = discovery_probe_results_for_surface(surface, probe_results or [])
+        burp_matches = discovery_burp_history_for_surface(surface, burp_history or [])
+        review_matches = discovery_review_candidates_for_surface(surface, review_candidates, matching_cluster_ids)
+        source_only = surface.get("type") in SOURCE_ONLY_DISCOVERY_SURFACE_TYPES
+
+        if source_only:
+            status = "source-only-context"
+            next_action = source_only_discovery_next_action(surface)
+        elif burp_matches:
+            status = "covered-by-burp-history"
+            next_action = "No static-discovery coverage action is required; keep Burp history fresh when this surface changes."
+        elif probe_matches:
+            status = "covered-by-probe-result"
+            next_action = "No static-discovery coverage action is required; current probe results touch this surface."
+        elif active_observations:
+            status = "covered-by-active-observation"
+            next_action = "Run burp-sync --observe when fresh Burp browser evidence is needed."
+        elif review_matches:
+            status = "review-gated"
+            next_action = "Promote one approved concrete local read-only observation path before automated Burp observation."
+        elif matching_cluster_ids:
+            status = "covered-by-profile-cluster"
+            next_action = "Profile routing covers this static surface; add a Burp observation or targeted probe when evidence is required."
+        else:
+            status = "uncovered"
+            next_action = "Add this static surface to the target profile, or document why it is intentionally out of scope."
+
+        increment_count(status_counts, status)
+        row = {
+            "id": surface["id"],
+            "type": surface["type"],
+            "path": surface.get("path"),
+            "methods": surface.get("methods", []),
+            "kind": surface.get("kind"),
+            "strategy_set": surface.get("strategy_set"),
+            "source_refs": surface.get("source_refs", []),
+            "status": status,
+            "profile_cluster_ids": matching_cluster_ids,
+            "declared_cluster_id": surface.get("cluster_id"),
+            "active_observation_count": len(active_observations),
+            "active_observations": active_observations,
+            "probe_result_count": len(probe_matches),
+            "probe_results": probe_matches,
+            "burp_history_count": len(burp_matches),
+            "burp_history": burp_matches,
+            "review_candidate_count": len(review_matches),
+            "review_candidates": review_matches,
+            "source_only": source_only,
+            "next_action": next_action,
+        }
+        if surface.get("action_names"):
+            row["action_names"] = surface["action_names"]
+        if surface.get("route_policy"):
+            row["route_policy"] = surface["route_policy"]
+        rows.append(row)
+
+    if active_plan_error:
+        status = "profile-error"
+    elif not surfaces:
+        status = "no-surfaces"
+    elif status_counts.get("uncovered"):
+        status = "uncovered"
+    elif status_counts.get("review-gated") or status_counts.get("source-only-context"):
+        status = "needs-human-review"
+    else:
+        status = "covered"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "source_root": repo_relative_or_absolute(source_root),
+        "profile": profile_summary(profile),
+        "summary": {
+            "surfaces": len(rows),
+            "status_counts": status_counts,
+            "route_inventory_status": route_inventory.get("status"),
+            "route_inventory_summary": route_inventory.get("summary", {}),
+            "profile_clusters": len(clusters.get("clusters", []) or []),
+            "review_candidates": len(review_candidates),
+            "active_observations": len(active_plan),
+            "active_plan_error": active_plan_error,
+        },
+        "surfaces": rows,
+        "artifact_refs": {
+            "route_inventory": repo_relative_or_absolute(route_inventory_path) if route_inventory_path else ROUTE_INVENTORY_ARTIFACT,
+            "target_profile": TARGET_PROFILE_ARTIFACT,
+            "endpoint_clusters": "endpoint-clusters.json",
+            "burp_history": "burp-history-observations.jsonl",
+            "probe_results": "probe-results.jsonl",
+            "review_candidates": "review-observation-candidates.json",
+            "reviewed_profile": "reviewed-profile.json",
+        },
+        "safety": "Read-only static-discovery coverage artifact. It reads local source/profile/artifacts only and does not send HTTP requests, invoke Server Actions, run Burp Scanner, sign wallets, or submit transactions.",
+    }
+
+
 def source_peek_cluster_ids(source_peeks: dict[str, Any] | None) -> set[str]:
     observed: set[str] = set()
     for item in (source_peeks or {}).get("source_peeks", []):
@@ -10182,6 +10588,7 @@ def build_artifact_manifest(
     status_sources: dict[str, Any] = {}
     status_source_names = {
         "blackbox-coverage.json",
+        DISCOVERY_COVERAGE_ARTIFACT,
         "burp-observation-coverage.json",
         "evidence-chain.json",
         "evidence-appendix.json",
@@ -10243,6 +10650,7 @@ def build_artifact_manifest(
     stale_inputs = []
     readiness_status = (status_sources.get("environment-readiness.json") or {}).get("status")
     coverage_status = (status_sources.get("blackbox-coverage.json") or {}).get("status")
+    discovery_coverage_status = (status_sources.get(DISCOVERY_COVERAGE_ARTIFACT) or {}).get("status")
     adjudication_status = (status_sources.get("adjudication.json") or {}).get("status")
     verification_status = (status_sources.get("verification-queue.json") or {}).get("status")
     profile_validation_status = (status_sources.get(PROFILE_VALIDATION_ARTIFACT) or {}).get("status")
@@ -10274,6 +10682,7 @@ def build_artifact_manifest(
             "missing_required": missing_required,
             "stale_inputs": stale_inputs,
             "coverage": coverage_status,
+            "discovery_coverage": discovery_coverage_status,
             "adjudication": adjudication_status,
             "verification_queue": verification_status,
             "readiness": readiness_status,
@@ -10317,6 +10726,7 @@ def artifact_statuses_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     return {
         "manifest": manifest.get("status"),
         "coverage": summary.get("coverage"),
+        "discovery_coverage": summary.get("discovery_coverage"),
         "adjudication": summary.get("adjudication"),
         "verification_queue": summary.get("verification_queue"),
         "readiness": summary.get("readiness"),
@@ -10366,6 +10776,7 @@ def artifact_health_status(checks: list[dict[str, Any]], statuses: dict[str, Any
         return "failed"
     if (
         statuses.get("verification_queue") == "needs-human-review"
+        or statuses.get("discovery_coverage") == "needs-human-review"
         or statuses.get("burp_observation_coverage") == "needs-human-review"
         or statuses.get("source_peek_requests") == "answered-with-manual-review"
         or statuses.get("coverage") == "covered-with-evidence-gaps"
@@ -10535,6 +10946,16 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
                     "id": "coverage",
                     "status": "failed",
                     "message": f"Coverage status is {coverage_status}.",
+                }
+            )
+
+        discovery_coverage_status = str(statuses.get("discovery_coverage") or "")
+        if discovery_coverage_status in {"uncovered", "failed", "profile-error", "missing-route-inventory", "no-surfaces"}:
+            checks.append(
+                {
+                    "id": "discovery-coverage",
+                    "status": "failed",
+                    "message": f"Discovery coverage status is {discovery_coverage_status}.",
                 }
             )
 
@@ -15198,6 +15619,49 @@ def run_burp_observation_coverage(args: argparse.Namespace) -> int:
     return 0 if coverage["status"] in {"covered", "needs-burp-sync"} else 1
 
 
+def run_discovery_coverage(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    route_inventory_path = resolve_repo_path(args.route_inventory) if args.route_inventory else artifact_dir / ROUTE_INVENTORY_ARTIFACT
+    if route_inventory_path.exists():
+        route_inventory = json.loads(read_text(route_inventory_path))
+    else:
+        route_inventory = discover_nextjs_routes(source_root)
+        route_inventory_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(route_inventory_path, route_inventory)
+
+    clusters = build_clusters(profile, source_root)
+    coverage = build_discovery_coverage(
+        target,
+        profile,
+        source_root,
+        route_inventory,
+        clusters,
+        route_inventory_path=route_inventory_path,
+        burp_history=load_jsonl(artifact_dir / "burp-history-observations.jsonl"),
+        probe_results=load_jsonl(artifact_dir / "probe-results.jsonl"),
+    )
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / DISCOVERY_COVERAGE_ARTIFACT
+    write_json(output_path, coverage)
+
+    print(f"Discovery coverage: {coverage['status']}")
+    print(
+        "Surfaces: "
+        f"{coverage['summary']['surfaces']} total, "
+        f"status_counts={json.dumps(coverage['summary']['status_counts'], sort_keys=True)}"
+    )
+    print(f"Route inventory: {route_inventory_path}")
+    print(f"Wrote {output_path}")
+
+    if coverage["status"] in {"uncovered", "profile-error", "missing-route-inventory", "failed", "no-surfaces"}:
+        return 1
+    if args.strict and coverage["status"] != "covered":
+        return 1
+    return 0
+
+
 def run_response_deltas(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -15426,6 +15890,7 @@ def run_artifact_health(args: argparse.Namespace) -> int:
             f"- {item['artifact_dir']}: {item['status']} "
             f"manifest={statuses.get('manifest')} "
             f"coverage={statuses.get('coverage')} "
+            f"discovery={statuses.get('discovery_coverage')} "
             f"verification={statuses.get('verification_queue')} "
             f"response_deltas={statuses.get('response_delta_analysis')} "
             f"source_peek_requests={statuses.get('source_peek_requests')} "
@@ -15529,6 +15994,22 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             )
             run_step("discovered-burp-sync", command)
 
+    if not args.skip_discovery_coverage and not args.skip_discovered and not suite_stopped:
+        coverage_args = [
+            "--route-inventory",
+            repo_relative_or_absolute(artifact_dir / ROUTE_INVENTORY_ARTIFACT),
+        ]
+        if args.strict:
+            coverage_args.append("--strict")
+        command = inferforge_cli_command(
+            args,
+            profile_path=discovered_profile_path,
+            artifact_dir=discovered_artifact_dir,
+            subcommand="discovery-coverage",
+            extra=coverage_args,
+        )
+        run_step("discovered-discovery-coverage", command)
+
     if not args.skip_orca_baseline and not suite_stopped:
         command = inferforge_cli_command(
             args,
@@ -15611,6 +16092,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             "skip_orca_baseline": bool(args.skip_orca_baseline),
             "skip_audit": bool(args.skip_audit),
             "skip_discover_profile": bool(args.skip_discover_profile),
+            "skip_discovery_coverage": bool(args.skip_discovery_coverage),
             "keep_probe_results": bool(args.keep_probe_results),
             "strict": bool(args.strict),
         },
@@ -16474,6 +16956,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     burp_observation_coverage.set_defaults(func=run_burp_observation_coverage)
 
+    discovery_coverage = sub.add_parser(
+        "discovery-coverage",
+        help="Compare static route discovery against the current profile, observations, and review gates",
+    )
+    discovery_coverage.add_argument(
+        "--route-inventory",
+        help="Route inventory JSON to check. Defaults to --artifact-dir/route-inventory.json, discovering from source if missing.",
+    )
+    discovery_coverage.add_argument(
+        "--output",
+        help="Where to write discovery-coverage.json. Defaults to --artifact-dir/discovery-coverage.json.",
+    )
+    discovery_coverage.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless every discovered surface is fully covered with no human-review gates.",
+    )
+    discovery_coverage.set_defaults(func=run_discovery_coverage)
+
     response_deltas = sub.add_parser(
         "response-deltas",
         help="Recompute response delta analysis from current probe results",
@@ -16599,6 +17100,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-discover-profile",
         action="store_true",
         help="Reuse the existing discovered profile instead of refreshing it first.",
+    )
+    regression_suite.add_argument(
+        "--skip-discovery-coverage",
+        action="store_true",
+        help="Skip static discovery coverage checking for the discovered profile.",
     )
     regression_suite.add_argument(
         "--skip-burp-sync",
