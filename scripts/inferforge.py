@@ -20691,6 +20691,24 @@ def run_readiness(args: argparse.Namespace) -> int:
     write_json(capabilities_path, capabilities)
     write_json(readiness_path, readiness)
     print(json.dumps(readiness, indent=2))
+    check_status_counts: dict[str, int] = {}
+    for check in readiness.get("checks", []) or []:
+        increment_count(check_status_counts, str(check.get("status") or "unknown"))
+    print(f"Readiness: {readiness['status']}")
+    print(
+        "Checks: "
+        f"{len(readiness.get('checks', []) or [])} total, "
+        f"status_counts={json.dumps(check_status_counts, sort_keys=True)}"
+    )
+    next_steps = readiness.get("next_steps", []) or []
+    if next_steps:
+        print("Next steps:")
+        for step in next_steps[:3]:
+            print(f"- {step}")
+        if len(next_steps) > 3:
+            print(f"- {len(next_steps) - 3} more step(s) in {readiness_path}")
+    else:
+        print("Next steps: none")
     print_refreshed_manifests(
         refresh_current_artifact_manifest(
             artifact_dir=artifact_dir,
