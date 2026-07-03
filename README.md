@@ -504,8 +504,8 @@ the probes.
 coverage gate, adjudication, and evidence gaps into concrete low-volume replay
 commands, read-only refresh commands, and explicit external blockers.
 Use `verification-queue --no-write` to preview the queue status, command safety
-totals, and top queue items without writing queue artifacts, reproduction steps,
-review blocker outputs, or refreshed manifests.
+totals, top queue items, and labeled command previews without writing queue
+artifacts, reproduction steps, review blocker outputs, or refreshed manifests.
 Server Action gaps are emitted as source-only `manual-review` items with no
 runnable command templates; the queue points back to `source-peek-results.json`
 and lists the action names, source file, and review questions. The read-only

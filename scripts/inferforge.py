@@ -11935,15 +11935,35 @@ def top_verification_queue_item_summaries(
     *,
     limit: int = 8,
 ) -> list[str]:
-    ranked_items = sorted(
-        enumerate(verification_queue.get("items", []) or []),
-        key=lambda row: (
-            verification_queue_item_status_rank(str(row[1].get("status") or "")),
-            verification_queue_item_priority_rank(str(row[1].get("priority") or "")),
-            row[0],
-        ),
-    )
-    return [format_verification_queue_item_summary(item) for _, item in ranked_items[:limit]]
+    ranked_items = ranked_verification_queue_items(verification_queue)
+    return [format_verification_queue_item_summary(item) for item in ranked_items[:limit]]
+
+
+def ranked_verification_queue_items(verification_queue: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for _, item in sorted(
+            enumerate(verification_queue.get("items", []) or []),
+            key=lambda row: (
+                verification_queue_item_status_rank(str(row[1].get("status") or "")),
+                verification_queue_item_priority_rank(str(row[1].get("priority") or "")),
+                row[0],
+            ),
+        )
+    ]
+
+
+def verification_queue_command_preview_lines(item: dict[str, Any], *, limit: int = 4) -> list[str]:
+    command_refs = (item.get("command_safety", {}) or {}).get("commands", []) or []
+    if not command_refs:
+        return []
+    lines = []
+    for ref in command_refs[:limit]:
+        command = inline_summary_text(ref.get("command"), max_chars=500)
+        lines.append(f"    - {format_command_ref_label(ref)} {command}")
+    if len(command_refs) > limit:
+        lines.append(f"    - ... +{len(command_refs) - limit} more commands")
+    return lines
 
 
 def merge_review_candidate_summary(existing: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
@@ -15182,6 +15202,10 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Verification queue: ready" in verification_queue_stdout
                 and "Items: 4 total" in verification_queue_stdout_text
                 and "Queue items:" in verification_queue_stdout
+                and "Command previews:" in verification_queue_stdout
+                and "- VERIFY-safe-audit-loop:" in verification_queue_stdout
+                and "[ready]" in verification_queue_stdout_text
+                and "audit --include-external --ws-resource-probes" in verification_queue_stdout_text
                 and "No files written (--no-write)." in verification_queue_stdout
                 and not any(
                     output_paths[key]
@@ -20837,6 +20861,18 @@ def run_verification_queue(args: argparse.Namespace) -> int:
                 print(f"- {total_items - len(item_summaries)} more item(s); rerun without --no-write to write reproduction steps")
             else:
                 print(f"- {total_items - len(item_summaries)} more item(s) in {reproduction_steps_path}")
+    if no_write:
+        preview_items = [
+            item
+            for item in ranked_verification_queue_items(verification_queue)
+            if verification_queue_command_preview_lines(item)
+        ][:4]
+        if preview_items:
+            print("Command previews:")
+            for item in preview_items:
+                print(f"- {item.get('id') or 'ITEM-unknown'}:")
+                for line in verification_queue_command_preview_lines(item):
+                    print(line)
     if no_write:
         print("No files written (--no-write).")
     else:
