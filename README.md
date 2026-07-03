@@ -532,9 +532,10 @@ command templates so the next manual approval step is visible without opening
 every individual blocker. The CLI prints the grouped blocker summaries first,
 including count, cluster, candidate ids, and next action. In `--no-write` mode,
 top groups with queued commands also print compact command safety totals and
-command templates so the approval step can be previewed without writing
-artifacts. When `--check-dir` is repeated, it builds a root-level rollup across
-multiple artifact directories:
+per-command classification labels such as `manual-template` and `review-gated`
+so the approval step can be previewed without writing artifacts. When
+`--check-dir` is repeated, it builds a root-level rollup across multiple
+artifact directories:
 
 ```bash
 python3 scripts/inferforge.py review-blockers

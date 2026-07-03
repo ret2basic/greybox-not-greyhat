@@ -11706,9 +11706,13 @@ def review_blocker_command_status(group_status: str) -> str | None:
 
 
 def review_blocker_group_command_safety(group: dict[str, Any]) -> dict[str, Any]:
+    return command_safety_summary(review_blocker_group_command_refs(group))
+
+
+def review_blocker_group_command_refs(group: dict[str, Any]) -> list[dict[str, Any]]:
     commands = review_blocker_group_command_templates(group)
     item_status = review_blocker_command_status(str(group.get("status") or ""))
-    refs = [
+    return [
         classify_verification_command(
             command,
             source=f"{group.get('id') or 'GROUP-unknown'}:commands[{index}]",
@@ -11716,7 +11720,6 @@ def review_blocker_group_command_safety(group: dict[str, Any]) -> dict[str, Any]
         )
         for index, command in enumerate(commands, start=1)
     ]
-    return command_safety_summary(refs)
 
 
 def compact_review_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -12826,6 +12829,8 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 and "Review blockers: needs-human-review" in no_write_stdout
                 and "command_safety=commands=2" in no_write_stdout
                 and "command_templates:" in no_write_stdout
+                and "[manual-template]" in no_write_stdout
+                and "[review-gated]" in no_write_stdout
                 and "promote-observation-candidate" in no_write_stdout
                 and "burp-sync --observe" in no_write_stdout
                 and "No files written (--no-write)." in no_write_stdout
@@ -20624,16 +20629,18 @@ def run_review_blockers(args: argparse.Namespace) -> int:
         for group in groups[:8]:
             print(f"- {format_review_blocker_group_summary(group)}")
             if no_write:
-                commands = review_blocker_group_command_templates(group)
-                if commands:
+                command_refs = review_blocker_group_command_refs(group)
+                if command_refs:
                     command_safety = (group.get("command_safety", {}) or {}).get("summary", {}) or {}
                     if command_safety:
                         print(f"  command_safety={format_command_safety_summary(command_safety)}")
                     print("  command_templates:")
-                    for command in commands[:4]:
-                        print(f"    - {inline_summary_text(command, max_chars=500)}")
-                    if len(commands) > 4:
-                        print(f"    - ... +{len(commands) - 4} more commands")
+                    for ref in command_refs[:4]:
+                        classification = ref.get("classification") or "unknown"
+                        command = inline_summary_text(ref.get("command"), max_chars=500)
+                        print(f"    - [{classification}] {command}")
+                    if len(command_refs) > 4:
+                        print(f"    - ... +{len(command_refs) - 4} more commands")
         if len(groups) > 8:
             if no_write:
                 print(f"- {len(groups) - 8} more group(s); rerun without --no-write to write the full blocker artifact")
