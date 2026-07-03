@@ -197,6 +197,18 @@ default regression-target paths leak into those plans. It writes
 `.greybox/profile-routing-selftest.json` and does not send HTTP requests or call
 Burp.
 
+Use the discovery coverage self-test to guard static surface classification:
+
+```bash
+python3 scripts/inferforge.py self-test-discovery-coverage
+```
+
+It builds a synthetic route inventory and profile that exercise Burp-history
+coverage, probe-result coverage, active observation coverage, profile-cluster
+coverage, review-gated rewrites, source-only contexts, and uncovered routes. It
+writes `.greybox/discovery-coverage-selftest.json` and does not send HTTP
+requests or call Burp.
+
 Run the current greybox workflow:
 
 ```bash
@@ -252,6 +264,7 @@ python3 scripts/inferforge.py audit --ws-resource-probes
 python3 scripts/inferforge.py decode-transactions
 python3 scripts/inferforge.py self-test-transactions
 python3 scripts/inferforge.py self-test-profile-routing
+python3 scripts/inferforge.py self-test-discovery-coverage
 python3 scripts/inferforge.py collect-quote --direction buy --wallet EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR --amount-in 1000000
 python3 scripts/inferforge.py collect-orca-baseline
 ```
@@ -489,11 +502,12 @@ sets. Use `--strict` in CI when human-review or external-configuration blockers
 should also fail the job.
 
 `regression-suite` runs the repeatable local regression workflow that is used to
-develop the tool against `infrafi-web`: refresh static discovery, check that the
-discovered profile covers every static surface or review gate, run deterministic
-Burp observe/sync for the checked-in profile and discovered profile, collect one
-source-known Orca pool baseline, run both audits, and then write
-`artifact-health.json` plus `regression-suite.json`. The suite clears only
+develop the tool against `infrafi-web`: run static self-tests, refresh static
+discovery, check that the discovered profile covers every static surface or
+review gate, run deterministic Burp observe/sync for the checked-in profile and
+discovered profile, collect one source-known Orca pool baseline, run both
+audits, and then write `artifact-health.json` plus `regression-suite.json`. The
+suite clears only
 generated `probe-results.jsonl` files in the selected regression artifact
 directories before audit so reruns do not accumulate stale probe rows. It does
 not run Burp Scanner, fuzz broadly, invoke Server Actions, sign wallets, or
@@ -503,9 +517,10 @@ submit transactions.
 python3 scripts/inferforge.py regression-suite --include-external --ws-resource-probes
 ```
 
-Use `--skip-discovery-coverage`, `--skip-burp-sync`, `--skip-orca-baseline`,
-`--skip-audit`, or `--skip-discovered` for narrower local checks. Use `--strict`
-when human-review or external-configuration blockers should fail the command.
+Use `--skip-self-tests`, `--skip-discovery-coverage`, `--skip-burp-sync`,
+`--skip-orca-baseline`, `--skip-audit`, or `--skip-discovered` for narrower
+local checks. Use `--strict` when human-review or external-configuration
+blockers should fail the command.
 
 `adjudicate` writes `.greybox/adjudication.json` and refreshes
 `.greybox/findings.json` plus `.greybox/hardening-notes.json`. The adjudicator
@@ -570,6 +585,7 @@ Key outputs:
 .greybox/artifact-manifest.json
 .greybox/artifact-health.json
 .greybox/regression-suite.json
+.greybox/discovery-coverage-selftest.json
 .greybox/target-profile.json
 .greybox/strategy-registry.json
 .greybox/profile-validation.json

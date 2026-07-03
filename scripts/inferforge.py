@@ -58,6 +58,7 @@ PROFILE_VALIDATION_ARTIFACT = "profile-validation.json"
 ROUTE_INVENTORY_ARTIFACT = "route-inventory.json"
 DISCOVERED_PROFILE_ARTIFACT = "discovered-profile.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
+DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REQUIRED_ARTIFACTS = [
     "index.html",
     "report.md",
@@ -119,6 +120,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     "regression-suite.json",
     "orca-baseline.json",
     "profile-routing-selftest.json",
+    DISCOVERY_COVERAGE_SELFTEST_ARTIFACT,
     "transaction-intent-policy.json",
 ]
 INDEX_ARTIFACT_ORDER = [
@@ -127,6 +129,7 @@ INDEX_ARTIFACT_ORDER = [
     "artifact-health.json",
     "regression-suite.json",
     DISCOVERY_COVERAGE_ARTIFACT,
+    DISCOVERY_COVERAGE_SELFTEST_ARTIFACT,
     TARGET_PROFILE_ARTIFACT,
     STRATEGY_REGISTRY_ARTIFACT,
     PROFILE_VALIDATION_ARTIFACT,
@@ -8746,6 +8749,437 @@ def build_discovery_coverage(
     }
 
 
+def build_discovery_coverage_selftest_profile() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "name": "discovery-coverage-selftest",
+        "display_name": "Discovery Coverage Self-Test",
+        "description": "Synthetic profile proving static discovery coverage classification.",
+        "target_type": "self-test",
+        "frameworks": ["Next.js App Router"],
+        "default_target": "http://127.0.0.1:9998",
+        "default_source_root": ".",
+        "strategy_sets": [
+            "nextjs-api-routes",
+            "quote-transaction-decoder",
+            "fixed-upstream-proxy",
+        ],
+        "safety": {
+            "no_wallet_signing": True,
+            "no_transaction_submission": True,
+            "no_burp_scanner": True,
+            "no_broad_fuzzing": True,
+            "prefer_loopback_targets": True,
+        },
+        "probe_targets": {},
+        "clusters": [
+            {
+                "id": "health",
+                "method": "GET",
+                "path": "/statusz",
+                "kind": "health",
+                "priority": "low",
+                "strategy_set": "nextjs-api-routes",
+                "match": {"methods": ["GET"], "paths": ["/statusz"]},
+                "source_refs": ["selftest/app/statusz/route.ts"],
+            },
+            {
+                "id": "quote",
+                "method": "POST",
+                "path": "/api/quote",
+                "kind": "orchestration-proxy",
+                "priority": "high",
+                "strategy_set": "quote-transaction-decoder",
+                "match": {"methods": ["POST"], "paths": ["/api/quote"]},
+                "source_refs": ["selftest/app/api/quote/route.ts"],
+            },
+            {
+                "id": "probed",
+                "method": "GET",
+                "path": "/api/probed",
+                "kind": "api-route",
+                "priority": "medium",
+                "strategy_set": "nextjs-api-routes",
+                "match": {"methods": ["GET"], "paths": ["/api/probed"]},
+                "source_refs": ["selftest/app/api/probed/route.ts"],
+            },
+            {
+                "id": "cluster-only",
+                "method": "GET",
+                "path": "/api/cluster-only",
+                "kind": "api-route",
+                "priority": "medium",
+                "strategy_set": "nextjs-api-routes",
+                "match": {"methods": ["GET"], "paths": ["/api/cluster-only"]},
+                "source_refs": ["selftest/app/api/cluster-only/route.ts"],
+            },
+            {
+                "id": "route-api-proxy-path",
+                "method": "ANY",
+                "path": "/api/proxy/{path*}",
+                "kind": "rewrite-proxy",
+                "priority": "medium",
+                "strategy_set": "fixed-upstream-proxy",
+                "match": {
+                    "path_patterns": ["/api/proxy/{path*}"],
+                    "path_prefixes": ["/api/proxy/"],
+                },
+                "source_refs": ["selftest/next.config.ts"],
+            },
+        ],
+        "source_peeks": [],
+        "burp_observation_plan": [
+            {
+                "id": "observe_statusz",
+                "method": "GET",
+                "path": "/statusz",
+                "headers": {"User-Agent": "InferForge-SelfTest/0.1"},
+                "expected_statuses": [200],
+                "cluster": "health",
+            },
+            {
+                "id": "observe_quote",
+                "method": "POST",
+                "path": "/api/quote",
+                "headers": {
+                    "User-Agent": "InferForge-SelfTest/0.1",
+                    "Content-Type": "application/json",
+                },
+                "body": "{}",
+                "expected_statuses": [400],
+                "cluster": "quote",
+            },
+        ],
+        "review_observation_candidates": [],
+        "websocket_observation": None,
+        "_profile_path": "self-test",
+        "_profile_loaded_from": "self-test",
+    }
+
+
+def discovery_coverage_selftest_route(
+    *,
+    cluster_id: str,
+    path: str,
+    methods: list[str],
+    kind: str = "api-route",
+    strategy_set: str = "nextjs-api-routes",
+) -> dict[str, Any]:
+    return {
+        "cluster_id": cluster_id,
+        "path": path,
+        "source_path": path,
+        "methods": methods,
+        "file": f"selftest/app{path}/route.ts",
+        "repo_file": f"selftest/app{path}/route.ts",
+        "router": "app",
+        "dynamic_segments": route_dynamic_segments(path),
+        "fixed_upstreams": [],
+        "strategy_set": strategy_set,
+        "kind": kind,
+        "priority": "medium",
+        "inference_reasons": ["self-test-route"],
+        "match": route_match_for_path(path, methods),
+        "next_config": {"path": path, "variants": [path]},
+    }
+
+
+def build_discovery_coverage_selftest_inventory(
+    *,
+    include_rewrite: bool = True,
+    include_source_only: bool = True,
+    include_uncovered: bool = True,
+) -> dict[str, Any]:
+    routes = [
+        discovery_coverage_selftest_route(
+            cluster_id="health",
+            path="/statusz",
+            methods=["GET"],
+            kind="health",
+        ),
+        discovery_coverage_selftest_route(
+            cluster_id="quote",
+            path="/api/quote",
+            methods=["POST"],
+            kind="orchestration-proxy",
+            strategy_set="quote-transaction-decoder",
+        ),
+        discovery_coverage_selftest_route(
+            cluster_id="probed",
+            path="/api/probed",
+            methods=["GET"],
+        ),
+        discovery_coverage_selftest_route(
+            cluster_id="cluster-only",
+            path="/api/cluster-only",
+            methods=["GET"],
+        ),
+    ]
+    if include_uncovered:
+        routes.append(
+            discovery_coverage_selftest_route(
+                cluster_id="unprofiled",
+                path="/api/unprofiled",
+                methods=["GET"],
+            )
+        )
+
+    rewrites = []
+    if include_rewrite:
+        rewrites.append(
+            {
+                "cluster_id": "route-api-proxy-path",
+                "path": "/api/proxy/{path*}",
+                "source_path": "/api/proxy/{path*}",
+                "methods": [],
+                "file": "selftest/next.config.ts",
+                "repo_file": "selftest/next.config.ts",
+                "dynamic_segments": ["path*"],
+                "fixed_upstreams": ["https://api.example.test"],
+                "strategy_set": "fixed-upstream-proxy",
+                "kind": "rewrite-proxy",
+                "priority": "medium",
+                "inference_reasons": ["self-test-rewrite"],
+                "match": {
+                    "path_patterns": ["/api/proxy/{path*}"],
+                    "path_prefixes": ["/api/proxy/"],
+                },
+                "rewrite": {
+                    "source": "/api/proxy/:path*",
+                    "source_pattern": "/api/proxy/{path*}",
+                    "destination_resolved": "https://api.example.test/:path*",
+                },
+                "next_config": {"path": "/api/proxy/{path*}", "variants": ["/api/proxy/{path*}"]},
+            }
+        )
+
+    middleware_entries = []
+    server_actions = []
+    if include_source_only:
+        middleware_entries.append(
+            {
+                "id": "middleware-selftest",
+                "kind": "nextjs-middleware",
+                "file": "selftest/middleware.ts",
+                "repo_file": "selftest/middleware.ts",
+                "matchers": [{"pattern": "/api/:path*", "variants": ["/api/{path*}"], "simple": True}],
+                "match_strategy": "static-matchers",
+                "inference_reasons": ["self-test-middleware"],
+                "line_patterns": {"handler": "export function middleware"},
+                "safety": "Static self-test middleware context only.",
+            }
+        )
+        server_actions.append(
+            {
+                "id": "server_action_selftest",
+                "kind": "nextjs-server-action",
+                "file": "selftest/actions.ts",
+                "repo_file": "selftest/actions.ts",
+                "scope": "file-level-use-server",
+                "action_names": ["mutateThing"],
+                "action_count": 1,
+                "use_server_directive_count": 1,
+                "inference_reasons": ["self-test-server-action"],
+                "line_patterns": {"use_server": "use server", "action:mutateThing": "mutateThing"},
+                "safety": "Static self-test Server Action context only.",
+            }
+        )
+
+    return {
+        "generated_at": utc_now(),
+        "status": "discovered",
+        "source_root": "selftest",
+        "app_root": "selftest/app",
+        "app_roots": ["selftest/app"],
+        "pages_api_roots": [],
+        "summary": {
+            "route_count": len(routes),
+            "app_router_route_count": len(routes),
+            "pages_router_api_route_count": 0,
+            "rewrite_count": len(rewrites),
+            "custom_server_entrypoint_count": 0,
+            "middleware_count": len(middleware_entries),
+            "server_action_file_count": len(server_actions),
+            "server_action_export_count": sum(item["action_count"] for item in server_actions),
+            "redirect_count": 0,
+            "header_route_count": 0,
+            "route_policy_count": 0,
+            "entrypoint_count": len(routes) + len(rewrites),
+            "surface_count": len(routes) + len(rewrites) + len(middleware_entries) + len(server_actions),
+            "api_route_count": sum(1 for route in routes if str(route.get("path") or "").startswith("/api/")),
+            "strategy_sets": sorted({item["strategy_set"] for item in [*routes, *rewrites]}),
+        },
+        "next_config": {},
+        "routes": routes,
+        "rewrites": rewrites,
+        "custom_server_entrypoints": [],
+        "middleware": middleware_entries,
+        "server_actions": server_actions,
+        "redirects": [],
+        "headers": [],
+        "safety": "Synthetic self-test inventory. No source files are read and no requests are sent.",
+    }
+
+
+def discovery_coverage_surface_statuses(coverage: dict[str, Any]) -> dict[str, str]:
+    statuses = {}
+    for surface in coverage.get("surfaces", []) or []:
+        key = str(surface.get("path") or surface.get("id"))
+        statuses[key] = str(surface.get("status") or "")
+        if surface.get("type") and surface.get("path"):
+            statuses[f"{surface.get('type')} {surface.get('path')}"] = str(surface.get("status") or "")
+    return statuses
+
+
+def build_discovery_coverage_selftest(source_root: Path) -> dict[str, Any]:
+    target = "http://127.0.0.1:9998"
+    profile = build_discovery_coverage_selftest_profile()
+    clusters = build_clusters(profile, source_root)
+    burp_history = [
+        {
+            "ts": utc_now(),
+            "source": "self-test",
+            "method": "GET",
+            "path": "/statusz",
+            "status": 200,
+        }
+    ]
+    probe_results = [
+        {
+            "ts": utc_now(),
+            "phase": "self-test",
+            "probe_id": "selftest_probed",
+            "method": "GET",
+            "path": "/api/probed",
+            "category": "probed",
+            "status": 404,
+            "expected": True,
+        }
+    ]
+
+    full_inventory = build_discovery_coverage_selftest_inventory()
+    full_coverage = build_discovery_coverage(
+        target,
+        profile,
+        source_root,
+        full_inventory,
+        clusters,
+        burp_history=burp_history,
+        probe_results=probe_results,
+    )
+    review_inventory = build_discovery_coverage_selftest_inventory(include_uncovered=False)
+    review_coverage = build_discovery_coverage(
+        target,
+        profile,
+        source_root,
+        review_inventory,
+        clusters,
+        burp_history=burp_history,
+        probe_results=probe_results,
+    )
+    covered_inventory = build_discovery_coverage_selftest_inventory(
+        include_rewrite=False,
+        include_source_only=False,
+        include_uncovered=False,
+    )
+    covered_coverage = build_discovery_coverage(
+        target,
+        profile,
+        source_root,
+        covered_inventory,
+        clusters,
+        burp_history=burp_history,
+        probe_results=probe_results,
+    )
+
+    full_statuses = discovery_coverage_surface_statuses(full_coverage)
+    assertions = [
+        {
+            "id": "full-status-uncovered",
+            "passed": full_coverage.get("status") == "uncovered",
+            "expected": "uncovered",
+            "actual": full_coverage.get("status"),
+        },
+        {
+            "id": "review-status-needs-human-review",
+            "passed": review_coverage.get("status") == "needs-human-review",
+            "expected": "needs-human-review",
+            "actual": review_coverage.get("status"),
+        },
+        {
+            "id": "covered-status-covered",
+            "passed": covered_coverage.get("status") == "covered",
+            "expected": "covered",
+            "actual": covered_coverage.get("status"),
+        },
+        {
+            "id": "burp-history-precedence",
+            "passed": full_statuses.get("/statusz") == "covered-by-burp-history",
+            "expected": "covered-by-burp-history",
+            "actual": full_statuses.get("/statusz"),
+        },
+        {
+            "id": "probe-result-coverage",
+            "passed": full_statuses.get("/api/probed") == "covered-by-probe-result",
+            "expected": "covered-by-probe-result",
+            "actual": full_statuses.get("/api/probed"),
+        },
+        {
+            "id": "active-observation-coverage",
+            "passed": full_statuses.get("/api/quote") == "covered-by-active-observation",
+            "expected": "covered-by-active-observation",
+            "actual": full_statuses.get("/api/quote"),
+        },
+        {
+            "id": "profile-cluster-coverage",
+            "passed": full_statuses.get("/api/cluster-only") == "covered-by-profile-cluster",
+            "expected": "covered-by-profile-cluster",
+            "actual": full_statuses.get("/api/cluster-only"),
+        },
+        {
+            "id": "rewrite-review-gate",
+            "passed": full_statuses.get("/api/proxy/{path*}") == "review-gated",
+            "expected": "review-gated",
+            "actual": full_statuses.get("/api/proxy/{path*}"),
+        },
+        {
+            "id": "uncovered-route-detected",
+            "passed": full_statuses.get("/api/unprofiled") == "uncovered",
+            "expected": "uncovered",
+            "actual": full_statuses.get("/api/unprofiled"),
+        },
+        {
+            "id": "source-only-context-detected",
+            "passed": full_coverage.get("summary", {}).get("status_counts", {}).get("source-only-context") == 2,
+            "expected": 2,
+            "actual": full_coverage.get("summary", {}).get("status_counts", {}).get("source-only-context"),
+        },
+    ]
+    passed = all(bool(item["passed"]) for item in assertions)
+    return {
+        "generated_at": utc_now(),
+        "status": "passed" if passed else "failed",
+        "profile": profile_summary(profile),
+        "assertions": assertions,
+        "cases": {
+            "full": {
+                "status": full_coverage.get("status"),
+                "summary": full_coverage.get("summary", {}),
+                "surface_statuses": full_statuses,
+            },
+            "review_only": {
+                "status": review_coverage.get("status"),
+                "summary": review_coverage.get("summary", {}),
+            },
+            "covered": {
+                "status": covered_coverage.get("status"),
+                "summary": covered_coverage.get("summary", {}),
+            },
+        },
+        "safety": "Static discovery coverage self-test only. It does not read source files, send HTTP requests, call Burp, sign wallets, or submit transactions.",
+    }
+
+
 def source_peek_cluster_ids(source_peeks: dict[str, Any] | None) -> set[str]:
     observed: set[str] = set()
     for item in (source_peeks or {}).get("source_peeks", []):
@@ -10603,6 +11037,7 @@ def build_artifact_manifest(
         "reviewed-profile-validation.json",
         "reviewed-observation-promotion.json",
         "profile-routing-selftest.json",
+        DISCOVERY_COVERAGE_SELFTEST_ARTIFACT,
         "burp-mcp-sync.json",
         "quote-collection.json",
         "transaction-intent.json",
@@ -15662,6 +16097,27 @@ def run_discovery_coverage(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_discovery_coverage_selftest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, _target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result = build_discovery_coverage_selftest(source_root)
+    result["current_profile_context"] = profile_summary(profile)
+    output_path = artifact_dir / DISCOVERY_COVERAGE_SELFTEST_ARTIFACT
+    write_json(output_path, result)
+    failed = [item for item in result.get("assertions", []) if not item.get("passed")]
+    print(f"Discovery coverage self-test: {result['status']}")
+    print(
+        "Cases: "
+        f"full={result['cases']['full']['status']} "
+        f"review_only={result['cases']['review_only']['status']} "
+        f"covered={result['cases']['covered']['status']}"
+    )
+    if failed:
+        print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
+    print(f"Wrote {output_path}")
+    return 0 if result["status"] == "passed" else 1
+
+
 def run_response_deltas(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -15936,6 +16392,31 @@ def run_regression_suite(args: argparse.Namespace) -> int:
         if not args.skip_discovered:
             preparation.append(remove_stale_probe_results(discovered_artifact_dir))
 
+    if not args.skip_self_tests:
+        command = inferforge_cli_command(
+            args,
+            profile_path=default_profile_path,
+            artifact_dir=artifact_dir,
+            subcommand="self-test-discovery-coverage",
+        )
+        if not run_step("self-test-discovery-coverage", command):
+            return_code_health = None
+            suite = {
+                "generated_at": utc_now(),
+                "status": "failed",
+                "target": target,
+                "source_root": repo_relative_or_absolute(source_root),
+                "profile": profile_summary(profile),
+                "preparation": preparation,
+                "steps": steps,
+                "artifact_health": return_code_health,
+                "safety": "Regression suite stopped on failure. No wallet signing, transaction submission, Burp Scanner, or broad fuzzing is performed.",
+            }
+            write_json(artifact_dir / "regression-suite.json", suite)
+            print(f"Regression suite: {suite['status']}")
+            print(f"Wrote {artifact_dir / 'regression-suite.json'}")
+            return 1
+
     if not args.skip_discover_profile and not args.skip_discovered:
         command = inferforge_cli_command(
             args,
@@ -16093,6 +16574,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             "skip_audit": bool(args.skip_audit),
             "skip_discover_profile": bool(args.skip_discover_profile),
             "skip_discovery_coverage": bool(args.skip_discovery_coverage),
+            "skip_self_tests": bool(args.skip_self_tests),
             "keep_probe_results": bool(args.keep_probe_results),
             "strict": bool(args.strict),
         },
@@ -17107,6 +17589,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip static discovery coverage checking for the discovered profile.",
     )
     regression_suite.add_argument(
+        "--skip-self-tests",
+        action="store_true",
+        help="Skip static self-tests that normally run before fixture regression steps.",
+    )
+    regression_suite.add_argument(
         "--skip-burp-sync",
         action="store_true",
         help="Skip Burp observe/sync steps and rely on existing Burp history artifacts.",
@@ -17185,6 +17672,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a static self-test proving profile-owned probe paths do not leak regression target paths",
     )
     profile_selftest.set_defaults(func=run_profile_routing_selftest)
+
+    discovery_coverage_selftest = sub.add_parser(
+        "self-test-discovery-coverage",
+        help="Run a static self-test for discovery-coverage classification and gates",
+    )
+    discovery_coverage_selftest.set_defaults(func=run_discovery_coverage_selftest)
 
     collect_quote = sub.add_parser(
         "collect-quote",
