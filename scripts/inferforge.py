@@ -11264,8 +11264,59 @@ def sorted_unique_strings(values: list[Any]) -> list[str]:
     return sorted({str(value) for value in values if value not in {None, ""}})
 
 
+def ordered_unique_strings(values: list[Any]) -> list[str]:
+    rows = []
+    seen: set[str] = set()
+    for value in values:
+        if value in {None, ""}:
+            continue
+        text = str(value)
+        if text in seen:
+            continue
+        seen.add(text)
+        rows.append(text)
+    return rows
+
+
+def compact_review_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for field in ["id", "cluster", "type", "status", "method", "path_template", "example_path"]:
+        if candidate.get(field):
+            compact[field] = candidate.get(field)
+    for field in ["approval_required", "fixed_upstreams", "source_refs"]:
+        values = sorted_unique_strings(candidate.get(field, []) or [])
+        if values:
+            compact[field] = values
+    command_templates = ordered_unique_strings(candidate.get("command_templates", []) or [])
+    if command_templates:
+        compact["command_templates"] = command_templates
+    if candidate.get("promote_to_burp_observation_plan"):
+        compact["promote_to_burp_observation_plan"] = candidate.get("promote_to_burp_observation_plan")
+    return compact
+
+
+def merge_review_candidate_summary(existing: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    incoming = compact_review_candidate(candidate)
+    for field in ["id", "cluster", "type", "status", "method", "path_template", "example_path"]:
+        if not existing.get(field) and incoming.get(field):
+            existing[field] = incoming[field]
+    for field in ["approval_required", "fixed_upstreams", "source_refs"]:
+        merged = sorted_unique_strings([*(existing.get(field, []) or []), *(incoming.get(field, []) or [])])
+        if merged:
+            existing[field] = merged
+    command_templates = ordered_unique_strings(
+        [*(existing.get("command_templates", []) or []), *(incoming.get("command_templates", []) or [])]
+    )
+    if command_templates:
+        existing["command_templates"] = command_templates
+    if not existing.get("promote_to_burp_observation_plan") and incoming.get("promote_to_burp_observation_plan"):
+        existing["promote_to_burp_observation_plan"] = incoming["promote_to_burp_observation_plan"]
+    return existing
+
+
 def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
+    review_candidate_maps: dict[str, dict[str, dict[str, Any]]] = {}
     for blocker in blockers:
         key = review_blocker_group_key(blocker)
         group = grouped.get(key)
@@ -11286,9 +11337,12 @@ def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str
                 "source_review_blockers": [],
                 "artifact_refs": [],
                 "review_candidate_ids": [],
+                "review_candidates": [],
+                "commands": [],
                 "source_counts": {},
             }
             grouped[key] = group
+            review_candidate_maps[key] = {}
         else:
             status = str(blocker.get("status") or "unknown")
             if review_blocker_status_rank(status) < review_blocker_status_rank(str(group.get("status") or "")):
@@ -11311,18 +11365,37 @@ def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str
         if blocker.get("source_review_blockers"):
             group["source_review_blockers"].append(blocker.get("source_review_blockers"))
         group["artifact_refs"].extend(blocker.get("artifact_refs", []) or [])
+        group["commands"].extend(blocker.get("commands", []) or [])
         for candidate in blocker.get("review_candidates", []) or []:
             if candidate.get("id"):
-                group["review_candidate_ids"].append(candidate.get("id"))
+                candidate_id = str(candidate.get("id"))
+                group["review_candidate_ids"].append(candidate_id)
+                candidate_map = review_candidate_maps.setdefault(key, {})
+                candidate_summary = candidate_map.setdefault(candidate_id, {"id": candidate_id})
+                merge_review_candidate_summary(candidate_summary, candidate)
 
     groups = []
-    for group in grouped.values():
+    for key, group in grouped.items():
         group["count"] = len(group["blocker_ids"])
         group["artifact_dirs"] = sorted_unique_strings(group["artifact_dirs"])
         group["sources"] = sorted_unique_strings(group["sources"])
         group["source_review_blockers"] = sorted_unique_strings(group["source_review_blockers"])
         group["artifact_refs"] = sorted_unique_strings(group["artifact_refs"])
         group["review_candidate_ids"] = sorted_unique_strings(group["review_candidate_ids"])
+        group["review_candidates"] = sorted(
+            review_candidate_maps.get(key, {}).values(),
+            key=lambda item: str(item.get("id") or ""),
+        )
+        group["commands"] = ordered_unique_strings(
+            [
+                *group.get("commands", []),
+                *[
+                    command
+                    for candidate in group["review_candidates"]
+                    for command in candidate.get("command_templates", []) or []
+                ],
+            ]
+        )
         group["blocker_ids"] = sorted_unique_strings(group["blocker_ids"])
         groups.append(group)
 
@@ -11801,6 +11874,20 @@ def build_review_blockers_selftest() -> dict[str, Any]:
         "method": "GET",
         "path_template": "/api/proxy/{path*}",
         "cluster": "route-api-proxy-path",
+        "example_path": "/api/proxy/<approved-read-only-path>",
+        "command_templates": [
+            (
+                "python3 scripts/inferforge.py --profile .greybox/discovered-profile.json "
+                "--artifact-dir .greybox/regression-discovered promote-observation-candidate "
+                "--candidate-id review_observe_route_api_proxy_path_approved_path "
+                f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH} "
+                "--output .greybox/regression-discovered/reviewed-profile.json"
+            ),
+            (
+                "python3 scripts/inferforge.py --profile .greybox/regression-discovered/reviewed-profile.json "
+                "--artifact-dir .greybox/regression-discovered burp-sync --observe --ws-upgrade --replace --count 80"
+            ),
+        ],
     }
     discovery_coverage = {
         "status": "needs-human-review",
@@ -12015,6 +12102,38 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             "expected": "source-peek-requests.json in markdown group context",
             "actual": "source-peek-requests.json" in markdown,
         },
+        {
+            "id": "rollup-route-group-preserves-candidate-details",
+            "passed": (
+                bool(rollup_route_group.get("review_candidates"))
+                and rollup_route_group["review_candidates"][0].get("path_template") == "/api/proxy/{path*}"
+                and any(
+                    "promote-observation-candidate" in command
+                    for command in rollup_route_group.get("commands", []) or []
+                )
+            ),
+            "expected": "route group candidate path template and promote command",
+            "actual": {
+                "review_candidates": rollup_route_group.get("review_candidates"),
+                "commands": rollup_route_group.get("commands"),
+            },
+        },
+        {
+            "id": "markdown-group-command-templates-rendered",
+            "passed": (
+                "Candidate details:" in markdown
+                and "Command templates:" in markdown
+                and "promote-observation-candidate" in markdown
+                and "REPLACE_WITH_APPROVED_CONCRETE_LOCAL_PATH" in markdown
+            ),
+            "expected": "group-level candidate command templates in markdown",
+            "actual": {
+                "candidate_details": "Candidate details:" in markdown,
+                "command_templates": "Command templates:" in markdown,
+                "promote": "promote-observation-candidate" in markdown,
+                "placeholder": "REPLACE_WITH_APPROVED_CONCRETE_LOCAL_PATH" in markdown,
+            },
+        },
     ]
     failed = [item for item in assertions if not item["passed"]]
     return {
@@ -12089,6 +12208,38 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
     ][:8]
 
     def append_group_context(item: dict[str, Any]) -> None:
+        candidates = item.get("review_candidates", []) or []
+        if candidates:
+            lines.append("  - Candidate details:")
+            for candidate in candidates[:4]:
+                details = []
+                if candidate.get("method"):
+                    details.append(f"method=`{candidate.get('method')}`")
+                if candidate.get("path_template"):
+                    details.append(f"path_template=`{candidate.get('path_template')}`")
+                if candidate.get("example_path"):
+                    details.append(f"example=`{candidate.get('example_path')}`")
+                suffix = f" {' '.join(details)}" if details else ""
+                lines.append(f"    - `{candidate.get('id')}`{suffix}")
+            if len(candidates) > 4:
+                lines.append(f"    - ... +{len(candidates) - 4} more candidates")
+        commands = ordered_unique_strings(
+            [
+                *(item.get("commands", []) or []),
+                *[
+                    command
+                    for candidate in candidates
+                    for command in candidate.get("command_templates", []) or []
+                ],
+            ]
+        )
+        if commands:
+            lines.append("  - Command templates:")
+            lines.append("    ```bash")
+            lines.extend(f"    {command}" for command in commands[:6])
+            if len(commands) > 6:
+                lines.append(f"    # ... +{len(commands) - 6} more commands")
+            lines.append("    ```")
         sources = item.get("sources", []) or []
         if sources:
             lines.append("  - Source artifacts: " + ", ".join(f"`{source}`" for source in sources[:6]))
@@ -12196,6 +12347,14 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
                 if approval_required:
                     lines.append("    - Approval required:")
                     lines.extend(f"      - {markdown_text(entry)}" for entry in approval_required)
+                command_templates = candidate.get("command_templates", []) or []
+                if command_templates:
+                    lines.append("    - Command templates:")
+                    lines.append("      ```bash")
+                    lines.extend(f"      {command}" for command in command_templates[:6])
+                    if len(command_templates) > 6:
+                        lines.append(f"      # ... +{len(command_templates) - 6} more commands")
+                    lines.append("      ```")
         commands = item.get("commands", []) or []
         if commands:
             lines.extend(["", "Commands:", "", "```bash"])
