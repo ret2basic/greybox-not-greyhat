@@ -15653,6 +15653,28 @@ def generate_index_html(
     hardening_note_count = len(hardening_notes or [])
     evidence_appendix_status = (evidence_appendix or {}).get("status", "unknown")
     verification_queue_status = (verification_queue or {}).get("status", "unknown")
+    review_blockers = load_optional_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT) or {}
+    review_blocker_summary = review_blockers.get("summary", {}) or {}
+    review_blocker_status = review_blockers.get("status", "unknown")
+    review_blocker_lines = [
+        f"- Status `{review_blocker_status}`",
+        f"- Blockers `{review_blocker_summary.get('blockers', 0)}`",
+        f"- Groups `{review_blocker_summary.get('groups', 0)}`",
+        f"- Status counts `{json.dumps(review_blocker_summary.get('status_counts', {}), sort_keys=True)}`",
+        f"- Category counts `{json.dumps(review_blocker_summary.get('category_counts', {}), sort_keys=True)}`",
+    ]
+    for group in (review_blockers.get("groups", []) or [])[:8]:
+        count_suffix = f" ({group.get('count')} blockers)" if group.get("count") else ""
+        line = (
+            f"- `{group.get('status')}` `{group.get('id')}`{count_suffix}: "
+            f"{markdown_text(group.get('title') or group.get('id'))}"
+        )
+        if group.get("next_action"):
+            line += f" next: {markdown_text(group.get('next_action'))}"
+        review_blocker_lines.append(line)
+        commands = ordered_unique_strings(group.get("commands", []) or [])
+        if commands:
+            review_blocker_lines.append(f"- Command `{commands[0]}`")
     attack_strategy_status = (attack_strategy or {}).get("status", "unknown")
     attack_strategy_summary = (attack_strategy or {}).get("summary", {}) or {}
     attack_strategy_lines = [
@@ -15875,6 +15897,7 @@ def generate_index_html(
       <div class="metric"><span>Source Peek Requests</span><strong>{e(source_peek_request_count)} · {e(source_peek_request_status)}</strong></div>
       <div class="metric"><span>Evidence Appendix</span><strong>{e(evidence_appendix_status)}</strong></div>
       <div class="metric"><span>Verification Queue</span><strong>{e(verification_queue_status)}</strong></div>
+      <div class="metric"><span>Review Blockers</span><strong>{e(review_blocker_status)}</strong></div>
       <div class="metric"><span>Attack Strategy</span><strong>{e(attack_strategy_status)}</strong></div>
       <div class="metric"><span>Command Templates</span><strong>{e(command_safety_counts.get('manual-template', 0))} manual · {e(command_safety_summary_doc.get('unsafe_template_count', 0))} unsafe</strong></div>
       <div class="metric"><span>Tx Candidates</span><strong>{e(transaction_intent.get('candidates_seen', 0))}</strong></div>
@@ -15885,6 +15908,9 @@ def generate_index_html(
 
 	    <h2>Findings And Notes</h2>
 	    <ul>{''.join(notes)}</ul>
+
+    <h2>Review Blockers</h2>
+    <ul>{html_list(review_blocker_lines)}</ul>
 
     <h2>Burp Observation Coverage</h2>
     <ul>{html_list(burp_observation_coverage_lines)}</ul>
