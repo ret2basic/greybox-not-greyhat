@@ -180,9 +180,10 @@ commands before writing profile artifacts. Use the reviewed profile with
 When a rewrite observation gap is present, `verification-queue` also emits the
 same promotion sequence as manual-review command templates:
 
-1. promote the approved path into `.greybox/reviewed-profile.json`;
-2. run `burp-sync --observe` with that reviewed profile;
-3. rerun `audit` with the reviewed profile.
+1. preview the promotion with `promote-observation-candidate --no-write`;
+2. promote the approved path into `.greybox/reviewed-profile.json`;
+3. run `burp-sync --observe` with that reviewed profile;
+4. rerun `audit` with the reviewed profile.
 
 The placeholder `REPLACE_WITH_APPROVED_CONCRETE_LOCAL_PATH` in the queue is
 deliberately rejected by the promote command until a human replaces it with one

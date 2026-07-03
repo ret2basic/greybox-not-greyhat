@@ -11088,6 +11088,17 @@ def review_candidate_command_templates(
                     "promote-observation-candidate "
                     f"--candidate-id {shlex.quote(candidate_id)} "
                     f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH} "
+                    f"--output {shlex.quote(reviewed_profile)} "
+                    "--no-write"
+                ),
+            ),
+            verification_command(
+                clusters,
+                artifact_dir,
+                (
+                    "promote-observation-candidate "
+                    f"--candidate-id {shlex.quote(candidate_id)} "
+                    f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH} "
                     f"--output {shlex.quote(reviewed_profile)}"
                 ),
             ),
@@ -14834,6 +14845,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and f"path={PLACEHOLDER_APPROVED_CONCRETE_PATH}" in review_candidates_stdout_text
                 and "command_templates:" in review_candidates_stdout_text
                 and "promote-observation-candidate" in review_candidates_stdout_text
+                and "--no-write" in review_candidates_stdout_text
                 and "No files written (--no-write)." in review_candidates_stdout
                 and not any(
                     output_paths[key]
@@ -18664,15 +18676,20 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         )
         queue_promotion_selftest_passed = (
             rewrite_queue_item is not None
-            and len(rewrite_queue_commands) == 3
+            and len(rewrite_queue_commands) == 4
             and "promote-observation-candidate" in rewrite_queue_commands[0]
             and f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH}" in rewrite_queue_commands[0]
             and "reviewed-profile.json" in rewrite_queue_commands[0]
-            and "burp-sync --observe" in rewrite_queue_commands[1]
-            and "audit --include-external --ws-resource-probes" in rewrite_queue_commands[2]
+            and "--no-write" in rewrite_queue_commands[0]
+            and "promote-observation-candidate" in rewrite_queue_commands[1]
+            and f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH}" in rewrite_queue_commands[1]
+            and "reviewed-profile.json" in rewrite_queue_commands[1]
+            and "--no-write" not in rewrite_queue_commands[1]
+            and "burp-sync --observe" in rewrite_queue_commands[2]
+            and "audit --include-external --ws-resource-probes" in rewrite_queue_commands[3]
             and all(command.count("--profile") <= 1 for command in rewrite_queue_commands)
             and all(command.count("--artifact-dir") == 1 for command in rewrite_queue_commands)
-            and rewrite_queue_command_counts.get("manual-template") == 1
+            and rewrite_queue_command_counts.get("manual-template") == 2
             and rewrite_queue_command_counts.get("review-gated") == 2
             and rewrite_queue_command_safety.get("unsafe_template_count") == 0
             and rewrite_queue_global_command_safety.get("unsafe_template_count") == 0
@@ -20567,10 +20584,10 @@ def run_review_blockers(args: argparse.Namespace) -> int:
                 commands = review_blocker_group_command_templates(group)
                 if commands:
                     print("  command_templates:")
-                    for command in commands[:3]:
+                    for command in commands[:4]:
                         print(f"    - {inline_summary_text(command, max_chars=500)}")
-                    if len(commands) > 3:
-                        print(f"    - ... +{len(commands) - 3} more commands")
+                    if len(commands) > 4:
+                        print(f"    - ... +{len(commands) - 4} more commands")
         if len(groups) > 8:
             if no_write:
                 print(f"- {len(groups) - 8} more group(s); rerun without --no-write to write the full blocker artifact")
