@@ -157,6 +157,26 @@ REPORT_FRESHNESS_INPUTS = [
     "probe-results.jsonl",
     "burp-history-observations.jsonl",
 ]
+DERIVED_ARTIFACT_FRESHNESS_RULES = [
+    {
+        "outputs": ["report.md", "index.html"],
+        "inputs": REPORT_FRESHNESS_INPUTS,
+        "reason": "derived-report-stale",
+        "next_step": "Run `python3 scripts/inferforge.py report` for this artifact directory.",
+    },
+    {
+        "outputs": ["reproduction-steps.md"],
+        "inputs": ["verification-queue.json"],
+        "reason": "derived-reproduction-steps-stale",
+        "next_step": "Run `python3 scripts/inferforge.py verification-queue` for this artifact directory.",
+    },
+    {
+        "outputs": [REVIEW_BLOCKERS_MARKDOWN_ARTIFACT],
+        "inputs": [REVIEW_BLOCKERS_ARTIFACT],
+        "reason": "derived-review-blockers-markdown-stale",
+        "next_step": "Run `python3 scripts/inferforge.py review-blockers` for this artifact directory.",
+    },
+]
 INDEX_ARTIFACT_ORDER = [
     "report.md",
     MANIFEST_NAME,
@@ -13034,22 +13054,21 @@ def manifest_integrity_issues(artifact_dir: Path, manifest: dict[str, Any]) -> l
     return issues
 
 
-def derived_report_freshness_issues(artifact_dir: Path) -> list[dict[str, Any]]:
+def derived_artifact_freshness_issues(artifact_dir: Path) -> list[dict[str, Any]]:
     issues = []
-    report_inputs = [
-        artifact_dir / name
-        for name in REPORT_FRESHNESS_INPUTS
-        if (artifact_dir / name).is_file()
-    ]
-    if not report_inputs:
-        return issues
-
-    def stale_inputs_for(derived_path: Path) -> list[dict[str, Any]]:
+    def stale_inputs_for(derived_path: Path, input_names: list[str]) -> list[dict[str, Any]]:
         if not derived_path.is_file():
+            return []
+        input_paths = [
+            artifact_dir / name
+            for name in input_names
+            if (artifact_dir / name).is_file()
+        ]
+        if not input_paths:
             return []
         derived_mtime_ns = derived_path.stat().st_mtime_ns
         newer = []
-        for input_path in report_inputs:
+        for input_path in input_paths:
             input_mtime_ns = input_path.stat().st_mtime_ns
             if input_mtime_ns > derived_mtime_ns:
                 newer.append(
@@ -13061,20 +13080,22 @@ def derived_report_freshness_issues(artifact_dir: Path) -> list[dict[str, Any]]:
         newer.sort(key=lambda item: (-int(item["mtime_ns"]), str(item["file"])))
         return newer
 
-    for derived_name in ["report.md", "index.html"]:
-        derived_path = artifact_dir / derived_name
-        newer_inputs = stale_inputs_for(derived_path)
-        if not newer_inputs:
-            continue
-        issues.append(
-            {
-                "file": derived_name,
-                "reason": "derived-report-stale",
-                "newer_inputs": [item["file"] for item in newer_inputs[:12]],
-                "newer_input_count": len(newer_inputs),
-                "next_step": "Run `python3 scripts/inferforge.py report` for this artifact directory.",
-            }
-        )
+    for rule in DERIVED_ARTIFACT_FRESHNESS_RULES:
+        input_names = [str(name) for name in rule.get("inputs", [])]
+        for derived_name in rule.get("outputs", []):
+            derived_path = artifact_dir / str(derived_name)
+            newer_inputs = stale_inputs_for(derived_path, input_names)
+            if not newer_inputs:
+                continue
+            issues.append(
+                {
+                    "file": str(derived_name),
+                    "reason": rule.get("reason"),
+                    "newer_inputs": [item["file"] for item in newer_inputs[:12]],
+                    "newer_input_count": len(newer_inputs),
+                    "next_step": rule.get("next_step"),
+                }
+            )
     return issues
 
 
@@ -13212,7 +13233,7 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
         statuses = artifact_statuses_from_manifest(manifest)
         missing_required = list((manifest.get("summary", {}) or {}).get("missing_required", []) or [])
         stale_inputs = manifest_integrity_issues(artifact_dir, manifest)
-        stale_inputs.extend(derived_report_freshness_issues(artifact_dir))
+        stale_inputs.extend(derived_artifact_freshness_issues(artifact_dir))
         if missing_required:
             checks.append(
                 {
@@ -13459,6 +13480,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         missing_dir = root / "missing"
         untracked_dir = root / "untracked"
         refresh_dir = root / "refresh"
+        derived_dir = root / "derived"
         for directory in [healthy_dir, modified_dir, missing_dir, untracked_dir]:
             directory.mkdir(parents=True)
             write_json(directory / "ok.json", {"status": "ready"})
@@ -13520,6 +13542,40 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             command="report",
         )
         report_refresh_after = build_single_artifact_health(refresh_dir)
+
+        derived_dir.mkdir(parents=True)
+        for name in REQUIRED_ARTIFACTS:
+            write_sample_artifact(derived_dir / name)
+        write_json(derived_dir / REVIEW_BLOCKERS_ARTIFACT, {"generated_at": utc_now(), "status": "ready", "summary": {}})
+        (derived_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT).write_text("# Review blockers\n\nold\n", encoding="utf-8")
+        write_json(derived_dir / "attack-strategy.json", {"generated_at": utc_now(), "status": "ready", "summary": {}})
+        derived_baseline_ns = 1_710_000_000_000_000_000
+        for path in derived_dir.iterdir():
+            if path.is_file():
+                set_mtime_ns(path, derived_baseline_ns)
+        for name in ["verification-queue.json", REVIEW_BLOCKERS_ARTIFACT, "attack-strategy.json"]:
+            path = derived_dir / name
+            if path.exists():
+                set_mtime_ns(path, derived_baseline_ns + 2_000)
+        write_artifact_manifest(derived_dir, "http://127.0.0.1:9997", command="self-test-artifact-health")
+        derived_stale = build_single_artifact_health(derived_dir)
+        for name in ["report.md", "index.html", "reproduction-steps.md", REVIEW_BLOCKERS_MARKDOWN_ARTIFACT]:
+            path = derived_dir / name
+            path.write_text(f"refreshed {name}\n", encoding="utf-8")
+            set_mtime_ns(path, derived_baseline_ns + 3_000)
+        derived_refreshed_manifests = refresh_manifests_for_artifact_outputs(
+            output_paths=[
+                derived_dir / "report.md",
+                derived_dir / "index.html",
+                derived_dir / "reproduction-steps.md",
+                derived_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT,
+            ],
+            artifact_dir=derived_dir,
+            check_dirs=[],
+            target="http://127.0.0.1:9997",
+            command="self-test-derived-refresh",
+        )
+        derived_refresh_after = build_single_artifact_health(derived_dir)
 
     def stale_reasons(item: dict[str, Any]) -> set[str]:
         return {str(entry.get("reason")) for entry in item.get("stale_inputs", []) or []}
@@ -13603,6 +13659,31 @@ def build_artifact_health_selftest() -> dict[str, Any]:
                 "after_stale_inputs": report_refresh_after.get("stale_inputs"),
             },
         },
+        {
+            "id": "derived-artifact-freshness-detects-stale-outputs",
+            "passed": (
+                derived_stale.get("status") == "failed"
+                and "derived-report-stale" in stale_reasons(derived_stale)
+                and "derived-reproduction-steps-stale" in stale_reasons(derived_stale)
+                and "derived-review-blockers-markdown-stale" in stale_reasons(derived_stale)
+            ),
+            "expected": "derived stale report, reproduction, and review-blocker markdown outputs",
+            "actual": derived_stale.get("stale_inputs"),
+        },
+        {
+            "id": "derived-artifact-refresh-clears-staleness",
+            "passed": (
+                derived_refresh_after.get("status") == "healthy"
+                and len(derived_refreshed_manifests) == 1
+                and not derived_refresh_after.get("stale_inputs")
+            ),
+            "expected": "refreshing derived outputs clears all freshness issues",
+            "actual": {
+                "after_status": derived_refresh_after.get("status"),
+                "refreshed_manifests": derived_refreshed_manifests,
+                "after_stale_inputs": derived_refresh_after.get("stale_inputs"),
+            },
+        },
     ]
     failed = [item for item in assertions if not item["passed"]]
     return {
@@ -13613,7 +13694,12 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "failed": len(failed),
             "aggregate_status": aggregate.get("status"),
             "stale_input_count": aggregate.get("summary", {}).get("stale_input_count"),
-            "manifest_refreshes": len(refreshed_manifests) + len(review_blockers_refreshed_manifests) + len(report_refreshed_manifests),
+            "manifest_refreshes": (
+                len(refreshed_manifests)
+                + len(review_blockers_refreshed_manifests)
+                + len(report_refreshed_manifests)
+                + len(derived_refreshed_manifests)
+            ),
         },
         "cases": {
             "healthy": healthy,
@@ -13630,6 +13716,9 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "review_blockers_refreshed_manifests": review_blockers_refreshed_manifests,
             "report_refresh_after": report_refresh_after,
             "report_refreshed_manifests": report_refreshed_manifests,
+            "derived_stale": derived_stale,
+            "derived_refresh_after": derived_refresh_after,
+            "derived_refreshed_manifests": derived_refreshed_manifests,
         },
         "assertions": assertions,
         "safety": "Synthetic artifact-health self-test. It writes temporary local files only and sends no requests.",
