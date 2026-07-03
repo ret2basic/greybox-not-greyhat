@@ -476,13 +476,15 @@ as `ready`, `manual-template` when they still contain `REPLACE_WITH_*`,
 control operators are present. `verification-queue` returns a non-zero status if
 unsafe command templates are generated.
 
-`review-blockers` writes `.greybox/review-blockers.json`, a read-only summary of
-the human-review, profile-update, and external blockers currently spread across
-discovery coverage, Burp observation coverage, verification queue, environment
-readiness, and artifact health. `audit` and `verification-queue` refresh it
-automatically. The command is useful as the first artifact to inspect after a
+`review-blockers` writes `.greybox/review-blockers.json` plus
+`.greybox/review-blockers.md`, a read-only summary of the human-review,
+profile-update, and external blockers currently spread across discovery
+coverage, Burp observation coverage, verification queue, environment readiness,
+and artifact health. `audit` and `verification-queue` refresh it automatically.
+The Markdown playbook is useful as the first artifact to inspect after a
 regression run because it keeps the approved-path, source-only review, missing
-profile coverage, and external-configuration actions in one list:
+profile coverage, external-configuration actions, and gated command templates in
+one list:
 
 ```bash
 python3 scripts/inferforge.py review-blockers
@@ -601,6 +603,7 @@ Key outputs:
 .greybox/artifact-health.json
 .greybox/regression-suite.json
 .greybox/review-blockers.json
+.greybox/review-blockers.md
 .greybox/discovery-coverage-selftest.json
 .greybox/target-profile.json
 .greybox/strategy-registry.json

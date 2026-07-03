@@ -60,6 +60,7 @@ DISCOVERED_PROFILE_ARTIFACT = "discovered-profile.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
+REVIEW_BLOCKERS_MARKDOWN_ARTIFACT = "review-blockers.md"
 REQUIRED_ARTIFACTS = [
     "index.html",
     "report.md",
@@ -121,6 +122,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     "regression-suite.json",
     "orca-baseline.json",
     REVIEW_BLOCKERS_ARTIFACT,
+    REVIEW_BLOCKERS_MARKDOWN_ARTIFACT,
     "profile-routing-selftest.json",
     DISCOVERY_COVERAGE_SELFTEST_ARTIFACT,
     "transaction-intent-policy.json",
@@ -131,6 +133,7 @@ INDEX_ARTIFACT_ORDER = [
     "artifact-health.json",
     "regression-suite.json",
     REVIEW_BLOCKERS_ARTIFACT,
+    REVIEW_BLOCKERS_MARKDOWN_ARTIFACT,
     DISCOVERY_COVERAGE_ARTIFACT,
     DISCOVERY_COVERAGE_SELFTEST_ARTIFACT,
     TARGET_PROFILE_ARTIFACT,
@@ -11224,6 +11227,121 @@ def build_review_blockers(
     }
 
 
+def markdown_text(value: Any) -> str:
+    return str(value).replace("\n", " ").strip()
+
+
+def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) -> None:
+    summary = review_blockers.get("summary", {}) or {}
+    blockers = review_blockers.get("blockers", []) or []
+    status_counts = summary.get("status_counts", {}) or {}
+    category_counts = summary.get("category_counts", {}) or {}
+    source_counts = summary.get("source_counts", {}) or {}
+    actionable = [
+        item
+        for item in blockers
+        if str(item.get("status") or "") in {"failed", "needs-profile-update", "needs-human-review"}
+    ][:8]
+    external = [
+        item
+        for item in blockers
+        if str(item.get("status") or "") == "ready-with-external-blockers"
+    ][:8]
+
+    lines = [
+        "# InferForge Review Blockers",
+        "",
+        f"Generated: {utc_now()}",
+        "",
+        f"- Target: `{review_blockers.get('target')}`",
+        f"- Status: `{review_blockers.get('status')}`",
+        f"- Blockers: `{summary.get('blockers', 0)}`",
+        f"- Status counts: `{json.dumps(status_counts, sort_keys=True)}`",
+        f"- Category counts: `{json.dumps(category_counts, sort_keys=True)}`",
+        f"- Source counts: `{json.dumps(source_counts, sort_keys=True)}`",
+        "",
+        "## Safety",
+        "",
+        "- This file is generated from local artifacts only.",
+        "- Do not sign wallets or submit Solana transactions from these steps.",
+        "- Replace REPLACE_WITH_* placeholders before running manual-review commands.",
+        "- Keep Burp Proxy Intercept off for unattended automation.",
+        "",
+        "## Next Actions",
+        "",
+    ]
+    if actionable:
+        for item in actionable:
+            lines.append(
+                f"- `{item.get('status')}` `{item.get('id')}`: {markdown_text(item.get('title'))}"
+            )
+            if item.get("next_action"):
+                lines.append(f"  - Next: {markdown_text(item.get('next_action'))}")
+    elif external:
+        lines.append("- No human-review blocker is first in line; resolve external configuration blockers below.")
+    else:
+        lines.append("- No blockers are currently reported.")
+
+    if external:
+        lines.extend(["", "## External Configuration", ""])
+        for item in external:
+            lines.append(
+                f"- `{item.get('id')}`: {markdown_text(item.get('title'))}"
+            )
+            if item.get("next_action"):
+                lines.append(f"  - Next: {markdown_text(item.get('next_action'))}")
+
+    lines.extend(["", "## Blockers", ""])
+    if not blockers:
+        lines.append("No blockers were reported.")
+    for item in blockers:
+        lines.extend(
+            [
+                f"### {item.get('id')}",
+                "",
+                f"- Status: `{item.get('status')}`",
+                f"- Category: `{item.get('category')}`",
+                f"- Priority: `{item.get('priority')}`",
+                f"- Source: `{item.get('source')}`",
+                f"- Cluster: `{item.get('cluster_id') or ''}`",
+                f"- Title: {markdown_text(item.get('title'))}",
+                f"- Reason: {markdown_text(item.get('reason'))}",
+            ]
+        )
+        if item.get("next_action"):
+            lines.append(f"- Next action: {markdown_text(item.get('next_action'))}")
+        refs = item.get("artifact_refs", []) or []
+        if refs:
+            lines.append("- Artifact refs: " + ", ".join(f"`{ref}`" for ref in refs))
+        candidates = item.get("review_candidates", []) or []
+        if candidates:
+            lines.append("- Review candidates:")
+            for candidate in candidates:
+                details = []
+                if candidate.get("type"):
+                    details.append(f"type=`{candidate.get('type')}`")
+                if candidate.get("status"):
+                    details.append(f"status=`{candidate.get('status')}`")
+                suffix = f" {' '.join(details)}" if details else ""
+                lines.append(f"  - `{candidate.get('id')}`{suffix}")
+                if candidate.get("path_template"):
+                    lines.append(f"    - Path template: `{candidate.get('path_template')}`")
+                if candidate.get("example_path"):
+                    lines.append(f"    - Example path: `{candidate.get('example_path')}`")
+                approval_required = candidate.get("approval_required", []) or []
+                if approval_required:
+                    lines.append("    - Approval required:")
+                    lines.extend(f"      - {markdown_text(entry)}" for entry in approval_required)
+        commands = item.get("commands", []) or []
+        if commands:
+            lines.extend(["", "Commands:", "", "```bash"])
+            lines.extend(str(command) for command in commands)
+            lines.append("```")
+        lines.append("")
+
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -14310,6 +14428,7 @@ def run_audit(args: argparse.Namespace) -> int:
         environment_readiness=environment_readiness,
     )
     write_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT, review_blockers)
+    write_review_blockers_markdown(artifact_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT, review_blockers)
     write_json(artifact_dir / "burp-capabilities.json", capabilities)
     write_json(
         artifact_dir / "config.json",
@@ -16572,6 +16691,7 @@ def run_verification_queue(args: argparse.Namespace) -> int:
         environment_readiness=load_optional_json(artifact_dir / "environment-readiness.json"),
     )
     write_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT, review_blockers)
+    write_review_blockers_markdown(artifact_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT, review_blockers)
     print(f"Verification queue: {verification_queue['status']}")
     print(
         "Items: "
@@ -16585,6 +16705,7 @@ def run_verification_queue(args: argparse.Namespace) -> int:
     print(f"Wrote {artifact_dir / 'verification-queue.json'}")
     print(f"Wrote {artifact_dir / 'reproduction-steps.md'}")
     print(f"Wrote {artifact_dir / REVIEW_BLOCKERS_ARTIFACT}")
+    print(f"Wrote {artifact_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT}")
     if verification_queue["status"] == "invalid-command-templates":
         return 2
     return 0 if verification_queue["status"] != "needs-human-review" else 1
@@ -16605,7 +16726,13 @@ def run_review_blockers(args: argparse.Namespace) -> int:
         artifact_health=load_optional_json(artifact_dir / "artifact-health.json"),
     )
     output_path = resolve_repo_path(args.output) if args.output else artifact_dir / REVIEW_BLOCKERS_ARTIFACT
+    markdown_path = (
+        resolve_repo_path(args.markdown_output)
+        if args.markdown_output
+        else artifact_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT
+    )
     write_json(output_path, review_blockers)
+    write_review_blockers_markdown(markdown_path, review_blockers)
     print(f"Review blockers: {review_blockers['status']}")
     print(
         "Blockers: "
@@ -16618,6 +16745,7 @@ def run_review_blockers(args: argparse.Namespace) -> int:
             f"source={blocker.get('source')} title={blocker.get('title')}"
         )
     print(f"Wrote {output_path}")
+    print(f"Wrote {markdown_path}")
     if review_blockers["status"] == "failed":
         return 1
     if args.strict and review_blockers["status"] != "ready":
@@ -17831,6 +17959,10 @@ def build_parser() -> argparse.ArgumentParser:
     review_blockers.add_argument(
         "--output",
         help="Where to write review-blockers.json. Defaults to --artifact-dir/review-blockers.json.",
+    )
+    review_blockers.add_argument(
+        "--markdown-output",
+        help="Where to write review-blockers.md. Defaults to --artifact-dir/review-blockers.md.",
     )
     review_blockers.add_argument(
         "--strict",
