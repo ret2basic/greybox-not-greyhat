@@ -552,7 +552,10 @@ every individual blocker. The CLI prints the grouped blocker summaries first,
 including count, cluster, candidate ids, and next action. In `--no-write` mode,
 top groups with queued commands also print compact command safety totals and
 per-command classification labels such as `manual-template` and `review-gated`
-so the approval step can be previewed without writing artifacts. When
+so the approval step can be previewed without writing artifacts. Commandless
+groups print compact follow-up context, including split next actions, artifact
+dirs, source artifacts, evidence refs, and per-source counts, so external or
+manual blockers remain actionable without opening the JSON artifact. When
 artifacts are written, the JSON stores the same per-command classification refs
 and the Markdown playbook renders them as shell comments before each command.
 When `--check-dir` is repeated, it builds a root-level rollup across multiple

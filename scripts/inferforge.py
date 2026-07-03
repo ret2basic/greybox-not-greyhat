@@ -11764,6 +11764,54 @@ def format_review_blocker_group_summary(group: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def split_review_blocker_next_actions(value: Any) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [
+        item.strip()
+        for item in text.split(";")
+        if item.strip()
+    ]
+
+
+def review_blocker_group_followup_preview_lines(group: dict[str, Any], *, limit: int = 3) -> list[str]:
+    status = str(group.get("status") or "")
+    if status not in {"failed", "needs-profile-update", "needs-human-review", "ready-with-external-blockers"}:
+        return []
+    lines = []
+    next_actions = split_review_blocker_next_actions(group.get("next_action"))
+    for action in next_actions[:limit]:
+        lines.append(f"  followup_next={inline_summary_text(action, max_chars=260)}")
+    if len(next_actions) > limit:
+        lines.append(f"  followup_next=... +{len(next_actions) - limit} more")
+
+    artifact_dirs = sorted_unique_strings(group.get("artifact_dirs", []) or [])
+    if artifact_dirs:
+        suffix = "" if len(artifact_dirs) <= 4 else f",+{len(artifact_dirs) - 4}"
+        lines.append(f"  artifact_dirs={','.join(artifact_dirs[:4])}{suffix}")
+
+    sources = sorted_unique_strings(group.get("sources", []) or [])
+    if sources:
+        suffix = "" if len(sources) <= 4 else f",+{len(sources) - 4}"
+        lines.append(f"  sources={','.join(sources[:4])}{suffix}")
+
+    refs = sorted_unique_strings(group.get("artifact_refs", []) or [])
+    if refs:
+        suffix = "" if len(refs) <= 6 else f",+{len(refs) - 6}"
+        lines.append(f"  evidence_refs={','.join(refs[:6])}{suffix}")
+
+    source_counts = group.get("source_counts", {}) or {}
+    if source_counts:
+        rendered_counts = [
+            f"{inline_summary_text(source, max_chars=100)}:{count}"
+            for source, count in sorted(source_counts.items())[:4]
+        ]
+        suffix = "" if len(source_counts) <= 4 else f",+{len(source_counts) - 4}"
+        lines.append(f"  source_counts={','.join(rendered_counts)}{suffix}")
+    return lines
+
+
 def top_review_blocker_group_summaries(review_blockers: dict[str, Any] | None, *, limit: int = 5) -> list[str]:
     groups = (review_blockers or {}).get("groups", []) or []
     return [format_review_blocker_group_summary(group) for group in groups[:limit]]
@@ -12896,6 +12944,8 @@ def build_review_blockers_selftest() -> dict[str, Any]:
     rollup_route_group_command_safety = (rollup_route_group.get("command_safety", {}) or {}).get("summary", {}) or {}
     rollup_route_group_command_refs = (rollup_route_group.get("command_safety", {}) or {}).get("commands", []) or []
     rollup_route_group_command_counts = rollup_route_group_command_safety.get("classification_counts", {}) or {}
+    rollup_readiness_group_followups = review_blocker_group_followup_preview_lines(rollup_readiness_group)
+    rollup_readiness_group_followup_text = "\n".join(rollup_readiness_group_followups)
     rollup_top_group_summaries = top_review_blocker_group_summaries(rollup, limit=2)
     assertions = [
         {
@@ -12945,6 +12995,21 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             "passed": rollup_readiness_group.get("count") == 4,
             "expected": 4,
             "actual": rollup_readiness_group.get("count"),
+        },
+        {
+            "id": "rollup-readiness-group-followup-preview-rendered",
+            "passed": (
+                "followup_next=Set a real M0_ORCHESTRATION_API_KEY" in rollup_readiness_group_followup_text
+                and "artifact_dirs=" in rollup_readiness_group_followup_text
+                and all(
+                    str(artifact_dir) in rollup_readiness_group_followup_text
+                    for artifact_dir in (rollup_readiness_group.get("artifact_dirs", []) or [])[:2]
+                )
+                and "environment-readiness.json" in rollup_readiness_group_followup_text
+                and "source_counts=" in rollup_readiness_group_followup_text
+            ),
+            "expected": "commandless readiness group no-write follow-up preview includes next steps and artifact context",
+            "actual": rollup_readiness_group_followups,
         },
         {
             "id": "markdown-group-sources-rendered",
@@ -13037,6 +13102,9 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 and "[review-gated]" in no_write_stdout
                 and "promote-observation-candidate" in no_write_stdout
                 and "burp-sync --observe" in no_write_stdout
+                and "followup_next=Set a real M0_ORCHESTRATION_API_KEY" in no_write_stdout
+                and "artifact_dirs=" in no_write_stdout
+                and "environment-readiness.json" in no_write_stdout
                 and "No files written (--no-write)." in no_write_stdout
                 and not any(no_write_outputs_exist.values())
             ),
@@ -21198,6 +21266,9 @@ def run_review_blockers(args: argparse.Namespace) -> int:
                         print(f"    - {label} {command}")
                     if len(command_refs) > 4:
                         print(f"    - ... +{len(command_refs) - 4} more commands")
+                else:
+                    for line in review_blocker_group_followup_preview_lines(group):
+                        print(line)
         if len(groups) > 8:
             if no_write:
                 print(f"- {len(groups) - 8} more group(s); rerun without --no-write to write the full blocker artifact")
