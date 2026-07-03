@@ -14401,6 +14401,68 @@ def mcp_tool_inventory_security_issues_in_value(value: Any, *, file_name: str, p
     return issues
 
 
+def regression_suite_output_security_issues(doc: Any, *, file_name: str) -> list[dict[str, Any]]:
+    if not isinstance(doc, dict):
+        return []
+    steps = doc.get("steps")
+    if not isinstance(steps, list):
+        return []
+
+    issues: list[dict[str, Any]] = []
+    for index, step in enumerate(steps):
+        step_path = f"$.steps[{index}]"
+        if not isinstance(step, dict):
+            continue
+        for raw_key in ["output_tail", "stdout", "stderr"]:
+            if raw_key in step and step.get(raw_key):
+                issues.append(
+                    {
+                        "file": file_name,
+                        "path": f"{step_path}.{raw_key}",
+                        "reason": "regression-step-output-raw-field",
+                    }
+                )
+        output = step.get("output")
+        if output is None:
+            continue
+        if isinstance(output, str):
+            issues.append(
+                {
+                    "file": file_name,
+                    "path": f"{step_path}.output",
+                    "reason": "regression-step-output-raw-string",
+                }
+            )
+            continue
+        if not isinstance(output, dict):
+            issues.append(
+                {
+                    "file": file_name,
+                    "path": f"{step_path}.output",
+                    "reason": "regression-step-output-invalid-shape",
+                }
+            )
+            continue
+        for raw_key in ["text", "tail", "raw", "stdout", "stderr"]:
+            if raw_key in output:
+                issues.append(
+                    {
+                        "file": file_name,
+                        "path": f"{step_path}.output.{raw_key}",
+                        "reason": "regression-step-output-raw-field",
+                    }
+                )
+        if output and output.get("text_redacted") is not True:
+            issues.append(
+                {
+                    "file": file_name,
+                    "path": f"{step_path}.output",
+                    "reason": "regression-step-output-not-redacted",
+                }
+            )
+    return issues
+
+
 def redacted_error_field_security_issues(value: Any, *, file_name: str, path: str, reason_prefix: str) -> list[dict[str, Any]]:
     if value is None or value == "":
         return []
@@ -14424,6 +14486,8 @@ def mcp_action_audit_security_issues(parsed_json_by_name: dict[str, Any]) -> lis
         issues.extend(mcp_tool_inventory_security_issues_in_value(doc, file_name=file_name))
         if file_name == "burp-mcp-sync.json":
             issues.extend(burp_sync_error_security_issues(doc, file_name=file_name))
+        if file_name == "regression-suite.json":
+            issues.extend(regression_suite_output_security_issues(doc, file_name=file_name))
     return issues
 
 
@@ -14548,18 +14612,18 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
     if security_issues:
         checks.append(
             {
-                "id": "mcp-action-audit-hygiene",
+                "id": "artifact-security-hygiene",
                 "status": "failed",
-                "message": f"{len(security_issues)} MCP action audit hygiene issue(s) found.",
+                "message": f"{len(security_issues)} artifact security hygiene issue(s) found.",
                 "security_issues": security_issues[:20],
             }
         )
     else:
         checks.append(
             {
-                "id": "mcp-action-audit-hygiene",
+                "id": "artifact-security-hygiene",
                 "status": "passed",
-                "message": "MCP action audit records do not expose raw sensitive argument, result, or error text.",
+                "message": "Audited artifacts do not expose raw sensitive command output, MCP arguments, results, or error text.",
             }
         )
 
@@ -14876,6 +14940,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         missing_dir = root / "missing"
         untracked_dir = root / "untracked"
         mcp_audit_leak_dir = root / "mcp-audit-leak"
+        regression_output_leak_dir = root / "regression-output-leak"
         refresh_dir = root / "refresh"
         derived_dir = root / "derived"
         for directory in [healthy_dir, modified_dir, missing_dir, untracked_dir]:
@@ -14935,6 +15000,24 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         )
         write_minimal_manifest(mcp_audit_leak_dir, ["burp-mcp-sync.json", "burp-capabilities.json"])
 
+        regression_output_leak_dir.mkdir(parents=True)
+        write_json(
+            regression_output_leak_dir / "regression-suite.json",
+            {
+                "generated_at": utc_now(),
+                "status": "failed",
+                "steps": [
+                    {
+                        "label": "raw-output-step",
+                        "status": "failed",
+                        "returncode": 1,
+                        "output_tail": "Authorization: Bearer should-not-appear",
+                    }
+                ],
+            },
+        )
+        write_minimal_manifest(regression_output_leak_dir, ["regression-suite.json"])
+
         healthy = build_single_artifact_health(healthy_dir)
         modified = build_single_artifact_health(modified_dir)
         missing = build_single_artifact_health(missing_dir)
@@ -14942,6 +15025,8 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         mcp_audit_leak = build_single_artifact_health(mcp_audit_leak_dir)
         mcp_audit_leak_rollup = build_artifact_health([mcp_audit_leak_dir])
         mcp_audit_leak_text = json.dumps(mcp_audit_leak, sort_keys=True)
+        regression_output_leak = build_single_artifact_health(regression_output_leak_dir)
+        regression_output_leak_text = json.dumps(regression_output_leak, sort_keys=True)
         aggregate = build_artifact_health([healthy_dir, modified_dir, missing_dir, untracked_dir])
         refresh_health = build_artifact_health([refresh_dir])
         refresh_output = refresh_dir / "artifact-health.json"
@@ -15129,6 +15214,21 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "artifact-health-detects-regression-step-output-leaks",
+            "passed": (
+                regression_output_leak.get("status") == "failed"
+                and "regression-step-output-raw-field"
+                in {str(issue.get("reason")) for issue in regression_output_leak.get("security_issues", []) or []}
+                and "should-not-appear" not in regression_output_leak_text
+                and "Authorization: Bearer" not in regression_output_leak_text
+            ),
+            "expected": "artifact-health fails when regression-suite step records contain raw command output without echoing the leaked value",
+            "actual": {
+                "status": regression_output_leak.get("status"),
+                "security_issues": regression_output_leak.get("security_issues"),
+            },
+        },
+        {
             "id": "artifact-health-output-refreshes-manifest",
             "passed": (
                 refresh_stale_before.get("status") == "failed"
@@ -15268,6 +15368,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "untracked": untracked,
             "mcp_audit_leak": mcp_audit_leak,
             "mcp_audit_leak_rollup": mcp_audit_leak_rollup,
+            "regression_output_leak": regression_output_leak,
             "aggregate": aggregate,
             "refresh_stale_before": refresh_stale_before,
             "refreshed_health": refreshed_health,
@@ -15998,6 +16099,8 @@ def build_no_write_selftest() -> dict[str, Any]:
             },
         }
     )
+    regression_step_output = regression_step_output_summary("Authorization: Bearer should-not-appear\nok\n")
+    regression_step_output_text = json.dumps(regression_step_output, sort_keys=True)
     mcp_audit_record = mcp_action_audit_record(
         tool="get_proxy_http_history_regex",
         arguments={
@@ -16304,6 +16407,20 @@ def build_no_write_selftest() -> dict[str, Any]:
                 "artifact_health": regression_health_summary_line,
                 "review_blockers": regression_review_blocker_summary_line,
             },
+        },
+        {
+            "id": "regression-step-output-summary-redacts-raw-output",
+            "passed": (
+                regression_step_output.get("text_redacted") is True
+                and regression_step_output.get("text_bytes")
+                == len("Authorization: Bearer should-not-appear\nok\n".encode("utf-8"))
+                and isinstance(regression_step_output.get("text_sha256"), str)
+                and regression_step_output.get("line_count") == 2
+                and "Authorization: Bearer" not in regression_step_output_text
+                and "should-not-appear" not in regression_step_output_text
+            ),
+            "expected": "regression step output summaries keep byte/hash/line metadata without raw stdout",
+            "actual": regression_step_output,
         },
         {
             "id": "attack-strategy-no-write-skips-artifacts",
@@ -16834,6 +16951,17 @@ def inferforge_cli_command(
     return command
 
 
+def regression_step_output_summary(output: str) -> dict[str, Any]:
+    encoded = output.encode("utf-8", errors="replace")
+    lines = output.splitlines()
+    return {
+        "text_bytes": len(encoded),
+        "text_sha256": hashlib.sha256(encoded).hexdigest(),
+        "line_count": len(lines),
+        "text_redacted": True,
+    }
+
+
 def run_regression_step(label: str, command: list[str], *, timeout: int) -> dict[str, Any]:
     started = time.monotonic()
     doc: dict[str, Any] = {
@@ -16861,8 +16989,11 @@ def run_regression_step(label: str, command: list[str], *, timeout: int) -> dict
                 "status": "timeout",
                 "returncode": None,
                 "duration_ms": duration_ms,
-                "output_tail": str(output)[-12000:],
-                "error": f"Timed out after {timeout} seconds.",
+                "output": regression_step_output_summary(str(output)),
+                "error": {
+                    **redacted_error_summary(error),
+                    "timeout_seconds": timeout,
+                },
                 "finished_at": utc_now(),
             }
         )
@@ -16874,8 +17005,8 @@ def run_regression_step(label: str, command: list[str], *, timeout: int) -> dict
                 "status": "failed-to-start",
                 "returncode": None,
                 "duration_ms": duration_ms,
-                "output_tail": "",
-                "error": str(error),
+                "output": regression_step_output_summary(""),
+                "error": redacted_error_summary(error),
                 "finished_at": utc_now(),
             }
         )
@@ -16887,7 +17018,7 @@ def run_regression_step(label: str, command: list[str], *, timeout: int) -> dict
             "status": "passed" if proc.returncode == 0 else "failed",
             "returncode": proc.returncode,
             "duration_ms": duration_ms,
-            "output_tail": proc.stdout[-12000:],
+            "output": regression_step_output_summary(proc.stdout),
             "finished_at": utc_now(),
         }
     )
