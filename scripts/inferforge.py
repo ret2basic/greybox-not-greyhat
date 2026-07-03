@@ -15580,6 +15580,7 @@ Burp MCP is installed and reachable on `127.0.0.1:9876`. Codex can send approved
         evidence_appendix,
         verification_queue,
         profile,
+        attack_strategy=attack_strategy,
     )
     return report
 
@@ -15603,6 +15604,7 @@ def generate_index_html(
     evidence_appendix: dict[str, Any] | None = None,
     verification_queue: dict[str, Any] | None = None,
     profile: dict[str, Any] | None = None,
+    attack_strategy: dict[str, Any] | None = None,
 ) -> None:
     def e(value: Any) -> str:
         return html.escape(str(value))
@@ -15648,6 +15650,21 @@ def generate_index_html(
     hardening_note_count = len(hardening_notes or [])
     evidence_appendix_status = (evidence_appendix or {}).get("status", "unknown")
     verification_queue_status = (verification_queue or {}).get("status", "unknown")
+    attack_strategy_status = (attack_strategy or {}).get("status", "unknown")
+    attack_strategy_summary = (attack_strategy or {}).get("summary", {}) or {}
+    attack_strategy_lines = [
+        f"- Status `{attack_strategy_status}`",
+        (
+            f"- Clusters with specific strategy `{attack_strategy_summary.get('clusters_with_specific_strategy', 0)}`"
+            f" / `{attack_strategy_summary.get('clusters', 0)}`"
+        ),
+        (
+            "- Uncovered clusters "
+            f"`{display_report_value(attack_strategy_summary.get('strategy_uncovered_clusters', []) or [])}`"
+        ),
+        f"- Waiting actions `{attack_strategy_summary.get('waiting_action_count', 0)}`",
+        f"- Relevant next actions `{attack_strategy_summary.get('relevant_next_actions', 0)}`",
+    ]
     command_safety_summary_doc = ((verification_queue or {}).get("summary", {}) or {}).get("command_safety", {}) or {}
     command_safety_counts = command_safety_summary_doc.get("classification_counts", {}) or {}
     burp_observation_coverage = load_optional_json(artifact_dir / "burp-observation-coverage.json") or {}
@@ -15855,6 +15872,7 @@ def generate_index_html(
       <div class="metric"><span>Source Peek Requests</span><strong>{e(source_peek_request_count)} · {e(source_peek_request_status)}</strong></div>
       <div class="metric"><span>Evidence Appendix</span><strong>{e(evidence_appendix_status)}</strong></div>
       <div class="metric"><span>Verification Queue</span><strong>{e(verification_queue_status)}</strong></div>
+      <div class="metric"><span>Attack Strategy</span><strong>{e(attack_strategy_status)}</strong></div>
       <div class="metric"><span>Command Templates</span><strong>{e(command_safety_counts.get('manual-template', 0))} manual · {e(command_safety_summary_doc.get('unsafe_template_count', 0))} unsafe</strong></div>
       <div class="metric"><span>Tx Candidates</span><strong>{e(transaction_intent.get('candidates_seen', 0))}</strong></div>
       <div class="metric"><span>Decoded Tx</span><strong>{e(transaction_intent.get('decoded_transactions', 0))}</strong></div>
@@ -15884,6 +15902,9 @@ def generate_index_html(
     <ul>{html_list(source_resolver_summary['server_action_lines'])}</ul>
     <h3>Observed Runtime And Condition Decisions</h3>
     <ul>{html_list(source_resolver_summary['observed_lines'])}</ul>
+
+    <h2>Attack Strategy</h2>
+    <ul>{html_list(attack_strategy_lines)}</ul>
 
 	    <h2>Probe Results</h2>
     <table>
