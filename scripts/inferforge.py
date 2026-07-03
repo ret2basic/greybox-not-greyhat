@@ -11696,6 +11696,29 @@ def review_blocker_group_command_templates(group: dict[str, Any]) -> list[str]:
     )
 
 
+def review_blocker_command_status(group_status: str) -> str | None:
+    return {
+        "needs-human-review": "manual-review",
+        "needs-profile-update": "manual-review",
+        "failed": "blocked",
+        "ready-with-external-blockers": "blocked-external",
+    }.get(group_status)
+
+
+def review_blocker_group_command_safety(group: dict[str, Any]) -> dict[str, Any]:
+    commands = review_blocker_group_command_templates(group)
+    item_status = review_blocker_command_status(str(group.get("status") or ""))
+    refs = [
+        classify_verification_command(
+            command,
+            source=f"{group.get('id') or 'GROUP-unknown'}:commands[{index}]",
+            item_status=item_status,
+        )
+        for index, command in enumerate(commands, start=1)
+    ]
+    return command_safety_summary(refs)
+
+
 def compact_review_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {}
     for field in ["id", "cluster", "type", "status", "method", "path_template", "example_path"]:
@@ -11955,6 +11978,7 @@ def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str
                 ],
             ]
         )
+        group["command_safety"] = {"summary": review_blocker_group_command_safety(group)}
         group["blocker_ids"] = sorted_unique_strings(group["blocker_ids"])
         groups.append(group)
 
@@ -12670,6 +12694,8 @@ def build_review_blockers_selftest() -> dict[str, Any]:
         {},
     )
     rollup_route_group_summary = format_review_blocker_group_summary(rollup_route_group)
+    rollup_route_group_command_safety = (rollup_route_group.get("command_safety", {}) or {}).get("summary", {}) or {}
+    rollup_route_group_command_counts = rollup_route_group_command_safety.get("classification_counts", {}) or {}
     rollup_top_group_summaries = top_review_blocker_group_summaries(rollup, limit=2)
     assertions = [
         {
@@ -12743,9 +12769,21 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "rollup-route-group-command-safety-rendered",
+            "passed": (
+                rollup_route_group_command_safety.get("commands") == 2
+                and rollup_route_group_command_counts.get("manual-template") == 1
+                and rollup_route_group_command_counts.get("review-gated") == 1
+                and rollup_route_group_command_safety.get("unsafe_template_count") == 0
+            ),
+            "expected": "route group command safety summarizes manual-template and review-gated commands",
+            "actual": rollup_route_group_command_safety,
+        },
+        {
             "id": "markdown-group-command-templates-rendered",
             "passed": (
                 "Candidate details:" in markdown
+                and "Command safety:" in markdown
                 and "Command templates:" in markdown
                 and "promote-observation-candidate" in markdown
                 and "REPLACE_WITH_APPROVED_CONCRETE_LOCAL_PATH" in markdown
@@ -12753,6 +12791,7 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             "expected": "group-level candidate command templates in markdown",
             "actual": {
                 "candidate_details": "Candidate details:" in markdown,
+                "command_safety": "Command safety:" in markdown,
                 "command_templates": "Command templates:" in markdown,
                 "promote": "promote-observation-candidate" in markdown,
                 "placeholder": "REPLACE_WITH_APPROVED_CONCRETE_LOCAL_PATH" in markdown,
@@ -12785,6 +12824,7 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             "passed": (
                 no_write_return_code == 0
                 and "Review blockers: needs-human-review" in no_write_stdout
+                and "command_safety=commands=2" in no_write_stdout
                 and "command_templates:" in no_write_stdout
                 and "promote-observation-candidate" in no_write_stdout
                 and "burp-sync --observe" in no_write_stdout
@@ -12916,6 +12956,9 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
                 lines.append(f"    - ... +{len(candidates) - 4} more candidates")
         commands = review_blocker_group_command_templates(item)
         if commands:
+            command_safety = (item.get("command_safety", {}) or {}).get("summary", {}) or {}
+            if command_safety:
+                lines.append(f"  - Command safety: `{format_command_safety_summary(command_safety)}`")
             lines.append("  - Command templates:")
             lines.append("    ```bash")
             lines.extend(f"    {command}" for command in commands[:6])
@@ -20583,6 +20626,9 @@ def run_review_blockers(args: argparse.Namespace) -> int:
             if no_write:
                 commands = review_blocker_group_command_templates(group)
                 if commands:
+                    command_safety = (group.get("command_safety", {}) or {}).get("summary", {}) or {}
+                    if command_safety:
+                        print(f"  command_safety={format_command_safety_summary(command_safety)}")
                     print("  command_templates:")
                     for command in commands[:4]:
                         print(f"    - {inline_summary_text(command, max_chars=500)}")
