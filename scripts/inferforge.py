@@ -11644,6 +11644,11 @@ def format_review_blocker_group_summary(group: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def top_review_blocker_group_summaries(review_blockers: dict[str, Any] | None, *, limit: int = 5) -> list[str]:
+    groups = (review_blockers or {}).get("groups", []) or []
+    return [format_review_blocker_group_summary(group) for group in groups[:limit]]
+
+
 def compact_review_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {}
     for field in ["id", "cluster", "type", "status", "method", "path_template", "example_path"]:
@@ -12414,6 +12419,7 @@ def build_review_blockers_selftest() -> dict[str, Any]:
         {},
     )
     rollup_route_group_summary = format_review_blocker_group_summary(rollup_route_group)
+    rollup_top_group_summaries = top_review_blocker_group_summaries(rollup, limit=2)
     assertions = [
         {
             "id": "default-status-external-only",
@@ -12513,6 +12519,16 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             "expected": "group summary includes status, count, cluster, candidate id, and next action",
             "actual": rollup_route_group_summary,
         },
+        {
+            "id": "top-group-summaries-prioritize-actionable-groups",
+            "passed": (
+                len(rollup_top_group_summaries) == 2
+                and "needs-human-review" in rollup_top_group_summaries[0]
+                and "route-api-proxy-path" in rollup_top_group_summaries[0]
+            ),
+            "expected": "top summaries start with the highest-priority human-review group",
+            "actual": rollup_top_group_summaries,
+        },
     ]
     failed = [item for item in assertions if not item["passed"]]
     return {
@@ -12544,6 +12560,7 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "summary": rollup.get("summary"),
                 "route_group": rollup_route_group,
                 "route_group_summary": rollup_route_group_summary,
+                "top_group_summaries": rollup_top_group_summaries,
                 "quote_group": rollup_quote_group,
                 "readiness_group": rollup_readiness_group,
             },
@@ -19581,8 +19598,8 @@ def run_review_blockers(args: argparse.Namespace) -> int:
     groups = review_blockers.get("groups", []) or []
     if groups:
         print("Groups:")
-        for group in groups[:8]:
-            print(f"- {format_review_blocker_group_summary(group)}")
+        for group_summary in top_review_blocker_group_summaries(review_blockers, limit=8):
+            print(f"- {group_summary}")
         if len(groups) > 8:
             print(f"- {len(groups) - 8} more group(s) in {output_path}")
     else:
@@ -20052,6 +20069,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             run_step("root-report", command)
     health = load_optional_json(artifact_dir / "artifact-health.json")
     review_blockers = None if args.skip_review_blockers else load_optional_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT)
+    review_blocker_top_groups = top_review_blocker_group_summaries(review_blockers, limit=5)
     suite_status = regression_suite_status(steps, health, strict=args.strict)
     suite = {
         "generated_at": utc_now(),
@@ -20090,6 +20108,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
         "review_blockers": {
             "status": None if not review_blockers else review_blockers.get("status"),
             "summary": None if not review_blockers else review_blockers.get("summary"),
+            "top_groups": review_blocker_top_groups,
             "artifact": REVIEW_BLOCKERS_ARTIFACT,
             "markdown": REVIEW_BLOCKERS_MARKDOWN_ARTIFACT,
         },
@@ -20102,6 +20121,10 @@ def run_regression_suite(args: argparse.Namespace) -> int:
     write_json(artifact_dir / "regression-suite.json", suite)
     artifact_manifest = write_artifact_manifest(artifact_dir, target, command="regression-suite")
     print(f"Regression suite: {suite_status}")
+    if review_blocker_top_groups:
+        print("Next blocker groups:")
+        for group_summary in review_blocker_top_groups:
+            print(f"- {group_summary}")
     print(f"Wrote {artifact_dir / 'regression-suite.json'}")
     print(f"Artifact manifest: {artifact_manifest['status']}")
     print(f"Wrote {artifact_dir / MANIFEST_NAME}")

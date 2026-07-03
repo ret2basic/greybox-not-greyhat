@@ -573,7 +573,8 @@ run deterministic Burp observe/sync for the checked-in profile and discovered
 profile, collect one source-known Orca pool baseline, run both audits, write
 artifact health, and then generate a root-level review-blocker
 rollup, `regression-suite.json`, and a refreshed root `artifact-manifest.json`. The
-suite clears only
+suite also prints the top grouped review blockers at the end so unattended runs
+surface the next action directly. It clears only
 generated `probe-results.jsonl` files in the selected regression artifact
 directories before audit so reruns do not accumulate stale probe rows. It does
 not run Burp Scanner, fuzz broadly, invoke Server Actions, sign wallets, or
