@@ -4040,6 +4040,87 @@ def mcp_tool_text(result: dict[str, Any]) -> str:
     return json.dumps(result, sort_keys=False)
 
 
+def mcp_audit_argument_value(key: str, value: Any) -> Any:
+    lowered = key.lower()
+    secret_markers = ["authorization", "cookie", "password", "secret", "token", "api_key", "api-key", "apikey"]
+    if any(marker in lowered for marker in secret_markers):
+        return "[redacted]"
+    if isinstance(value, str) and lowered in {"content", "body", "request", "raw", "raw_request", "raw_response"}:
+        encoded = value.encode("utf-8", errors="replace")
+        return {
+            "bytes": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+    if isinstance(value, str) and lowered == "regex":
+        encoded = value.encode("utf-8", errors="replace")
+        return {
+            "bytes": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [mcp_audit_argument_value(key, item) for item in value[:20]]
+    if isinstance(value, dict):
+        return {
+            str(child_key): mcp_audit_argument_value(str(child_key), child_value)
+            for child_key, child_value in sorted(value.items(), key=lambda row: str(row[0]))[:20]
+        }
+    return str(type(value).__name__)
+
+
+def mcp_audit_arguments(arguments: dict[str, Any] | None) -> dict[str, Any]:
+    return {
+        str(key): mcp_audit_argument_value(str(key), value)
+        for key, value in sorted((arguments or {}).items(), key=lambda row: str(row[0]))
+    }
+
+
+def mcp_action_audit_record(
+    *,
+    tool: str,
+    arguments: dict[str, Any] | None,
+    status: str,
+    result_text: str | None = None,
+    error: Any = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "at": utc_now(),
+        "tool": tool,
+        "status": status,
+        "arguments": mcp_audit_arguments(arguments),
+    }
+    if result_text is not None:
+        encoded = result_text.encode("utf-8", errors="replace")
+        record["result"] = {
+            "text_bytes": len(encoded),
+            "text_sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+    if error is not None:
+        record["error"] = str(error)[:500]
+    return record
+
+
+def append_mcp_action_audit(
+    sync_artifact: dict[str, Any],
+    *,
+    tool: str,
+    arguments: dict[str, Any] | None,
+    status: str,
+    result_text: str | None = None,
+    error: Any = None,
+) -> None:
+    sync_artifact.setdefault("mcp_actions", []).append(
+        mcp_action_audit_record(
+            tool=tool,
+            arguments=arguments,
+            status=status,
+            result_text=result_text,
+            error=error,
+        )
+    )
+
+
 def http_request(
     target: str,
     method: str,
@@ -15286,6 +15367,20 @@ def build_no_write_selftest() -> dict[str, Any]:
     ready_followup_preview_lines = verification_queue_followup_preview_lines(
         {"id": "READY-commandless", "status": "ready", "reason": "No preview expected."}
     )
+    mcp_audit_record = mcp_action_audit_record(
+        tool="get_proxy_http_history_regex",
+        arguments={
+            "count": 80,
+            "offset": 0,
+            "regex": "User-Agent: InferForge-Test",
+            "content": "GET /secret HTTP/1.1\r\nAuthorization: Bearer test\r\n\r\n",
+            "api_key": "should-not-appear",
+            "x-api-key": "dash-secret-should-not-appear",
+        },
+        status="succeeded",
+        result_text="history item",
+    )
+    mcp_audit_record_text = json.dumps(mcp_audit_record, sort_keys=True)
     assertions = [
         {
             "id": "review-candidates-no-write-skips-artifacts",
@@ -15560,6 +15655,25 @@ def build_no_write_selftest() -> dict[str, Any]:
                 "no_write": readiness_overflow_no_write,
                 "write": readiness_overflow_write,
             },
+        },
+        {
+            "id": "mcp-action-audit-redacts-sensitive-values",
+            "passed": (
+                mcp_audit_record.get("tool") == "get_proxy_http_history_regex"
+                and mcp_audit_record.get("status") == "succeeded"
+                and mcp_audit_record.get("arguments", {}).get("count") == 80
+                and mcp_audit_record.get("arguments", {}).get("api_key") == "[redacted]"
+                and mcp_audit_record.get("arguments", {}).get("x-api-key") == "[redacted]"
+                and isinstance(mcp_audit_record.get("arguments", {}).get("regex"), dict)
+                and isinstance(mcp_audit_record.get("arguments", {}).get("content"), dict)
+                and "User-Agent: InferForge-Test" not in mcp_audit_record_text
+                and "Authorization: Bearer test" not in mcp_audit_record_text
+                and "should-not-appear" not in mcp_audit_record_text
+                and "dash-secret-should-not-appear" not in mcp_audit_record_text
+                and mcp_audit_record.get("result", {}).get("text_bytes") == len("history item".encode("utf-8"))
+            ),
+            "expected": "MCP action audit records keep tool/count/status while hashing or redacting sensitive arguments and response text",
+            "actual": mcp_audit_record,
         },
     ]
     failed = [item for item in assertions if not item["passed"]]
@@ -20312,6 +20426,7 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                     "ok": None,
                     "error": None,
                 },
+                "mcp_actions": [],
                 "observe_before_sync": bool(args.observe),
                 "error": str(error),
                 "safety": [
@@ -20370,6 +20485,7 @@ def run_burp_sync(args: argparse.Namespace) -> int:
             "ok": None,
             "error": None,
         },
+        "mcp_actions": [],
         "observe_before_sync": bool(args.observe),
         "safety": [
             "Uses Burp MCP only for Proxy Intercept state and history retrieval.",
@@ -20380,32 +20496,91 @@ def run_burp_sync(args: argparse.Namespace) -> int:
     try:
         with McpSseClient(args.mcp_url, timeout=args.mcp_timeout) as client:
             if not args.keep_intercept_state:
+                intercept_arguments = {"intercepting": False}
                 try:
-                    client.call_tool("set_proxy_intercept_state", {"intercepting": False})
+                    intercept_result = client.call_tool("set_proxy_intercept_state", intercept_arguments)
+                    append_mcp_action_audit(
+                        sync_artifact,
+                        tool="set_proxy_intercept_state",
+                        arguments=intercept_arguments,
+                        status="succeeded",
+                        result_text=mcp_tool_text(intercept_result),
+                    )
                     sync_artifact["intercept"]["ok"] = True
                 except Exception as error:
+                    append_mcp_action_audit(
+                        sync_artifact,
+                        tool="set_proxy_intercept_state",
+                        arguments=intercept_arguments,
+                        status="failed",
+                        error=error,
+                    )
                     sync_artifact["intercept"]["ok"] = False
                     sync_artifact["intercept"]["error"] = str(error)
                     raise
 
-            http_result = client.call_tool(
-                "get_proxy_http_history_regex",
-                {"count": args.count, "offset": args.offset, "regex": history_regex},
-            )
-            if http_result.get("isError"):
-                raise RuntimeError(mcp_tool_text(http_result))
+            http_arguments = {"count": args.count, "offset": args.offset, "regex": history_regex}
+            try:
+                http_result = client.call_tool("get_proxy_http_history_regex", http_arguments)
+            except Exception as error:
+                append_mcp_action_audit(
+                    sync_artifact,
+                    tool="get_proxy_http_history_regex",
+                    arguments=http_arguments,
+                    status="failed",
+                    error=error,
+                )
+                raise
             raw_text = mcp_tool_text(http_result)
+            if http_result.get("isError"):
+                append_mcp_action_audit(
+                    sync_artifact,
+                    tool="get_proxy_http_history_regex",
+                    arguments=http_arguments,
+                    status="failed",
+                    result_text=raw_text,
+                )
+                raise RuntimeError(raw_text)
+            append_mcp_action_audit(
+                sync_artifact,
+                tool="get_proxy_http_history_regex",
+                arguments=http_arguments,
+                status="succeeded",
+                result_text=raw_text,
+            )
             raw_path.parent.mkdir(parents=True, exist_ok=True)
             raw_path.write_text(raw_text, encoding="utf-8")
 
             if args.websocket_history:
-                ws_result = client.call_tool(
-                    "get_proxy_websocket_history_regex",
-                    {"count": args.count, "offset": args.offset, "regex": history_regex},
-                )
-                if ws_result.get("isError"):
-                    raise RuntimeError(mcp_tool_text(ws_result))
+                ws_arguments = {"count": args.count, "offset": args.offset, "regex": history_regex}
+                try:
+                    ws_result = client.call_tool("get_proxy_websocket_history_regex", ws_arguments)
+                except Exception as error:
+                    append_mcp_action_audit(
+                        sync_artifact,
+                        tool="get_proxy_websocket_history_regex",
+                        arguments=ws_arguments,
+                        status="failed",
+                        error=error,
+                    )
+                    raise
                 ws_raw_text = mcp_tool_text(ws_result)
+                if ws_result.get("isError"):
+                    append_mcp_action_audit(
+                        sync_artifact,
+                        tool="get_proxy_websocket_history_regex",
+                        arguments=ws_arguments,
+                        status="failed",
+                        result_text=ws_raw_text,
+                    )
+                    raise RuntimeError(ws_raw_text)
+                append_mcp_action_audit(
+                    sync_artifact,
+                    tool="get_proxy_websocket_history_regex",
+                    arguments=ws_arguments,
+                    status="succeeded",
+                    result_text=ws_raw_text,
+                )
                 ws_raw_path.parent.mkdir(parents=True, exist_ok=True)
                 ws_raw_path.write_text(ws_raw_text, encoding="utf-8")
                 sync_artifact["websocket_history"] = {

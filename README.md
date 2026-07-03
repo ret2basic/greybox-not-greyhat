@@ -372,7 +372,9 @@ off, optionally run the deterministic `burp-observe` flow, read matching Burp
 Proxy HTTP history directly through Burp MCP, save the raw MCP output to
 `.greybox/burp-mcp-history-latest.txt`, import normalized observations, refresh
 traffic clustering, write `.greybox/burp-mcp-sync.json`, and refresh the managed
-artifact manifest:
+artifact manifest. The sync artifact includes `mcp_actions`, a compact audit log
+of Burp MCP tool calls with sensitive request bodies, regex values, tokens, and
+secrets hashed or redacted:
 
 ```bash
 python3 scripts/inferforge.py burp-sync --observe --ws-upgrade --replace
