@@ -657,12 +657,13 @@ every static surface or review gate, run deterministic Burp observe/sync for
 the checked-in profile and discovered profile, collect one source-known Orca
 pool baseline, run both audits, write artifact health, and then generate a
 root-level review-blocker rollup, `regression-suite.json`, and a refreshed root
-`artifact-manifest.json`. The suite also prints the top grouped review blockers
-at the end so unattended runs surface the next action directly. It clears only
-generated `probe-results.jsonl` files in the selected regression artifact
-directories before audit so reruns do not accumulate stale probe rows. It does
-not run Burp Scanner, fuzz broadly, invoke Server Actions, sign wallets, or
-submit transactions.
+`artifact-manifest.json`. The final log prints step counts, artifact-health
+gate counts including `security_issues`, review-blocker counts, and the top
+grouped review blockers so unattended runs surface both health gates and next
+actions directly. It clears only generated `probe-results.jsonl` files in the
+selected regression artifact directories before audit so reruns do not
+accumulate stale probe rows. It does not run Burp Scanner, fuzz broadly, invoke
+Server Actions, sign wallets, or submit transactions.
 
 ```bash
 python3 scripts/inferforge.py regression-suite --include-external --ws-resource-probes

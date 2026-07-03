@@ -15974,6 +15974,30 @@ def build_no_write_selftest() -> dict[str, Any]:
     ready_followup_preview_lines = verification_queue_followup_preview_lines(
         {"id": "READY-commandless", "status": "ready", "reason": "No preview expected."}
     )
+    regression_health_summary_line = regression_suite_artifact_health_summary_line(
+        {
+            "status": "needs-human-review",
+            "summary": {
+                "artifact_dirs": 3,
+                "status_counts": {"needs-human-review": 2, "ready-with-external-blockers": 1},
+                "parse_error_count": 0,
+                "missing_required_count": 0,
+                "stale_input_count": 0,
+                "security_issue_count": 0,
+            },
+        }
+    )
+    regression_review_blocker_summary_line = regression_suite_review_blockers_summary_line(
+        {
+            "status": "needs-human-review",
+            "summary": {
+                "blockers": 21,
+                "groups": 5,
+                "status_counts": {"needs-human-review": 5, "ready-with-external-blockers": 16},
+                "group_status_counts": {"needs-human-review": 1, "ready-with-external-blockers": 4},
+            },
+        }
+    )
     mcp_audit_record = mcp_action_audit_record(
         tool="get_proxy_http_history_regex",
         arguments={
@@ -16258,6 +16282,27 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "manual_preview": manual_followup_preview_lines,
                 "ready_preview": ready_followup_preview_lines,
+            },
+        },
+        {
+            "id": "regression-suite-final-summary-lines-surface-health-gates",
+            "passed": (
+                regression_health_summary_line.startswith("Artifact health gate:")
+                and "status=needs-human-review" in regression_health_summary_line
+                and "dirs=3" in regression_health_summary_line
+                and "parse_errors=0" in regression_health_summary_line
+                and "missing_required=0" in regression_health_summary_line
+                and "stale_inputs=0" in regression_health_summary_line
+                and "security_issues=0" in regression_health_summary_line
+                and regression_review_blocker_summary_line.startswith("Review blocker gate:")
+                and "blockers=21" in regression_review_blocker_summary_line
+                and "groups=5" in regression_review_blocker_summary_line
+                and "needs-human-review" in regression_review_blocker_summary_line
+            ),
+            "expected": "regression-suite final summary lines include artifact-health security gates and review-blocker counts",
+            "actual": {
+                "artifact_health": regression_health_summary_line,
+                "review_blockers": regression_review_blocker_summary_line,
             },
         },
         {
@@ -16892,6 +16937,52 @@ def regression_suite_status(steps: list[dict[str, Any]], health: dict[str, Any] 
     if strict and health_status != "healthy":
         return "failed"
     return str(health_status or "unknown")
+
+
+def regression_suite_step_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
+    status_counts: dict[str, int] = {}
+    failed_labels = []
+    for step in steps:
+        status = str(step.get("status") or "unknown")
+        increment_count(status_counts, status)
+        if regression_step_failed(step):
+            failed_labels.append(step.get("label"))
+    return {
+        "total": len(steps),
+        "status_counts": status_counts,
+        "failed": len(failed_labels),
+        "failed_labels": [str(label) for label in failed_labels if label],
+    }
+
+
+def regression_suite_artifact_health_summary_line(health: dict[str, Any] | None) -> str:
+    if not health:
+        return "Artifact health gate: missing artifact-health.json"
+    summary = health.get("summary", {}) or {}
+    return (
+        "Artifact health gate: "
+        f"status={health.get('status') or 'unknown'} "
+        f"dirs={summary.get('artifact_dirs', 0)} "
+        f"status_counts={json.dumps(summary.get('status_counts', {}), sort_keys=True)} "
+        f"parse_errors={summary.get('parse_error_count', 0)} "
+        f"missing_required={summary.get('missing_required_count', 0)} "
+        f"stale_inputs={summary.get('stale_input_count', 0)} "
+        f"security_issues={summary.get('security_issue_count', 0)}"
+    )
+
+
+def regression_suite_review_blockers_summary_line(review_blockers: dict[str, Any] | None) -> str:
+    if not review_blockers:
+        return "Review blocker gate: skipped or missing review-blockers.json"
+    summary = review_blockers.get("summary", {}) or {}
+    return (
+        "Review blocker gate: "
+        f"status={review_blockers.get('status') or 'unknown'} "
+        f"blockers={summary.get('blockers', 0)} "
+        f"groups={summary.get('groups', 0)} "
+        f"status_counts={json.dumps(summary.get('status_counts', {}), sort_keys=True)} "
+        f"group_status_counts={json.dumps(summary.get('group_status_counts', {}), sort_keys=True)}"
+    )
 
 
 def decode_base64_candidate(value: str) -> bytes | None:
@@ -23085,6 +23176,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
     review_blockers = None if args.skip_review_blockers else load_optional_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT)
     review_blocker_top_groups = top_review_blocker_group_summaries(review_blockers, limit=5)
     suite_status = regression_suite_status(steps, health, strict=args.strict)
+    step_summary = regression_suite_step_summary(steps)
     suite = {
         "generated_at": utc_now(),
         "status": suite_status,
@@ -23114,6 +23206,20 @@ def run_regression_suite(args: argparse.Namespace) -> int:
         },
         "preparation": preparation,
         "steps": steps,
+        "summary": {
+            "steps": step_summary,
+            "artifact_health_status": None if not health else health.get("status"),
+            "artifact_health_security_issues": None
+            if not health
+            else (health.get("summary", {}) or {}).get("security_issue_count", 0),
+            "review_blockers_status": None if not review_blockers else review_blockers.get("status"),
+            "review_blocker_count": None
+            if not review_blockers
+            else (review_blockers.get("summary", {}) or {}).get("blockers", 0),
+            "review_blocker_group_count": None
+            if not review_blockers
+            else (review_blockers.get("summary", {}) or {}).get("groups", 0),
+        },
         "artifact_health": {
             "status": None if not health else health.get("status"),
             "summary": None if not health else health.get("summary"),
@@ -23135,6 +23241,14 @@ def run_regression_suite(args: argparse.Namespace) -> int:
     write_json(artifact_dir / "regression-suite.json", suite)
     artifact_manifest = write_artifact_manifest(artifact_dir, target, command="regression-suite")
     print(f"Regression suite: {suite_status}")
+    print(
+        "Steps: "
+        f"total={step_summary['total']} "
+        f"failed={step_summary['failed']} "
+        f"status_counts={json.dumps(step_summary['status_counts'], sort_keys=True)}"
+    )
+    print(regression_suite_artifact_health_summary_line(health))
+    print(regression_suite_review_blockers_summary_line(review_blockers))
     if review_blocker_top_groups:
         print("Next blocker groups:")
         for group_summary in review_blocker_top_groups:
