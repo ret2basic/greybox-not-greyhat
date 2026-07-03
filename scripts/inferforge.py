@@ -10,11 +10,13 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import contextlib
 from email.utils import parsedate_to_datetime
 import hashlib
 import html
 import http.client
 import inspect
+import io
 import ipaddress
 import json
 import os
@@ -12407,6 +12409,38 @@ def build_review_blockers_selftest() -> dict[str, Any]:
         markdown_path = root / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT
         write_review_blockers_markdown(markdown_path, rollup)
         markdown = read_text(markdown_path)
+        profile_path = root / "profile.json"
+        no_write_output_dir = root / "no-write-output"
+        write_json(profile_path, profile)
+        parser = build_parser()
+        no_write_args = parser.parse_args(
+            [
+                "--profile",
+                str(profile_path),
+                "--artifact-dir",
+                str(no_write_output_dir),
+                "--target",
+                target,
+                "--source-root",
+                str(root),
+                "review-blockers",
+                "--check-dir",
+                str(default_dir),
+                "--check-dir",
+                str(discovered_dir),
+                "--no-write",
+            ]
+        )
+        stdout_buffer = io.StringIO()
+        with contextlib.redirect_stdout(stdout_buffer):
+            no_write_return_code = no_write_args.func(no_write_args)
+        no_write_stdout = stdout_buffer.getvalue()
+        no_write_outputs_exist = {
+            "artifact_dir": no_write_output_dir.exists(),
+            REVIEW_BLOCKERS_ARTIFACT: (no_write_output_dir / REVIEW_BLOCKERS_ARTIFACT).exists(),
+            REVIEW_BLOCKERS_MARKDOWN_ARTIFACT: (no_write_output_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT).exists(),
+            MANIFEST_NAME: (no_write_output_dir / MANIFEST_NAME).exists(),
+        }
 
     single_route_group = review_blocker_group_by_cluster(discovered_blockers, "route-api-proxy-path") or {}
     rollup_route_group = review_blocker_group_by_cluster(rollup, "route-api-proxy-path") or {}
@@ -12530,6 +12564,21 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             "expected": "top summaries start with the highest-priority human-review group",
             "actual": rollup_top_group_summaries,
         },
+        {
+            "id": "cli-no-write-skips-review-blocker-outputs",
+            "passed": (
+                no_write_return_code == 0
+                and "Review blockers: needs-human-review" in no_write_stdout
+                and "No files written (--no-write)." in no_write_stdout
+                and not any(no_write_outputs_exist.values())
+            ),
+            "expected": "review-blockers --no-write prints summary without writing output artifacts or manifests",
+            "actual": {
+                "return_code": no_write_return_code,
+                "stdout": no_write_stdout.splitlines(),
+                "outputs_exist": no_write_outputs_exist,
+            },
+        },
     ]
     failed = [item for item in assertions if not item["passed"]]
     return {
@@ -12564,6 +12613,11 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "top_group_summaries": rollup_top_group_summaries,
                 "quote_group": rollup_quote_group,
                 "readiness_group": rollup_readiness_group,
+            },
+            "no_write": {
+                "return_code": no_write_return_code,
+                "stdout": no_write_stdout.splitlines(),
+                "outputs_exist": no_write_outputs_exist,
             },
         },
         "assertions": assertions,
@@ -19709,8 +19763,10 @@ def run_verification_queue(args: argparse.Namespace) -> int:
 
 def run_review_blockers(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     check_dirs: list[Path] = []
     for item in args.check_dir or []:
         check_dirs.append(resolve_repo_path(item))
@@ -19752,15 +19808,17 @@ def run_review_blockers(args: argparse.Namespace) -> int:
         if args.markdown_output
         else artifact_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT
     )
-    write_json(output_path, review_blockers)
-    write_review_blockers_markdown(markdown_path, review_blockers)
-    refreshed_manifests = refresh_manifests_for_artifact_outputs(
-        output_paths=[output_path, markdown_path],
-        artifact_dir=artifact_dir,
-        check_dirs=deduped_dirs,
-        target=target,
-        command="review-blockers",
-    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, review_blockers)
+        write_review_blockers_markdown(markdown_path, review_blockers)
+        refreshed_manifests = refresh_manifests_for_artifact_outputs(
+            output_paths=[output_path, markdown_path],
+            artifact_dir=artifact_dir,
+            check_dirs=deduped_dirs,
+            target=target,
+            command="review-blockers",
+        )
     print(f"Review blockers: {review_blockers['status']}")
     print(
         "Blockers: "
@@ -19787,10 +19845,13 @@ def run_review_blockers(args: argparse.Namespace) -> int:
                 f"- {blocker.get('id')}: {blocker.get('status')} "
                 f"source={blocker.get('source')} title={blocker.get('title')}"
             )
-    print(f"Wrote {output_path}")
-    print(f"Wrote {markdown_path}")
-    for item in refreshed_manifests:
-        print(f"Refreshed {item['manifest']}: {item['status']}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print(f"Wrote {markdown_path}")
+        for item in refreshed_manifests:
+            print(f"Refreshed {item['manifest']}: {item['status']}")
     if review_blockers["status"] == "failed":
         return 1
     if args.strict and review_blockers["status"] != "ready":
@@ -21430,6 +21491,11 @@ def build_parser() -> argparse.ArgumentParser:
     review_blockers.add_argument(
         "--markdown-output",
         help="Where to write review-blockers.md. Defaults to --artifact-dir/review-blockers.md.",
+    )
+    review_blockers.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print blocker summary only; do not write review-blockers.json, review-blockers.md, or refreshed manifests.",
     )
     review_blockers.add_argument(
         "--strict",

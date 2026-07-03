@@ -516,10 +516,16 @@ python3 scripts/inferforge.py review-blockers
 python3 scripts/inferforge.py review-blockers \
   --check-dir .greybox/regression-default \
   --check-dir .greybox/regression-discovered
+python3 scripts/inferforge.py review-blockers \
+  --check-dir .greybox/regression-default \
+  --check-dir .greybox/regression-discovered \
+  --no-write
 ```
 
 Use `--discover-child-runs` to roll up child artifact directories under
-`.greybox`, and use `--strict` when any remaining blocker should fail a CI job.
+`.greybox`, `--no-write` to print the same grouped summary without writing
+`review-blockers.json`, `review-blockers.md`, or refreshed manifests, and
+`--strict` when any remaining blocker should fail a CI job.
 
 `manifest` writes `.greybox/artifact-manifest.json`, an integrity snapshot with
 SHA256 hashes, sizes, modification timestamps, generated-at timestamps, JSONL row
@@ -558,6 +564,7 @@ python3 scripts/inferforge.py artifact-health \
   --check-dir .greybox/regression-discovered
 
 python3 scripts/inferforge.py artifact-health --discover-child-runs
+python3 scripts/inferforge.py artifact-health --discover-child-runs --no-write
 ```
 
 By default the command returns non-zero only for failed or missing artifact
