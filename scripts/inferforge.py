@@ -11106,6 +11106,22 @@ def review_candidate_command_templates(
     ]
 
 
+def promoted_observation_followup_commands(output_path: Path, artifact_dir: Path | None) -> list[str]:
+    reviewed_profile = repo_relative_or_absolute(output_path)
+    return [
+        verification_command_for_profile(
+            reviewed_profile,
+            artifact_dir,
+            "burp-sync --observe --ws-upgrade --replace --count 80",
+        ),
+        verification_command_for_profile(
+            reviewed_profile,
+            artifact_dir,
+            "audit --include-external --ws-resource-probes",
+        ),
+    ]
+
+
 def contextualize_review_candidates(
     candidates: list[dict[str, Any]],
     clusters: dict[str, Any],
@@ -14836,6 +14852,9 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Promotion preview: review_no_write_candidate" in promote_stdout
                 and "Observation: GET /api/no-write/status cluster=no-write" in promote_stdout
                 and "Profile validation:" in promote_stdout_text
+                and "Next commands:" in promote_stdout
+                and "burp-sync --observe" in promote_stdout_text
+                and "audit --include-external --ws-resource-probes" in promote_stdout_text
                 and "No files written (--no-write)." in promote_stdout
                 and not any(
                     output_paths[key]
@@ -21221,6 +21240,7 @@ def run_promote_observation_candidate(args: argparse.Namespace) -> int:
     )
     clusters = build_clusters(normalized, source_root)
     validation = build_profile_validation_artifact(normalized, clusters, source_root)
+    followup_commands = promoted_observation_followup_commands(output_path, artifact_dir)
     if no_write:
         print(f"Promotion preview: {args.candidate_id}")
         print(f"Observation: {observation['method']} {observation['path']} cluster={observation['cluster']}")
@@ -21228,6 +21248,10 @@ def run_promote_observation_candidate(args: argparse.Namespace) -> int:
         print(f"Output profile: {output_path}")
         if output_path.exists() and not args.force:
             print("Output profile exists; rerun without --no-write requires --force to overwrite it.")
+        if followup_commands:
+            print("Next commands:")
+            for command in followup_commands:
+                print(f"- {command}")
         print("No files written (--no-write).")
         return 0 if validation["status"] != "failed" else 1
 
@@ -21251,6 +21275,10 @@ def run_promote_observation_candidate(args: argparse.Namespace) -> int:
     print(f"Wrote {output_path}")
     print(f"Wrote {artifact_dir / 'reviewed-profile-validation.json'}")
     print(f"Wrote {artifact_dir / 'reviewed-observation-promotion.json'}")
+    if followup_commands:
+        print("Next commands:")
+        for command in followup_commands:
+            print(f"- {command}")
     print_refreshed_manifests(
         refresh_current_artifact_manifest(
             artifact_dir=artifact_dir,
