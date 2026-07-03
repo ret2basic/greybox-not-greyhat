@@ -319,26 +319,28 @@ from chain state.
 
 `collect-quote` is the safe quote-corpus helper. It requests `/api/quote`, saves
 a successful quote response to `.greybox/transaction-payloads.json`, writes
-`.greybox/quote-collection.json`, and immediately refreshes
-`.greybox/transaction-intent.json`. It does not sign transactions or submit them
-to Solana. Non-200 responses are recorded as collection metadata without being
-treated as transaction payloads. The collection artifact includes
+`.greybox/quote-collection.json`, refreshes `.greybox/transaction-intent.json`,
+updates the related evidence/readiness artifacts, and refreshes the managed
+artifact manifest. It does not sign transactions or submit them to Solana.
+Non-200 responses are recorded as collection metadata without being treated as
+transaction payloads. The collection artifact includes
 `diagnosis.classification`, for example `m0-config-missing-or-placeholder` when
 the local M0 key is absent or still set to the template placeholder.
 
 `readiness` writes `.greybox/environment-readiness.json`, combining target
 health, redacted environment configuration state, the last quote collection
-diagnosis, and transaction-corpus status. `self-test-transactions` writes
+diagnosis, and transaction-corpus status, then refreshes the managed artifact
+manifest. `self-test-transactions` writes
 `.greybox/transaction-decoder-selftest.json`; it generates a synthetic local
 Solana versioned transaction to prove the candidate extractor, decoder, and
-intent-policy checks work, but it is not a substitute for a real M0 quote
-corpus.
+intent-policy checks work, but it is not a substitute for a real M0 quote corpus.
 
 `burp-sync` is the preferred automatic Burp loop. It can force Proxy Intercept
 off, optionally run the deterministic `burp-observe` flow, read matching Burp
 Proxy HTTP history directly through Burp MCP, save the raw MCP output to
 `.greybox/burp-mcp-history-latest.txt`, import normalized observations, refresh
-traffic clustering, and write `.greybox/burp-mcp-sync.json`:
+traffic clustering, write `.greybox/burp-mcp-sync.json`, and refresh the managed
+artifact manifest:
 
 ```bash
 python3 scripts/inferforge.py burp-sync --observe --ws-upgrade --replace
@@ -349,8 +351,9 @@ Without `--observe`, `burp-sync` only reads/imports existing Burp history. Use
 it is.
 
 `burp-observe` sends only the deterministic, low-volume observation set through
-Burp Proxy and writes `.greybox/burp-observation-run.json`. It is meant to
-create Burp HTTP history for `/health`, `/api/quote`,
+Burp Proxy, writes `.greybox/burp-observation-run.json`, and refreshes the
+managed artifact manifest. It is meant to create Burp HTTP history for `/health`,
+`/api/quote`,
 `/api/rpc/solana/devnet`, Orca pool validation, and optionally one WebSocket
 upgrade. It does not read Burp history by itself; `burp-sync` or
 `import-burp-history` handles the history import step.
@@ -510,12 +513,15 @@ SHA256 hashes, sizes, modification timestamps, generated-at timestamps, JSONL ro
 counts, key status summaries, and missing-required-artifact checks. `audit`
 generates this manifest as its final write so the manifest covers the rendered
 report and index page. Standalone local refresh commands that rewrite existing
-top-level artifacts, such as `coverage`, `burp-observation-coverage`,
-`response-deltas`, `source-peek-requests`, `evidence-chain`,
-`evidence-appendix`, `verification-queue`, `review-blockers`, `gate`,
-`adjudicate`, `artifact-health`, `profile`, `plan`, `review-candidates`,
-`discover-profile`, and the static `self-test-*` commands, also refresh the
-manifest when their output lands in the managed artifact directory.
+top-level artifacts, such as `profile`, `plan`, `collect`, `burp-observe`,
+`burp-sync`, `import-burp-history`, `coverage`, `burp-observation-coverage`,
+`discovery-coverage`, `response-deltas`, `source-peek-requests`,
+`evidence-chain`, `evidence-appendix`, `verification-queue`, `review-blockers`,
+`gate`, `adjudicate`, `artifact-health`, `review-candidates`,
+`promote-observation-candidate`, `discover-profile`, `capabilities`,
+`readiness`, `decode-transactions`, `collect-quote`, `collect-orca-baseline`,
+and the static `self-test-*` commands, also refresh the manifest when their
+output lands in the managed artifact directory.
 
 `artifact-health` writes `.greybox/artifact-health.json`, a local health summary
 over one or more artifact directories. It parses every top-level JSON and JSONL
@@ -595,8 +601,8 @@ During import, InferForge also scans full raw Burp response bodies for
 `.greybox/burp-transaction-candidates.json`, and refreshes
 `.greybox/transaction-intent.json`. This lets a successful quote captured by
 Burp's built-in browser feed the transaction intent decoder without copying
-payloads by hand. The decoder remains inspect-only: it does not sign or submit
-transactions.
+payloads by hand. It also refreshes the managed artifact manifest. The decoder
+remains inspect-only: it does not sign or submit transactions.
 
 Pipe raw MCP output directly when convenient:
 

@@ -3390,6 +3390,14 @@ def write_target_profile_artifact(
     return doc
 
 
+def target_profile_artifact_paths(artifact_dir: Path) -> list[Path]:
+    return [
+        artifact_dir / TARGET_PROFILE_ARTIFACT,
+        artifact_dir / STRATEGY_REGISTRY_ARTIFACT,
+        artifact_dir / PROFILE_VALIDATION_ARTIFACT,
+    ]
+
+
 def redact_text(value: str | None, *, max_chars: int = 500) -> str | None:
     if value is None:
         return None
@@ -15713,6 +15721,19 @@ def run_collect(args: argparse.Namespace) -> int:
 
     print(f"Collected {len(burp_history)} Burp history observations")
     print(f"Selected clusters: {', '.join(selection['selected_cluster_ids']) or '(none)'}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="collect",
+            output_paths=[
+                *target_profile_artifact_paths(artifact_dir),
+                artifact_dir / "endpoint-clusters.json",
+                artifact_dir / "traffic-index.json",
+                artifact_dir / "collection-summary.json",
+            ],
+        )
+    )
     return 0
 
 
@@ -15734,8 +15755,9 @@ def run_burp_observe(args: argparse.Namespace) -> int:
     try:
         observation_plan = build_burp_observation_plan(target, profile)
     except ValueError as error:
+        output_path = artifact_dir / "burp-observation-run.json"
         write_json(
-            artifact_dir / "burp-observation-run.json",
+            output_path,
             {
                 "generated_at": utc_now(),
                 "status": "blocked-profile-validation",
@@ -15749,7 +15771,18 @@ def run_burp_observe(args: argparse.Namespace) -> int:
             },
         )
         print(f"Burp observation blocked by profile validation: {error}")
-        print(f"Wrote {artifact_dir / 'burp-observation-run.json'}")
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="burp-observe",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    output_path,
+                ],
+            )
+        )
         return 2
     try:
         with TargetProbeLock(target, purpose="burp-observe"):
@@ -15796,8 +15829,9 @@ def run_burp_observe(args: argparse.Namespace) -> int:
                     else ws_observation.get("status") in set(ws_observation.get("expected_statuses", []))
                 )
     except RuntimeError as error:
+        output_path = artifact_dir / "target-probe-lock.json"
         write_json(
-            artifact_dir / "target-probe-lock.json",
+            output_path,
             {
                 "generated_at": utc_now(),
                 "status": "blocked",
@@ -15807,7 +15841,18 @@ def run_burp_observe(args: argparse.Namespace) -> int:
             },
         )
         print(f"Target probe lock blocked burp-observe: {error}")
-        print(f"Wrote {artifact_dir / 'target-probe-lock.json'}")
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="burp-observe",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    output_path,
+                ],
+            )
+        )
         return 2
 
     all_items = requests + ([ws_observation] if ws_observation else [])
@@ -15843,7 +15888,8 @@ def run_burp_observe(args: argparse.Namespace) -> int:
             "import_command": "python3 scripts/inferforge.py burp-sync --replace",
         },
     }
-    write_json(artifact_dir / "burp-observation-run.json", artifact)
+    output_path = artifact_dir / "burp-observation-run.json"
+    write_json(output_path, artifact)
 
     print(f"Burp proxy open: {proxy_open}")
     for item in all_items:
@@ -15851,8 +15897,19 @@ def run_burp_observe(args: argparse.Namespace) -> int:
             f"{item.get('id')} {item.get('method')} {item.get('path')} -> "
             f"{item.get('status')} ({'ok' if item.get('expected') else 'unexpected'})"
         )
-    print(f"Wrote {artifact_dir / 'burp-observation-run.json'}")
+    print(f"Wrote {output_path}")
     print(f"History regex: {history_regex}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="burp-observe",
+            output_paths=[
+                *target_profile_artifact_paths(artifact_dir),
+                output_path,
+            ],
+        )
+    )
     return 0 if proxy_open and not unexpected else 1
 
 
@@ -15962,6 +16019,14 @@ def run_import_burp_history(args: argparse.Namespace) -> int:
 
     if not inputs:
         print("No Burp MCP history input provided; pass --input PATH or pipe raw MCP output on stdin")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="import-burp-history",
+                output_paths=target_profile_artifact_paths(artifact_dir),
+            )
+        )
         return 2
 
     summary = import_burp_history_inputs(
@@ -15986,6 +16051,22 @@ def run_import_burp_history(args: argparse.Namespace) -> int:
         f"{summary['decoded_transactions']} decoded"
     )
     print(f"Selected clusters: {', '.join(summary['selection']['selected_cluster_ids']) or '(none)'}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="import-burp-history",
+            output_paths=[
+                *target_profile_artifact_paths(artifact_dir),
+                artifact_dir / "burp-history-observations.jsonl",
+                artifact_dir / "burp-transaction-candidates.json",
+                artifact_dir / "endpoint-clusters.json",
+                artifact_dir / "traffic-index.json",
+                artifact_dir / "transaction-intent.json",
+                artifact_dir / "collection-summary.json",
+            ],
+        )
+    )
     return 0
 
 
@@ -17426,7 +17507,48 @@ def run_burp_sync(args: argparse.Namespace) -> int:
         if observe_result != 0:
             return observe_result
 
-    observation_plan = build_burp_observation_plan(target, profile)
+    try:
+        observation_plan = build_burp_observation_plan(target, profile)
+    except ValueError as error:
+        sync_path = artifact_dir / "burp-mcp-sync.json"
+        write_json(
+            sync_path,
+            {
+                "generated_at": utc_now(),
+                "status": "blocked-profile-validation",
+                "profile": profile_summary(profile),
+                "target": target,
+                "mcp_url": args.mcp_url,
+                "history_regex": None,
+                "http_history": None,
+                "websocket_history": None,
+                "intercept": {
+                    "requested_off": False,
+                    "ok": None,
+                    "error": None,
+                },
+                "observe_before_sync": bool(args.observe),
+                "error": str(error),
+                "safety": [
+                    "No Burp MCP history was read because the active Burp observation plan is not a reviewed concrete local path set.",
+                    "Does not run Burp Scanner, sign wallets, submit Solana transactions, or fuzz broadly.",
+                ],
+            },
+        )
+        print(f"Burp MCP sync blocked by profile validation: {error}")
+        print(f"Wrote {sync_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="burp-sync",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    sync_path,
+                ],
+            )
+        )
+        return 2
     observation_artifact_path = artifact_dir / "burp-observation-run.json"
     observed_ws_upgrade = False
     if observation_artifact_path.exists():
@@ -17512,8 +17634,20 @@ def run_burp_sync(args: argparse.Namespace) -> int:
     except Exception as error:
         sync_artifact["status"] = "failed"
         sync_artifact["error"] = str(error)
-        write_json(artifact_dir / "burp-mcp-sync.json", sync_artifact)
+        sync_path = artifact_dir / "burp-mcp-sync.json"
+        write_json(sync_path, sync_artifact)
         print(f"Burp MCP sync failed: {error}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="burp-sync",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    sync_path,
+                ],
+            )
+        )
         return 1
 
     try:
@@ -17533,13 +17667,27 @@ def run_burp_sync(args: argparse.Namespace) -> int:
         sync_artifact["status"] = "failed-import"
         sync_artifact["error"] = str(error)
         sync_artifact["http_history"]["bytes"] = len(raw_text.encode("utf-8"))
-        write_json(artifact_dir / "burp-mcp-sync.json", sync_artifact)
+        sync_path = artifact_dir / "burp-mcp-sync.json"
+        write_json(sync_path, sync_artifact)
         print(f"Burp MCP history import failed: {error}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="burp-sync",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    raw_path,
+                    sync_path,
+                ],
+            )
+        )
         return 1
     sync_artifact["status"] = "synced"
     sync_artifact["http_history"]["bytes"] = len(raw_text.encode("utf-8"))
     sync_artifact["import"] = import_summary
-    write_json(artifact_dir / "burp-mcp-sync.json", sync_artifact)
+    sync_path = artifact_dir / "burp-mcp-sync.json"
+    write_json(sync_path, sync_artifact)
 
     print(f"Burp MCP sync: synced via {args.mcp_url}")
     print(f"Raw HTTP history: {raw_path}")
@@ -17548,6 +17696,25 @@ def run_burp_sync(args: argparse.Namespace) -> int:
     selection = import_summary["selection"]
     print(f"Observed clusters: {', '.join(selection['observed_cluster_ids']) or '(none)'}")
     print(f"Source-assisted selected clusters: {', '.join(selection['selected_cluster_ids']) or '(none)'}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="burp-sync",
+            output_paths=[
+                *target_profile_artifact_paths(artifact_dir),
+                raw_path,
+                ws_raw_path,
+                artifact_dir / "burp-history-observations.jsonl",
+                artifact_dir / "burp-transaction-candidates.json",
+                artifact_dir / "endpoint-clusters.json",
+                artifact_dir / "traffic-index.json",
+                artifact_dir / "transaction-intent.json",
+                artifact_dir / "collection-summary.json",
+                sync_path,
+            ],
+        )
+    )
     return 0
 
 
@@ -17744,6 +17911,18 @@ def run_discovery_coverage(args: argparse.Namespace) -> int:
     )
     print(f"Route inventory: {route_inventory_path}")
     print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="discovery-coverage",
+            output_paths=[
+                *target_profile_artifact_paths(artifact_dir),
+                route_inventory_path,
+                output_path,
+            ],
+        )
+    )
 
     if coverage["status"] in {"uncovered", "profile-error", "missing-route-inventory", "failed", "no-surfaces"}:
         return 1
@@ -18672,6 +18851,18 @@ def run_promote_observation_candidate(args: argparse.Namespace) -> int:
     print(f"Wrote {output_path}")
     print(f"Wrote {artifact_dir / 'reviewed-profile-validation.json'}")
     print(f"Wrote {artifact_dir / 'reviewed-observation-promotion.json'}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="promote-observation-candidate",
+            output_paths=[
+                output_path,
+                artifact_dir / "reviewed-profile-validation.json",
+                artifact_dir / "reviewed-observation-promotion.json",
+            ],
+        )
+    )
     return 0 if validation["status"] != "failed" else 1
 
 
@@ -18801,8 +18992,20 @@ def run_capabilities(args: argparse.Namespace) -> int:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     write_target_profile_artifact(artifact_dir, profile, target, source_root)
     capabilities = build_capabilities(target, artifact_dir, profile)
-    write_json(artifact_dir / "burp-capabilities.json", capabilities)
+    output_path = artifact_dir / "burp-capabilities.json"
+    write_json(output_path, capabilities)
     print(json.dumps(capabilities, indent=2))
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="capabilities",
+            output_paths=[
+                *target_profile_artifact_paths(artifact_dir),
+                output_path,
+            ],
+        )
+    )
     return 0 if capabilities["target"]["reachable"] and capabilities["burp"]["mcp_port_open"] else 1
 
 
@@ -18823,9 +19026,23 @@ def run_readiness(args: argparse.Namespace) -> int:
         quote_collection=quote_collection,
         transaction_intent=transaction_intent,
     )
-    write_json(artifact_dir / "burp-capabilities.json", capabilities)
-    write_json(artifact_dir / "environment-readiness.json", readiness)
+    capabilities_path = artifact_dir / "burp-capabilities.json"
+    readiness_path = artifact_dir / "environment-readiness.json"
+    write_json(capabilities_path, capabilities)
+    write_json(readiness_path, readiness)
     print(json.dumps(readiness, indent=2))
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="readiness",
+            output_paths=[
+                *target_profile_artifact_paths(artifact_dir),
+                capabilities_path,
+                readiness_path,
+            ],
+        )
+    )
     return 0 if readiness["status"] == "ready" else 1
 
 
@@ -18848,12 +19065,25 @@ def run_decode_transactions(args: argparse.Namespace) -> int:
         intent_amount_in=args.intent_amount_in,
         intent_allowed_programs=args.intent_allowed_program or None,
     )
-    write_json(artifact_dir / "transaction-intent.json", transaction_intent)
-    print(f"Wrote {artifact_dir / 'transaction-intent.json'}")
+    output_path = artifact_dir / "transaction-intent.json"
+    write_json(output_path, transaction_intent)
+    print(f"Wrote {output_path}")
     print(
         "Transactions: "
         f"{transaction_intent['candidates_seen']} candidates, "
         f"{transaction_intent['decoded_transactions']} decoded"
+    )
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="decode-transactions",
+            output_paths=[
+                *target_profile_artifact_paths(artifact_dir),
+                artifact_dir / "burp-transaction-candidates.json",
+                output_path,
+            ],
+        )
     )
     return 0
 
@@ -18993,8 +19223,9 @@ def run_collect_quote(args: argparse.Namespace) -> int:
                 timeout=30,
             )
     except RuntimeError as error:
+        lock_path = artifact_dir / "target-probe-lock.json"
         write_json(
-            artifact_dir / "target-probe-lock.json",
+            lock_path,
             {
                 "generated_at": utc_now(),
                 "status": "blocked",
@@ -19004,7 +19235,20 @@ def run_collect_quote(args: argparse.Namespace) -> int:
             },
         )
         print(f"Target probe lock blocked collect-quote: {error}")
-        print(f"Wrote {artifact_dir / 'target-probe-lock.json'}")
+        print(f"Wrote {lock_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="collect-quote",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    artifact_dir / "burp-transaction-candidates.json",
+                    artifact_dir / "transaction-intent-policy.json",
+                    lock_path,
+                ],
+            )
+        )
         return 2
 
     saved_payload = None
@@ -19110,6 +19354,27 @@ def run_collect_quote(args: argparse.Namespace) -> int:
     print(f"Decoder self-test: {transaction_decoder_selftest['status']}")
     print(f"Readiness: {environment_readiness['status']}")
     print(f"Evidence gaps: {len(evidence_gaps['gaps'])}")
+    output_paths = [
+        *target_profile_artifact_paths(artifact_dir),
+        artifact_dir / "burp-transaction-candidates.json",
+        artifact_dir / "transaction-intent-policy.json",
+        artifact_dir / "quote-collection.json",
+        artifact_dir / "transaction-intent.json",
+        artifact_dir / "evidence-gaps.json",
+        artifact_dir / "transaction-decoder-selftest.json",
+        artifact_dir / "burp-capabilities.json",
+        artifact_dir / "environment-readiness.json",
+    ]
+    if saved_payload:
+        output_paths.append(output_path)
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="collect-quote",
+            output_paths=output_paths,
+        )
+    )
     return 0
 
 
@@ -19128,8 +19393,9 @@ def run_collect_orca_baseline(args: argparse.Namespace) -> int:
                 profile=profile,
             )
     except RuntimeError as error:
+        lock_path = artifact_dir / "target-probe-lock.json"
         write_json(
-            artifact_dir / "target-probe-lock.json",
+            lock_path,
             {
                 "generated_at": utc_now(),
                 "status": "blocked",
@@ -19139,7 +19405,18 @@ def run_collect_orca_baseline(args: argparse.Namespace) -> int:
             },
         )
         print(f"Target probe lock blocked collect-orca-baseline: {error}")
-        print(f"Wrote {artifact_dir / 'target-probe-lock.json'}")
+        print(f"Wrote {lock_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="collect-orca-baseline",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    lock_path,
+                ],
+            )
+        )
         return 2
     write_json(artifact_dir / "orca-baseline.json", baseline)
 
@@ -19179,6 +19456,18 @@ def run_collect_orca_baseline(args: argparse.Namespace) -> int:
     print(f"Address: {request.get('address')}")
     print(f"Wrote {artifact_dir / 'orca-baseline.json'}")
     print(f"Evidence gaps: {len(evidence_gaps['gaps'])}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="collect-orca-baseline",
+            output_paths=[
+                *target_profile_artifact_paths(artifact_dir),
+                artifact_dir / "orca-baseline.json",
+                artifact_dir / "evidence-gaps.json",
+            ],
+        )
+    )
     return 0 if baseline.get("success") else 1
 
 
