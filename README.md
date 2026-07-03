@@ -152,7 +152,14 @@ This keeps `infrafi-web` as a regression target instead of hardcoding its
 Review-only candidates can be promoted without hand-editing JSON:
 
 ```bash
-python3 scripts/inferforge.py --profile .greybox/discovered-profile.json review-candidates
+python3 scripts/inferforge.py --profile .greybox/discovered-profile.json review-candidates --no-write
+
+python3 scripts/inferforge.py \
+  --profile .greybox/discovered-profile.json \
+  promote-observation-candidate \
+  --candidate-id review_observe_route_api_infrafi_path_approved_path \
+  --path /api/infrafi/status \
+  --no-write
 
 python3 scripts/inferforge.py \
   --profile .greybox/discovered-profile.json \
@@ -165,8 +172,9 @@ python3 scripts/inferforge.py \
 The `--path` value must be a concrete local path that matches the candidate
 template; replace the example with the actual approved read-only path. Full
 URLs, placeholders, braces, angle brackets, whitespace, and non-matching
-prefixes are rejected. Use the reviewed profile with `burp-sync --observe` only
-after the path has been approved.
+prefixes are rejected. Use `--no-write` to validate the path and preview the
+promoted observation before writing profile artifacts. Use the reviewed profile
+with `burp-sync --observe` only after the path has been approved.
 
 When a rewrite observation gap is present, `verification-queue` also emits the
 same promotion sequence as manual-review command templates:

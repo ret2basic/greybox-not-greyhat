@@ -14679,6 +14679,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         capabilities_output_dir = root / "capabilities-output"
         readiness_output_dir = root / "readiness-output"
         verification_queue_output_dir = root / "verification-queue-output"
+        promote_output_dir = root / "promote-output"
 
         original_build_capabilities = globals()["build_capabilities"]
         try:
@@ -14739,6 +14740,24 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--no-write",
                 ]
             )
+            promote_return_code, promote_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(promote_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "promote-observation-candidate",
+                    "--candidate-id",
+                    "review_no_write_candidate",
+                    "--path",
+                    "/api/no-write/status",
+                    "--no-write",
+                ]
+            )
         finally:
             globals()["build_capabilities"] = original_build_capabilities
 
@@ -14763,10 +14782,16 @@ def build_no_write_selftest() -> dict[str, Any]:
                 verification_queue_output_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT
             ).exists(),
             "verification_queue_manifest": (verification_queue_output_dir / MANIFEST_NAME).exists(),
+            "promote_dir": promote_output_dir.exists(),
+            "promote_reviewed_profile": (promote_output_dir / "reviewed-profile.json").exists(),
+            "promote_validation": (promote_output_dir / "reviewed-profile-validation.json").exists(),
+            "promote_artifact": (promote_output_dir / "reviewed-observation-promotion.json").exists(),
+            "promote_manifest": (promote_output_dir / MANIFEST_NAME).exists(),
         }
 
     review_candidates_stdout_text = "\n".join(review_candidates_stdout)
     verification_queue_stdout_text = "\n".join(verification_queue_stdout)
+    promote_stdout_text = "\n".join(promote_stdout)
     assertions = [
         {
             "id": "review-candidates-no-write-skips-artifacts",
@@ -14801,6 +14826,33 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": review_candidates_return_code,
                 "stdout": review_candidates_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "promote-observation-candidate-no-write-skips-artifacts",
+            "passed": (
+                promote_return_code == 0
+                and "Promotion preview: review_no_write_candidate" in promote_stdout
+                and "Observation: GET /api/no-write/status cluster=no-write" in promote_stdout
+                and "Profile validation:" in promote_stdout_text
+                and "No files written (--no-write)." in promote_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "promote_dir",
+                        "promote_reviewed_profile",
+                        "promote_validation",
+                        "promote_artifact",
+                        "promote_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in promote_stdout)
+            ),
+            "expected": "promote-observation-candidate --no-write validates a concrete path without writing artifacts or manifests",
+            "actual": {
+                "return_code": promote_return_code,
+                "stdout": promote_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -21139,9 +21191,11 @@ def run_review_candidates(args: argparse.Namespace) -> int:
 
 def run_promote_observation_candidate(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
     output_path = Path(args.output).resolve() if args.output else artifact_dir / "reviewed-profile.json"
-    if output_path.exists() and not args.force:
+    if not no_write and output_path.exists() and not args.force:
         print(f"Refusing to overwrite existing profile without --force: {output_path}")
         return 2
     expected_statuses = [int(value) for value in args.expected_status] if args.expected_status else None
@@ -21159,10 +21213,24 @@ def run_promote_observation_candidate(args: argparse.Namespace) -> int:
         print(f"Could not promote candidate: {error}")
         return 2
 
-    write_json(output_path, promoted_profile)
-    normalized = normalize_target_profile(promoted_profile, profile_path=output_path)
+    if not no_write:
+        write_json(output_path, promoted_profile)
+    normalized = normalize_target_profile(
+        promoted_profile,
+        profile_path=output_path if output_path.exists() else None,
+    )
     clusters = build_clusters(normalized, source_root)
     validation = build_profile_validation_artifact(normalized, clusters, source_root)
+    if no_write:
+        print(f"Promotion preview: {args.candidate_id}")
+        print(f"Observation: {observation['method']} {observation['path']} cluster={observation['cluster']}")
+        print(f"Profile validation: {validation['status']}")
+        print(f"Output profile: {output_path}")
+        if output_path.exists() and not args.force:
+            print("Output profile exists; rerun without --no-write requires --force to overwrite it.")
+        print("No files written (--no-write).")
+        return 0 if validation["status"] != "failed" else 1
+
     write_json(artifact_dir / "reviewed-profile-validation.json", validation)
     write_json(
         artifact_dir / "reviewed-observation-promotion.json",
@@ -21930,6 +21998,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allowed response status for the promoted observation. Repeat as needed.",
     )
     promote_candidate.add_argument("--note", help="Short review note to store with the promoted observation")
+    promote_candidate.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Validate and preview the promoted observation without writing reviewed profile artifacts or refreshed manifests.",
+    )
     promote_candidate.set_defaults(func=run_promote_observation_candidate)
 
     discover_profile = sub.add_parser(
