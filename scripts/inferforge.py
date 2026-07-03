@@ -14638,6 +14638,15 @@ def mcp_action_audit_security_issues(parsed_json_by_name: dict[str, Any]) -> lis
         issues.extend(mcp_tool_inventory_security_issues_in_value(doc, file_name=file_name))
         if file_name == "burp-mcp-sync.json":
             issues.extend(burp_sync_error_security_issues(doc, file_name=file_name))
+        if file_name == "burp-observation-run.json":
+            issues.extend(
+                redacted_error_field_security_issues(
+                    doc.get("error"),
+                    file_name=file_name,
+                    path="$.error",
+                    reason_prefix="burp-observation-run-error",
+                )
+            )
         if file_name == "regression-suite.json":
             issues.extend(regression_suite_output_security_issues(doc, file_name=file_name))
         if file_name == "warmup-results.json":
@@ -15117,6 +15126,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         probe_body_text_leak_dir = root / "probe-body-text-leak"
         target_lock_error_leak_dir = root / "target-lock-error-leak"
         raw_history_leak_dir = root / "raw-history-leak"
+        observation_error_leak_dir = root / "observation-error-leak"
         refresh_dir = root / "refresh"
         derived_dir = root / "derived"
         for directory in [healthy_dir, modified_dir, missing_dir, untracked_dir]:
@@ -15250,6 +15260,18 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         )
         write_minimal_manifest(raw_history_leak_dir, ["burp-mcp-history-latest.txt"])
 
+        observation_error_leak_dir.mkdir(parents=True)
+        write_json(
+            observation_error_leak_dir / "burp-observation-run.json",
+            {
+                "generated_at": utc_now(),
+                "status": "blocked-profile-validation",
+                "error": "Observation profile raw error should-not-appear",
+                "requests": [],
+            },
+        )
+        write_minimal_manifest(observation_error_leak_dir, ["burp-observation-run.json"])
+
         healthy = build_single_artifact_health(healthy_dir)
         modified = build_single_artifact_health(modified_dir)
         missing = build_single_artifact_health(missing_dir)
@@ -15265,6 +15287,8 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         target_lock_error_leak_text = json.dumps(target_lock_error_leak, sort_keys=True)
         raw_history_leak = build_single_artifact_health(raw_history_leak_dir)
         raw_history_leak_text = json.dumps(raw_history_leak, sort_keys=True)
+        observation_error_leak = build_single_artifact_health(observation_error_leak_dir)
+        observation_error_leak_text = json.dumps(observation_error_leak, sort_keys=True)
         sanitized_probe_artifact_sample = sanitize_probe_result_for_artifact(
             {
                 "probe_id": "sanitize-sample",
@@ -15546,6 +15570,22 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "artifact-health-detects-burp-observation-error-leaks",
+            "passed": (
+                observation_error_leak.get("status") == "failed"
+                and {
+                    "burp-observation-run-error-raw-string",
+                }.issubset({str(issue.get("reason")) for issue in observation_error_leak.get("security_issues", []) or []})
+                and "should-not-appear" not in observation_error_leak_text
+                and "Observation profile raw error" not in observation_error_leak_text
+            ),
+            "expected": "artifact-health fails when burp-observation-run artifacts contain raw error strings without echoing leaked values",
+            "actual": {
+                "status": observation_error_leak.get("status"),
+                "security_issues": observation_error_leak.get("security_issues"),
+            },
+        },
+        {
             "id": "artifact-health-output-refreshes-manifest",
             "passed": (
                 refresh_stale_before.get("status") == "failed"
@@ -15689,6 +15729,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "probe_body_text_leak": probe_body_text_leak,
             "target_lock_error_leak": target_lock_error_leak,
             "raw_history_leak": raw_history_leak,
+            "observation_error_leak": observation_error_leak,
             "aggregate": aggregate,
             "refresh_stale_before": refresh_stale_before,
             "refreshed_health": refreshed_health,
@@ -20140,7 +20181,7 @@ def run_burp_observe(args: argparse.Namespace) -> int:
                 "status": "blocked-profile-validation",
                 "profile": profile_summary(profile),
                 "target": target,
-                "error": str(error),
+                "error": redacted_error_summary(error),
                 "requests": [],
                 "websocket_upgrade": None,
                 "summary": {"total": 0, "unexpected": 0, "clusters": []},
