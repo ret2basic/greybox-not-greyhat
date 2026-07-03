@@ -11750,6 +11750,69 @@ def format_review_candidate_cli_lines(candidate: dict[str, Any]) -> list[str]:
     return lines
 
 
+def verification_queue_item_status_rank(status: str) -> int:
+    return {
+        "manual-review": 0,
+        "blocked": 0,
+        "blocked-external": 1,
+        "ready": 2,
+    }.get(status, 9)
+
+
+def verification_queue_item_priority_rank(priority: str) -> int:
+    return {"high": 0, "medium": 1, "low": 2}.get(priority, 9)
+
+
+def format_verification_queue_item_summary(item: dict[str, Any]) -> str:
+    parts = [
+        f"{item.get('id') or 'ITEM-unknown'}:",
+        str(item.get("status") or "unknown"),
+        f"priority={item.get('priority') or 'unknown'}",
+    ]
+    if item.get("cluster_id"):
+        parts.append(f"cluster={item.get('cluster_id')}")
+    review_candidate_ids = [
+        str(candidate.get("id"))
+        for candidate in item.get("review_candidates", []) or []
+        if isinstance(candidate, dict) and candidate.get("id")
+    ]
+    if review_candidate_ids:
+        suffix = "" if len(review_candidate_ids) <= 3 else f",+{len(review_candidate_ids) - 3}"
+        parts.append(f"candidates={','.join(review_candidate_ids[:3])}{suffix}")
+    commands = item.get("commands", []) or []
+    if commands:
+        parts.append(f"commands={len(commands)}")
+    command_safety = (item.get("command_safety", {}) or {}).get("summary", {}) or {}
+    if command_safety:
+        parts.append(
+            "command_safety="
+            f"runnable={command_safety.get('runnable', 0)},"
+            f"manual={command_safety.get('requires_manual_input', 0)},"
+            f"external={command_safety.get('blocked_external', 0)},"
+            f"unsafe={command_safety.get('unsafe_template_count', 0)}"
+        )
+    title = inline_summary_text(item.get("title") or "", max_chars=120)
+    if title:
+        parts.append(f"title={title}")
+    return " ".join(parts)
+
+
+def top_verification_queue_item_summaries(
+    verification_queue: dict[str, Any],
+    *,
+    limit: int = 8,
+) -> list[str]:
+    ranked_items = sorted(
+        enumerate(verification_queue.get("items", []) or []),
+        key=lambda row: (
+            verification_queue_item_status_rank(str(row[1].get("status") or "")),
+            verification_queue_item_priority_rank(str(row[1].get("priority") or "")),
+            row[0],
+        ),
+    )
+    return [format_verification_queue_item_summary(item) for _, item in ranked_items[:limit]]
+
+
 def merge_review_candidate_summary(existing: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     incoming = compact_review_candidate(candidate)
     for field in ["id", "cluster", "type", "status", "method", "path_template", "example_path"]:
@@ -14622,6 +14685,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         review_candidates_output_dir = root / "review-candidates-output"
         capabilities_output_dir = root / "capabilities-output"
         readiness_output_dir = root / "readiness-output"
+        verification_queue_output_dir = root / "verification-queue-output"
 
         original_build_capabilities = globals()["build_capabilities"]
         try:
@@ -14668,6 +14732,20 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--no-write",
                 ]
             )
+            verification_queue_return_code, verification_queue_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(verification_queue_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "verification-queue",
+                    "--no-write",
+                ]
+            )
         finally:
             globals()["build_capabilities"] = original_build_capabilities
 
@@ -14683,9 +14761,19 @@ def build_no_write_selftest() -> dict[str, Any]:
             "readiness_capabilities_json": (readiness_output_dir / "burp-capabilities.json").exists(),
             "readiness_json": (readiness_output_dir / "environment-readiness.json").exists(),
             "readiness_manifest": (readiness_output_dir / MANIFEST_NAME).exists(),
+            "verification_queue_dir": verification_queue_output_dir.exists(),
+            "verification_queue_target_profile_json": (verification_queue_output_dir / TARGET_PROFILE_ARTIFACT).exists(),
+            "verification_queue_json": (verification_queue_output_dir / "verification-queue.json").exists(),
+            "verification_queue_reproduction_steps": (verification_queue_output_dir / "reproduction-steps.md").exists(),
+            "verification_queue_review_blockers": (verification_queue_output_dir / REVIEW_BLOCKERS_ARTIFACT).exists(),
+            "verification_queue_review_blockers_markdown": (
+                verification_queue_output_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT
+            ).exists(),
+            "verification_queue_manifest": (verification_queue_output_dir / MANIFEST_NAME).exists(),
         }
 
     review_candidates_stdout_text = "\n".join(review_candidates_stdout)
+    verification_queue_stdout_text = "\n".join(verification_queue_stdout)
     assertions = [
         {
             "id": "review-candidates-no-write-skips-artifacts",
@@ -14719,6 +14807,35 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": review_candidates_return_code,
                 "stdout": review_candidates_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "verification-queue-no-write-skips-artifacts",
+            "passed": (
+                verification_queue_return_code == 0
+                and "Verification queue: ready" in verification_queue_stdout
+                and "Items: 4 total" in verification_queue_stdout_text
+                and "Queue items:" in verification_queue_stdout
+                and "No files written (--no-write)." in verification_queue_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "verification_queue_dir",
+                        "verification_queue_target_profile_json",
+                        "verification_queue_json",
+                        "verification_queue_reproduction_steps",
+                        "verification_queue_review_blockers",
+                        "verification_queue_review_blockers_markdown",
+                        "verification_queue_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in verification_queue_stdout)
+            ),
+            "expected": "verification-queue --no-write prints queue summary without writing artifacts or manifests",
+            "actual": {
+                "return_code": verification_queue_return_code,
+                "stdout": verification_queue_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -20218,8 +20335,10 @@ def run_report(args: argparse.Namespace) -> int:
 
 def run_verification_queue(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     clusters_path = artifact_dir / "endpoint-clusters.json"
     clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
     verification_queue = build_verification_queue(
@@ -20237,8 +20356,6 @@ def run_verification_queue(args: argparse.Namespace) -> int:
     reproduction_steps_path = artifact_dir / "reproduction-steps.md"
     review_blockers_path = artifact_dir / REVIEW_BLOCKERS_ARTIFACT
     review_blockers_markdown_path = artifact_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT
-    write_json(verification_queue_path, verification_queue)
-    write_reproduction_steps(artifact_dir, verification_queue)
     review_blockers = build_review_blockers(
         target=target,
         profile=profile,
@@ -20249,24 +20366,13 @@ def run_verification_queue(args: argparse.Namespace) -> int:
         source_peek_requests=load_optional_json(artifact_dir / "source-peek-requests.json"),
         environment_readiness=load_optional_json(artifact_dir / "environment-readiness.json"),
     )
-    write_json(review_blockers_path, review_blockers)
-    write_review_blockers_markdown(review_blockers_markdown_path, review_blockers)
-    print(f"Verification queue: {verification_queue['status']}")
-    print(
-        "Items: "
-        f"{verification_queue['summary']['items']} total, "
-        f"status_counts={json.dumps(verification_queue['summary']['status_counts'], sort_keys=True)}"
-    )
-    print(
-        "Command safety: "
-        f"{format_command_safety_summary(verification_queue['summary'].get('command_safety', {}) or {})}"
-    )
-    print(f"Wrote {verification_queue_path}")
-    print(f"Wrote {reproduction_steps_path}")
-    print(f"Wrote {review_blockers_path}")
-    print(f"Wrote {review_blockers_markdown_path}")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
+    refreshed_manifests = []
+    if not no_write:
+        write_json(verification_queue_path, verification_queue)
+        write_reproduction_steps(artifact_dir, verification_queue)
+        write_json(review_blockers_path, review_blockers)
+        write_review_blockers_markdown(review_blockers_markdown_path, review_blockers)
+        refreshed_manifests = refresh_current_artifact_manifest(
             artifact_dir=artifact_dir,
             target=target,
             command="verification-queue",
@@ -20277,7 +20383,35 @@ def run_verification_queue(args: argparse.Namespace) -> int:
                 review_blockers_markdown_path,
             ],
         )
+    print(f"Verification queue: {verification_queue['status']}")
+    print(
+        "Items: "
+        f"{verification_queue['summary']['items']} total, "
+        f"status_counts={json.dumps(verification_queue['summary']['status_counts'], sort_keys=True)}"
     )
+    print(
+        "Command safety: "
+        f"{format_command_safety_summary(verification_queue['summary'].get('command_safety', {}) or {})}"
+    )
+    item_summaries = top_verification_queue_item_summaries(verification_queue)
+    if item_summaries:
+        print("Queue items:")
+        for item_summary in item_summaries:
+            print(f"- {item_summary}")
+        total_items = len(verification_queue.get("items", []) or [])
+        if total_items > len(item_summaries):
+            if no_write:
+                print(f"- {total_items - len(item_summaries)} more item(s); rerun without --no-write to write reproduction steps")
+            else:
+                print(f"- {total_items - len(item_summaries)} more item(s) in {reproduction_steps_path}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {verification_queue_path}")
+        print(f"Wrote {reproduction_steps_path}")
+        print(f"Wrote {review_blockers_path}")
+        print(f"Wrote {review_blockers_markdown_path}")
+        print_refreshed_manifests(refreshed_manifests)
     return verification_queue_exit_code(verification_queue)
 
 
@@ -22074,6 +22208,11 @@ def build_parser() -> argparse.ArgumentParser:
     verification_queue = sub.add_parser(
         "verification-queue",
         help="Recompute verification queue and reproduction steps from current artifacts",
+    )
+    verification_queue.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print queue summary only; do not write verification-queue.json, reproduction steps, review blockers, or refreshed manifests.",
     )
     verification_queue.set_defaults(func=run_verification_queue)
 
