@@ -14803,6 +14803,10 @@ def build_no_write_selftest() -> dict[str, Any]:
             ],
         }
         write_json(profile_path, profile)
+        invalid_profile_path = root / "invalid-profile.json"
+        invalid_profile = json_clone(profile)
+        invalid_profile["strategy_sets"] = []
+        write_json(invalid_profile_path, invalid_profile)
         review_candidates_output_dir = root / "review-candidates-output"
         plan_output_dir = root / "plan-output"
         capabilities_output_dir = root / "capabilities-output"
@@ -14810,6 +14814,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         attack_strategy_output_dir = root / "attack-strategy-output"
         verification_queue_output_dir = root / "verification-queue-output"
         promote_output_dir = root / "promote-output"
+        invalid_promote_output_dir = root / "invalid-promote-output"
 
         original_build_capabilities = globals()["build_capabilities"]
         try:
@@ -14916,6 +14921,24 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--no-write",
                 ]
             )
+            invalid_promote_return_code, invalid_promote_stdout = run_cli(
+                [
+                    "--profile",
+                    str(invalid_profile_path),
+                    "--artifact-dir",
+                    str(invalid_promote_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "promote-observation-candidate",
+                    "--candidate-id",
+                    "review_no_write_candidate",
+                    "--path",
+                    "/api/no-write/status",
+                    "--no-write",
+                ]
+            )
         finally:
             globals()["build_capabilities"] = original_build_capabilities
 
@@ -14956,6 +14979,11 @@ def build_no_write_selftest() -> dict[str, Any]:
             "promote_validation": (promote_output_dir / "reviewed-profile-validation.json").exists(),
             "promote_artifact": (promote_output_dir / "reviewed-observation-promotion.json").exists(),
             "promote_manifest": (promote_output_dir / MANIFEST_NAME).exists(),
+            "invalid_promote_dir": invalid_promote_output_dir.exists(),
+            "invalid_promote_reviewed_profile": (invalid_promote_output_dir / "reviewed-profile.json").exists(),
+            "invalid_promote_validation": (invalid_promote_output_dir / "reviewed-profile-validation.json").exists(),
+            "invalid_promote_artifact": (invalid_promote_output_dir / "reviewed-observation-promotion.json").exists(),
+            "invalid_promote_manifest": (invalid_promote_output_dir / MANIFEST_NAME).exists(),
         }
 
     review_candidates_stdout_text = "\n".join(review_candidates_stdout)
@@ -14963,6 +14991,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     attack_strategy_stdout_text = "\n".join(attack_strategy_stdout)
     verification_queue_stdout_text = "\n".join(verification_queue_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
+    invalid_promote_stdout_text = "\n".join(invalid_promote_stdout)
     assertions = [
         {
             "id": "review-candidates-no-write-skips-artifacts",
@@ -15057,6 +15086,34 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": promote_return_code,
                 "stdout": promote_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "promote-observation-candidate-no-write-renders-validation-issues",
+            "passed": (
+                invalid_promote_return_code == 1
+                and "Promotion preview: review_no_write_candidate" in invalid_promote_stdout
+                and "Profile validation: failed" in invalid_promote_stdout
+                and "Validation issues:" in invalid_promote_stdout
+                and "no-effective-clusters" in invalid_promote_stdout_text
+                and "No files written (--no-write)." in invalid_promote_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "invalid_promote_dir",
+                        "invalid_promote_reviewed_profile",
+                        "invalid_promote_validation",
+                        "invalid_promote_artifact",
+                        "invalid_promote_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in invalid_promote_stdout)
+            ),
+            "expected": "promote-observation-candidate --no-write prints validation issues without writing artifacts when preview validation fails",
+            "actual": {
+                "return_code": invalid_promote_return_code,
+                "stdout": invalid_promote_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -15164,6 +15221,10 @@ def build_no_write_selftest() -> dict[str, Any]:
             "plan": {
                 "return_code": plan_return_code,
                 "stdout": plan_stdout,
+            },
+            "invalid_promote": {
+                "return_code": invalid_promote_return_code,
+                "stdout": invalid_promote_stdout,
             },
             "capabilities": {
                 "return_code": capabilities_return_code,
@@ -21493,6 +21554,15 @@ def run_promote_observation_candidate(args: argparse.Namespace) -> int:
         print(f"Promotion preview: {args.candidate_id}")
         print(f"Observation: {observation['method']} {observation['path']} cluster={observation['cluster']}")
         print(f"Profile validation: {validation['status']}")
+        validation_issues = validation.get("issues", []) or []
+        if validation_issues:
+            print("Validation issues:")
+            for issue in validation_issues[:5]:
+                issue_id = inline_summary_text(issue.get("id") or "unknown", max_chars=120)
+                message = inline_summary_text(issue.get("message") or "", max_chars=240)
+                print(f"- {issue_id}: {message}" if message else f"- {issue_id}")
+            if len(validation_issues) > 5:
+                print(f"- ... +{len(validation_issues) - 5} more issue(s)")
         print(f"Output profile: {output_path}")
         if output_path.exists() and not args.force:
             print("Output profile exists; rerun without --no-write requires --force to overwrite it.")
