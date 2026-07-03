@@ -11870,6 +11870,9 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             artifact_dir=root,
             check_dirs=[default_dir, discovered_dir],
         )
+        markdown_path = root / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT
+        write_review_blockers_markdown(markdown_path, rollup)
+        markdown = read_text(markdown_path)
 
     single_route_group = review_blocker_group_by_cluster(discovered_blockers, "route-api-proxy-path") or {}
     rollup_route_group = review_blocker_group_by_cluster(rollup, "route-api-proxy-path") or {}
@@ -11916,6 +11919,12 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             "passed": rollup_quote_group.get("count") == 2,
             "expected": 2,
             "actual": rollup_quote_group.get("count"),
+        },
+        {
+            "id": "markdown-group-sources-rendered",
+            "passed": "source-peek-requests.json" in markdown and "Source artifacts:" in markdown,
+            "expected": "source-peek-requests.json in markdown group context",
+            "actual": "source-peek-requests.json" in markdown,
         },
     ]
     failed = [item for item in assertions if not item["passed"]]
@@ -11989,6 +11998,15 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
         if str(item.get("status") or "") == "ready-with-external-blockers"
     ][:8]
 
+    def append_group_context(item: dict[str, Any]) -> None:
+        sources = item.get("sources", []) or []
+        if sources:
+            lines.append("  - Source artifacts: " + ", ".join(f"`{source}`" for source in sources[:6]))
+        refs = item.get("artifact_refs", []) or []
+        if refs:
+            suffix = "" if len(refs) <= 8 else f" (+{len(refs) - 8} more)"
+            lines.append("  - Evidence refs: " + ", ".join(f"`{ref}`" for ref in refs[:8]) + suffix)
+
     lines = [
         "# InferForge Review Blockers",
         "",
@@ -12027,6 +12045,7 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
                 lines.append(f"  - Next: {markdown_text(item.get('next_action'))}")
             if item.get("review_candidate_ids"):
                 lines.append("  - Review candidates: " + ", ".join(f"`{candidate_id}`" for candidate_id in item.get("review_candidate_ids", [])))
+            append_group_context(item)
     elif external:
         lines.append("- No human-review blocker is first in line; resolve external configuration blockers below.")
     else:
@@ -12043,6 +12062,7 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
             )
             if item.get("next_action"):
                 lines.append(f"  - Next: {markdown_text(item.get('next_action'))}")
+            append_group_context(item)
 
     lines.extend(["", "## Blockers", ""])
     if not blockers:
