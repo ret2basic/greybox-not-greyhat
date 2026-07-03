@@ -10753,6 +10753,7 @@ def build_verification_queue(
             commands=replay_commands,
             evidence_refs=replay_refs,
             safety="Representative replay only. Keep request volume low and stay within the configured target.",
+            extra={"cluster_id": cluster_id},
         )
 
     for gap in (evidence_gaps or {}).get("gaps", []):
@@ -10791,6 +10792,8 @@ def build_verification_queue(
         if any(candidate.get("type") == "server-action-source-review" for candidate in contextual_candidates):
             evidence_refs.append("source-peek-results.json")
         extra = {}
+        if gap.get("cluster_id"):
+            extra["cluster_id"] = gap.get("cluster_id")
         if contextual_candidates:
             extra["review_candidates"] = contextual_candidates
         add_item(
@@ -10973,6 +10976,106 @@ def review_blocker_status_rank(status: str) -> int:
         "ready-with-external-blockers": 3,
         "ready": 4,
     }.get(status, 9)
+
+
+def review_blocker_priority_rank(priority: str) -> int:
+    return {"high": 0, "medium": 1, "low": 2}.get(priority, 9)
+
+
+def review_blocker_group_key(blocker: dict[str, Any]) -> str:
+    category = str(blocker.get("category") or "unknown")
+    status = str(blocker.get("status") or "unknown")
+    cluster_id = str(blocker.get("cluster_id") or "")
+    if cluster_id:
+        return f"{category}:{status}:cluster:{cluster_id}"
+    candidate_ids = sorted(
+        str(candidate.get("id"))
+        for candidate in blocker.get("review_candidates", []) or []
+        if candidate.get("id")
+    )
+    if candidate_ids:
+        return f"{category}:{status}:candidates:{'|'.join(candidate_ids)}"
+    blocker_id = str(blocker.get("run_blocker_id") or blocker.get("id") or "")
+    if blocker_id:
+        return f"{category}:{status}:id:{blocker_id}"
+    return f"{category}:{status}:title:{blocker.get('title') or 'blocker'}"
+
+
+def sorted_unique_strings(values: list[Any]) -> list[str]:
+    return sorted({str(value) for value in values if value not in {None, ""}})
+
+
+def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for blocker in blockers:
+        key = review_blocker_group_key(blocker)
+        group = grouped.get(key)
+        if not group:
+            group = {
+                "id": f"GROUP-{safe_probe_id(key)}",
+                "key": key,
+                "status": str(blocker.get("status") or "unknown"),
+                "category": str(blocker.get("category") or "unknown"),
+                "priority": str(blocker.get("priority") or "medium"),
+                "title": blocker.get("title"),
+                "reason": blocker.get("reason"),
+                "next_action": blocker.get("next_action"),
+                "cluster_id": blocker.get("cluster_id"),
+                "blocker_ids": [],
+                "artifact_dirs": [],
+                "sources": [],
+                "source_review_blockers": [],
+                "artifact_refs": [],
+                "review_candidate_ids": [],
+                "source_counts": {},
+            }
+            grouped[key] = group
+        else:
+            status = str(blocker.get("status") or "unknown")
+            if review_blocker_status_rank(status) < review_blocker_status_rank(str(group.get("status") or "")):
+                group["status"] = status
+            priority = str(blocker.get("priority") or "medium")
+            if review_blocker_priority_rank(priority) < review_blocker_priority_rank(str(group.get("priority") or "")):
+                group["priority"] = priority
+            category = str(blocker.get("category") or "unknown")
+            if group.get("category") != category:
+                group["category"] = "mixed"
+            if not group.get("cluster_id") and blocker.get("cluster_id"):
+                group["cluster_id"] = blocker.get("cluster_id")
+
+        group["blocker_ids"].append(str(blocker.get("id") or "blocker"))
+        if blocker.get("artifact_dir"):
+            group["artifact_dirs"].append(blocker.get("artifact_dir"))
+        if blocker.get("source"):
+            group["sources"].append(blocker.get("source"))
+            increment_count(group["source_counts"], str(blocker.get("source")))
+        if blocker.get("source_review_blockers"):
+            group["source_review_blockers"].append(blocker.get("source_review_blockers"))
+        group["artifact_refs"].extend(blocker.get("artifact_refs", []) or [])
+        for candidate in blocker.get("review_candidates", []) or []:
+            if candidate.get("id"):
+                group["review_candidate_ids"].append(candidate.get("id"))
+
+    groups = []
+    for group in grouped.values():
+        group["count"] = len(group["blocker_ids"])
+        group["artifact_dirs"] = sorted_unique_strings(group["artifact_dirs"])
+        group["sources"] = sorted_unique_strings(group["sources"])
+        group["source_review_blockers"] = sorted_unique_strings(group["source_review_blockers"])
+        group["artifact_refs"] = sorted_unique_strings(group["artifact_refs"])
+        group["review_candidate_ids"] = sorted_unique_strings(group["review_candidate_ids"])
+        group["blocker_ids"] = sorted_unique_strings(group["blocker_ids"])
+        groups.append(group)
+
+    groups.sort(
+        key=lambda item: (
+            review_blocker_status_rank(str(item.get("status") or "")),
+            review_blocker_priority_rank(str(item.get("priority") or "")),
+            str(item.get("cluster_id") or ""),
+            str(item.get("id") or ""),
+        )
+    )
+    return groups
 
 
 def build_review_blockers(
@@ -11193,10 +11296,16 @@ def build_review_blockers(
     blockers.sort(
         key=lambda item: (
             review_blocker_status_rank(str(item.get("status") or "")),
-            {"high": 0, "medium": 1, "low": 2}.get(str(item.get("priority") or ""), 9),
+            review_blocker_priority_rank(str(item.get("priority") or "")),
             str(item.get("id") or ""),
         )
     )
+    groups = build_review_blocker_groups(blockers)
+    group_status_counts: dict[str, int] = {}
+    group_category_counts: dict[str, int] = {}
+    for group in groups:
+        increment_count(group_status_counts, str(group.get("status") or "unknown"))
+        increment_count(group_category_counts, str(group.get("category") or "unknown"))
 
     return {
         "generated_at": utc_now(),
@@ -11206,8 +11315,11 @@ def build_review_blockers(
         "artifact_dir": str(artifact_dir),
         "summary": {
             "blockers": len(blockers),
+            "groups": len(groups),
             "status_counts": status_counts,
             "category_counts": category_counts,
+            "group_status_counts": group_status_counts,
+            "group_category_counts": group_category_counts,
             "source_counts": source_counts,
             "discovery_coverage": (discovery_coverage or {}).get("status"),
             "burp_observation_coverage": (burp_observation_coverage or {}).get("status"),
@@ -11215,6 +11327,7 @@ def build_review_blockers(
             "environment_readiness": (environment_readiness or {}).get("status"),
             "artifact_health": (artifact_health or {}).get("status"),
         },
+        "groups": groups,
         "blockers": blockers,
         "artifact_refs": {
             "discovery_coverage": DISCOVERY_COVERAGE_ARTIFACT,
@@ -11306,11 +11419,17 @@ def build_review_blockers_rollup(
     blockers.sort(
         key=lambda item: (
             review_blocker_status_rank(str(item.get("status") or "")),
-            {"high": 0, "medium": 1, "low": 2}.get(str(item.get("priority") or ""), 9),
+            review_blocker_priority_rank(str(item.get("priority") or "")),
             str(item.get("artifact_dir") or ""),
             str(item.get("run_blocker_id") or item.get("id") or ""),
         )
     )
+    groups = build_review_blocker_groups(blockers)
+    group_status_counts: dict[str, int] = {}
+    group_category_counts: dict[str, int] = {}
+    for group in groups:
+        increment_count(group_status_counts, str(group.get("status") or "unknown"))
+        increment_count(group_category_counts, str(group.get("category") or "unknown"))
 
     return {
         "generated_at": utc_now(),
@@ -11321,15 +11440,19 @@ def build_review_blockers_rollup(
         "mode": "rollup",
         "summary": {
             "blockers": len(blockers),
+            "groups": len(groups),
             "runs": len(runs),
             "missing_review_blockers": missing,
             "status_counts": status_counts,
             "category_counts": category_counts,
+            "group_status_counts": group_status_counts,
+            "group_category_counts": group_category_counts,
             "source_counts": source_counts,
             "run_status_counts": run_status_counts,
             "artifact_health": (artifact_health or {}).get("status"),
         },
         "runs": runs,
+        "groups": groups,
         "blockers": blockers,
         "artifact_refs": {
             "artifact_health": "artifact-health.json",
@@ -11345,16 +11468,29 @@ def markdown_text(value: Any) -> str:
 
 def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) -> None:
     summary = review_blockers.get("summary", {}) or {}
+    groups = review_blockers.get("groups", []) or []
     blockers = review_blockers.get("blockers", []) or []
     status_counts = summary.get("status_counts", {}) or {}
     category_counts = summary.get("category_counts", {}) or {}
+    group_status_counts = summary.get("group_status_counts", {}) or {}
+    group_category_counts = summary.get("group_category_counts", {}) or {}
     source_counts = summary.get("source_counts", {}) or {}
-    actionable = [
+    grouped_actionable = [
+        item
+        for item in groups
+        if str(item.get("status") or "") in {"failed", "needs-profile-update", "needs-human-review"}
+    ][:8]
+    grouped_external = [
+        item
+        for item in groups
+        if str(item.get("status") or "") == "ready-with-external-blockers"
+    ][:8]
+    actionable = grouped_actionable or [
         item
         for item in blockers
         if str(item.get("status") or "") in {"failed", "needs-profile-update", "needs-human-review"}
     ][:8]
-    external = [
+    external = grouped_external or [
         item
         for item in blockers
         if str(item.get("status") or "") == "ready-with-external-blockers"
@@ -11368,9 +11504,12 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
         f"- Target: `{review_blockers.get('target')}`",
         f"- Status: `{review_blockers.get('status')}`",
         f"- Blockers: `{summary.get('blockers', 0)}`",
+        f"- Blocker groups: `{summary.get('groups', len(groups))}`",
         f"- Mode: `{review_blockers.get('mode', 'single')}`",
         f"- Status counts: `{json.dumps(status_counts, sort_keys=True)}`",
         f"- Category counts: `{json.dumps(category_counts, sort_keys=True)}`",
+        f"- Group status counts: `{json.dumps(group_status_counts, sort_keys=True)}`",
+        f"- Group category counts: `{json.dumps(group_category_counts, sort_keys=True)}`",
         f"- Source counts: `{json.dumps(source_counts, sort_keys=True)}`",
         "",
         "## Safety",
@@ -11385,12 +11524,16 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
     ]
     if actionable:
         for item in actionable:
-            run_prefix = f"[{item.get('artifact_dir')}] " if item.get("artifact_dir") else ""
+            artifact_dirs = item.get("artifact_dirs", []) or []
+            run_prefix = f"[{', '.join(artifact_dirs)}] " if artifact_dirs else f"[{item.get('artifact_dir')}] " if item.get("artifact_dir") else ""
+            count_suffix = f" ({item.get('count')} blockers)" if item.get("count") else ""
             lines.append(
-                f"- `{item.get('status')}` `{item.get('id')}`: {run_prefix}{markdown_text(item.get('title'))}"
+                f"- `{item.get('status')}` `{item.get('id')}`{count_suffix}: {run_prefix}{markdown_text(item.get('title'))}"
             )
             if item.get("next_action"):
                 lines.append(f"  - Next: {markdown_text(item.get('next_action'))}")
+            if item.get("review_candidate_ids"):
+                lines.append("  - Review candidates: " + ", ".join(f"`{candidate_id}`" for candidate_id in item.get("review_candidate_ids", [])))
     elif external:
         lines.append("- No human-review blocker is first in line; resolve external configuration blockers below.")
     else:
@@ -11399,9 +11542,11 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
     if external:
         lines.extend(["", "## External Configuration", ""])
         for item in external:
-            run_prefix = f"[{item.get('artifact_dir')}] " if item.get("artifact_dir") else ""
+            artifact_dirs = item.get("artifact_dirs", []) or []
+            run_prefix = f"[{', '.join(artifact_dirs)}] " if artifact_dirs else f"[{item.get('artifact_dir')}] " if item.get("artifact_dir") else ""
+            count_suffix = f" ({item.get('count')} blockers)" if item.get("count") else ""
             lines.append(
-                f"- `{item.get('id')}`: {run_prefix}{markdown_text(item.get('title'))}"
+                f"- `{item.get('id')}`{count_suffix}: {run_prefix}{markdown_text(item.get('title'))}"
             )
             if item.get("next_action"):
                 lines.append(f"  - Next: {markdown_text(item.get('next_action'))}")

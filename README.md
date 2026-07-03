@@ -484,8 +484,10 @@ and artifact health. `audit` and `verification-queue` refresh it automatically.
 The Markdown playbook is useful as the first artifact to inspect after a
 regression run because it keeps the approved-path, source-only review, missing
 profile coverage, external-configuration actions, and gated command templates in
-one list. When `--check-dir` is repeated, it builds a root-level rollup across
-multiple artifact directories:
+one list. The JSON also includes grouped blockers so repeated runs can preserve
+per-run evidence while the playbook shows de-duplicated next actions. When
+`--check-dir` is repeated, it builds a root-level rollup across multiple
+artifact directories:
 
 ```bash
 python3 scripts/inferforge.py review-blockers
