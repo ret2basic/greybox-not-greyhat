@@ -13,6 +13,7 @@ from email.utils import parsedate_to_datetime
 import hashlib
 import html
 import http.client
+import inspect
 import ipaddress
 import json
 import os
@@ -65,6 +66,7 @@ REVIEW_BLOCKERS_MARKDOWN_ARTIFACT = "review-blockers.md"
 REVIEW_BLOCKERS_SELFTEST_ARTIFACT = "review-blockers-selftest.json"
 COMMAND_SAFETY_SELFTEST_ARTIFACT = "command-safety-selftest.json"
 ARTIFACT_HEALTH_SELFTEST_ARTIFACT = "artifact-health-selftest.json"
+MANIFEST_REFRESH_SELFTEST_ARTIFACT = "manifest-refresh-selftest.json"
 REQUIRED_ARTIFACTS = [
     "index.html",
     "report.md",
@@ -132,6 +134,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     REVIEW_BLOCKERS_SELFTEST_ARTIFACT,
     COMMAND_SAFETY_SELFTEST_ARTIFACT,
     ARTIFACT_HEALTH_SELFTEST_ARTIFACT,
+    MANIFEST_REFRESH_SELFTEST_ARTIFACT,
     "transaction-intent-policy.json",
 ]
 INDEX_ARTIFACT_ORDER = [
@@ -146,6 +149,7 @@ INDEX_ARTIFACT_ORDER = [
     REVIEW_BLOCKERS_SELFTEST_ARTIFACT,
     COMMAND_SAFETY_SELFTEST_ARTIFACT,
     ARTIFACT_HEALTH_SELFTEST_ARTIFACT,
+    MANIFEST_REFRESH_SELFTEST_ARTIFACT,
     TARGET_PROFILE_ARTIFACT,
     STRATEGY_REGISTRY_ARTIFACT,
     PROFILE_VALIDATION_ARTIFACT,
@@ -13116,6 +13120,143 @@ def build_artifact_health_selftest() -> dict[str, Any]:
     }
 
 
+def build_manifest_refresh_selftest() -> dict[str, Any]:
+    def refresh_expectation(
+        command: str,
+        function: str,
+        *,
+        min_refreshes: int = 1,
+        min_prints: int = 1,
+    ) -> dict[str, Any]:
+        return {
+            "command": command,
+            "function": function,
+            "mode": "refresh-current-manifest",
+            "markers": {
+                "refresh_current_artifact_manifest(": min_refreshes,
+                "print_refreshed_manifests(": min_prints,
+            },
+        }
+
+    expectations = [
+        {
+            "command": "audit",
+            "function": "run_audit",
+            "mode": "final-manifest",
+            "markers": {"write_artifact_manifest(": 1},
+        },
+        {
+            "command": "manifest",
+            "function": "run_manifest",
+            "mode": "final-manifest",
+            "markers": {"write_artifact_manifest(": 1},
+        },
+        {
+            "command": "regression-suite",
+            "function": "run_regression_suite",
+            "mode": "final-manifest",
+            "markers": {"write_artifact_manifest(": 1},
+        },
+        {
+            "command": "artifact-health",
+            "function": "run_artifact_health",
+            "mode": "managed-output-refresh",
+            "markers": {"write_artifact_health_artifact(": 1},
+        },
+        {
+            "command": "review-blockers",
+            "function": "run_review_blockers",
+            "mode": "multi-directory-refresh",
+            "markers": {"refresh_manifests_for_artifact_outputs(": 1},
+        },
+        refresh_expectation("profile", "run_profile"),
+        refresh_expectation("plan", "run_plan"),
+        refresh_expectation("review-candidates", "run_review_candidates"),
+        refresh_expectation("promote-observation-candidate", "run_promote_observation_candidate"),
+        refresh_expectation("discover-profile", "run_discover_profile", min_refreshes=2, min_prints=2),
+        refresh_expectation("collect", "run_collect"),
+        refresh_expectation("burp-observe", "run_burp_observe", min_refreshes=3, min_prints=3),
+        refresh_expectation("burp-sync", "run_burp_sync", min_refreshes=4, min_prints=4),
+        refresh_expectation("import-burp-history", "run_import_burp_history", min_refreshes=2, min_prints=2),
+        refresh_expectation("gate", "run_gate", min_refreshes=2, min_prints=2),
+        refresh_expectation("coverage", "run_coverage"),
+        refresh_expectation("burp-observation-coverage", "run_burp_observation_coverage"),
+        refresh_expectation("discovery-coverage", "run_discovery_coverage"),
+        refresh_expectation("response-deltas", "run_response_deltas"),
+        refresh_expectation("source-peek-requests", "run_source_peek_requests"),
+        refresh_expectation("evidence-chain", "run_evidence_chain"),
+        refresh_expectation("evidence-appendix", "run_evidence_appendix"),
+        refresh_expectation("verification-queue", "run_verification_queue"),
+        refresh_expectation("adjudicate", "run_adjudicate"),
+        refresh_expectation("capabilities", "run_capabilities"),
+        refresh_expectation("readiness", "run_readiness"),
+        refresh_expectation("decode-transactions", "run_decode_transactions"),
+        refresh_expectation("self-test-profile-routing", "run_profile_routing_selftest"),
+        refresh_expectation("self-test-discovery-coverage", "run_discovery_coverage_selftest"),
+        refresh_expectation("self-test-command-safety", "run_command_safety_selftest"),
+        refresh_expectation("self-test-review-blockers", "run_review_blockers_selftest"),
+        refresh_expectation("self-test-artifact-health", "run_artifact_health_selftest"),
+        refresh_expectation("self-test-manifest-refresh", "run_manifest_refresh_selftest"),
+        refresh_expectation("self-test-transactions", "run_transaction_decoder_selftest"),
+        refresh_expectation("collect-quote", "run_collect_quote", min_refreshes=2, min_prints=2),
+        refresh_expectation("collect-orca-baseline", "run_collect_orca_baseline", min_refreshes=2, min_prints=2),
+    ]
+
+    assertions = []
+    cases = []
+    for expectation in expectations:
+        function_name = expectation["function"]
+        function = globals().get(function_name)
+        source = inspect.getsource(function) if function else ""
+        marker_counts = {
+            marker: source.count(marker)
+            for marker in expectation["markers"]
+        }
+        missing_markers = [
+            {
+                "marker": marker,
+                "expected_min": expected_min,
+                "actual": marker_counts.get(marker, 0),
+            }
+            for marker, expected_min in expectation["markers"].items()
+            if marker_counts.get(marker, 0) < expected_min
+        ]
+        case = {
+            "command": expectation["command"],
+            "function": function_name,
+            "mode": expectation["mode"],
+            "marker_counts": marker_counts,
+            "missing_markers": missing_markers,
+        }
+        cases.append(case)
+        assertions.append(
+            {
+                "id": f"{expectation['command']}-manifest-refresh-marker",
+                "passed": bool(function) and not missing_markers,
+                "expected": expectation["markers"],
+                "actual": marker_counts if function else "function-not-found",
+            }
+        )
+
+    mode_counts: dict[str, int] = {}
+    for item in expectations:
+        increment_count(mode_counts, item["mode"])
+    failed = [item for item in assertions if not item["passed"]]
+    return {
+        "generated_at": utc_now(),
+        "status": "failed" if failed else "passed",
+        "summary": {
+            "commands": len(expectations),
+            "assertions": len(assertions),
+            "failed": len(failed),
+            "mode_counts": mode_counts,
+        },
+        "cases": cases,
+        "assertions": assertions,
+        "safety": "Static source self-test. It reads local InferForge command functions only and sends no requests.",
+    }
+
+
 def inferforge_cli_command(
     args: argparse.Namespace,
     *,
@@ -18370,6 +18511,36 @@ def run_artifact_health_selftest(args: argparse.Namespace) -> int:
     return 0 if result["status"] == "passed" else 1
 
 
+def run_manifest_refresh_selftest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, _target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result = build_manifest_refresh_selftest()
+    result["current_profile_context"] = profile_summary(profile)
+    output_path = artifact_dir / MANIFEST_REFRESH_SELFTEST_ARTIFACT
+    write_json(output_path, result)
+    print(f"Manifest refresh self-test: {result['status']}")
+    print(
+        "Cases: "
+        f"commands={result['summary']['commands']}, "
+        f"assertions={result['summary']['assertions']}, "
+        f"failed={result['summary']['failed']}, "
+        f"modes={json.dumps(result['summary']['mode_counts'], sort_keys=True)}"
+    )
+    failed = [item for item in result.get("assertions", []) if not item.get("passed")]
+    if failed:
+        print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=resolve_target(args, profile),
+            command="self-test-manifest-refresh",
+            output_paths=[output_path],
+        )
+    )
+    return 0 if result["status"] == "passed" else 1
+
+
 def run_manifest(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -18493,6 +18664,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             ("self-test-command-safety", "self-test-command-safety"),
             ("self-test-review-blockers", "self-test-review-blockers"),
             ("self-test-artifact-health", "self-test-artifact-health"),
+            ("self-test-manifest-refresh", "self-test-manifest-refresh"),
             ("self-test-transactions", "self-test-transactions"),
         ]:
             command = inferforge_cli_command(
@@ -18887,6 +19059,14 @@ def run_discover_profile(args: argparse.Namespace) -> int:
     if explicit_output and output_path.exists() and not args.force:
         print(f"Refusing to overwrite existing profile without --force: {output_path}")
         print(f"Wrote {artifact_dir / ROUTE_INVENTORY_ARTIFACT}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="discover-profile",
+                output_paths=[artifact_dir / ROUTE_INVENTORY_ARTIFACT],
+            )
+        )
         return 2
 
     write_json(output_path, discovered_profile)
@@ -20035,6 +20215,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a static self-test for artifact-health manifest integrity checks",
     )
     artifact_health_selftest.set_defaults(func=run_artifact_health_selftest)
+    manifest_refresh_selftest = sub.add_parser(
+        "self-test-manifest-refresh",
+        help="Run a static self-test for artifact writer manifest refresh coverage",
+    )
+    manifest_refresh_selftest.set_defaults(func=run_manifest_refresh_selftest)
 
     collect_quote = sub.add_parser(
         "collect-quote",
