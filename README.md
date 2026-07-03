@@ -529,7 +529,7 @@ discovery, check that the discovered profile covers every static surface or
 review gate, run deterministic Burp observe/sync for the checked-in profile and
 discovered profile, collect one source-known Orca pool baseline, run both
 audits, write artifact health, and then generate a root-level review-blocker
-rollup plus `regression-suite.json`. The
+rollup, `regression-suite.json`, and a refreshed root `artifact-manifest.json`. The
 suite clears only
 generated `probe-results.jsonl` files in the selected regression artifact
 directories before audit so reruns do not accumulate stale probe rows. It does

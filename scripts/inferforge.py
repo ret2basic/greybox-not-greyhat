@@ -11597,10 +11597,23 @@ def build_artifact_manifest(
         status in {"covered-with-external-blocker", "no-reportable-findings-with-external-blocker", "ready-with-external-blockers", "waiting-for-external-configuration"}
         for status in [coverage_status, adjudication_status, verification_status, review_blockers_status, readiness_status]
     )
+    human_review_required = any(
+        status in {"needs-human-review", "answered-with-manual-review", "covered-with-evidence-gaps"}
+        for status in [
+            coverage_status,
+            discovery_coverage_status,
+            verification_status,
+            review_blockers_status,
+            burp_observation_status,
+            source_peek_request_status,
+        ]
+    )
     if missing_required:
         manifest_status = "incomplete"
     elif profile_validation_status == "failed":
         manifest_status = "failed-profile-validation"
+    elif human_review_required:
+        manifest_status = "needs-human-review"
     elif external_blocked:
         manifest_status = "complete-with-external-blocker"
     else:
@@ -17176,6 +17189,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
         )
         run_step("review-blockers-rollup", command)
     health = load_optional_json(artifact_dir / "artifact-health.json")
+    review_blockers = None if args.skip_review_blockers else load_optional_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT)
     suite_status = regression_suite_status(steps, health, strict=args.strict)
     suite = {
         "generated_at": utc_now(),
@@ -17211,6 +17225,12 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             "summary": None if not health else health.get("summary"),
             "artifact": "artifact-health.json",
         },
+        "review_blockers": {
+            "status": None if not review_blockers else review_blockers.get("status"),
+            "summary": None if not review_blockers else review_blockers.get("summary"),
+            "artifact": REVIEW_BLOCKERS_ARTIFACT,
+            "markdown": REVIEW_BLOCKERS_MARKDOWN_ARTIFACT,
+        },
         "safety": [
             "Runs the existing deterministic low-volume InferForge regression commands.",
             "Does not run Burp Scanner, sign wallets, submit Solana transactions, invoke Server Actions, or fuzz broadly.",
@@ -17218,8 +17238,11 @@ def run_regression_suite(args: argparse.Namespace) -> int:
         ],
     }
     write_json(artifact_dir / "regression-suite.json", suite)
+    artifact_manifest = write_artifact_manifest(artifact_dir, target, command="regression-suite")
     print(f"Regression suite: {suite_status}")
     print(f"Wrote {artifact_dir / 'regression-suite.json'}")
+    print(f"Artifact manifest: {artifact_manifest['status']}")
+    print(f"Wrote {artifact_dir / MANIFEST_NAME}")
     if suite_status == "failed":
         return 1
     if args.strict and suite_status != "healthy":
