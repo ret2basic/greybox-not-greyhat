@@ -12004,6 +12004,57 @@ def verification_queue_command_preview_lines(item: dict[str, Any], *, limit: int
     return lines
 
 
+def verification_queue_followup_preview_lines(item: dict[str, Any], *, limit: int = 3) -> list[str]:
+    status = str(item.get("status") or "")
+    if status not in {"manual-review", "blocked", "blocked-external"}:
+        return []
+
+    lines = []
+    reason = inline_summary_text(item.get("reason") or "", max_chars=260)
+    if reason:
+        lines.append(f"    reason={reason}")
+
+    prerequisites = [
+        inline_summary_text(entry, max_chars=260)
+        for entry in item.get("prerequisites", []) or []
+        if str(entry or "").strip()
+    ]
+    for prerequisite in prerequisites[:limit]:
+        lines.append(f"    prerequisite={prerequisite}")
+    if len(prerequisites) > limit:
+        lines.append(f"    prerequisite=... +{len(prerequisites) - limit} more")
+
+    review_candidates = [
+        candidate
+        for candidate in item.get("review_candidates", []) or []
+        if isinstance(candidate, dict)
+    ]
+    for candidate in review_candidates[:limit]:
+        parts = [f"candidate={candidate.get('id') or 'candidate'}"]
+        if candidate.get("type"):
+            parts.append(f"type={candidate.get('type')}")
+        if candidate.get("path_template"):
+            parts.append(f"path_template={candidate.get('path_template')}")
+        if candidate.get("source_refs"):
+            parts.append(
+                "source_refs="
+                + ",".join(inline_summary_text(ref, max_chars=80) for ref in candidate.get("source_refs", [])[:3])
+            )
+        lines.append("    " + " ".join(parts))
+    if len(review_candidates) > limit:
+        lines.append(f"    candidate=... +{len(review_candidates) - limit} more")
+
+    evidence_refs = [str(ref) for ref in item.get("evidence_refs", []) or [] if str(ref or "").strip()]
+    if evidence_refs:
+        suffix = "" if len(evidence_refs) <= 6 else f",+{len(evidence_refs) - 6}"
+        lines.append(f"    evidence_refs={','.join(evidence_refs[:6])}{suffix}")
+
+    safety = inline_summary_text(item.get("safety") or "", max_chars=260)
+    if safety:
+        lines.append(f"    safety={safety}")
+    return lines
+
+
 def merge_review_candidate_summary(existing: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     incoming = compact_review_candidate(candidate)
     for field in ["id", "cluster", "type", "status", "method", "path_template", "example_path"]:
@@ -15116,6 +15167,28 @@ def build_no_write_selftest() -> dict[str, Any]:
         no_write=False,
         output_path=attack_strategy_output_dir / "attack-strategy.json",
     ) or ""
+    manual_followup_preview_lines = verification_queue_followup_preview_lines(
+        {
+            "id": "MANUAL-commandless",
+            "status": "manual-review",
+            "reason": "Review the browser-only flow before adding automated replay.",
+            "prerequisites": ["Use Burp built-in browser to exercise the relevant UI flow."],
+            "review_candidates": [
+                {
+                    "id": "review_manual_flow",
+                    "type": "server-action-source-review",
+                    "path_template": "/api/no-write/{path*}",
+                    "source_refs": ["src/app/actions.ts"],
+                }
+            ],
+            "evidence_refs": ["source-peek-results.json", "verification-queue.json"],
+            "safety": "Manual source review only; no active request is generated.",
+        }
+    )
+    manual_followup_preview_text = "\n".join(manual_followup_preview_lines)
+    ready_followup_preview_lines = verification_queue_followup_preview_lines(
+        {"id": "READY-commandless", "status": "ready", "reason": "No preview expected."}
+    )
     assertions = [
         {
             "id": "review-candidates-no-write-skips-artifacts",
@@ -15280,6 +15353,24 @@ def build_no_write_selftest() -> dict[str, Any]:
                 "return_code": verification_queue_return_code,
                 "stdout": verification_queue_stdout,
                 "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "verification-queue-followup-preview-renders-commandless-review",
+            "passed": (
+                "reason=Review the browser-only flow" in manual_followup_preview_text
+                and "prerequisite=Use Burp built-in browser" in manual_followup_preview_text
+                and "candidate=review_manual_flow" in manual_followup_preview_text
+                and "type=server-action-source-review" in manual_followup_preview_text
+                and "source_refs=src/app/actions.ts" in manual_followup_preview_text
+                and "evidence_refs=source-peek-results.json,verification-queue.json" in manual_followup_preview_text
+                and "safety=Manual source review only" in manual_followup_preview_text
+                and ready_followup_preview_lines == []
+            ),
+            "expected": "commandless manual-review queue items render actionable no-write follow-up details",
+            "actual": {
+                "manual_preview": manual_followup_preview_lines,
+                "ready_preview": ready_followup_preview_lines,
             },
         },
         {
@@ -20951,6 +21042,18 @@ def run_verification_queue(args: argparse.Namespace) -> int:
             for item in preview_items:
                 print(f"- {item.get('id') or 'ITEM-unknown'}:")
                 for line in verification_queue_command_preview_lines(item):
+                    print(line)
+        followup_items = [
+            item
+            for item in ranked_verification_queue_items(verification_queue)
+            if not verification_queue_command_preview_lines(item)
+            and verification_queue_followup_preview_lines(item)
+        ][:4]
+        if followup_items:
+            print("Manual/external previews:")
+            for item in followup_items:
+                print(f"- {item.get('id') or 'ITEM-unknown'}:")
+                for line in verification_queue_followup_preview_lines(item):
                     print(line)
     if no_write:
         print("No files written (--no-write).")
