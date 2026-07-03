@@ -481,8 +481,9 @@ unsafe command templates are generated.
 `review-blockers` writes `.greybox/review-blockers.json` plus
 `.greybox/review-blockers.md`, a read-only summary of the human-review,
 profile-update, and external blockers currently spread across discovery
-coverage, Burp observation coverage, verification queue, environment readiness,
-and artifact health. `audit` and `verification-queue` refresh it automatically.
+coverage, Burp observation coverage, verification queue, source-peek requests,
+environment readiness, and artifact health. `audit` and `verification-queue`
+refresh it automatically.
 The Markdown playbook is useful as the first artifact to inspect after a
 regression run because it keeps the approved-path, source-only review, missing
 profile coverage, external-configuration actions, and gated command templates in

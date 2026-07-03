@@ -11283,6 +11283,7 @@ def build_review_blockers(
     discovery_coverage: dict[str, Any] | None = None,
     burp_observation_coverage: dict[str, Any] | None = None,
     verification_queue: dict[str, Any] | None = None,
+    source_peek_requests: dict[str, Any] | None = None,
     environment_readiness: dict[str, Any] | None = None,
     artifact_health: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -11431,6 +11432,36 @@ def build_review_blockers(
             evidence={"command_safety": command_safety},
         )
 
+    for request in (source_peek_requests or {}).get("requests", []) or []:
+        request_status = str(request.get("status") or "")
+        if request_status != "manual-review":
+            continue
+        cluster_ids = request.get("cluster_ids", []) or []
+        cluster_id = str(cluster_ids[0]) if cluster_ids else None
+        add_blocker(
+            blocker_id=f"SOURCE-PEEK-{request.get('id')}",
+            source="source-peek-requests.json",
+            category="human-review",
+            status="needs-human-review",
+            priority="medium",
+            title=f"Source peek request requires review: {request.get('entrypoint') or request.get('id')}",
+            reason=str(request.get("reason") or "Source-peek request is marked manual-review."),
+            next_action="Answer the source-review questions and refresh source-peek-requests/evidence artifacts.",
+            cluster_id=cluster_id,
+            artifact_refs=["source-peek-requests.json", request.get("answer_artifact") or "source-peek-results.json"],
+            review_candidates=[
+                {"id": candidate_id}
+                for candidate_id in request.get("review_candidate_ids", []) or []
+            ],
+            evidence={
+                "trigger": request.get("trigger"),
+                "gap_id": request.get("gap_id"),
+                "questions": request.get("questions", []),
+                "source_refs": request.get("source_refs", []),
+                "safety": request.get("safety"),
+            },
+        )
+
     for check in (environment_readiness or {}).get("checks", []) or []:
         check_status = str(check.get("status") or "")
         if check_status not in {"blocked", "failed"}:
@@ -11521,6 +11552,7 @@ def build_review_blockers(
             "discovery_coverage": (discovery_coverage or {}).get("status"),
             "burp_observation_coverage": (burp_observation_coverage or {}).get("status"),
             "verification_queue": (verification_queue or {}).get("status"),
+            "source_peek_requests": (source_peek_requests or {}).get("status"),
             "environment_readiness": (environment_readiness or {}).get("status"),
             "artifact_health": (artifact_health or {}).get("status"),
         },
@@ -11530,6 +11562,7 @@ def build_review_blockers(
             "discovery_coverage": DISCOVERY_COVERAGE_ARTIFACT,
             "burp_observation_coverage": "burp-observation-coverage.json",
             "verification_queue": "verification-queue.json",
+            "source_peek_requests": "source-peek-requests.json",
             "environment_readiness": "environment-readiness.json",
             "artifact_health": "artifact-health.json",
         },
@@ -11787,6 +11820,25 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             }
         ],
     }
+    source_peek_requests = {
+        "status": "answered-with-manual-review",
+        "requests": [
+            {
+                "id": "PEEK-gap-gap_route_api_proxy_path_burp_observation",
+                "trigger": "evidence-gap",
+                "status": "manual-review",
+                "gap_id": "GAP-route-api-proxy-path-burp-observation",
+                "entrypoint": "Browser-flow observation missing",
+                "cluster_ids": ["route-api-proxy-path"],
+                "reason": "A reviewed concrete local observation path is required.",
+                "questions": ["Choose one known safe concrete path before automated Burp observation."],
+                "source_refs": ["next.config.ts"],
+                "review_candidate_ids": [review_candidate["id"]],
+                "answer_artifact": "source-peek-results.json",
+                "safety": "Manual source review only.",
+            }
+        ],
+    }
 
     default_blockers = build_review_blockers(
         target=target,
@@ -11802,6 +11854,7 @@ def build_review_blockers_selftest() -> dict[str, Any]:
         discovery_coverage=discovery_coverage,
         burp_observation_coverage=burp_observation_coverage,
         verification_queue=discovered_queue,
+        source_peek_requests=source_peek_requests,
         environment_readiness=environment_readiness,
     )
 
@@ -11836,8 +11889,8 @@ def build_review_blockers_selftest() -> dict[str, Any]:
         },
         {
             "id": "discovered-route-group-count",
-            "passed": single_route_group.get("count") == 4,
-            "expected": 4,
+            "passed": single_route_group.get("count") == 5,
+            "expected": 5,
             "actual": single_route_group.get("count"),
         },
         {
@@ -11853,9 +11906,9 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             "actual": rollup.get("summary", {}).get("groups"),
         },
         {
-            "id": "rollup-route-group-preserves-four-source-blockers",
-            "passed": rollup_route_group.get("count") == 4,
-            "expected": 4,
+            "id": "rollup-route-group-preserves-source-peek-blocker",
+            "passed": rollup_route_group.get("count") == 5,
+            "expected": 5,
             "actual": rollup_route_group.get("count"),
         },
         {
@@ -15089,6 +15142,7 @@ def run_audit(args: argparse.Namespace) -> int:
         discovery_coverage=load_optional_json(artifact_dir / DISCOVERY_COVERAGE_ARTIFACT),
         burp_observation_coverage=burp_observation_coverage,
         verification_queue=verification_queue,
+        source_peek_requests=source_peek_requests,
         environment_readiness=environment_readiness,
     )
     write_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT, review_blockers)
@@ -17352,6 +17406,7 @@ def run_verification_queue(args: argparse.Namespace) -> int:
         discovery_coverage=load_optional_json(artifact_dir / DISCOVERY_COVERAGE_ARTIFACT),
         burp_observation_coverage=load_optional_json(artifact_dir / "burp-observation-coverage.json"),
         verification_queue=verification_queue,
+        source_peek_requests=load_optional_json(artifact_dir / "source-peek-requests.json"),
         environment_readiness=load_optional_json(artifact_dir / "environment-readiness.json"),
     )
     write_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT, review_blockers)
@@ -17410,6 +17465,7 @@ def run_review_blockers(args: argparse.Namespace) -> int:
             discovery_coverage=load_optional_json(artifact_dir / DISCOVERY_COVERAGE_ARTIFACT),
             burp_observation_coverage=load_optional_json(artifact_dir / "burp-observation-coverage.json"),
             verification_queue=load_optional_json(artifact_dir / "verification-queue.json"),
+            source_peek_requests=load_optional_json(artifact_dir / "source-peek-requests.json"),
             environment_readiness=load_optional_json(artifact_dir / "environment-readiness.json"),
             artifact_health=load_optional_json(artifact_dir / "artifact-health.json"),
         )
