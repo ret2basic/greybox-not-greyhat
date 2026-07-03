@@ -11672,6 +11672,84 @@ def compact_review_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
+def review_candidate_rewrite_summaries(candidate: dict[str, Any], *, limit: int = 3) -> list[str]:
+    summaries: list[str] = []
+    for rewrite in candidate.get("rewrites", []) or []:
+        if not isinstance(rewrite, dict):
+            continue
+        source = rewrite.get("source") or rewrite.get("source_pattern") or rewrite.get("source_framework_pattern")
+        destination = (
+            rewrite.get("destination_resolved")
+            or rewrite.get("destination")
+            or rewrite.get("destination_template")
+        )
+        parts = []
+        if source:
+            parts.append(f"source={inline_summary_text(source, max_chars=120)}")
+        if destination:
+            parts.append(f"destination={inline_summary_text(destination, max_chars=160)}")
+        if rewrite.get("phase"):
+            parts.append(f"phase={inline_summary_text(rewrite.get('phase'), max_chars=60)}")
+        if parts:
+            summaries.append(" ".join(parts))
+    if len(summaries) <= limit:
+        return summaries
+    return [*summaries[:limit], f"... +{len(summaries) - limit} more rewrites"]
+
+
+def format_review_candidate_cli_lines(candidate: dict[str, Any]) -> list[str]:
+    compact = compact_review_candidate(candidate)
+    lines = [
+        (
+            f"- {compact.get('id') or 'unknown'} "
+            f"cluster={compact.get('cluster') or 'unknown'} "
+            f"type={compact.get('type') or 'unknown'} "
+            f"status={compact.get('status') or 'unknown'}"
+        )
+    ]
+    for field in ["method", "path_template", "example_path"]:
+        if compact.get(field):
+            lines.append(f"  {field}={compact[field]}")
+    for field in ["source_refs", "fixed_upstreams"]:
+        values = compact.get(field, []) or []
+        if values:
+            suffix = "" if len(values) <= 4 else f",+{len(values) - 4}"
+            lines.append(f"  {field}={','.join(str(value) for value in values[:4])}{suffix}")
+    for rewrite_summary in review_candidate_rewrite_summaries(candidate):
+        lines.append(f"  rewrite={rewrite_summary}")
+
+    approval_required = ordered_unique_strings(candidate.get("approval_required", []) or [])
+    if approval_required:
+        lines.append("  approval_required:")
+        for entry in approval_required:
+            lines.append(f"    - {inline_summary_text(entry, max_chars=220)}")
+
+    promote = compact.get("promote_to_burp_observation_plan")
+    if isinstance(promote, dict):
+        promote_parts = []
+        for field in ["id", "cluster", "method", "path"]:
+            if promote.get(field):
+                promote_parts.append(f"{field}={inline_summary_text(promote.get(field), max_chars=160)}")
+        expected_statuses = promote.get("expected_statuses")
+        if isinstance(expected_statuses, list) and expected_statuses:
+            promote_parts.append(
+                "expected_statuses="
+                + ",".join(str(status) for status in expected_statuses[:12])
+                + (f",+{len(expected_statuses) - 12}" if len(expected_statuses) > 12 else "")
+            )
+        if promote_parts:
+            lines.append("  promote_to_burp_observation_plan: " + " ".join(promote_parts))
+
+    command_templates = compact.get("command_templates", []) or []
+    if command_templates:
+        lines.append("  command_templates:")
+        for command in command_templates[:4]:
+            lines.append(f"    - {inline_summary_text(command, max_chars=240)}")
+        if len(command_templates) > 4:
+            lines.append(f"    - ... +{len(command_templates) - 4} more commands")
+    return lines
+
+
 def merge_review_candidate_summary(existing: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     incoming = compact_review_candidate(candidate)
     for field in ["id", "cluster", "type", "status", "method", "path_template", "example_path"]:
@@ -14507,6 +14585,35 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "path_template": "/api/no-write/{path*}",
                     "cluster": "no-write",
                     "example_path": "/api/no-write/status",
+                    "source_refs": ["no-write.config.ts"],
+                    "rewrites": [
+                        {
+                            "source": "/api/no-write/:path*",
+                            "source_pattern": "/api/no-write/{path*}",
+                            "destination_resolved": "https://example.test/:path*",
+                            "destination_template": "${NO_WRITE_TARGET}/:path*",
+                            "phase": "array",
+                        }
+                    ],
+                    "fixed_upstreams": ["https://example.test"],
+                    "approval_required": [
+                        "Choose one known safe read-only path.",
+                        "Confirm the upstream request is non-mutating.",
+                    ],
+                    "promote_to_burp_observation_plan": {
+                        "id": "burp_observe_no_write_reviewed_path",
+                        "method": "GET",
+                        "path": PLACEHOLDER_APPROVED_CONCRETE_PATH,
+                        "expected_statuses": [200, 204, 400, 403, 404, 405, 502],
+                        "cluster": "no-write",
+                    },
+                    "command_templates": [
+                        (
+                            "python3 scripts/inferforge.py promote-observation-candidate "
+                            "--candidate-id review_no_write_candidate "
+                            f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH}"
+                        )
+                    ],
                     "safety": "Synthetic no-write candidate.",
                 }
             ],
@@ -14578,13 +14685,24 @@ def build_no_write_selftest() -> dict[str, Any]:
             "readiness_manifest": (readiness_output_dir / MANIFEST_NAME).exists(),
         }
 
+    review_candidates_stdout_text = "\n".join(review_candidates_stdout)
     assertions = [
         {
             "id": "review-candidates-no-write-skips-artifacts",
             "passed": (
                 review_candidates_return_code == 0
                 and "Review observation candidates: 1" in review_candidates_stdout
-                and "review_no_write_candidate" in "\n".join(review_candidates_stdout)
+                and "review_no_write_candidate" in review_candidates_stdout_text
+                and "method=GET" in review_candidates_stdout_text
+                and "path_template=/api/no-write/{path*}" in review_candidates_stdout_text
+                and "source_refs=no-write.config.ts" in review_candidates_stdout_text
+                and "fixed_upstreams=https://example.test" in review_candidates_stdout_text
+                and "rewrite=source=/api/no-write/:path* destination=https://example.test/:path* phase=array" in review_candidates_stdout_text
+                and "approval_required:" in review_candidates_stdout_text
+                and "Choose one known safe read-only path." in review_candidates_stdout_text
+                and "promote_to_burp_observation_plan: id=burp_observe_no_write_reviewed_path" in review_candidates_stdout_text
+                and f"path={PLACEHOLDER_APPROVED_CONCRETE_PATH}" in review_candidates_stdout_text
+                and "command_templates:" in review_candidates_stdout_text
                 and "No files written (--no-write)." in review_candidates_stdout
                 and not any(
                     output_paths[key]
@@ -20867,14 +20985,8 @@ def run_review_candidates(args: argparse.Namespace) -> int:
     output_path = artifact_dir / "review-observation-candidates.json"
     print(f"Review observation candidates: {len(candidates)}")
     for candidate in candidates:
-        print(
-            f"- {candidate.get('id')} "
-            f"cluster={candidate.get('cluster')} "
-            f"type={candidate.get('type')} "
-            f"status={candidate.get('status')}"
-        )
-        if candidate.get("example_path"):
-            print(f"  example_path={candidate.get('example_path')}")
+        for line in format_review_candidate_cli_lines(candidate):
+            print(line)
     if no_write:
         print("No files written (--no-write).")
     else:

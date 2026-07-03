@@ -119,11 +119,13 @@ Profiles separate endpoint discovery from concrete probe paths:
   are not executed by `burp-sync --observe` until a concrete approved path is
   promoted into `burp_observation_plan`.
 - `review-candidates` lists these inert templates and writes
-  `.greybox/review-observation-candidates.json`; use `--no-write` to print the
-  same list without writing artifacts. After reviewing one concrete local
-  read-only path, use `promote-observation-candidate` to write a separate
-  reviewed profile. Promotion is a profile edit only; it does not send HTTP
-  traffic.
+  `.greybox/review-observation-candidates.json`; use `--no-write` to print an
+  approval-focused summary without writing artifacts. The dry-run output shows
+  path templates, source refs, fixed upstreams, approval requirements, and
+  promotion placeholders so the human review step can approve one concrete local
+  read-only path without opening the JSON artifact. After review, use
+  `promote-observation-candidate` to write a separate reviewed profile.
+  Promotion is a profile edit only; it does not send HTTP traffic.
 - Generic `nextjs-api-routes` clusters with concrete probe paths receive only
   low-risk HEAD, OPTIONS preflight, and GET method-confusion or availability
   probes. Dynamic routes with unresolved `{param}` segments are skipped until
