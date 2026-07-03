@@ -17672,6 +17672,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
 
     if not args.skip_self_tests:
         for label, subcommand in [
+            ("self-test-profile-routing", "self-test-profile-routing"),
             ("self-test-discovery-coverage", "self-test-discovery-coverage"),
             ("self-test-command-safety", "self-test-command-safety"),
             ("self-test-review-blockers", "self-test-review-blockers"),

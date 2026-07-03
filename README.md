@@ -529,7 +529,8 @@ sets. Use `--strict` in CI when human-review or external-configuration blockers
 should also fail the job.
 
 `regression-suite` runs the repeatable local regression workflow that is used to
-develop the tool against `infrafi-web`: run static self-tests, refresh static
+develop the tool against `infrafi-web`: run static profile-routing, discovery
+coverage, command-safety, and review-blocker self-tests, refresh static
 discovery, check that the discovered profile covers every static surface or
 review gate, run deterministic Burp observe/sync for the checked-in profile and
 discovered profile, collect one source-known Orca pool baseline, run both
