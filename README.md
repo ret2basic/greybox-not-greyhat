@@ -433,6 +433,12 @@ source-only Server Action discovery. This artifact does not send traffic or read
 more than the existing source resolver context; it records the question,
 black-box evidence refs, source refs, and answer artifact for review.
 
+`attack-strategy.json` is the machine-readable strategy contract for the run. It
+records the active methodology, specific strategy coverage for each endpoint
+cluster, next-development-action status counts, and a top-level status such as
+`ready-for-regression`, `needs-external-evidence`, or `needs-strategy-review`.
+It is generated from local run context only; it does not execute probes.
+
 `source-peek-results.json` also includes an `endpoint_resolver` section. The
 resolver statically maps observed HTTP endpoints back to matching Next.js App
 Router route files or `next.config.*` rewrite definitions, including source

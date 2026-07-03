@@ -7359,6 +7359,32 @@ def build_attack_strategy(
             "safety": "No high-volume rate-limit testing by default; no real wallet transaction submission.",
         },
         {
+            "id": "strategy-nextjs-api-routes",
+            "title": "Generic Next.js API route strategy",
+            "applies_to": ["nextjs-api-routes", "app-route", "pages-api-route"],
+            "attacker_model": "Unauthenticated browser or script that can call local Next.js API routes directly.",
+            "primary_questions": [
+                "Are HTTP methods, content types, and malformed bodies handled consistently?",
+                "Do route handlers expose debug data, stack traces, internal headers, or unexpected successful responses?",
+                "Are source-only routes or Server Actions kept separate from reportable black-box findings until evidence exists?",
+            ],
+            "safe_probe_queue": [
+                "implemented: low-volume method confusion for discovered API routes",
+                "implemented: response-delta grouping so unexpected generic route responses become hardening notes unless impact is proven",
+                "implemented: source-peek requests only when a concrete black-box question exists",
+            ],
+            "source_peek_triggers": [
+                "Any generic route returns an unexpected successful response to a method confusion probe.",
+                "Any source-discovered route lacks black-box or Burp evidence.",
+                "Any Server Action is source-only and needs manual review before verification.",
+            ],
+            "finding_gate": [
+                "Require a concrete attacker-controllable request and impact before reportability.",
+                "Keep framework-default or low-impact generic-route behavior as hardening notes.",
+            ],
+            "safety": "No broad crawling; only route inventory-derived low-volume probes.",
+        },
+        {
             "id": "strategy-rpc-websocket",
             "title": "Solana WebSocket RPC proxy strategy",
             "applies_to": ["solana-rpc-ws"],
@@ -7441,61 +7467,191 @@ def build_attack_strategy(
             ],
             "safety": "No broad address enumeration.",
         },
+        {
+            "id": "strategy-fixed-upstream-rewrite",
+            "title": "Generic fixed-upstream rewrite proxy strategy",
+            "applies_to": ["fixed-upstream-proxy", "rewrite-proxy"],
+            "attacker_model": "Client that controls a path segment or query string routed through a fixed upstream rewrite/proxy.",
+            "primary_questions": [
+                "Is the upstream origin fixed by configuration rather than attacker input?",
+                "Can encoded traversal, absolute URLs, query injection, or extra path segments escape the intended upstream path?",
+                "Does the proxy require a reviewed concrete read-only path before automated Burp observation?",
+                "Are upstream errors, auth context, cache headers, and response shapes safe to expose?",
+            ],
+            "safe_probe_queue": [
+                "review-only by default: promote exactly one approved concrete local read-only path before automated observation",
+                "implemented for known pool-style fixed upstreams: invalid path segment and encoded traversal probes",
+                "use Burp built-in-browser history to prove the reviewed path before adding broader replay evidence",
+            ],
+            "source_peek_triggers": [
+                "Any dynamic rewrite source is discovered without an active reviewed observation path.",
+                "Any fixed upstream destination is environment-derived or not resolved in source discovery.",
+                "Any response suggests attacker-controlled upstream URL construction.",
+            ],
+            "finding_gate": [
+                "Show the reviewed local path and upstream destination template.",
+                "Show request/response evidence for one concrete path before claiming coverage.",
+                "Do not enumerate upstream resources or guess private object identifiers.",
+            ],
+            "safety": "Review-gated for dynamic rewrites; no broad path enumeration.",
+        },
     ]
 
     next_actions = [
         {
             "id": "NEXT-burp-history-ingest",
             "title": "Make Burp history collection first-class",
+            "applies_to": ["all"],
             "reason": "Burp MCP history works; the CLI can now normalize raw MCP HTTP history output into reusable observations.",
             "status": "implemented-via-import-burp-history-command",
         },
         {
             "id": "NEXT-quote-validator",
             "title": "Implement quote-specific validator and transaction intent decoder",
+            "applies_to": ["quote"],
             "reason": "The strongest current signal is thin local quote validation and executable payload trust boundary.",
             "status": "implemented-in-local-runner",
         },
         {
             "id": "NEXT-transaction-intent-corpus",
             "title": "Feed real quote transaction payloads into the decoder",
+            "applies_to": ["quote"],
             "reason": "The decoder is implemented; it needs a successful quote payload corpus to compare transaction instructions against user intent.",
             "status": "waiting-for-real-quote-response",
         },
         {
             "id": "NEXT-transaction-intent-policy",
             "title": "Compare decoded transactions against swap intent",
+            "applies_to": ["quote"],
             "reason": "A decoded transaction is only useful if it can be compared against the intended wallet, direction, and token mints without signing or submitting it.",
             "status": "implemented-via-intent-policy-checks",
         },
         {
             "id": "NEXT-probe-selection",
             "title": "Rank probes by endpoint kind and evidence gaps",
+            "applies_to": ["all"],
             "reason": "The runner should choose probes from observed attack surface, not only a fixed list.",
             "status": "implemented-via-probe-ranking-artifact-and-max-probes",
         },
         {
             "id": "NEXT-ws-message-shape",
             "title": "Implement safe WebSocket message-shape probes",
+            "applies_to": ["solana-rpc-ws"],
             "reason": "The WS proxy should reject malformed JSON, binary frames, duplicate keys, empty or oversized batches, and blocked methods before upstream forwarding.",
             "status": "implemented-via-ws-probes-and-server-validation",
         },
         {
             "id": "NEXT-rpc-high-impact-negative-probes",
             "title": "Exercise high-impact Solana RPC methods with invalid transaction payloads",
+            "applies_to": ["solana-rpc-http"],
             "reason": "sendTransaction and simulateTransaction are high-impact allowlisted methods; safe negative probes should prove invalid, unsigned payloads do not succeed or leak internals.",
             "status": "implemented-via-invalid-transaction-rpc-probes",
         },
     ]
+    cluster_rows = clusters.get("clusters", []) or []
+    cluster_ids = [str(cluster.get("id") or "") for cluster in cluster_rows if cluster.get("id")]
+    cluster_kinds = {str(cluster.get("kind") or "") for cluster in cluster_rows if cluster.get("kind")}
+    cluster_strategy_sets = {str(cluster.get("strategy_set") or "") for cluster in cluster_rows if cluster.get("strategy_set")}
+
+    def labels_apply_to_current_clusters(labels: list[Any]) -> bool:
+        applies_to = {str(item) for item in labels or []}
+        return (
+            not applies_to
+            or "all" in applies_to
+            or bool(applies_to.intersection(cluster_ids))
+            or bool(applies_to.intersection(cluster_kinds))
+            or bool(applies_to.intersection(cluster_strategy_sets))
+        )
+
+    relevant_next_actions = [
+        action
+        for action in next_actions
+        if labels_apply_to_current_clusters(action.get("applies_to", ["all"]))
+    ]
+    next_action_status_counts: dict[str, int] = {}
+    for action in relevant_next_actions:
+        increment_count(next_action_status_counts, str(action.get("status") or "unknown"))
+
+    def strategy_matches_cluster(strategy: dict[str, Any], cluster: dict[str, Any]) -> bool:
+        applies_to = {str(item) for item in strategy.get("applies_to", []) or []}
+        return (
+            "all" in applies_to
+            or str(cluster.get("id") or "") in applies_to
+            or str(cluster.get("kind") or "") in applies_to
+            or str(cluster.get("strategy_set") or "") in applies_to
+        )
+
+    specific_strategies = [
+        strategy
+        for strategy in strategies
+        if "all" not in {str(item) for item in strategy.get("applies_to", []) or []}
+    ]
+    strategy_coverage = []
+    uncovered_strategy_clusters = []
+    for cluster in cluster_rows:
+        cluster_id = str(cluster.get("id") or "")
+        matching = [
+            str(strategy.get("id"))
+            for strategy in specific_strategies
+            if strategy_matches_cluster(strategy, cluster)
+        ]
+        exempt = str(cluster.get("kind") or "") == "health" or cluster_id == "health"
+        if not matching and not exempt:
+            uncovered_strategy_clusters.append(cluster_id)
+        strategy_coverage.append(
+            {
+                "cluster_id": cluster_id,
+                "kind": cluster.get("kind"),
+                "strategy_set": cluster.get("strategy_set"),
+                "strategy_ids": matching,
+                "exempt": exempt,
+            }
+        )
+
+    waiting_action_count = sum(
+        count
+        for status, count in next_action_status_counts.items()
+        if status.startswith("waiting-") or status in {"blocked", "blocked-external"}
+    )
+    if uncovered_strategy_clusters:
+        status = "needs-strategy-review"
+    elif suspicions:
+        status = "active-investigation"
+    elif not burp_history:
+        status = "needs-burp-history"
+    elif waiting_action_count:
+        status = "needs-external-evidence"
+    else:
+        status = "ready-for-regression"
 
     return {
         "generated_at": utc_now(),
+        "status": status,
         "methodology": "black-box-first greybox: Burp observations -> safe probes -> source peek -> finding gate",
-        "clusters_seen": [cluster["id"] for cluster in clusters["clusters"]],
+        "summary": {
+            "clusters": len(cluster_ids),
+            "strategies": len(strategies),
+            "clusters_with_specific_strategy": len(
+                [
+                    item
+                    for item in strategy_coverage
+                    if item.get("strategy_ids") and not item.get("exempt")
+                ]
+            ),
+            "strategy_uncovered_clusters": uncovered_strategy_clusters,
+            "burp_history_items": len(burp_history),
+            "active_suspicions": len(suspicions),
+            "next_action_status_counts": next_action_status_counts,
+            "waiting_action_count": waiting_action_count,
+            "relevant_next_actions": len(relevant_next_actions),
+        },
+        "clusters_seen": cluster_ids,
         "burp_history_items": len(burp_history),
         "active_suspicions": [item["id"] for item in suspicions],
+        "strategy_coverage": strategy_coverage,
         "strategies": strategies,
         "next_development_actions": next_actions,
+        "safety": "Strategy artifact only. It does not send requests, fuzz, invoke Burp Scanner, sign wallets, or submit transactions.",
     }
 
 
@@ -12438,6 +12594,7 @@ def build_artifact_manifest(
         REVIEW_BLOCKERS_ARTIFACT,
         "adjudication.json",
         "environment-readiness.json",
+        "attack-strategy.json",
         PROFILE_VALIDATION_ARTIFACT,
         "discovered-profile-validation.json",
         "review-observation-candidates.json",
@@ -12501,6 +12658,7 @@ def build_artifact_manifest(
     burp_observation_status = (status_sources.get("burp-observation-coverage.json") or {}).get("status")
     response_delta_status = (status_sources.get("response-delta-analysis.json") or {}).get("status")
     source_peek_request_status = (status_sources.get("source-peek-requests.json") or {}).get("status")
+    attack_strategy_status = (status_sources.get("attack-strategy.json") or {}).get("status")
     external_blocked = any(
         status in {"covered-with-external-blocker", "no-reportable-findings-with-external-blocker", "ready-with-external-blockers", "waiting-for-external-configuration"}
         for status in [coverage_status, adjudication_status, verification_status, review_blockers_status, readiness_status]
@@ -12548,6 +12706,7 @@ def build_artifact_manifest(
             "burp_observation_coverage": burp_observation_status,
             "response_delta_analysis": response_delta_status,
             "source_peek_requests": source_peek_request_status,
+            "attack_strategy": attack_strategy_status,
             "review_artifacts_present": review_artifacts_present,
             "discovery_artifacts_present": discovery_artifacts_present,
             "known_optional_artifacts_present": optional_artifacts_present,
@@ -14999,10 +15158,22 @@ def generate_report(
     else:
         suspicion_lines.append("- No suspicions generated from this run.")
 
+    strategy_summary = attack_strategy.get("summary", {}) or {}
     strategy_lines = [
+        f"- Strategy status: `{attack_strategy.get('status', 'unknown')}`",
+        f"- Clusters with specific strategy: `{strategy_summary.get('clusters_with_specific_strategy', 0)}` / `{strategy_summary.get('clusters', 0)}`",
+        (
+            "- Strategy-uncovered clusters: "
+            f"`{', '.join(strategy_summary.get('strategy_uncovered_clusters', []) or []) or 'none'}`"
+        ),
+        f"- Next action statuses: `{json.dumps(strategy_summary.get('next_action_status_counts', {}), sort_keys=True)}`",
+        "",
+        "Strategy registry:",
+    ]
+    strategy_lines.extend(
         f"- `{item['id']}`: {item['title']}"
         for item in attack_strategy["strategies"]
-    ]
+    )
     gate_lines = [
         f"- `{item['suspicion_id']}` `{item['entrypoint']}` -> `{item['gate_status']}`"
         for item in finding_gate["gates"]
@@ -17602,6 +17773,45 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and response_delta_endpoint.get("status") == "review-needed"
         and response_delta_endpoint.get("unexpected_count") == 1
     )
+    rewrite_attack_strategy = build_attack_strategy(
+        rewrite_clusters,
+        [],
+        [
+            {
+                "method": "GET",
+                "path": "/api/proxy/users/42",
+                "status": 200,
+                "source": "self-test",
+            }
+        ],
+    )
+    rewrite_strategy_route_coverage = next(
+        (
+            item
+            for item in rewrite_attack_strategy.get("strategy_coverage", [])
+            if item.get("cluster_id") == "route-api-proxy-path"
+        ),
+        {},
+    )
+    unknown_attack_strategy = build_attack_strategy(
+        {
+            "clusters": [
+                {
+                    "id": "opaque-service",
+                    "kind": "opaque-proxy",
+                    "strategy_set": "custom",
+                }
+            ]
+        },
+        [],
+        [{"method": "GET", "path": "/opaque", "status": 200, "source": "self-test"}],
+    )
+    attack_strategy_status_passed = (
+        rewrite_attack_strategy.get("status") == "ready-for-regression"
+        and "strategy-fixed-upstream-rewrite" in rewrite_strategy_route_coverage.get("strategy_ids", [])
+        and unknown_attack_strategy.get("status") == "needs-strategy-review"
+        and unknown_attack_strategy.get("summary", {}).get("strategy_uncovered_clusters") == ["opaque-service"]
+    )
 
     probe_paths = {probe.path for probe in probes}
     warmup_paths = {probe.path for probe in warmups}
@@ -17652,6 +17862,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and configured_nextjs_runtime_passed
         and initial_artifacts_passed
         and target_lock_passed
+        and attack_strategy_status_passed
     )
 
     artifact = {
@@ -17682,6 +17893,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "summary": response_delta_selftest.get("summary", {}),
             "cluster": response_delta_cluster,
             "endpoint": response_delta_endpoint,
+        },
+        "attack_strategy_status": {
+            "status": "passed" if attack_strategy_status_passed else "failed",
+            "rewrite_status": rewrite_attack_strategy.get("status"),
+            "rewrite_summary": rewrite_attack_strategy.get("summary", {}),
+            "rewrite_route_coverage": rewrite_strategy_route_coverage,
+            "unknown_status": unknown_attack_strategy.get("status"),
+            "unknown_summary": unknown_attack_strategy.get("summary", {}),
         },
         "active_observation_validation": {
             "status": "passed" if unsafe_observation_validation_passed else "failed",
