@@ -377,10 +377,12 @@ Proxy HTTP history directly through Burp MCP, save the raw MCP output to
 traffic clustering, write `.greybox/burp-mcp-sync.json`, and refresh the managed
 artifact manifest. The sync artifact includes `mcp_actions`, a compact audit log
 of Burp MCP tool calls with sensitive request bodies, regex values, tokens, and
-secrets hashed or redacted. `burp-sync` prefers the regex history tools and
-falls back to the non-regex HTTP/WebSocket history tools when a Burp MCP version
-does not expose or cannot run the regex variant; fallback imports still apply
-the local target/profile filters before writing normalized observations:
+secrets hashed or redacted; MCP exception messages are summarized by type,
+length, and SHA-256 instead of stored as raw text. `burp-sync` prefers the regex
+history tools and falls back to the non-regex HTTP/WebSocket history tools when
+a Burp MCP version does not expose or cannot run the regex variant; fallback
+imports still apply the local target/profile filters before writing normalized
+observations:
 
 ```bash
 python3 scripts/inferforge.py burp-sync --observe --ws-upgrade --replace

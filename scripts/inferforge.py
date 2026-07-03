@@ -4082,6 +4082,17 @@ def mcp_audit_arguments(arguments: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def mcp_audit_error(error: Any) -> dict[str, Any]:
+    message = str(error)
+    encoded = message.encode("utf-8", errors="replace")
+    return {
+        "type": type(error).__name__,
+        "message_bytes": len(encoded),
+        "message_sha256": hashlib.sha256(encoded).hexdigest(),
+        "message_redacted": True,
+    }
+
+
 def mcp_action_audit_record(
     *,
     tool: str,
@@ -4103,7 +4114,7 @@ def mcp_action_audit_record(
             "text_sha256": hashlib.sha256(encoded).hexdigest(),
         }
     if error is not None:
-        record["error"] = str(error)[:500]
+        record["error"] = mcp_audit_error(error)
     return record
 
 
@@ -15590,7 +15601,18 @@ def build_no_write_selftest() -> dict[str, Any]:
         status="succeeded",
         result_text="history item",
     )
+    mcp_failed_audit_record = mcp_action_audit_record(
+        tool="get_proxy_http_history_regex",
+        arguments={
+            "count": 80,
+            "offset": 0,
+            "regex": "Cookie: session=secret",
+        },
+        status="failed",
+        error=RuntimeError("Authorization: Bearer test\nraw response body should-not-appear"),
+    )
     mcp_audit_record_text = json.dumps(mcp_audit_record, sort_keys=True)
+    mcp_failed_audit_record_text = json.dumps(mcp_failed_audit_record, sort_keys=True)
     mcp_tool_inventory = summarize_burp_mcp_tool_inventory(
         [
             "get_proxy_http_history_regex",
@@ -15916,9 +15938,23 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "should-not-appear" not in mcp_audit_record_text
                 and "dash-secret-should-not-appear" not in mcp_audit_record_text
                 and mcp_audit_record.get("result", {}).get("text_bytes") == len("history item".encode("utf-8"))
+                and mcp_failed_audit_record.get("status") == "failed"
+                and mcp_failed_audit_record.get("error", {}).get("type") == "RuntimeError"
+                and mcp_failed_audit_record.get("error", {}).get("message_redacted") is True
+                and mcp_failed_audit_record.get("error", {}).get("message_bytes")
+                == len("Authorization: Bearer test\nraw response body should-not-appear".encode("utf-8"))
+                and isinstance(mcp_failed_audit_record.get("error", {}).get("message_sha256"), str)
+                and isinstance(mcp_failed_audit_record.get("arguments", {}).get("regex"), dict)
+                and "Authorization: Bearer test" not in mcp_failed_audit_record_text
+                and "raw response body" not in mcp_failed_audit_record_text
+                and "should-not-appear" not in mcp_failed_audit_record_text
+                and "Cookie: session=secret" not in mcp_failed_audit_record_text
             ),
-            "expected": "MCP action audit records keep tool/count/status while hashing or redacting sensitive arguments and response text",
-            "actual": mcp_audit_record,
+            "expected": "MCP action audit records keep tool/count/status while hashing or redacting sensitive arguments, response text, and exception messages",
+            "actual": {
+                "succeeded": mcp_audit_record,
+                "failed": mcp_failed_audit_record,
+            },
         },
         {
             "id": "burp-mcp-tool-inventory-classifies-required-and-disabled-capabilities",
@@ -15958,7 +15994,7 @@ def build_no_write_selftest() -> dict[str, Any]:
             "expected": "MCP history reads audit a failed regex call, fall back to non-regex history, and do not leak regex or MCP error response text in audit records or fallback reasons",
             "actual": {
                 "read": fallback_history_read,
-                "calls": fallback_client.calls,
+                "called_tools": [name for name, _arguments in fallback_client.calls],
                 "actions": fallback_audit_artifact.get("mcp_actions", []),
             },
         },
