@@ -352,6 +352,13 @@ transaction payloads. The collection artifact includes
 `diagnosis.classification`, for example `m0-config-missing-or-placeholder` when
 the local M0 key is absent or still set to the template placeholder.
 
+`capabilities` writes `.greybox/burp-capabilities.json`, checks target health,
+Burp MCP readiness, Burp Proxy availability, and Codex MCP registration, then
+prints a concise `Burp tools:` line for approval-sensitive operations such as
+Proxy history reads, HTTP request sends, Repeater creation, and automatic
+Intercept disablement. Use `--no-write` to preview these checks without
+refreshing capability artifacts.
+
 `readiness` writes `.greybox/environment-readiness.json`, combining target
 health, redacted environment configuration state, the last quote collection
 diagnosis, and transaction-corpus status, then refreshes the managed artifact

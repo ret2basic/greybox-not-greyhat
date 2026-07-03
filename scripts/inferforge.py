@@ -15099,6 +15099,7 @@ def build_no_write_selftest() -> dict[str, Any]:
 
     review_candidates_stdout_text = "\n".join(review_candidates_stdout)
     plan_stdout_text = "\n".join(plan_stdout)
+    capabilities_stdout_text = "\n".join(capabilities_stdout)
     attack_strategy_stdout_text = "\n".join(attack_strategy_stdout)
     verification_queue_stdout_text = "\n".join(verification_queue_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
@@ -15327,6 +15328,9 @@ def build_no_write_selftest() -> dict[str, Any]:
             "passed": (
                 capabilities_return_code == 0
                 and "Capabilities: ready" in capabilities_stdout
+                and "Burp tools:" in capabilities_stdout_text
+                and "http_history=stubbed" in capabilities_stdout_text
+                and "intercept=stubbed" in capabilities_stdout_text
                 and "No files written (--no-write)." in capabilities_stdout
                 and not any(output_paths[key] for key in ["capabilities_dir", "capabilities_json", "capabilities_manifest"])
                 and not any(line.startswith("Refreshed ") for line in capabilities_stdout)
@@ -21956,6 +21960,15 @@ def run_capabilities(args: argparse.Namespace) -> int:
         f"codex_mcp_get_burp_ok={burp_info.get('codex_mcp_get_burp_ok')} "
         f"check_script_ok={burp_info.get('check_script_ok')}"
     )
+    approval_tools = burp_info.get("approval_sensitive_tools", {}) or {}
+    if approval_tools:
+        print(
+            "Burp tools: "
+            f"http_history={approval_tools.get('observed_get_proxy_http_history') or 'unknown'} "
+            f"http_request={approval_tools.get('observed_send_http1_request') or 'unknown'} "
+            f"repeater={approval_tools.get('observed_create_repeater_tab') or 'unknown'} "
+            f"intercept={approval_tools.get('observed_set_proxy_intercept_state') or 'unknown'}"
+        )
     if no_write:
         print("No files written (--no-write).")
     else:
