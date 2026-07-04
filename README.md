@@ -438,15 +438,15 @@ default local target application port for the checked-in profile, not Burp's
 proxy or Burp's built-in browser. Keep it closed unless a local app regression
 actually needs the dev server.
 
-`burp-sync`, `audit`, `validation-plan`, `iteration-decision`, and
-`regression-suite` also take an internal current-resource preflight before
-memory-sensitive work. The internal gate is intentionally conservative
-(`MemAvailable` below 2048 MiB or used swap above 1024 MiB is a warning).
-When `audit` or `regression-suite` hits that gate, it writes a resource-gate
-artifact and exits before active probes, Burp history reads, Node transaction
-decoding, or the full regression step schedule. Use `--allow-resource-warning`
-only after reviewing local pressure and narrowing the command with limits or
-skip flags.
+`burp-sync`, `audit`, `collect-quote`, `collect-orca-baseline`,
+`validation-plan`, `iteration-decision`, and `regression-suite` also take an
+internal current-resource preflight before memory-sensitive work. The internal
+gate is intentionally conservative (`MemAvailable` below 2048 MiB or used swap
+above 1024 MiB is a warning). When an active command hits that gate, it writes a
+resource-gate artifact and exits before active probes, Burp history reads, quote
+or Orca baseline requests, Node transaction decoding, or the full regression
+step schedule. Use `--allow-resource-warning` only after reviewing local
+pressure and narrowing the command with limits or skip flags.
 
 Review program scope, authentication context, and endpoint criticality before
 any active probes:
@@ -906,7 +906,9 @@ profile's quote path, saves a successful quote response to
 `.greybox/transaction-payloads.json`, writes `.greybox/quote-collection.json`,
 refreshes `.greybox/transaction-intent.json`, updates the related
 evidence/readiness artifacts, and refreshes the managed artifact manifest. It
-does not sign transactions or submit them to Solana.
+does not sign transactions or submit them to Solana. On constrained hosts it
+blocks behind the resource gate before sending the quote request or running
+transaction decoding unless `--allow-resource-warning` is passed explicitly.
 Non-200 responses are recorded as collection metadata without being treated as
 transaction payloads. The collection artifact includes
 `diagnosis.classification`, for example `m0-config-missing-or-placeholder` when
@@ -1516,7 +1518,9 @@ Use `collect-orca-baseline` to collect exactly one positive baseline from the
 source-known DAWN Orca pool list in `src/lib/partners/orca.ts`, or pass one
 explicit `--address`. The command records status, cache headers, body hash, and
 JSON shape to `.greybox/orca-baseline.json`; it does not enumerate pool
-addresses and does not store the full response body. When this baseline is
+addresses and does not store the full response body. It also blocks behind the
+resource gate before sending the baseline request unless
+`--allow-resource-warning` is passed explicitly. When this baseline is
 missing, `verification-queue` includes a manual-review command template for one
 approved `--address` rather than trying candidate addresses automatically. The
 template uses `REPLACE_WITH_APPROVED_POOL_ADDRESS` so it is shell-safe but still

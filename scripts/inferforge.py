@@ -36889,11 +36889,15 @@ def run_regression_suite(args: argparse.Namespace) -> int:
         run_step("discovered-discovery-coverage", command)
 
     if not args.skip_orca_baseline and not suite_stopped:
+        orca_args = []
+        if args.allow_resource_warning:
+            orca_args.append("--allow-resource-warning")
         command = inferforge_cli_command(
             args,
             profile_path=default_profile_path,
             artifact_dir=default_artifact_dir,
             subcommand="collect-orca-baseline",
+            extra=orca_args,
         )
         run_step("default-orca-baseline", command)
 
@@ -36903,6 +36907,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
                 profile_path=discovered_profile_path,
                 artifact_dir=discovered_artifact_dir,
                 subcommand="collect-orca-baseline",
+                extra=orca_args,
             )
             run_step("discovered-orca-baseline", command)
 
@@ -39061,6 +39066,49 @@ def run_collect_quote(args: argparse.Namespace) -> int:
     write_target_profile_artifact(artifact_dir, profile, target, source_root)
     ensure_burp_transaction_candidates_artifact(artifact_dir)
 
+    resource_snapshot = build_default_resource_snapshot(max_processes=8)
+    resource_status = artifact_summary_status(resource_snapshot)
+    if resource_status != "healthy" and not args.allow_resource_warning:
+        resource_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
+        blocked_path = artifact_dir / "collect-quote-resource-gate.json"
+        write_json(resource_path, resource_snapshot)
+        write_json(
+            blocked_path,
+            resource_gate_blocked_artifact(
+                command="collect-quote",
+                target=target,
+                profile=profile,
+                resource_snapshot=resource_snapshot,
+                blocked_actions=[
+                    "quote request to target",
+                    "transaction payload file writes from live response",
+                    "transaction candidate decoding",
+                    "evidence-gap refresh after active collection",
+                ],
+            ),
+        )
+        print(
+            "Quote collection blocked by resource gate: "
+            f"{resource_status} warnings={resource_gate_warnings_text(resource_snapshot)}"
+        )
+        print("No quote request or transaction decoding was run.")
+        print(f"Wrote {resource_path}")
+        print(f"Wrote {blocked_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="collect-quote",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    artifact_dir / "burp-transaction-candidates.json",
+                    resource_path,
+                    blocked_path,
+                ],
+            )
+        )
+        return 2
+
     quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
     output_path = Path(args.output).resolve() if args.output else artifact_dir / "transaction-payloads.json"
     try:
@@ -39299,6 +39347,48 @@ def run_collect_orca_baseline(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    resource_snapshot = build_default_resource_snapshot(max_processes=8)
+    resource_status = artifact_summary_status(resource_snapshot)
+    if resource_status != "healthy" and not args.allow_resource_warning:
+        resource_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
+        blocked_path = artifact_dir / "collect-orca-baseline-resource-gate.json"
+        write_json(resource_path, resource_snapshot)
+        write_json(
+            blocked_path,
+            resource_gate_blocked_artifact(
+                command="collect-orca-baseline",
+                target=target,
+                profile=profile,
+                resource_snapshot=resource_snapshot,
+                blocked_actions=[
+                    "Orca pool baseline request to target",
+                    "positive upstream baseline collection",
+                    "transaction intent fallback decoding",
+                    "evidence-gap refresh after active collection",
+                ],
+            ),
+        )
+        print(
+            "Orca baseline collection blocked by resource gate: "
+            f"{resource_status} warnings={resource_gate_warnings_text(resource_snapshot)}"
+        )
+        print("No Orca baseline request or transaction decoding was run.")
+        print(f"Wrote {resource_path}")
+        print(f"Wrote {blocked_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="collect-orca-baseline",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    resource_path,
+                    blocked_path,
+                ],
+            )
+        )
+        return 2
 
     try:
         with TargetProbeLock(target, purpose="collect-orca-baseline"):
@@ -40787,6 +40877,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="Allowed compiled instruction program ID for immediate transaction-intent checks. Repeat as needed.",
     )
+    collect_quote.add_argument(
+        "--allow-resource-warning",
+        action="store_true",
+        help="Allow the quote request and transaction decoding when the local memory/swap resource gate is warning.",
+    )
     collect_quote.set_defaults(func=run_collect_quote)
 
     collect_orca = sub.add_parser(
@@ -40800,6 +40895,11 @@ def build_parser() -> argparse.ArgumentParser:
     collect_orca.add_argument(
         "--address",
         help="Explicit single Orca pool address to baseline instead of reading ORCA_WHIRLPOOLS.",
+    )
+    collect_orca.add_argument(
+        "--allow-resource-warning",
+        action="store_true",
+        help="Allow the Orca baseline request when the local memory/swap resource gate is warning.",
     )
     collect_orca.set_defaults(func=run_collect_orca_baseline)
     return parser
