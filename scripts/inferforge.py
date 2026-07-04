@@ -2280,7 +2280,7 @@ def extract_export_list_route_methods(source: str) -> set[str]:
 
 def extract_route_methods(source: str) -> list[str]:
     methods = set(re.findall(r"export\s+(?:async\s+)?function\s+([A-Z]+)\b", source))
-    methods.update(re.findall(r"export\s+const\s+([A-Z]+)\s*=", source))
+    methods.update(re.findall(r"export\s+const\s+([A-Z]+)\b(?:\s*:[^\n=]+)?\s*=", source))
     methods.update(extract_export_list_route_methods(source))
     return sorted(method for method in methods if method in HTTP_METHODS)
 
@@ -23150,12 +23150,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         ),
         "direct_reexport": extract_route_methods("export { GET } from './handler'\n"),
         "renamed_reexport": extract_route_methods("export { mutate as PATCH } from './handler'\n"),
+        "typed_const_export": extract_route_methods(
+            "type RouteHandler = () => Response\n"
+            "export const PUT: RouteHandler = () => Response.json({ ok: true })\n"
+        ),
         "type_export_ignored": extract_route_methods("export type { GET } from './types'\n"),
     }
     route_method_export_list_passed = (
         route_method_export_list_samples.get("handler_aliases") == ["GET", "POST"]
         and route_method_export_list_samples.get("direct_reexport") == ["GET"]
         and route_method_export_list_samples.get("renamed_reexport") == ["PATCH"]
+        and route_method_export_list_samples.get("typed_const_export") == ["PUT"]
         and route_method_export_list_samples.get("type_export_ignored") == []
     )
     with tempfile.TemporaryDirectory(prefix="inferforge-discovery-selftest-") as temp_dir:
