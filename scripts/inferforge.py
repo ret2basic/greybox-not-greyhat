@@ -412,10 +412,24 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
         return []
 
     rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        rows.append(json.loads(line))
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def count_jsonl_rows(path: Path) -> int:
+    if not path.exists():
+        return 0
+
+    rows = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            rows += 1
     return rows
 
 
@@ -25962,7 +25976,7 @@ def remove_stale_probe_results(artifact_dir: Path) -> dict[str, Any]:
         }
     rows = 0
     try:
-        rows = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+        rows = count_jsonl_rows(path)
         path.unlink()
     except OSError as error:
         return {
