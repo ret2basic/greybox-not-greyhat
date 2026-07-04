@@ -19533,9 +19533,11 @@ def build_verification_queue(
             command = curl_command_for_probe(target, evidence)
             if command:
                 replay_commands.append(command)
-            replay_refs.append(str(evidence.get("evidence_id")))
-        if not replay_commands and cluster_id == "solana-rpc-ws":
-            replay_commands.append(cmd("audit --ws-resource-probes"))
+            evidence_id = evidence.get("evidence_id")
+            if evidence_id:
+                replay_refs.append(str(evidence_id))
+        if not replay_commands and not replay_refs:
+            continue
         add_item(
             f"REPLAY-{cluster_id}",
             f"Replay representative evidence for {cluster_id}",
@@ -32635,6 +32637,47 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         artifact_dir=queue_artifact_dir,
         verification_queue=strategy_external_queue,
     )
+    empty_replay_queue = build_verification_queue(
+        "http://127.0.0.1:9998",
+        {
+            "clusters": [
+                {"id": "quote", "priority": "high"},
+                {"id": "solana-rpc-ws", "priority": "high"},
+            ]
+        },
+        {
+            "clusters": [
+                {
+                    "cluster_id": "quote",
+                    "priority": "high",
+                    "coverage_status": "not-probed",
+                    "probe_summary": {"total": 0},
+                    "representative_probe_evidence": [],
+                },
+                {
+                    "cluster_id": "solana-rpc-ws",
+                    "priority": "high",
+                    "coverage_status": "not-probed",
+                    "probe_summary": {"total": 0},
+                    "representative_probe_evidence": [],
+                },
+            ]
+        },
+        {"gaps": []},
+        {"status": "covered"},
+        {"status": "no-reportable-findings", "external_blockers": [], "decisions": []},
+        {"status": "ready"},
+        queue_artifact_dir,
+    )
+    empty_replay_queue_item_ids = [
+        str(item.get("id") or "")
+        for item in empty_replay_queue.get("items", [])
+        if isinstance(item, dict)
+    ]
+    empty_replay_queue_passed = (
+        empty_replay_queue.get("summary", {}).get("items") == 4
+        and not any(item_id.startswith("REPLAY-") for item_id in empty_replay_queue_item_ids)
+    )
     provider_neutral_quote_output_blob = json.dumps(
         {
             "attack_strategy": external_attack_strategy,
@@ -32777,6 +32820,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and approval_status_profile_neutral_passed
         and missing_profile_fallback_passed
         and attack_strategy_status_passed
+        and empty_replay_queue_passed
     )
 
     artifact = {
@@ -33005,6 +33049,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "blockers_status": strategy_external_blockers.get("status"),
                 "blocker_ids": [item.get("id") for item in strategy_external_blockers.get("blockers", [])],
             },
+        },
+        "empty_replay_queue": {
+            "status": "passed" if empty_replay_queue_passed else "failed",
+            "queue_status": empty_replay_queue.get("status"),
+            "summary": empty_replay_queue.get("summary", {}),
+            "item_ids": empty_replay_queue_item_ids,
         },
         "active_observation_validation": {
             "status": "passed" if unsafe_observation_validation_passed else "failed",
