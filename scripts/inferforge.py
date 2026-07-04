@@ -87,7 +87,7 @@ DEFAULT_RESOURCE_CRITICAL_BURP_SYNC_COUNT = 3
 DEFAULT_RESOURCE_DEGRADED_OFFLINE_COMMAND_LIMIT = 4
 DEFAULT_RESOURCE_CRITICAL_OFFLINE_COMMAND_LIMIT = 2
 DEFAULT_RESOURCE_CRITICAL_AVAILABLE_MIB = 1024
-DEFAULT_RESOURCE_CRITICAL_SWAP_USED_PCT = 75.0
+DEFAULT_RESOURCE_CRITICAL_SWAP_USED_PCT = 60.0
 DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES = 512 * 1024
 DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES = 256 * 1024
 DEFAULT_TRANSACTION_FLOW_REVIEW_MAX_FILE_BYTES = 512 * 1024
@@ -6620,7 +6620,21 @@ def numeric_resource_value(value: Any) -> float | None:
         return None
 
 
-def build_resource_budget(status: str, warnings: list[str], memory: dict[str, Any]) -> dict[str, Any]:
+def build_resource_budget(
+    status: str,
+    warnings: list[str],
+    memory: dict[str, Any],
+    release_candidates: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    release_candidates = release_candidates or []
+    release_candidate_rss_mib = round(
+        sum(
+            numeric_resource_value(candidate.get("rss_mib")) or 0.0
+            for candidate in release_candidates
+            if isinstance(candidate, dict)
+        ),
+        1,
+    )
     mem_available_mib = numeric_resource_value(memory.get("mem_available_mib"))
     swap_used_pct = numeric_resource_value(memory.get("swap_used_pct"))
     severe_memory_pressure = bool(
@@ -6634,8 +6648,10 @@ def build_resource_budget(status: str, warnings: list[str], memory: dict[str, An
         mode = "normal"
         offline_limit = 8
         burp_count_limit = DEFAULT_BURP_SYNC_COUNT
+        max_parallel_commands = 2
         active_target_traffic = "allowed-after-resource-check"
         browser_automation = "allowed-after-resource-check"
+        active_service_start = "allowed-after-resource-check"
         recommendations = [
             "Run resource-snapshot --strict immediately before active target traffic.",
             "Keep Burp history reads bounded and avoid raw history persistence unless explicitly debugging.",
@@ -6644,8 +6660,10 @@ def build_resource_budget(status: str, warnings: list[str], memory: dict[str, An
         mode = "critical"
         offline_limit = DEFAULT_RESOURCE_CRITICAL_OFFLINE_COMMAND_LIMIT
         burp_count_limit = DEFAULT_RESOURCE_CRITICAL_BURP_SYNC_COUNT
+        max_parallel_commands = 1
         active_target_traffic = "blocked"
         browser_automation = "blocked"
+        active_service_start = "blocked"
         recommendations = [
             "Do not start the target server, browser automation, Burp Scanner, Intruder, broad crawling, or active probes.",
             "Run only short offline planning, artifact-health, and source-review commands until swap pressure clears.",
@@ -6655,21 +6673,35 @@ def build_resource_budget(status: str, warnings: list[str], memory: dict[str, An
         mode = "degraded"
         offline_limit = DEFAULT_RESOURCE_DEGRADED_OFFLINE_COMMAND_LIMIT
         burp_count_limit = DEFAULT_RESOURCE_WARNING_BURP_SYNC_COUNT
+        max_parallel_commands = 1
         active_target_traffic = "blocked"
         browser_automation = "blocked"
+        active_service_start = "blocked"
         recommendations = [
             "Prefer no-write offline review commands and avoid starting new long-running local services.",
             "Run active target traffic only after resource-snapshot --strict is healthy.",
             "If a resource warning is explicitly accepted, keep Burp history and probe limits at the resource-budget caps.",
         ]
+    if mode != "normal" and release_candidates:
+        recommendations.insert(
+            0,
+            (
+                f"Review {len(release_candidates)} release candidate(s) before active work; "
+                f"estimated reclaimable RSS is {release_candidate_rss_mib} MiB."
+            ),
+        )
 
     return {
         "mode": mode,
         "warnings": warnings,
         "offline_command_preview_limit": offline_limit,
         "burp_history_count_limit": burp_count_limit,
+        "max_parallel_commands": max_parallel_commands,
         "active_target_traffic": active_target_traffic,
         "browser_automation": browser_automation,
+        "active_service_start": active_service_start,
+        "release_candidate_count": len(release_candidates),
+        "release_candidate_rss_mib": release_candidate_rss_mib,
         "allow_raw_burp_history": False,
         "allow_scanner_or_intruder": False,
         "recommendations": recommendations,
@@ -6918,7 +6950,8 @@ def build_resource_snapshot(
         for port in sorted(set(watch_ports))
     }
     top_processes = top_rss_processes(max(max_processes, 8))
-    resource_budget = build_resource_budget(status, warnings, memory)
+    release_candidates = resource_release_candidates(top_processes)
+    resource_budget = build_resource_budget(status, warnings, memory, release_candidates=release_candidates)
     return {
         "generated_at": utc_now(),
         "status": status,
@@ -6933,7 +6966,7 @@ def build_resource_snapshot(
         "resource_budget": resource_budget,
         "watched_ports": watched_ports,
         "top_rss_processes": top_processes[:max_processes],
-        "release_candidates": resource_release_candidates(top_processes),
+        "release_candidates": release_candidates,
         "safety": (
             "Local /proc snapshot only. Command lines are shortened and secret-like "
             "tokens are redacted; no network requests or target probes are performed."
@@ -6997,6 +7030,11 @@ def resource_budget_for_snapshot(resource_snapshot: dict[str, Any] | None) -> di
         status,
         [str(item) for item in resource_snapshot.get("warnings", []) or []],
         resource_snapshot.get("memory", {}) if isinstance(resource_snapshot.get("memory"), dict) else {},
+        release_candidates=(
+            resource_snapshot.get("release_candidates", [])
+            if isinstance(resource_snapshot.get("release_candidates"), list)
+            else []
+        ),
     )
 
 
@@ -34794,6 +34832,19 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 for item in resource_release_candidate_sample
             )
         )
+        resource_budget_swap_pressure_sample = build_resource_budget(
+            "warning",
+            ["swap-usage-above-threshold"],
+            {"mem_available_mib": 3700, "swap_used_pct": 62.0},
+            release_candidates=resource_release_candidate_sample,
+        )
+        resource_budget_swap_pressure_passed = (
+            resource_budget_swap_pressure_sample.get("mode") == "critical"
+            and resource_budget_swap_pressure_sample.get("max_parallel_commands") == 1
+            and resource_budget_swap_pressure_sample.get("active_service_start") == "blocked"
+            and resource_budget_swap_pressure_sample.get("release_candidate_count") == 3
+            and resource_budget_swap_pressure_sample.get("release_candidate_rss_mib") == 1960.0
+        )
     blackbox_asset_profile_paths = {
         cluster.get("path")
         for cluster in blackbox_asset_profile_sample.get("clusters", [])
@@ -37602,8 +37653,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "item_ids": empty_replay_queue_item_ids,
         },
         "resource_release_candidates": {
-            "status": "passed" if resource_release_candidates_passed else "failed",
+            "status": "passed"
+            if resource_release_candidates_passed and resource_budget_swap_pressure_passed
+            else "failed",
             "candidates": resource_release_candidate_sample,
+            "swap_pressure_budget": resource_budget_swap_pressure_sample,
         },
         "active_observation_validation": {
             "status": "passed" if unsafe_observation_validation_passed else "failed",
@@ -40751,7 +40805,10 @@ def run_resource_snapshot(args: argparse.Namespace) -> int:
             f"mode={budget.get('mode')} "
             f"offline_preview_limit={budget.get('offline_command_preview_limit')} "
             f"burp_history_count_limit={budget.get('burp_history_count_limit')} "
-            f"active_target_traffic={budget.get('active_target_traffic')}"
+            f"max_parallel={budget.get('max_parallel_commands')} "
+            f"active_target_traffic={budget.get('active_target_traffic')} "
+            f"browser_automation={budget.get('browser_automation')} "
+            f"release_candidate_rss={budget.get('release_candidate_rss_mib')}MiB"
         )
     port_text = ", ".join(
         f"{port}={'listening' if status.get('listening') else 'closed'}"
@@ -43584,8 +43641,8 @@ def build_parser() -> argparse.ArgumentParser:
     resource_snapshot.add_argument(
         "--warn-swap-used-mib",
         type=positive_int,
-        default=1024,
-        help="Warn when used swap is above this many MiB.",
+        default=DEFAULT_RESOURCE_WARN_SWAP_USED_MIB,
+        help=f"Warn when used swap is above this many MiB. Defaults to {DEFAULT_RESOURCE_WARN_SWAP_USED_MIB}.",
     )
     resource_snapshot.add_argument(
         "--no-write",
