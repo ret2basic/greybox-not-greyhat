@@ -94,6 +94,7 @@ BLACKBOX_PROFILE_ARTIFACT = "blackbox-profile.json"
 BLACKBOX_ASSET_CANDIDATES_ARTIFACT = "blackbox-asset-candidates.json"
 BLACKBOX_ASSET_PROFILE_ARTIFACT = "blackbox-asset-profile.json"
 HOST_TAKEOVER_BASELINE_ARTIFACT = "host-takeover-baseline.json"
+RESOURCE_SNAPSHOT_ARTIFACT = "resource-snapshot.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -255,6 +256,7 @@ INDEX_ARTIFACT_ORDER = [
     "probe-results.jsonl",
     "probe-results-summary.json",
     HOST_TAKEOVER_BASELINE_ARTIFACT,
+    RESOURCE_SNAPSHOT_ARTIFACT,
     "response-delta-analysis.json",
     "warmup-results.json",
     "traffic-index.json",
@@ -5190,6 +5192,64 @@ def config_url_review_ref(
 CONFIG_HOST_PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
 
 
+def config_host_impact_hypotheses(host: str, scope_status: str, roles: set[str]) -> list[dict[str, Any]]:
+    hypotheses: list[dict[str, Any]] = []
+    if roles & {"api-or-service-reference", "websocket-reference"}:
+        hypotheses.append(
+            {
+                "impact": "improper-confidential-information-disclosure",
+                "severity_floor": "high-if-sensitive-user-data-is-exposed",
+                "evidence_needed": "A read-only PoC showing confidential user data for another user or protected account context.",
+                "safe_validation_boundary": "Do not authenticate as or act for another user; confirm scope before any request.",
+            }
+        )
+        hypotheses.append(
+            {
+                "impact": "unauthorized-authenticated-action",
+                "severity_floor": "critical-if-actions-are-performed-for-another-user",
+                "evidence_needed": "A non-destructive PoC showing an authenticated action can be taken for another user without interaction.",
+                "safe_validation_boundary": "No trading, withdrawals, wallet signing, or state-changing requests without explicit authorization.",
+            }
+        )
+    if "rpc-reference" in roles:
+        hypotheses.append(
+            {
+                "impact": "wallet-or-transaction-argument-manipulation",
+                "severity_floor": "critical-if-wallet-or-transaction-parameters-can-be-maliciously-changed",
+                "evidence_needed": "A local or read-only PoC showing transaction arguments, contract addresses, or wallet interactions can be modified.",
+                "safe_validation_boundary": "Do not sign wallets, submit transactions, or use privileged/private keys.",
+            }
+        )
+    if "testnet-reference" in roles:
+        hypotheses.append(
+            {
+                "impact": "production-testnet-boundary-confusion",
+                "severity_floor": "informational-unless-production-user-impact-is-demonstrated",
+                "evidence_needed": "Evidence that testnet configuration affects production users, funds, orders, or sensitive data.",
+                "safe_validation_boundary": "Do not assume testnet impact is in scope; review program scope first.",
+            }
+        )
+    if "static-asset-reference" in roles and scope_status != "allowed-host":
+        hypotheses.append(
+            {
+                "impact": "persistent-static-content-injection",
+                "severity_floor": "high-if-persistent-content-can-be-modified-on-target-application",
+                "evidence_needed": "A non-destructive PoC showing target application content can be persistently injected or modified.",
+                "safe_validation_boundary": "Do not claim, overwrite, upload, or modify third-party/static resources.",
+            }
+        )
+    if scope_status != "allowed-host":
+        hypotheses.append(
+            {
+                "impact": "subdomain-takeover",
+                "severity_floor": "high-or-critical-depending-on-wallet-interaction-and-program-impact",
+                "evidence_needed": "Provider-specific dangling-domain evidence without claiming or configuring the resource.",
+                "safe_validation_boundary": "Use explicit-host DNS/HTTP baselines only; do not enumerate subdomains or claim resources.",
+            }
+        )
+    return hypotheses
+
+
 def triage_config_host(host: str, scope_status: str, roles: dict[str, int]) -> dict[str, Any]:
     role_set = set(roles)
     if scope_status == "allowed-host":
@@ -5199,6 +5259,8 @@ def triage_config_host(host: str, scope_status: str, roles: dict[str, int]) -> d
             "review_required": False,
             "reason": "Host is already in the explicit allowed host set for this run.",
             "safe_next_step": "Use the existing profile and bounded probe workflow; do not expand scope from this entry alone.",
+            "impact_hypotheses": config_host_impact_hypotheses(host, scope_status, role_set),
+            "reportability_gate": "Not reportable from configuration reference alone.",
         }
 
     if role_set & {"rpc-reference", "api-or-service-reference", "websocket-reference"}:
@@ -5212,6 +5274,8 @@ def triage_config_host(host: str, scope_status: str, roles: dict[str, int]) -> d
                 + ", ".join(sorted(role_set & {"rpc-reference", "api-or-service-reference", "websocket-reference"}))
             ),
             "safe_next_step": "Confirm bounty scope and read-only semantics before any DNS, HTTP, WebSocket, or API probing.",
+            "impact_hypotheses": config_host_impact_hypotheses(host, scope_status, role_set),
+            "reportability_gate": "Requires confirmed scope plus PoC for sensitive data exposure, unauthorized action, transaction manipulation, or takeover.",
         }
 
     if "testnet-reference" in role_set:
@@ -5221,6 +5285,8 @@ def triage_config_host(host: str, scope_status: str, roles: dict[str, int]) -> d
             "review_required": True,
             "reason": f"Runtime config references testnet-like host `{host}`; production/testnet boundaries need scope review.",
             "safe_next_step": "Do not probe until the program scope confirms testnet hosts and impact eligibility.",
+            "impact_hypotheses": config_host_impact_hypotheses(host, scope_status, role_set),
+            "reportability_gate": "Requires demonstrated production user, funds, order, or sensitive-data impact.",
         }
 
     if "static-asset-reference" in role_set:
@@ -5230,6 +5296,8 @@ def triage_config_host(host: str, scope_status: str, roles: dict[str, int]) -> d
             "review_required": scope_status != "allowed-host",
             "reason": f"Runtime config references static asset host `{host}` outside the explicit allowed host set.",
             "safe_next_step": "Review scope before fetching static assets; prefer local hashes and page references first.",
+            "impact_hypotheses": config_host_impact_hypotheses(host, scope_status, role_set),
+            "reportability_gate": "Requires proof of persistent target-app content modification or takeover; asset reference alone is not reportable.",
         }
 
     return {
@@ -5238,6 +5306,8 @@ def triage_config_host(host: str, scope_status: str, roles: dict[str, int]) -> d
         "review_required": scope_status != "allowed-host",
         "reason": f"Runtime config references `{host}` outside the explicit allowed host set.",
         "safe_next_step": "Confirm bounty scope and impact hypothesis before any probing.",
+        "impact_hypotheses": config_host_impact_hypotheses(host, scope_status, role_set),
+        "reportability_gate": "Requires confirmed scope and a concrete in-scope impact PoC.",
     }
 
 
@@ -5255,6 +5325,8 @@ def build_config_host_map(
     scope_status_counts: dict[str, int] = {}
     role_counts: dict[str, int] = {}
     source_kind_counts: dict[str, int] = {}
+    impact_hypothesis_counts: dict[str, int] = {}
+    reportability_gate_counts: dict[str, int] = {}
 
     for source in sources:
         text = str(source.get("text") or "")
@@ -5334,6 +5406,11 @@ def build_config_host_map(
         item["triage"] = triage
         increment_count(triage_class_counts, str(triage["class"]))
         increment_count(triage_priority_counts, str(triage["priority"]))
+        for hypothesis in triage.get("impact_hypotheses", []) or []:
+            if isinstance(hypothesis, dict) and hypothesis.get("impact"):
+                increment_count(impact_hypothesis_counts, str(hypothesis["impact"]))
+        if triage.get("reportability_gate"):
+            increment_count(reportability_gate_counts, str(triage["reportability_gate"]))
     return {
         "generated_at": utc_now(),
         "status": "review-required" if review_hosts else "complete",
@@ -5349,6 +5426,8 @@ def build_config_host_map(
             "source_kind_counts": dict(sorted(source_kind_counts.items())),
             "triage_class_counts": dict(sorted(triage_class_counts.items())),
             "triage_priority_counts": dict(sorted(triage_priority_counts.items())),
+            "impact_hypothesis_counts": dict(sorted(impact_hypothesis_counts.items())),
+            "reportability_gate_counts": dict(sorted(reportability_gate_counts.items())),
         },
         "hosts": sorted(
             host_items.values(),
@@ -6380,6 +6459,174 @@ def redact_text(value: str | None, *, max_chars: int = 500) -> str | None:
     if len(redacted) > max_chars:
         return redacted[:max_chars] + "...[truncated]"
     return redacted
+
+
+def kib_to_mib(value: int | None) -> float | None:
+    if value is None:
+        return None
+    return round(value / 1024, 1)
+
+
+def read_proc_meminfo() -> dict[str, int]:
+    meminfo_path = Path("/proc/meminfo")
+    meminfo: dict[str, int] = {}
+    try:
+        lines = meminfo_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return meminfo
+    for line in lines:
+        key, sep, rest = line.partition(":")
+        if not sep:
+            continue
+        parts = rest.strip().split()
+        if not parts or not parts[0].isdigit():
+            continue
+        meminfo[key] = int(parts[0])
+    return meminfo
+
+
+def proc_cmdline_preview(pid: int, *, max_chars: int = 180) -> str | None:
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()[:4096]
+    except OSError:
+        return None
+    parts = [
+        part.decode("utf-8", errors="replace")
+        for part in raw.split(b"\0")
+        if part
+    ]
+    if not parts:
+        return None
+    return redact_text(" ".join(parts), max_chars=max_chars)
+
+
+def parse_proc_status(pid: int) -> dict[str, Any] | None:
+    try:
+        lines = (Path("/proc") / str(pid) / "status").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    parsed: dict[str, Any] = {"pid": pid}
+    for line in lines:
+        key, sep, rest = line.partition(":")
+        if not sep:
+            continue
+        value = rest.strip()
+        if key == "Name":
+            parsed["name"] = value
+        elif key == "PPid":
+            try:
+                parsed["ppid"] = int(value)
+            except ValueError:
+                pass
+        elif key == "VmRSS":
+            parts = value.split()
+            if parts and parts[0].isdigit():
+                parsed["rss_kib"] = int(parts[0])
+    if "rss_kib" not in parsed:
+        return None
+    parsed["rss_mib"] = kib_to_mib(int(parsed["rss_kib"]))
+    preview = proc_cmdline_preview(pid)
+    if preview:
+        parsed["command_preview"] = preview
+    return parsed
+
+
+def top_rss_processes(limit: int) -> list[dict[str, Any]]:
+    proc_root = Path("/proc")
+    processes: list[dict[str, Any]] = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return processes
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        parsed = parse_proc_status(int(entry.name))
+        if parsed is not None:
+            processes.append(parsed)
+    processes.sort(key=lambda item: int(item.get("rss_kib") or 0), reverse=True)
+    return processes[:limit]
+
+
+def listening_tcp_ports() -> list[int]:
+    ports: set[int] = set()
+    for path in [Path("/proc/net/tcp"), Path("/proc/net/tcp6")]:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 4 or parts[3] != "0A":
+                continue
+            local_address = parts[1]
+            if ":" not in local_address:
+                continue
+            _address, port_hex = local_address.rsplit(":", 1)
+            try:
+                ports.add(int(port_hex, 16))
+            except ValueError:
+                continue
+    return sorted(ports)
+
+
+def build_resource_snapshot(
+    *,
+    max_processes: int,
+    watch_ports: list[int],
+    warn_available_mib: int,
+    warn_swap_used_mib: int,
+) -> dict[str, Any]:
+    meminfo = read_proc_meminfo()
+    mem_total = meminfo.get("MemTotal")
+    mem_available = meminfo.get("MemAvailable", meminfo.get("MemFree"))
+    swap_total = meminfo.get("SwapTotal")
+    swap_free = meminfo.get("SwapFree")
+    swap_used = None
+    if swap_total is not None and swap_free is not None:
+        swap_used = max(0, swap_total - swap_free)
+    warnings: list[str] = []
+    if mem_available is not None and mem_available < warn_available_mib * 1024:
+        warnings.append("available-memory-below-threshold")
+    if swap_used is not None and swap_used > warn_swap_used_mib * 1024:
+        warnings.append("swap-usage-above-threshold")
+
+    listening_ports = set(listening_tcp_ports())
+    watched_ports = {
+        str(port): {"listening": port in listening_ports}
+        for port in sorted(set(watch_ports))
+    }
+    return {
+        "generated_at": utc_now(),
+        "status": "warning" if warnings else "healthy",
+        "warnings": warnings,
+        "thresholds": {
+            "warn_available_mib": warn_available_mib,
+            "warn_swap_used_mib": warn_swap_used_mib,
+        },
+        "memory": {
+            "mem_total_mib": kib_to_mib(mem_total),
+            "mem_available_mib": kib_to_mib(mem_available),
+            "mem_available_pct": (
+                round((mem_available / mem_total) * 100, 1)
+                if mem_total and mem_available is not None
+                else None
+            ),
+            "swap_total_mib": kib_to_mib(swap_total),
+            "swap_used_mib": kib_to_mib(swap_used),
+            "swap_used_pct": (
+                round((swap_used / swap_total) * 100, 1)
+                if swap_total and swap_used is not None
+                else None
+            ),
+        },
+        "watched_ports": watched_ports,
+        "top_rss_processes": top_rss_processes(max_processes),
+        "safety": (
+            "Local /proc snapshot only. Command lines are shortened and secret-like "
+            "tokens are redacted; no network requests or target probes are performed."
+        ),
+    }
 
 
 def contains_unredacted_secret_text(value: str) -> bool:
@@ -15442,6 +15689,8 @@ def build_verification_queue(
             prerequisites=[
                 "Review whether each runtime host is in bounty scope before using it as a target.",
                 "Prioritize hosts tied to API, RPC, quote, prod, or testnet roles; ignore analytics/CDN-only hosts unless they carry an in-scope impact.",
+                "Treat impact mappings as hypotheses only; a runtime configuration reference is not a reportable finding by itself.",
+                "Report only after confirmed scope and a concrete PoC for a listed impact gate.",
                 "Do not probe sibling or external hosts until scope and impact are confirmed.",
             ],
             safety="Scope review only. Runtime config host mapping is passive and does not request referenced hosts.",
@@ -25775,6 +26024,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         item.get("host"): item.get("triage", {})
         for item in blackbox_asset_map_sample.get("config_hosts", {}).get("hosts", [])
     }
+    blackbox_config_host_impacts = {
+        host: {
+            hypothesis.get("impact")
+            for hypothesis in (triage.get("impact_hypotheses", []) or [])
+            if isinstance(hypothesis, dict)
+        }
+        for host, triage in blackbox_config_host_triage.items()
+    }
     blackbox_asset_profile_sample, blackbox_asset_profile_summary_sample = build_blackbox_profile_from_asset_candidates(
         blackbox_asset_map_sample,
         name="blackbox-asset-selftest",
@@ -25865,10 +26122,18 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_asset_map_sample.get("config_hosts", {}).get("summary", {}).get("triage_priority_counts", {}).get("high") == 1
         and blackbox_asset_map_sample.get("config_hosts", {}).get("summary", {}).get("triage_priority_counts", {}).get("low") == 1
         and blackbox_asset_map_sample.get("config_hosts", {}).get("summary", {}).get("triage_priority_counts", {}).get("info") == 1
+        and blackbox_asset_map_sample.get("config_hosts", {}).get("summary", {}).get("impact_hypothesis_counts", {}).get("improper-confidential-information-disclosure") == 2
+        and blackbox_asset_map_sample.get("config_hosts", {}).get("summary", {}).get("impact_hypothesis_counts", {}).get("persistent-static-content-injection") == 1
+        and blackbox_asset_map_sample.get("config_hosts", {}).get("summary", {}).get("impact_hypothesis_counts", {}).get("subdomain-takeover") == 2
         and blackbox_config_host_triage.get("api.blackbox.test", {}).get("class") == "runtime-service-host-review"
         and blackbox_config_host_triage.get("api.blackbox.test", {}).get("priority") == "high"
+        and "improper-confidential-information-disclosure" in blackbox_config_host_impacts.get("api.blackbox.test", set())
+        and "unauthorized-authenticated-action" in blackbox_config_host_impacts.get("api.blackbox.test", set())
         and blackbox_config_host_triage.get("cdn.blackbox.test", {}).get("class") == "static-asset-host-review"
+        and "persistent-static-content-injection" in blackbox_config_host_impacts.get("cdn.blackbox.test", set())
+        and "subdomain-takeover" in blackbox_config_host_impacts.get("cdn.blackbox.test", set())
         and blackbox_config_host_triage.get("quote.blackbox.test", {}).get("class") == "explicitly-allowed-runtime-host"
+        and blackbox_config_host_triage.get("quote.blackbox.test", {}).get("reportability_gate") == "Not reportable from configuration reference alone."
         and "top-secret" not in json.dumps(blackbox_asset_map_sample.get("config_hosts", {}), sort_keys=True)
         and "AbC1234567890Token" not in json.dumps(blackbox_asset_map_sample.get("config_hosts", {}), sort_keys=True)
         and "{token}" in json.dumps(blackbox_asset_map_sample.get("config_hosts", {}), sort_keys=True)
@@ -30385,6 +30650,58 @@ def run_readiness(args: argparse.Namespace) -> int:
     return 0 if readiness["status"] == "ready" else 1
 
 
+def run_resource_snapshot(args: argparse.Namespace) -> int:
+    artifact_dir = Path(args.artifact_dir).resolve()
+    target = args.target or DEFAULT_TARGET
+    no_write = bool(args.no_write)
+    watch_ports = args.watch_port if args.watch_port else [3100]
+    snapshot = build_resource_snapshot(
+        max_processes=args.max_processes,
+        watch_ports=watch_ports,
+        warn_available_mib=args.warn_available_mib,
+        warn_swap_used_mib=args.warn_swap_used_mib,
+    )
+    output_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
+    if not no_write:
+        write_json(output_path, snapshot)
+    memory = snapshot.get("memory", {})
+    print(f"Resource snapshot: {snapshot['status']}")
+    print(
+        "Memory: "
+        f"available={memory.get('mem_available_mib')}MiB "
+        f"({memory.get('mem_available_pct')}%) "
+        f"swap_used={memory.get('swap_used_mib')}MiB "
+        f"({memory.get('swap_used_pct')}%)"
+    )
+    warnings = snapshot.get("warnings", []) or []
+    print(f"Warnings: {', '.join(warnings) if warnings else 'none'}")
+    port_text = ", ".join(
+        f"{port}={'listening' if status.get('listening') else 'closed'}"
+        for port, status in snapshot.get("watched_ports", {}).items()
+    )
+    print(f"Watched ports: {port_text if port_text else 'none'}")
+    for process in snapshot.get("top_rss_processes", [])[: min(5, args.max_processes)]:
+        print(
+            "RSS: "
+            f"pid={process.get('pid')} "
+            f"rss={process.get('rss_mib')}MiB "
+            f"name={process.get('name')}"
+        )
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="resource-snapshot",
+                output_paths=[output_path],
+            )
+        )
+    return 0
+
+
 def run_decode_transactions(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -31647,6 +31964,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print readiness checks only; do not write capability/readiness artifacts or refreshed manifests.",
     )
     readiness.set_defaults(func=run_readiness)
+
+    resource_snapshot = sub.add_parser(
+        "resource-snapshot",
+        help="Record a lightweight local memory/swap/process snapshot before long-running work",
+    )
+    resource_snapshot.add_argument(
+        "--max-processes",
+        type=positive_int,
+        default=12,
+        help="Number of top RSS processes to include.",
+    )
+    resource_snapshot.add_argument(
+        "--watch-port",
+        action="append",
+        type=positive_int,
+        help="TCP listening port to summarize. Repeat as needed. Defaults to 3100.",
+    )
+    resource_snapshot.add_argument(
+        "--warn-available-mib",
+        type=positive_int,
+        default=1024,
+        help="Warn when MemAvailable is below this many MiB.",
+    )
+    resource_snapshot.add_argument(
+        "--warn-swap-used-mib",
+        type=positive_int,
+        default=1024,
+        help="Warn when used swap is above this many MiB.",
+    )
+    resource_snapshot.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print resource status only; do not write resource-snapshot.json or refresh manifests.",
+    )
+    resource_snapshot.set_defaults(func=run_resource_snapshot)
 
     decode = sub.add_parser(
         "decode-transactions",

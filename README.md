@@ -132,6 +132,13 @@ It also builds a passive runtime URL host map from the page and fetched
 same-origin assets so API, RPC, quote, prod, or testnet host references can be
 reviewed for scope before any request is sent to them. Service-like sibling
 hosts are prioritized above static/analytics-style hosts in the review queue.
+Each runtime host triage item now includes `impact_hypotheses` and a
+`reportability_gate` so leads stay aligned to concrete Web/App bounty impacts:
+confidential user-data disclosure, unauthorized authenticated action,
+wallet/transaction argument manipulation, production/testnet boundary
+confusion, persistent static-content modification, or subdomain takeover.
+These mappings are hypotheses only. A configuration reference is not reportable
+without confirmed scope and a concrete PoC for the listed impact.
 
 Each candidate is triaged before it reaches the review queue:
 
@@ -196,6 +203,20 @@ The default resource caps are intentionally small: 4 same-origin script assets,
 256 KiB per fetched resource, and 80 retained candidates. Raise `--max-assets`,
 `--max-bytes`, or `--candidate-limit` only when the runner has enough memory and
 the target scope permits the extra page-asset requests.
+
+On memory-constrained VPS runs, snapshot local resource pressure before
+starting unattended work:
+
+```bash
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  resource-snapshot --watch-port 3100 --watch-port 2455
+```
+
+`resource-snapshot` reads local `/proc` memory, swap, TCP listener, and top RSS
+process metadata only; it sends no network requests. Port `3100` is the default
+local target application port for the checked-in profile, not Burp's proxy or
+Burp's built-in browser. Keep it closed unless a local app regression actually
+needs the dev server.
 
 Review program scope, authentication context, and endpoint criticality before
 any active probes:
@@ -1242,7 +1263,9 @@ Current known state:
 - Burp MCP is installed and listening on `127.0.0.1:9876`.
 - Codex has a `burp` MCP server registered through `mcp-proxy-all.jar`.
 - Codex can create Burp Repeater tabs through MCP.
-- Codex can send approved MCP HTTP requests to `127.0.0.1:3100`.
+- Codex can send approved MCP HTTP requests to `127.0.0.1:3100` when the local
+  target app is running; this is the default app target port, not the Burp Proxy
+  listener or Burp's built-in browser.
 - Codex can read Burp Proxy HTTP history after Burp's built-in browser has
   generated traffic.
 - Codex can set Burp Proxy Intercept on/off through MCP.
