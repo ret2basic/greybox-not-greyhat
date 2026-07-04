@@ -11433,7 +11433,12 @@ def build_suspicions(
             {
                 "id": "SUSP-quote-json-001",
                 "status": "hardening-note",
-                "entrypoint": "POST /api/quote",
+                "entrypoint": entrypoint_for_cluster(
+                    cluster_map,
+                    "quote",
+                    [row for row in malformed if row],
+                    "POST /api/quote",
+                ),
                 "hypothesis": "Malformed request bodies are handled as server errors and leak parser details.",
                 "blackbox_evidence": [
                     row for row in malformed if row and row.get("status") == 500
@@ -11465,7 +11470,12 @@ def build_suspicions(
             {
                 "id": "SUSP-quote-shape-validation-003",
                 "status": "hardening-note",
-                "entrypoint": "POST /api/quote",
+                "entrypoint": entrypoint_for_cluster(
+                    cluster_map,
+                    "quote",
+                    local_validation_misses,
+                    "POST /api/quote",
+                ),
                 "hypothesis": "Some malformed or incomplete quote request shapes are not rejected by local validation.",
                 "blackbox_evidence": local_validation_misses,
                 "source_questions": [
@@ -11494,7 +11504,12 @@ def build_suspicions(
             {
                 "id": "SUSP-quote-validation-002",
                 "status": "hardening-note",
-                "entrypoint": "POST /api/quote",
+                "entrypoint": entrypoint_for_cluster(
+                    cluster_map,
+                    "quote",
+                    forwarded_policy_probes,
+                    "POST /api/quote",
+                ),
                 "hypothesis": "Shape-valid but business-invalid quote bodies are forwarded to the upstream quote provider before local policy validation.",
                 "blackbox_evidence": forwarded_policy_probes,
                 "source_questions": [
@@ -11522,7 +11537,12 @@ def build_suspicions(
             {
                 "id": "SUSP-rpc-policy-001",
                 "status": "hardening-note",
-                "entrypoint": "POST /api/rpc/solana/[cluster]",
+                "entrypoint": entrypoint_for_cluster(
+                    cluster_map,
+                    "solana-rpc-http",
+                    rpc_policy_misses,
+                    "POST /api/rpc/solana/[cluster]",
+                ),
                 "hypothesis": "One or more Solana RPC proxy policy probes did not receive the expected local enforcement response.",
                 "blackbox_evidence": rpc_policy_misses,
                 "source_questions": [
@@ -11550,7 +11570,12 @@ def build_suspicions(
             {
                 "id": "SUSP-rpc-ws-policy-001",
                 "status": "hardening-note",
-                "entrypoint": "WS /api/rpc/solana/[cluster]",
+                "entrypoint": entrypoint_for_cluster(
+                    cluster_map,
+                    "solana-rpc-ws",
+                    ws_policy_misses,
+                    "WS /api/rpc/solana/[cluster]",
+                ),
                 "hypothesis": "One or more Solana WebSocket RPC proxy policy probes did not receive the expected local close or handshake rejection.",
                 "blackbox_evidence": ws_policy_misses,
                 "source_questions": [
@@ -11578,7 +11603,12 @@ def build_suspicions(
             {
                 "id": "SUSP-orca-policy-001",
                 "status": "hardening-note",
-                "entrypoint": "GET /api/orca/pools/[address]",
+                "entrypoint": entrypoint_for_cluster(
+                    cluster_map,
+                    "orca-pools",
+                    orca_policy_misses,
+                    "GET /api/orca/pools/[address]",
+                ),
                 "hypothesis": "One or more Orca fixed-upstream proxy probes did not receive the expected local address, method, or route guard response.",
                 "blackbox_evidence": orca_policy_misses,
                 "source_questions": [
@@ -23750,6 +23780,54 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for item in generic_hardening_notes
         )
     )
+    quote_source_profile = json_clone(test_profile)
+    for cluster in quote_source_profile.get("clusters", []):
+        if cluster.get("id") == "quote":
+            cluster["source_refs"] = ["selftest/src/app/bridge/quote/route.ts"]
+    quote_source_clusters = build_clusters(quote_source_profile, ROOT)
+    quote_policy_miss_row = {
+        "ts": utc_now(),
+        "phase": "self-test",
+        "probe_id": "quote_amount_wrong_type",
+        "label": "Quote amount wrong type",
+        "target": target,
+        "method": "POST",
+        "path": "/bridge/quote",
+        "category": "quote",
+        "external": False,
+        "policy_field": "amount",
+        "risk": "safe-local-quote-validation",
+        "expectation": "status",
+        "expectation_result": "unexpected-status",
+        "expected_statuses": [400],
+        "status": 500,
+        "expected": False,
+        "duration_ms": 1,
+        "error": None,
+        "body_sample": '{"error":"unexpected"}',
+        "body_text": '{"error":"unexpected"}',
+        "body_sha256": hashlib.sha256(b'{"error":"unexpected"}').hexdigest(),
+        "body_truncated": False,
+        "body_length": len('{"error":"unexpected"}'),
+        "interesting": True,
+        "attempt_count": 1,
+    }
+    quote_profile_suspicions = build_suspicions([quote_policy_miss_row], quote_source_clusters)
+    quote_profile_suspicion = next(
+        (
+            item
+            for item in quote_profile_suspicions
+            if item.get("id") == "SUSP-quote-shape-validation-003"
+        ),
+        None,
+    )
+    quote_profile_hardening_profile_passed = (
+        quote_profile_suspicion is not None
+        and quote_profile_suspicion.get("entrypoint") == "POST /bridge/quote"
+        and quote_profile_suspicion.get("source_refs") == ["selftest/src/app/bridge/quote/route.ts"]
+        and "/api/quote" not in json.dumps(quote_profile_suspicion, sort_keys=True)
+        and "infrafi-web/src" not in json.dumps(quote_profile_suspicion, sort_keys=True)
+    )
     generic_expected_row = json_clone(generic_unexpected_row)
     generic_expected_row.update(
         {
@@ -24089,6 +24167,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and not leaked_paths
         and not missing_paths
         and generic_attribution_passed
+        and quote_profile_hardening_profile_passed
         and response_delta_selftest_passed
         and ws_resource_open_item_passed
         and unsafe_observation_validation_passed
@@ -24132,6 +24211,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "gate_status": None if generic_gate_item is None else generic_gate_item.get("gate_status"),
             "source_refs": [] if generic_suspicion is None else generic_suspicion.get("source_refs", []),
             "hardening_note_ids": [item.get("id") for item in generic_hardening_notes],
+        },
+        "quote_profile_hardening_attribution": {
+            "status": "passed" if quote_profile_hardening_profile_passed else "failed",
+            "suspicion": quote_profile_suspicion,
         },
         "quote_intent_profile_routing": {
             "status": "passed" if quote_intent_profile_passed else "failed",
