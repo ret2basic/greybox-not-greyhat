@@ -8264,6 +8264,7 @@ def hypothesis_from_rpc_method_policy(
     rpc_method_policy: dict[str, Any],
     *,
     target_host: str,
+    transaction_flow_review: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     review = (
         rpc_method_policy.get("remote_transaction_signing_review")
@@ -8293,6 +8294,37 @@ def hypothesis_from_rpc_method_policy(
         for item in [*frontend_refs[:5], *remote_refs[:5]]
         if item.get("file") and item.get("line")
     ]
+    flow_artifact = transaction_flow_review if isinstance(transaction_flow_review, dict) else {}
+    flow_summary = flow_artifact.get("summary") if isinstance(flow_artifact.get("summary"), dict) else {}
+    flow_dataflows = [
+        item for item in flow_artifact.get("dataflows", []) or [] if isinstance(item, dict)
+    ]
+    flow_required_evidence = [
+        str(item)
+        for item in flow_artifact.get("required_evidence", []) or []
+        if str(item).strip()
+    ]
+    remote_payload_flow = next(
+        (
+            item
+            for item in flow_dataflows
+            if item.get("id") == "remote-payload-to-wallet-signing"
+        ),
+        None,
+    )
+    flow_ref_sources = [
+        f"{ref.get('file')}:{ref.get('line')}"
+        for item in flow_dataflows[:5]
+        for ref in item.get("refs", [])[:4]
+        if isinstance(ref, dict) and ref.get("file") and ref.get("line")
+    ]
+    artifact_status = str(flow_artifact.get("status") or "") if flow_artifact else ""
+    enriched_status = artifact_status or status
+    enriched_next_step = (
+        flow_artifact.get("next_step")
+        if isinstance(flow_artifact.get("next_step"), str)
+        else None
+    ) or review.get("next_step")
     return {
         "id": f"HYP-transaction-flow-{safe_hypothesis_id(status, target_host)}",
         "type": "transaction-flow-review",
@@ -8312,32 +8344,43 @@ def hypothesis_from_rpc_method_policy(
             "Can remotely supplied transaction material reach wallet signing with a sender, recipient, mint, amount, "
             "program, or signer intent mismatch?"
         ),
-        "reportability_gate": review.get("reportability_gate")
+        "reportability_gate": flow_artifact.get("reportability_gate")
+        or review.get("reportability_gate")
         or "Static transaction-flow evidence is not reportable without decoded intent mismatch or user-funds impact.",
-        "next_step": review.get("next_step")
+        "next_step": enriched_next_step
         or "Collect one approved quote response and run decode-transactions before any signing flow.",
         "evidence_refs": compact_source_refs(
             [
                 "rpc-method-policy.json",
+                TRANSACTION_FLOW_REVIEW_ARTIFACT,
                 "transaction-intent.json",
                 "burp-transaction-candidates.json",
                 *source_refs,
+                *flow_ref_sources,
             ]
         ),
         "transaction_flow_review": {
-            "status": status,
+            "status": enriched_status,
+            "rpc_policy_status": status,
+            "artifact_status": artifact_status or "missing",
             "frontend_signing_ref_count": review.get("frontend_signing_ref_count", len(frontend_refs)),
             "remote_transaction_material_ref_count": review.get(
                 "remote_transaction_material_ref_count",
                 len(remote_refs),
             ),
+            "dataflow_count": len(flow_dataflows),
+            "remote_payload_to_wallet_signing": bool(remote_payload_flow),
+            "remote_signing_sink_ref_count": flow_summary.get("remote_signing_sink_refs", 0),
+            "local_signing_sink_ref_count": flow_summary.get("local_signing_sink_refs", 0),
             "static_signal_count": static_intent_review.get("signal_count", 0),
             "static_intent_review": static_intent_review,
+            "dataflows": flow_dataflows[:5],
             "frontend_transaction_dependency_refs": frontend_refs[:5],
             "remote_transaction_material_refs": remote_refs[:5],
-            "required_evidence": review.get("required_evidence", []),
+            "required_evidence": flow_required_evidence or review.get("required_evidence", []),
         },
-        "safety": review.get("safety")
+        "safety": flow_artifact.get("safety")
+        or review.get("safety")
         or "Offline transaction-flow review only. Do not sign wallets or submit transactions.",
     }
 
@@ -8857,6 +8900,7 @@ def build_hypothesis_matrix_run(
         profile=profile,
         artifact_dir=artifact_dir,
     )
+    transaction_flow_review = load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT) or {}
     asset_candidates = load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT) or {}
     harness_loop = build_harness_loop_run(target=target, profile=profile, artifact_dir=artifact_dir)
 
@@ -8888,7 +8932,11 @@ def build_hypothesis_matrix_run(
         for hypothesis in hypothesis_from_cluster(cluster, target_host=target_host, resource_gated=resource_gated):
             add_hypothesis(hypotheses, hypothesis)
 
-    rpc_hypothesis = hypothesis_from_rpc_method_policy(rpc_method_policy, target_host=target_host)
+    rpc_hypothesis = hypothesis_from_rpc_method_policy(
+        rpc_method_policy,
+        target_host=target_host,
+        transaction_flow_review=transaction_flow_review,
+    )
     if rpc_hypothesis:
         add_hypothesis(hypotheses, rpc_hypothesis)
     rpc_resource_hypothesis = hypothesis_from_rpc_rate_limit_resource_policy(
@@ -15298,6 +15346,8 @@ def transaction_flow_match_categories() -> dict[str, list[str]]:
     return {
         "remote_transaction_sources": [
             "transactionBase64s",
+            "executableQuote.payloads",
+            "extractRemoteTransactions(",
             "payload.data.transaction",
             "data.transaction",
             "payloads.map",
@@ -15305,6 +15355,7 @@ def transaction_flow_match_categories() -> dict[str, list[str]]:
         "transaction_deserializers": [
             "VersionedTransaction.deserialize",
             "deserializeTransaction(",
+            "extractRemoteTransactions(",
             "Buffer.from(base64",
         ],
         "wallet_signing_sinks": [
@@ -32827,6 +32878,15 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         rewrite_transaction_policy = build_rpc_method_policy(rewrite_source_root, [], profile=rewrite_normalized)
         rewrite_transaction_matrix_dir = Path(temp_dir) / "transaction-flow-artifacts"
         rewrite_transaction_matrix_dir.mkdir()
+        rewrite_transaction_flow_review = build_transaction_flow_review(
+            rewrite_source_root,
+            rewrite_normalized,
+            rpc_method_policy=rewrite_transaction_policy,
+        )
+        write_json(
+            rewrite_transaction_matrix_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT,
+            rewrite_transaction_flow_review,
+        )
         rewrite_transaction_matrix = build_hypothesis_matrix_run(
             target="http://127.0.0.1:9998",
             profile=rewrite_normalized,
@@ -33438,6 +33498,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for signal in transaction_static_review.get("signals", [])
             if isinstance(signal, dict)
         }
+        transaction_flow_review_dataflow_ids = {
+            item.get("id")
+            for item in rewrite_transaction_flow_review.get("dataflows", [])
+            if isinstance(item, dict)
+        }
         transaction_flow_hypothesis_passed = (
             rewrite_transaction_policy.get("remote_transaction_signing_review", {}).get("status")
             == "needs-transaction-intent-corpus"
@@ -33450,17 +33515,32 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "preview-wallet-execution-wallet-review",
                 "client-recent-blockhash-rewrite",
             }.issubset(transaction_static_signal_ids)
+            and rewrite_transaction_flow_review.get("status") == "needs-transaction-intent-corpus"
+            and "remote-payload-to-wallet-signing" in transaction_flow_review_dataflow_ids
             and rewrite_transaction_matrix.get("summary", {}).get("rpc_method_policy_source") == "profile-fallback"
             and rewrite_transaction_hypothesis is not None
             and rewrite_transaction_hypothesis.get("status") == "ready-for-offline-review"
             and rewrite_transaction_hypothesis.get("impact") == "transaction-integrity"
             and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("status")
             == "needs-transaction-intent-corpus"
+            and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("artifact_status")
+            == "needs-transaction-intent-corpus"
+            and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("dataflow_count", 0) >= 3
+            and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("remote_payload_to_wallet_signing")
+            is True
+            and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("remote_signing_sink_ref_count", 0) >= 1
             and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
+            and TRANSACTION_FLOW_REVIEW_ARTIFACT in (rewrite_transaction_hypothesis.get("evidence_refs", []) or [])
             and rewrite_transaction_validation_item is not None
             and rewrite_transaction_validation_item.get("status") == "ready-offline"
             and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("status")
             == "needs-transaction-intent-corpus"
+            and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("dataflow_count", 0) >= 3
+            and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get(
+                "remote_signing_sink_ref_count",
+                0,
+            )
+            >= 1
             and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
         )
         rate_limit_resource_review = rewrite_transaction_policy.get("rate_limit_resource_review", {})
@@ -38522,7 +38602,9 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         f"{transaction_flow.get('status')} "
                         f"frontend_refs={transaction_flow.get('frontend_signing_ref_count', 0)} "
                         f"remote_tx_refs={transaction_flow.get('remote_transaction_material_ref_count', 0)} "
-                        f"static_signals={transaction_flow.get('static_signal_count', 0)}"
+                        f"static_signals={transaction_flow.get('static_signal_count', 0)} "
+                        f"dataflows={transaction_flow.get('dataflow_count', 0)} "
+                        f"remote_signing_sinks={transaction_flow.get('remote_signing_sink_ref_count', 0)}"
                     )
                 resource_review = (
                     item.get("resource_abuse_review")
