@@ -80,6 +80,40 @@ python3 scripts/inferforge.py --source-root ./some-nextjs-app discover-profile \
   --output profiles/some-nextjs-app.json
 ```
 
+For a pure black-box bounty target where you do not have source, start from
+Burp built-in browser history instead of static discovery. Exercise only
+in-scope user flows in Burp, keep Proxy Intercept off for repeatable automation,
+then import or sync the normalized history:
+
+```bash
+python3 scripts/inferforge.py --target https://in-scope.example \
+  --artifact-dir .greybox/in-scope-example \
+  burp-sync --replace
+```
+
+Generate a black-box profile from those observed requests:
+
+```bash
+python3 scripts/inferforge.py --target https://in-scope.example \
+  --artifact-dir .greybox/in-scope-example \
+  blackbox-profile \
+  --output profiles/in-scope-example-blackbox.json
+```
+
+`blackbox-profile` does not send HTTP traffic. It reads
+`burp-history-observations.jsonl`, skips likely static assets by default,
+groups concrete observed paths into `blackbox-http-observed` clusters, strips
+query values from the profile while keeping query parameter names, and marks
+`assessment_mode: "blackbox"` so later artifacts do not try to read local
+source code. Review program scope, authentication context, and endpoint
+criticality before any active probes:
+
+```bash
+python3 scripts/inferforge.py --profile profiles/in-scope-example-blackbox.json \
+  --artifact-dir .greybox/in-scope-example \
+  plan --observed-only --no-write
+```
+
 Use `--profile`, `--target`, and `--source-root` to onboard another similar
 application while keeping the same tool pipeline:
 
@@ -92,6 +126,7 @@ The profile's `strategy_sets` list controls which built-in bounded strategies
 are active for the run. The current registry includes:
 
 ```text
+blackbox-http-observed
 nextjs-api-routes
 solana-json-rpc-proxy
 quote-transaction-decoder

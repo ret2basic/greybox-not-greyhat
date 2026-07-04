@@ -80,6 +80,7 @@ MAX_RESPONSE_BYTES = 256 * 1024
 MAX_BODY_SAMPLE_CHARS = 1200
 MAX_REQUEST_CONTEXTS_PER_ENDPOINT = 6
 REDACTED_VALUE = "[redacted]"
+GENERIC_HTTP_ROUTE_STRATEGY_SETS = {"nextjs-api-routes", "blackbox-http-observed"}
 BASE64_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{80,}={0,2})(?![A-Za-z0-9+/=])")
 PLACEHOLDER_ENV_RE = re.compile(r"^YOUR_[A-Z0-9_]+_HERE$", re.IGNORECASE)
 COMMAND_PLACEHOLDER_RE = re.compile(r"REPLACE_WITH_[A-Z0-9_]+")
@@ -89,6 +90,7 @@ STRATEGY_REGISTRY_ARTIFACT = "strategy-registry.json"
 PROFILE_VALIDATION_ARTIFACT = "profile-validation.json"
 ROUTE_INVENTORY_ARTIFACT = "route-inventory.json"
 DISCOVERED_PROFILE_ARTIFACT = "discovered-profile.json"
+BLACKBOX_PROFILE_ARTIFACT = "blackbox-profile.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -147,7 +149,10 @@ REVIEW_ARTIFACTS = [
 DISCOVERY_ARTIFACTS = [
     ROUTE_INVENTORY_ARTIFACT,
     DISCOVERED_PROFILE_ARTIFACT,
+    BLACKBOX_PROFILE_ARTIFACT,
     "discovered-profile-validation.json",
+    "blackbox-profile-validation.json",
+    "blackbox-profile-summary.json",
     DISCOVERY_COVERAGE_ARTIFACT,
 ]
 KNOWN_OPTIONAL_ARTIFACTS = [
@@ -299,6 +304,13 @@ SERVER_ACTION_REVIEW_KEYWORDS = {
     "withdraw",
 }
 STRATEGY_REGISTRY: dict[str, dict[str, Any]] = {
+    "blackbox-http-observed": {
+        "title": "Observed HTTP endpoint baseline",
+        "description": "Pure black-box workflow for endpoints already observed in Burp Proxy history.",
+        "cluster_ids": [],
+        "probe_categories": ["blackbox-observed-http"],
+        "safety": "Replays no captured bodies; plans only low-volume HEAD, OPTIONS, and GET availability/method checks.",
+    },
     "nextjs-api-routes": {
         "title": "Next.js API route baseline",
         "description": "Baseline local route availability, CORS preflight, and low-risk method handling for profile-defined Next.js routes.",
@@ -422,6 +434,7 @@ def default_target_profile() -> dict[str, Any]:
         "name": "infrafi-web",
         "display_name": "InfraFi Web",
         "description": "Default regression target used to develop InferForge as a reusable Burp-first greybox tool.",
+        "assessment_mode": "greybox",
         "target_type": "nextjs-web3-defi-app",
         "frameworks": ["Next.js App Router", "Solana", "M0 orchestration", "Orca"],
         "default_target": DEFAULT_TARGET,
@@ -783,6 +796,7 @@ def neutral_target_profile_defaults(
         "name": name,
         "display_name": str(profile.get("display_name") or name),
         "description": "",
+        "assessment_mode": str(profile.get("assessment_mode") or "greybox"),
         "target_type": "custom-web-app",
         "frameworks": [],
         "default_target": DEFAULT_TARGET,
@@ -834,6 +848,7 @@ def normalize_target_profile(profile: dict[str, Any], *, profile_path: Path | No
         "name",
         "display_name",
         "description",
+        "assessment_mode",
         "target_type",
         "frameworks",
         "default_target",
@@ -859,6 +874,15 @@ def normalize_target_profile(profile: dict[str, Any], *, profile_path: Path | No
     normalized["_profile_loaded_from"] = "file" if profile_path and profile_path.exists() else "builtin-default"
     normalized["_profile_defaulted_keys"] = defaulted_keys
     return normalized
+
+
+def assessment_mode(profile: dict[str, Any] | None) -> str:
+    mode = str((profile or {}).get("assessment_mode") or "").strip().lower()
+    return mode or "greybox"
+
+
+def is_blackbox_assessment(profile: dict[str, Any] | None) -> bool:
+    return assessment_mode(profile) == "blackbox"
 
 
 def default_strategy_set_for_cluster(cluster_id: str) -> str | None:
@@ -1526,7 +1550,8 @@ def generic_nextjs_route_targets(profile: dict[str, Any] | None) -> list[dict[st
         cluster_id = str(cluster.get("id") or "")
         if not cluster_id or cluster_id == "health":
             continue
-        if strategy_set_for_cluster(cluster) != "nextjs-api-routes":
+        strategy_set = strategy_set_for_cluster(cluster)
+        if strategy_set not in GENERIC_HTTP_ROUTE_STRATEGY_SETS:
             continue
         path = probe_target_path(profile, cluster_id, "path", str(cluster.get("path") or ""))
         if not is_concrete_probe_path(path):
@@ -1538,6 +1563,7 @@ def generic_nextjs_route_targets(profile: dict[str, Any] | None) -> list[dict[st
                 "methods": sorted(cluster_declared_methods(cluster)),
                 "kind": cluster.get("kind") or "api-route",
                 "priority": cluster.get("priority") or "low",
+                "strategy_set": strategy_set,
             }
         )
     return targets
@@ -1595,6 +1621,19 @@ def build_profile_validation_artifact(
                 "id": f"unknown-strategy-set:{strategy_id}",
                 "severity": "error",
                 "message": f"Profile enables strategy set `{strategy_id}`, but it is not in the InferForge registry.",
+            }
+        )
+
+    mode = assessment_mode(profile)
+    if mode not in {"greybox", "blackbox"}:
+        warnings.append(
+            {
+                "id": "profile:unknown-assessment-mode",
+                "severity": "warning",
+                "message": (
+                    f"Profile assessment_mode `{mode}` is not recognized. "
+                    "Supported modes are `greybox` and `blackbox`."
+                ),
             }
         )
 
@@ -2165,6 +2204,8 @@ def build_profile_validation_artifact(
 
 
 HTTP_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+HTTP_METHOD_ORDER = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+HTTP_METHOD_ORDER_INDEX = {method: index for index, method in enumerate(HTTP_METHOD_ORDER)}
 ROUTE_FILE_NAMES = {"route.js", "route.jsx", "route.ts", "route.tsx"}
 PAGES_API_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx"}
 NEXT_CONFIG_FILE_NAMES = {
@@ -4574,6 +4615,7 @@ def build_discovered_profile(
         "name": name,
         "display_name": display_name,
         "description": "Starter target profile generated from static Next.js route, rewrite, middleware, and custom-server discovery. Review and edit before a full audit.",
+        "assessment_mode": "greybox",
         "target_type": "discovered-nextjs-app",
         "frameworks": frameworks,
         "default_target": target,
@@ -4631,6 +4673,257 @@ def build_discovered_profile(
     if quote_provider is not None:
         profile["quote_provider"] = quote_provider
     return profile
+
+
+STATIC_ASSET_PATH_PREFIXES = (
+    "/_next/",
+    "/static/",
+    "/assets/",
+    "/favicon",
+    "/robots.txt",
+    "/sitemap.xml",
+)
+STATIC_ASSET_EXTENSIONS = {
+    ".avif",
+    ".css",
+    ".gif",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".js",
+    ".json",
+    ".map",
+    ".png",
+    ".svg",
+    ".webp",
+    ".woff",
+    ".woff2",
+}
+
+
+def blackbox_profile_path(raw_path: Any) -> str:
+    parsed = urllib.parse.urlparse(str(raw_path or "/"))
+    path = parsed.path or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
+
+
+def blackbox_query_keys(raw_path: Any) -> list[str]:
+    parsed = urllib.parse.urlparse(str(raw_path or ""))
+    keys = sorted({key for key, _value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if key})
+    return keys
+
+
+def is_static_asset_path(path: str) -> bool:
+    lower_path = path.lower()
+    if any(lower_path == prefix or lower_path.startswith(prefix) for prefix in STATIC_ASSET_PATH_PREFIXES):
+        return True
+    suffix = Path(urllib.parse.urlparse(path).path).suffix.lower()
+    return suffix in STATIC_ASSET_EXTENSIONS
+
+
+def blackbox_cluster_id_for_path(path: str) -> str:
+    path_hash = hashlib.sha1(path.encode("utf-8")).hexdigest()[:8]
+    prefix = safe_probe_id(path.strip("/") or "root")[:48]
+    return f"blackbox-{prefix}-{path_hash}"
+
+
+def blackbox_endpoint_kind(path: str, methods: set[str], content_types: set[str]) -> str:
+    if path.startswith("/api/") or any("json" in content_type for content_type in content_types):
+        return "observed-api-endpoint"
+    if methods & {"POST", "PUT", "PATCH", "DELETE"}:
+        return "observed-stateful-endpoint"
+    return "observed-http-endpoint"
+
+
+def blackbox_endpoint_priority(methods: set[str], statuses: set[int | None], kind: str) -> str:
+    if methods & {"POST", "PUT", "PATCH", "DELETE"}:
+        return "medium"
+    if any(status is not None and status >= 500 for status in statuses):
+        return "medium"
+    if kind == "observed-api-endpoint":
+        return "medium"
+    return "low"
+
+
+def build_blackbox_profile_from_history(
+    burp_history: list[dict[str, Any]],
+    *,
+    name: str,
+    display_name: str,
+    target: str,
+    include_static_assets: bool = False,
+    max_endpoints: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    target_netloc = urllib.parse.urlparse(target).netloc
+    by_path: dict[str, dict[str, Any]] = {}
+    skipped_static = 0
+    skipped_ws = 0
+    skipped_host = 0
+
+    for row in burp_history:
+        method = str(row.get("method") or "").upper()
+        host = str(row.get("host") or "")
+        if target_netloc and host and host != target_netloc:
+            skipped_host += 1
+            continue
+        if method == "WS":
+            skipped_ws += 1
+            continue
+        if method not in HTTP_METHODS:
+            continue
+        path = blackbox_profile_path(row.get("path"))
+        if not include_static_assets and is_static_asset_path(path):
+            skipped_static += 1
+            continue
+        item = by_path.setdefault(
+            path,
+            {
+                "path": path,
+                "methods": set(),
+                "statuses": set(),
+                "hosts": set(),
+                "query_keys": set(),
+                "content_types": set(),
+                "observation_count": 0,
+            },
+        )
+        item["methods"].add(method)
+        item["statuses"].add(row.get("status"))
+        if host:
+            item["hosts"].add(host)
+        item["query_keys"].update(blackbox_query_keys(row.get("path")))
+        if row.get("content_type"):
+            item["content_types"].add(str(row.get("content_type")))
+        item["observation_count"] += 1
+
+    rows = sorted(
+        by_path.values(),
+        key=lambda item: (
+            -int(item["observation_count"]),
+            item["path"],
+        ),
+    )
+    if max_endpoints is not None:
+        rows = rows[:max_endpoints]
+
+    clusters: list[dict[str, Any]] = []
+    probe_targets: dict[str, Any] = {}
+    observed_endpoint_summaries: list[dict[str, Any]] = []
+    for item in rows:
+        path = str(item["path"])
+        methods = {str(method) for method in item["methods"]}
+        statuses = set(item["statuses"])
+        content_types = {str(content_type) for content_type in item["content_types"]}
+        kind = blackbox_endpoint_kind(path, methods, content_types)
+        cluster_id = blackbox_cluster_id_for_path(path)
+        ordered_methods = sorted(
+            methods,
+            key=lambda method: (HTTP_METHOD_ORDER_INDEX.get(method, 99), method),
+        )
+        statuses_sorted = sorted(status for status in statuses if isinstance(status, int))
+        query_keys = sorted(str(key) for key in item["query_keys"])
+        cluster = {
+            "id": cluster_id,
+            "method": ordered_methods[0] if ordered_methods else "ANY",
+            "path": path,
+            "kind": kind,
+            "priority": blackbox_endpoint_priority(methods, statuses, kind),
+            "strategy_set": "blackbox-http-observed",
+            "match": {"methods": ordered_methods, "paths": [path]},
+            "source_refs": [],
+            "discovery": {
+                "source": "burp-history",
+                "observation_count": int(item["observation_count"]),
+                "observed_methods": ordered_methods,
+                "observed_statuses": statuses_sorted,
+                "query_keys": query_keys,
+                "hosts": sorted(str(host) for host in item["hosts"]),
+                "content_types": sorted(content_types),
+                "notes": [
+                    "Generated from already captured Burp Proxy history.",
+                    "Query values are intentionally not copied into the profile.",
+                    "Active probes are limited to low-volume method and CORS baseline checks against this observed concrete path.",
+                ],
+            },
+        }
+        clusters.append(cluster)
+        probe_targets[cluster_id] = {"path": path}
+        observed_endpoint_summaries.append(
+            {
+                "cluster_id": cluster_id,
+                "path": path,
+                "methods": ordered_methods,
+                "statuses": statuses_sorted,
+                "query_keys": query_keys,
+                "observation_count": int(item["observation_count"]),
+            }
+        )
+
+    profile = {
+        "schema_version": 1,
+        "name": name,
+        "display_name": display_name,
+        "description": "Pure black-box target profile generated from normalized Burp Proxy history. Review scope, authentication context, and endpoint criticality before active audit probes.",
+        "assessment_mode": "blackbox",
+        "target_type": "blackbox-web-app",
+        "frameworks": [],
+        "default_target": target,
+        "default_source_root": ".",
+        "strategy_sets": ["blackbox-http-observed"],
+        "safety": {
+            "no_wallet_signing": True,
+            "no_transaction_submission": True,
+            "no_burp_scanner": True,
+            "no_broad_fuzzing": True,
+            "prefer_loopback_targets": False,
+            "requires_bounty_scope_review": True,
+        },
+        "probe_targets": probe_targets,
+        "quote_intent": {},
+        "quote_request": {},
+        "quote_response": {},
+        "quote_provider": {},
+        "environment_readiness": {"checks": []},
+        "clusters": clusters,
+        "source_peeks": [],
+        "burp_observation_plan": [],
+        "review_observation_candidates": [],
+        "websocket_observation": None,
+        "blackbox": {
+            "generated_at": utc_now(),
+            "history_source": "burp-history-observations.jsonl",
+            "observed_endpoint_count": len(clusters),
+            "include_static_assets": include_static_assets,
+            "max_endpoints": max_endpoints,
+            "skipped_static_asset_observations": skipped_static,
+            "skipped_websocket_observations": skipped_ws,
+            "skipped_other_host_observations": skipped_host,
+            "workflow": [
+                "Use Burp built-in browser to exercise in-scope user flows.",
+                "Run burp-sync or import-burp-history to refresh normalized observations.",
+                "Run blackbox-profile to regenerate this profile from observations.",
+                "Review scope and run plan --observed-only --no-write before audit.",
+            ],
+        },
+    }
+    summary = {
+        "generated_at": utc_now(),
+        "status": "generated" if clusters else "no-observed-endpoints",
+        "target": target,
+        "profile": {"name": name, "display_name": display_name},
+        "input_observations": len(burp_history),
+        "generated_clusters": len(clusters),
+        "skipped": {
+            "static_asset_observations": skipped_static,
+            "websocket_observations": skipped_ws,
+            "other_host_observations": skipped_host,
+        },
+        "endpoints": observed_endpoint_summaries,
+        "safety": "Profile generation is read-only over normalized Burp history and does not send HTTP requests.",
+    }
+    return profile, summary
 
 
 def load_target_profile(profile_path: str | None) -> dict[str, Any]:
@@ -6479,23 +6772,30 @@ def build_probe_plan(
             path = route["path"]
             methods = set(route.get("methods", []))
             prefix = safe_probe_id(cluster_id)
+            route_strategy_set = str(route.get("strategy_set") or "nextjs-api-routes")
+            route_label = (
+                "Black-box observed endpoint"
+                if route_strategy_set == "blackbox-http-observed"
+                else "Next.js route"
+            )
+            probe_prefix = "blackbox" if route_strategy_set == "blackbox-http-observed" else "nextjs"
             generated.append(
                 Probe(
-                    f"nextjs_{prefix}_head",
-                    f"Next.js route HEAD baseline {cluster_id}",
+                    f"{probe_prefix}_{prefix}_head",
+                    f"{route_label} HEAD baseline {cluster_id}",
                     "HEAD",
                     path,
                     expected_statuses=(200, 204, 400, 403, 404, 405),
                     category=cluster_id,
                     policy_field="method",
                     risk="safe-generic-route-method-probe",
-                    strategy_set="nextjs-api-routes",
+                    strategy_set=route_strategy_set,
                 )
             )
             generated.append(
                 Probe(
-                    f"nextjs_{prefix}_options_preflight",
-                    f"Next.js route OPTIONS preflight {cluster_id}",
+                    f"{probe_prefix}_{prefix}_options_preflight",
+                    f"{route_label} OPTIONS preflight {cluster_id}",
                     "OPTIONS",
                     path,
                     origin=allowed_origin,
@@ -6503,7 +6803,7 @@ def build_probe_plan(
                     category=cluster_id,
                     policy_field="cors-preflight",
                     risk="safe-generic-route-preflight-probe",
-                    strategy_set="nextjs-api-routes",
+                    strategy_set=route_strategy_set,
                 )
             )
             if not methods:
@@ -6511,29 +6811,29 @@ def build_probe_plan(
             if "GET" in methods:
                 generated.append(
                     Probe(
-                        f"nextjs_{prefix}_get_availability",
-                        f"Next.js route GET availability {cluster_id}",
+                        f"{probe_prefix}_{prefix}_get_availability",
+                        f"{route_label} GET availability {cluster_id}",
                         "GET",
                         path,
                         expected_statuses=(200, 204, 304, 400, 403, 404),
                         category=cluster_id,
                         policy_field="availability",
                         risk="safe-generic-route-availability-probe",
-                        strategy_set="nextjs-api-routes",
+                        strategy_set=route_strategy_set,
                     )
                 )
             else:
                 generated.append(
                     Probe(
-                        f"nextjs_{prefix}_get_method_confusion",
-                        f"Next.js route GET method confusion {cluster_id}",
+                        f"{probe_prefix}_{prefix}_get_method_confusion",
+                        f"{route_label} GET method confusion {cluster_id}",
                         "GET",
                         path,
                         expected_statuses=(400, 403, 404, 405),
                         category=cluster_id,
                         policy_field="method",
                         risk="safe-generic-route-method-probe",
-                        strategy_set="nextjs-api-routes",
+                        strategy_set=route_strategy_set,
                     )
                 )
         return generated
@@ -8513,6 +8813,24 @@ def build_source_peeks(
     observed_endpoints: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     profile = profile or default_target_profile()
+    if is_blackbox_assessment(profile):
+        return {
+            "generated_at": utc_now(),
+            "status": "not-applicable",
+            "target": profile.get("name"),
+            "profile": profile_summary(profile),
+            "assessment_mode": "blackbox",
+            "source_root": None,
+            "source_peeks": [],
+            "endpoint_resolver": {
+                "status": "not-applicable",
+                "reason": "pure-blackbox-profile",
+                "observed_endpoint_count": len(observed_endpoints or []),
+                "matched": [],
+                "unresolved": [],
+            },
+            "safety": "Pure black-box mode does not read local source files or resolve endpoints to source refs.",
+        }
 
     def display_path(path: Path) -> str:
         try:
@@ -8865,8 +9183,13 @@ def source_cluster_ids(clusters: dict[str, Any]) -> set[str]:
 
 def observed_cluster_ids(traffic_index: dict[str, Any], clusters: dict[str, Any]) -> set[str]:
     observed: set[str] = set()
+    active_cluster_ids = source_cluster_ids(clusters)
     for endpoint in traffic_index.get("endpoints", []):
-        observed.update(str(cluster_id) for cluster_id in endpoint.get("cluster_ids", []) or [])
+        observed.update(
+            str(cluster_id)
+            for cluster_id in endpoint.get("cluster_ids", []) or []
+            if str(cluster_id) in active_cluster_ids
+        )
         observed.update(classify_endpoint(endpoint["method"], endpoint["path"], clusters))
     return observed
 
@@ -9176,6 +9499,33 @@ def build_attack_strategy(
                 "Do not mark a finding valid without request/response evidence and an explicit attacker model.",
             ],
             "automation_state": "implemented-as-artifact-contract",
+        },
+        {
+            "id": "strategy-blackbox-http-observed",
+            "title": "Pure black-box observed HTTP endpoint strategy",
+            "applies_to": ["blackbox-http-observed", "observed-http-endpoint", "observed-api-endpoint"],
+            "attacker_model": "An authorized bug-bounty tester using Burp browser history from in-scope user flows.",
+            "primary_questions": [
+                "Which observed endpoints are stable enough for low-volume replay-free checks?",
+                "Do HEAD, OPTIONS, or GET method checks expose unexpected successful behavior, CORS policy gaps, or debug responses?",
+                "Which endpoints need manual review, authentication context, or a richer profile before any deeper test is appropriate?",
+            ],
+            "safe_probe_queue": [
+                "implemented: build a profile only from normalized Burp history; no crawling or directory guessing",
+                "implemented: low-volume HEAD, OPTIONS, and GET checks against observed concrete paths only",
+                "implemented: response-delta grouping and finding gates before reportability",
+                "manual: use Burp built-in browser to add more normal user-flow evidence before expanding scope",
+            ],
+            "source_peek_triggers": [
+                "Pure black-box mode records source context as not-applicable.",
+                "Any source-specific question must be converted into an external/manual evidence request, not local source reads.",
+            ],
+            "finding_gate": [
+                "Require Burp request/response evidence from the in-scope host.",
+                "Require an explicit bounty-scope note before reporting.",
+                "Do not infer exploitability from method oddities without concrete impact.",
+            ],
+            "safety": "No Burp Scanner, Intruder, broad crawling, high-volume fuzzing, credential attacks, wallet signing, or transaction submission.",
         },
         {
             "id": "strategy-rpc-http",
@@ -11308,7 +11658,9 @@ def build_blackbox_coverage(
     burp_observation_run: dict[str, Any] | None,
     environment_readiness: dict[str, Any] | None,
     transaction_decoder_selftest: dict[str, Any] | None,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    blackbox_mode = is_blackbox_assessment(profile)
     burp_cluster_ids = observed_cluster_ids(build_traffic_index([], burp_history), clusters)
     source_cluster_ids_seen = source_peek_cluster_ids(source_peeks, clusters)
     observation_clusters = set((burp_observation_run or {}).get("summary", {}).get("clusters", []))
@@ -11353,18 +11705,33 @@ def build_blackbox_coverage(
                 if row.get("policy_field") is not None
             }
         )
-        active_probe_required = cluster_id != "health" and cluster_kind not in {"rewrite-proxy"}
+        active_probe_required = cluster_id != "health" and cluster_kind not in {"rewrite-proxy"} and not blackbox_mode
+        safe_probe_required = active_probe_required or bool(required_unexpected)
         burp_observed = cluster_id in burp_cluster_ids
+        source_context_required = cluster_id != "health" and not blackbox_mode
+        source_context_status = (
+            "not-applicable"
+            if not source_context_required
+            else ("passed" if cluster_id in source_cluster_ids_seen else "failed")
+        )
         safe_probe_status = (
             "failed"
             if required_unexpected
             else "warning"
             if open_item_unexpected
-            else ("passed" if rows else ("failed" if active_probe_required else "not-applicable"))
+            else (
+                "passed"
+                if rows
+                else (
+                    "warning"
+                    if blackbox_mode and cluster_id != "health"
+                    else ("failed" if active_probe_required else "not-applicable")
+                )
+            )
         )
         policy_status = (
             "not-applicable"
-            if cluster_id == "health" or not active_probe_required
+            if cluster_id == "health" or (blackbox_mode and not policy_fields) or not (active_probe_required or policy_fields)
             else ("passed" if policy_fields else "failed")
         )
         checks = [
@@ -11383,13 +11750,16 @@ def build_blackbox_coverage(
                     "required_unexpected_count": len(required_unexpected),
                     "open_item_unexpected_count": len(open_item_unexpected),
                 },
-                required=active_probe_required,
+                required=safe_probe_required,
             ),
             make_check(
                 "source-context-available",
-                "passed" if cluster_id == "health" or cluster_id in source_cluster_ids_seen else "failed",
-                cluster_id in source_cluster_ids_seen,
-                required=cluster_id != "health",
+                source_context_status,
+                {
+                    "available": cluster_id in source_cluster_ids_seen,
+                    "assessment_mode": "blackbox" if blackbox_mode else "greybox",
+                },
+                required=source_context_required,
             ),
             make_check(
                 "policy-fields-covered",
@@ -11442,6 +11812,8 @@ def build_blackbox_coverage(
         )
 
     readiness_status = (environment_readiness or {}).get("status")
+    if blackbox_mode and not environment_readiness_config(profile).get("checks"):
+        readiness_status = None
     if readiness_status and readiness_status != "ready":
         external_blockers.append(
             {
@@ -11450,7 +11822,11 @@ def build_blackbox_coverage(
                 "next_steps": (environment_readiness or {}).get("next_steps", []),
             }
         )
-    if (transaction_decoder_selftest or {}).get("status") != "passed":
+    transaction_decoder_required = any(
+        strategy_set_for_cluster(cluster) == "quote-transaction-decoder"
+        for cluster in clusters.get("clusters", [])
+    )
+    if transaction_decoder_required and (transaction_decoder_selftest or {}).get("status") != "passed":
         required_failures.append("transaction-decoder-selftest")
 
     non_external_gaps = [gap_id for gap_id in gap_ids if gap_id != "GAP-quote-transaction-corpus"]
@@ -11466,7 +11842,12 @@ def build_blackbox_coverage(
     return {
         "generated_at": utc_now(),
         "status": status,
-        "methodology": "Burp-observed black-box surface plus safe probes, narrow source context, and finding/evidence gates.",
+        "assessment_mode": "blackbox" if blackbox_mode else "greybox",
+        "methodology": (
+            "Pure Burp-observed black-box surface plus low-volume safe probes and finding/evidence gates."
+            if blackbox_mode
+            else "Burp-observed black-box surface plus safe probes, narrow source context, and finding/evidence gates."
+        ),
         "summary": {
             "cluster_count": len(cluster_coverage),
             "covered_clusters": sum(1 for item in cluster_coverage if item["status"] == "covered"),
@@ -11476,6 +11857,7 @@ def build_blackbox_coverage(
             "non_external_evidence_gaps": non_external_gaps,
             "required_failures": required_failures,
             "warnings": warnings,
+            "transaction_decoder_required": transaction_decoder_required,
         },
         "external_blockers": external_blockers,
         "cluster_coverage": cluster_coverage,
@@ -17743,6 +18125,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("review-candidates", "run_review_candidates"),
         refresh_expectation("promote-observation-candidate", "run_promote_observation_candidate"),
         refresh_expectation("discover-profile", "run_discover_profile", min_refreshes=2, min_prints=2),
+        refresh_expectation("blackbox-profile", "run_blackbox_profile"),
         refresh_expectation("collect", "run_collect"),
         refresh_expectation("burp-observe", "run_burp_observe", min_refreshes=3, min_prints=3),
         refresh_expectation("burp-sync", "run_burp_sync", min_refreshes=4, min_prints=4),
@@ -21848,6 +22231,7 @@ def run_audit(args: argparse.Namespace) -> int:
         burp_observation_run,
         environment_readiness,
         transaction_decoder_selftest,
+        profile=profile,
     )
     write_json(artifact_dir / "blackbox-coverage.json", sanitize_artifact_samples(blackbox_coverage))
     evidence_chain = build_evidence_chain(
@@ -23315,6 +23699,117 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and pages_api_method_samples.get("template_literal_real") == ["PUT"]
         and pages_api_method_samples.get("commented_req_method_ignored") == []
         and pages_api_method_samples.get("string_fixture_ignored") == []
+    )
+    blackbox_history_samples = [
+        {
+            "method": "GET",
+            "path": "/dashboard?token=secret-value&view=summary",
+            "host": "blackbox.test",
+            "status": 200,
+            "content_type": "text/html",
+        },
+        {
+            "method": "POST",
+            "path": "/api/session?debug=true",
+            "host": "blackbox.test",
+            "status": 400,
+            "content_type": "application/json",
+        },
+        {
+            "method": "GET",
+            "path": "/_next/static/chunk.js",
+            "host": "blackbox.test",
+            "status": 200,
+            "content_type": "application/javascript",
+        },
+        {
+            "method": "WS",
+            "path": "/socket",
+            "host": "blackbox.test",
+            "status": 101,
+            "content_type": None,
+        },
+        {
+            "method": "GET",
+            "path": "/other-host",
+            "host": "other.test",
+            "status": 200,
+            "content_type": "text/html",
+        },
+    ]
+    blackbox_profile_sample, blackbox_summary_sample = build_blackbox_profile_from_history(
+        blackbox_history_samples,
+        name="blackbox-selftest",
+        display_name="Blackbox Self-Test",
+        target="http://blackbox.test",
+    )
+    blackbox_normalized_profile = normalize_target_profile(
+        blackbox_profile_sample,
+        profile_path=ROOT / "scripts/inferforge.py",
+    )
+    blackbox_clusters_sample = build_clusters(blackbox_normalized_profile, ROOT)
+    blackbox_source_peeks_sample = build_source_peeks(
+        ROOT,
+        blackbox_normalized_profile,
+        build_traffic_index([], blackbox_history_samples).get("endpoints", []),
+    )
+    blackbox_coverage_sample = build_blackbox_coverage(
+        blackbox_clusters_sample,
+        [],
+        blackbox_history_samples,
+        blackbox_source_peeks_sample,
+        {"gaps": []},
+        None,
+        {"status": "ready"},
+        {"status": "failed"},
+        profile=blackbox_normalized_profile,
+    )
+    blackbox_probe_ids_sample = [
+        probe.id
+        for probe in build_probe_plan(
+            "http://blackbox.test",
+            include_external=False,
+            selected_clusters={cluster["id"] for cluster in blackbox_clusters_sample.get("clusters", [])},
+            profile=blackbox_normalized_profile,
+        )
+    ]
+    stale_cluster_selection_sample = select_cluster_ids(
+        {
+            "endpoints": [
+                {
+                    "method": "GET",
+                    "path": "/dashboard",
+                    "statuses": [200],
+                    "cluster_ids": ["quote", "solana-rpc-http"],
+                }
+            ]
+        },
+        blackbox_clusters_sample,
+        source_assisted=False,
+    )
+    blackbox_profile_text_sample = json.dumps(blackbox_profile_sample, sort_keys=True)
+    blackbox_source_context_checks = [
+        check
+        for item in blackbox_coverage_sample.get("cluster_coverage", [])
+        for check in item.get("checks", [])
+        if check.get("id") == "source-context-available"
+    ]
+    blackbox_mode_samples_passed = (
+        blackbox_profile_sample.get("assessment_mode") == "blackbox"
+        and blackbox_summary_sample.get("generated_clusters") == 2
+        and blackbox_summary_sample.get("skipped", {}).get("static_asset_observations") == 1
+        and blackbox_summary_sample.get("skipped", {}).get("websocket_observations") == 1
+        and blackbox_summary_sample.get("skipped", {}).get("other_host_observations") == 1
+        and "secret-value" not in blackbox_profile_text_sample
+        and {cluster.get("path") for cluster in blackbox_profile_sample.get("clusters", [])}
+        == {"/dashboard", "/api/session"}
+        and blackbox_source_peeks_sample.get("status") == "not-applicable"
+        and blackbox_coverage_sample.get("status") == "covered"
+        and blackbox_coverage_sample.get("assessment_mode") == "blackbox"
+        and all(check.get("status") == "not-applicable" for check in blackbox_source_context_checks)
+        and any(probe_id.startswith("blackbox_") for probe_id in blackbox_probe_ids_sample)
+        and "quote" not in stale_cluster_selection_sample.get("selected_cluster_ids", [])
+        and "solana-rpc-http" not in stale_cluster_selection_sample.get("selected_cluster_ids", [])
     )
     any_method_match_reasons = entrypoint_match_reasons(
         {
@@ -24939,6 +25434,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and unsafe_observation_validation_passed
         and route_method_export_list_passed
         and pages_api_method_samples_passed
+        and blackbox_mode_samples_passed
         and any_method_match_reason_passed
         and rewrite_discovery_passed
         and profile_custom_ws_discovery_passed
@@ -24992,6 +25488,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         "pages_api_method_detection": {
             "status": "passed" if pages_api_method_samples_passed else "failed",
             "samples": pages_api_method_samples,
+        },
+        "blackbox_mode": {
+            "status": "passed" if blackbox_mode_samples_passed else "failed",
+            "summary": blackbox_summary_sample,
+            "profile_cluster_paths": [cluster.get("path") for cluster in blackbox_profile_sample.get("clusters", [])],
+            "source_peek_status": blackbox_source_peeks_sample.get("status"),
+            "coverage_status": blackbox_coverage_sample.get("status"),
+            "probe_ids": blackbox_probe_ids_sample,
         },
         "any_method_match_reasons": {
             "status": "passed" if any_method_match_reason_passed else "failed",
@@ -25804,8 +26308,8 @@ def run_coverage(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     write_target_profile_artifact(artifact_dir, profile, target, source_root)
-    clusters_path = artifact_dir / "endpoint-clusters.json"
-    clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
+    clusters = build_clusters(profile, source_root)
+    write_json(artifact_dir / "endpoint-clusters.json", clusters)
     results = load_jsonl(artifact_dir / "probe-results.jsonl")
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
 
@@ -25818,6 +26322,7 @@ def run_coverage(args: argparse.Namespace) -> int:
         load_optional_json(artifact_dir / "burp-observation-run.json"),
         load_optional_json(artifact_dir / "environment-readiness.json"),
         load_optional_json(artifact_dir / "transaction-decoder-selftest.json"),
+        profile=profile,
     )
     output_path = artifact_dir / "blackbox-coverage.json"
     write_json(output_path, coverage)
@@ -25828,7 +26333,7 @@ def run_coverage(args: argparse.Namespace) -> int:
             artifact_dir=artifact_dir,
             target=target,
             command="coverage",
-            output_paths=[output_path],
+            output_paths=[artifact_dir / "endpoint-clusters.json", output_path],
         )
     )
     return 0 if coverage["status"] in {"covered", "covered-with-external-blocker"} else 1
@@ -26008,6 +26513,7 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
             load_optional_json(artifact_dir / "burp-observation-run.json"),
             environment_readiness,
             transaction_decoder_selftest,
+            profile=profile,
         )
 
     evidence_chain = build_evidence_chain(
@@ -27285,6 +27791,62 @@ def run_discover_profile(args: argparse.Namespace) -> int:
     return 0 if validation["status"] != "failed" else 1
 
 
+def run_blackbox_profile(args: argparse.Namespace) -> int:
+    _base_profile, artifact_dir, target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    history_path = Path(args.history).resolve() if args.history else artifact_dir / "burp-history-observations.jsonl"
+    burp_history = load_jsonl(history_path)
+    parsed_target = urllib.parse.urlparse(target)
+    default_name = re.sub(r"[^A-Za-z0-9_-]+", "-", (parsed_target.netloc or "blackbox-target").lower()).strip("-")
+    name = args.name or default_name or "blackbox-target"
+    display_name = args.display_name or parsed_target.netloc or name
+    max_endpoints = args.max_endpoints if args.max_endpoints and args.max_endpoints > 0 else None
+    blackbox_profile, summary = build_blackbox_profile_from_history(
+        burp_history,
+        name=name,
+        display_name=display_name,
+        target=target,
+        include_static_assets=args.include_static_assets,
+        max_endpoints=max_endpoints,
+    )
+    output_path = Path(args.output).resolve() if args.output else artifact_dir / BLACKBOX_PROFILE_ARTIFACT
+    explicit_output = bool(args.output)
+    if explicit_output and output_path.exists() and not args.force:
+        print(f"Refusing to overwrite existing profile without --force: {output_path}")
+        return 2
+
+    write_json(output_path, blackbox_profile)
+    normalized = normalize_target_profile(blackbox_profile, profile_path=output_path)
+    source_root = resolve_repo_path(normalized.get("default_source_root") or ".")
+    clusters = build_clusters(normalized, source_root)
+    validation = build_profile_validation_artifact(normalized, clusters, source_root)
+    validation_path = artifact_dir / "blackbox-profile-validation.json"
+    summary_path = artifact_dir / "blackbox-profile-summary.json"
+    write_json(validation_path, validation)
+    write_json(summary_path, summary)
+
+    print(f"Black-box input observations: {summary['input_observations']}")
+    print(f"Generated black-box clusters: {summary['generated_clusters']}")
+    print(f"Generated profile validation: {validation['status']}")
+    print(f"Wrote {output_path}")
+    print(f"Wrote {validation_path}")
+    print(f"Wrote {summary_path}")
+    print("Next: review scope, then run plan with this profile before any active audit probes.")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="blackbox-profile",
+            output_paths=[
+                output_path,
+                validation_path,
+                summary_path,
+            ],
+        )
+    )
+    return 0 if summary["status"] == "generated" and validation["status"] != "failed" else 1
+
+
 def run_adjudicate(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -28097,6 +28659,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow overwriting an explicit --output profile path",
     )
     discover_profile.set_defaults(func=run_discover_profile)
+
+    blackbox_profile = sub.add_parser(
+        "blackbox-profile",
+        help="Build a pure black-box profile from normalized Burp history observations",
+    )
+    blackbox_profile.add_argument(
+        "--history",
+        help="Normalized Burp history JSONL. Defaults to ARTIFACT_DIR/burp-history-observations.jsonl",
+    )
+    blackbox_profile.add_argument(
+        "--output",
+        help="Where to write the generated black-box profile. Defaults to .greybox/blackbox-profile.json",
+    )
+    blackbox_profile.add_argument("--name", help="Profile machine name. Defaults to the target host")
+    blackbox_profile.add_argument("--display-name", help="Profile display name. Defaults to the target host")
+    blackbox_profile.add_argument(
+        "--max-endpoints",
+        type=positive_int,
+        default=80,
+        help="Maximum observed endpoint paths to include. Defaults to 80.",
+    )
+    blackbox_profile.add_argument(
+        "--include-static-assets",
+        action="store_true",
+        help="Include likely static asset paths from Burp history. Defaults to skipping them.",
+    )
+    blackbox_profile.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwriting an explicit --output profile path",
+    )
+    blackbox_profile.set_defaults(func=run_blackbox_profile)
 
     collect = sub.add_parser("collect", help="Normalize available Burp history observations into traffic artifacts")
     collect.add_argument(
