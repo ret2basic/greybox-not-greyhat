@@ -15842,6 +15842,55 @@ def build_evidence_gaps(
             "Stop if any probe would require a real signature, broad enumeration, or repeated upstream traffic.",
         )
 
+    rate_limit_review = (
+        rpc_method_policy.get("rate_limit_resource_review")
+        if isinstance((rpc_method_policy or {}).get("rate_limit_resource_review"), dict)
+        else {}
+    )
+    if rate_limit_review.get("status") == "needs-deployment-review":
+        source_refs = compact_source_refs(
+            [
+                f"{ref.get('file')}:{ref.get('line')}"
+                for signal in rate_limit_review.get("signals", []) or []
+                if isinstance(signal, dict)
+                for ref in signal.get("refs", []) or []
+                if isinstance(ref, dict) and ref.get("file") and ref.get("line")
+            ]
+        )
+        add_gap(
+            "GAP-rpc-resource-control-deployment-review",
+            "solana-rpc-http",
+            "RPC resource-control deployment evidence missing",
+            "medium",
+            (
+                "Static source review found client-keyed in-memory rate-limit fallback signals, but this run does not "
+                "prove the production proxy trust model, external rate-limit store health, or key TTL/eviction bounds."
+            ),
+            (
+                "Review deployment proxy header trust, external rate-limit store configuration, monitoring/fallback alerts, "
+                "and in-memory key TTL/eviction evidence. Do not validate with rate-limit stress or DoS traffic."
+            ),
+            "Deployment/source review only; do not run flood, rate-limit stress, or DoS validation.",
+            review_candidates=[
+                {
+                    "id": "review_rpc_resource_control_deployment",
+                    "type": "deployment-resource-control-review",
+                    "status": "manual-review",
+                    "source_refs": source_refs[:8],
+                    "signals": [
+                        {
+                            "id": signal.get("id"),
+                            "summary": signal.get("summary"),
+                            "review_question": signal.get("review_question"),
+                        }
+                        for signal in rate_limit_review.get("signals", []) or []
+                        if isinstance(signal, dict)
+                    ],
+                    "required_evidence": rate_limit_review.get("required_evidence", []),
+                }
+            ],
+        )
+
     rpc_rows = results_by_cluster.get("solana-rpc-http", [])
     if rpc_rows:
         high_impact_rows = [
@@ -31184,6 +31233,40 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             ),
             None,
         )
+        rewrite_resource_evidence_gaps = build_evidence_gaps(
+            rewrite_clusters,
+            [],
+            [],
+            {"candidates_seen": 1},
+            rpc_method_policy=rewrite_transaction_policy,
+            profile=rewrite_normalized,
+        )
+        rewrite_resource_gap = next(
+            (
+                gap
+                for gap in rewrite_resource_evidence_gaps.get("gaps", [])
+                if gap.get("id") == "GAP-rpc-resource-control-deployment-review"
+            ),
+            None,
+        )
+        rewrite_resource_queue = build_verification_queue(
+            "http://127.0.0.1:9998",
+            rewrite_clusters,
+            {"clusters": []},
+            rewrite_resource_evidence_gaps,
+            {"status": "covered-with-evidence-gaps"},
+            {"status": "no-reportable-findings", "external_blockers": [], "decisions": []},
+            {"status": "ready"},
+            rewrite_transaction_matrix_dir,
+        )
+        rewrite_resource_queue_item = next(
+            (
+                item
+                for item in rewrite_resource_queue.get("items", [])
+                if item.get("id") == "RESOLVE-GAP-rpc-resource-control-deployment-review"
+            ),
+            None,
+        )
         rewrite_cluster = next(
             (
                 cluster
@@ -31763,6 +31846,15 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rewrite_resource_validation_item.get("status") == "ready-offline"
             and rewrite_resource_validation_item.get("resource_abuse_review", {}).get("status")
             == "needs-deployment-review"
+            and rewrite_resource_gap is not None
+            and rewrite_resource_gap.get("priority") == "medium"
+            and rewrite_resource_queue_item is not None
+            and rewrite_resource_queue_item.get("status") == "manual-review"
+            and rewrite_resource_queue_item.get("commands") == []
+            and any(
+                candidate.get("type") == "deployment-resource-control-review"
+                for candidate in rewrite_resource_queue_item.get("review_candidates", []) or []
+            )
         )
         rewrite_server_action_report_lines = rewrite_source_resolver_report.get("server_action_lines", [])
         rewrite_discovery_passed = (
@@ -32989,6 +33081,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "policy_review": rate_limit_resource_review,
                 "hypothesis": rewrite_resource_hypothesis,
                 "validation_item": rewrite_resource_validation_item,
+                "evidence_gap": rewrite_resource_gap,
+                "queue_item": rewrite_resource_queue_item,
             },
             "source_resolver_report_summary": rewrite_source_resolver_report,
             "observation_clusters": sorted(rewrite_observation_clusters),
@@ -33755,7 +33849,11 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
     write_json(traffic_index_path, sanitize_artifact_samples(traffic_index))
     source_peeks = load_optional_json(artifact_dir / "source-peek-results.json")
     transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {"candidates_seen": 0}
-    rpc_method_policy = load_optional_json(artifact_dir / "rpc-method-policy.json")
+    rpc_method_policy = load_optional_json(artifact_dir / "rpc-method-policy.json") or build_rpc_method_policy(
+        source_root,
+        results,
+        profile=profile,
+    )
     orca_baseline = load_optional_json(artifact_dir / "orca-baseline.json")
     quote_collection = load_optional_json(artifact_dir / "quote-collection.json")
     evidence_gaps = build_evidence_gaps(
