@@ -92,6 +92,7 @@ ROUTE_INVENTORY_ARTIFACT = "route-inventory.json"
 DISCOVERED_PROFILE_ARTIFACT = "discovered-profile.json"
 BLACKBOX_PROFILE_ARTIFACT = "blackbox-profile.json"
 BLACKBOX_ASSET_CANDIDATES_ARTIFACT = "blackbox-asset-candidates.json"
+BLACKBOX_ASSET_PROFILE_ARTIFACT = "blackbox-asset-profile.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -151,9 +152,12 @@ DISCOVERY_ARTIFACTS = [
     ROUTE_INVENTORY_ARTIFACT,
     DISCOVERED_PROFILE_ARTIFACT,
     BLACKBOX_PROFILE_ARTIFACT,
+    BLACKBOX_ASSET_PROFILE_ARTIFACT,
     "discovered-profile-validation.json",
     "blackbox-profile-validation.json",
     "blackbox-profile-summary.json",
+    "blackbox-asset-profile-validation.json",
+    "blackbox-asset-profile-summary.json",
     DISCOVERY_COVERAGE_ARTIFACT,
     BLACKBOX_ASSET_CANDIDATES_ARTIFACT,
 ]
@@ -5432,6 +5436,200 @@ def build_blackbox_asset_map(
             "Query values are stripped from candidate paths.",
         ],
     }
+
+
+def build_blackbox_profile_from_asset_candidates(
+    candidate_doc: dict[str, Any],
+    *,
+    name: str,
+    display_name: str,
+    target: str,
+    allowed_classes: set[str],
+    max_endpoints: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    target_netloc = urllib.parse.urlparse(target).netloc.lower()
+    by_path: dict[str, dict[str, Any]] = {}
+    skipped = {
+        "other_host": 0,
+        "non_http": 0,
+        "triage_class": 0,
+        "unsafe_method": 0,
+        "static_asset": 0,
+    }
+
+    for candidate in candidate_doc.get("candidates", []) or []:
+        if not isinstance(candidate, dict):
+            continue
+        host = str(candidate.get("host") or target_netloc).lower()
+        if target_netloc and host != target_netloc:
+            skipped["other_host"] += 1
+            continue
+        if candidate.get("kind") != "http-candidate":
+            skipped["non_http"] += 1
+            continue
+        triage = candidate.get("triage", {}) if isinstance(candidate.get("triage"), dict) else {}
+        triage_class = str(triage.get("class") or "")
+        if triage_class not in allowed_classes:
+            skipped["triage_class"] += 1
+            continue
+        method_hint = str(candidate.get("method_hint") or "").upper()
+        if method_hint in {"", "UNKNOWN"}:
+            method = "GET"
+        elif method_hint in {"GET", "HEAD"}:
+            method = method_hint
+        else:
+            skipped["unsafe_method"] += 1
+            continue
+        path = blackbox_profile_path(candidate.get("path"))
+        if is_static_asset_path(path):
+            skipped["static_asset"] += 1
+            continue
+        item = by_path.setdefault(
+            path,
+            {
+                "path": path,
+                "methods": set(),
+                "hosts": set(),
+                "query_keys": set(),
+                "source_candidate_ids": [],
+                "triage_classes": set(),
+                "triage_risks": set(),
+                "source_count": 0,
+            },
+        )
+        item["methods"].add(method)
+        item["hosts"].add(host)
+        item["query_keys"].update(str(key) for key in candidate.get("query_keys", []) or [] if str(key))
+        candidate_id = str(candidate.get("id") or "")
+        if candidate_id and candidate_id not in item["source_candidate_ids"]:
+            item["source_candidate_ids"].append(candidate_id)
+        if triage_class:
+            item["triage_classes"].add(triage_class)
+        if triage.get("risk"):
+            item["triage_risks"].add(str(triage.get("risk")))
+        item["source_count"] += len(candidate.get("sources", []) or [])
+
+    rows = sorted(
+        by_path.values(),
+        key=lambda item: (
+            item["path"],
+        ),
+    )
+    if max_endpoints is not None:
+        rows = rows[:max_endpoints]
+
+    clusters: list[dict[str, Any]] = []
+    probe_targets: dict[str, Any] = {}
+    endpoint_summaries: list[dict[str, Any]] = []
+    for item in rows:
+        path = str(item["path"])
+        methods = sorted(
+            {str(method) for method in item["methods"]},
+            key=lambda method: (HTTP_METHOD_ORDER_INDEX.get(method, 99), method),
+        )
+        cluster_id = blackbox_cluster_id_for_path(path)
+        query_keys = sorted(str(key) for key in item["query_keys"])
+        cluster = {
+            "id": cluster_id,
+            "method": methods[0] if methods else "GET",
+            "path": path,
+            "kind": "asset-discovered-page-route",
+            "priority": "low",
+            "strategy_set": "blackbox-http-observed",
+            "match": {"methods": methods or ["GET"], "paths": [path]},
+            "source_refs": [],
+            "discovery": {
+                "source": BLACKBOX_ASSET_CANDIDATES_ARTIFACT,
+                "review_status": "reviewed-low-risk-promotion",
+                "active_probe_policy": "head-or-get-after-review",
+                "source_candidate_ids": item["source_candidate_ids"],
+                "query_keys": query_keys,
+                "hosts": sorted(str(host) for host in item["hosts"]),
+                "triage_classes": sorted(str(value) for value in item["triage_classes"]),
+                "triage_risks": sorted(str(value) for value in item["triage_risks"]),
+                "source_count": int(item["source_count"]),
+                "notes": [
+                    "Generated from reviewed static asset candidates.",
+                    "Only low-risk page-route candidates are promoted by default.",
+                    "Query values are intentionally not copied into the profile.",
+                    "Run plan --no-write before any active probes.",
+                ],
+            },
+        }
+        clusters.append(cluster)
+        probe_targets[cluster_id] = {"path": path}
+        endpoint_summaries.append(
+            {
+                "cluster_id": cluster_id,
+                "path": path,
+                "methods": methods,
+                "query_keys": query_keys,
+                "source_candidate_ids": item["source_candidate_ids"],
+                "triage_classes": sorted(str(value) for value in item["triage_classes"]),
+            }
+        )
+
+    profile = {
+        "schema_version": 1,
+        "name": name,
+        "display_name": display_name,
+        "description": "Pure black-box target profile generated from reviewed static asset endpoint candidates. Review scope before active probes.",
+        "assessment_mode": "blackbox",
+        "target_type": "blackbox-web-app",
+        "frameworks": [],
+        "default_target": target,
+        "default_source_root": ".",
+        "strategy_sets": ["blackbox-http-observed"],
+        "safety": {
+            "no_wallet_signing": True,
+            "no_transaction_submission": True,
+            "no_burp_scanner": True,
+            "no_broad_fuzzing": True,
+            "prefer_loopback_targets": False,
+            "requires_bounty_scope_review": True,
+            "asset_candidates_profile": True,
+        },
+        "probe_targets": probe_targets,
+        "quote_intent": {},
+        "quote_request": {},
+        "quote_response": {},
+        "quote_provider": {},
+        "environment_readiness": {"checks": []},
+        "clusters": clusters,
+        "source_peeks": [],
+        "burp_observation_plan": [],
+        "review_observation_candidates": [],
+        "websocket_observation": None,
+        "blackbox": {
+            "generated_at": utc_now(),
+            "history_source": BLACKBOX_ASSET_CANDIDATES_ARTIFACT,
+            "asset_candidate_profile": True,
+            "allowed_triage_classes": sorted(allowed_classes),
+            "observed_endpoint_count": 0,
+            "asset_endpoint_count": len(clusters),
+            "max_endpoints": max_endpoints,
+            "skipped": skipped,
+            "workflow": [
+                "Run blackbox-asset-map to refresh static asset candidates.",
+                "Run blackbox-asset-profile to promote reviewed low-risk page-route candidates.",
+                "Run plan --no-write with this profile before any active probes.",
+                "Keep API, WebSocket, and mutation-sensitive candidates in manual review until a safe reproduction plan exists.",
+            ],
+        },
+    }
+    summary = {
+        "generated_at": utc_now(),
+        "status": "generated" if clusters else "no-promoted-candidates",
+        "target": target,
+        "profile": {"name": name, "display_name": display_name},
+        "input_candidates": len(candidate_doc.get("candidates", []) or []),
+        "generated_clusters": len(clusters),
+        "allowed_triage_classes": sorted(allowed_classes),
+        "skipped": skipped,
+        "endpoints": endpoint_summaries,
+        "safety": "Profile generation is read-only over static asset candidates and does not send HTTP requests.",
+    }
+    return profile, summary
 
 
 def load_target_profile(profile_path: str | None) -> dict[str, Any]:
@@ -18920,6 +19118,8 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("promote-observation-candidate", "run_promote_observation_candidate"),
         refresh_expectation("discover-profile", "run_discover_profile", min_refreshes=2, min_prints=2),
         refresh_expectation("blackbox-profile", "run_blackbox_profile"),
+        refresh_expectation("blackbox-asset-profile", "run_blackbox_asset_profile"),
+        refresh_expectation("blackbox-asset-map", "run_blackbox_asset_map"),
         refresh_expectation("collect", "run_collect"),
         refresh_expectation("burp-observe", "run_burp_observe", min_refreshes=3, min_prints=3),
         refresh_expectation("burp-sync", "run_burp_sync", min_refreshes=4, min_prints=4),
@@ -24694,6 +24894,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "url": "https://blackbox.test/assets/app.js",
                 "status": 200,
                 "text": (
+                    'const tradeRoute = "/trade/BTCUSD?from=homepage&debug=1";\n'
+                    "/* padding keeps unrelated method hints outside the literal analysis window. */\n"
+                    + ("x" * 200)
+                    + "\n"
                     'fetch("/api/orders?token=secret-value&market=ETH-USD", { method: "POST" });\n'
                     'const socket = new WebSocket("wss://quote.blackbox.test/ws/v1/quotes?symbol=BTC-USD");\n'
                     'const ignored = "/assets/logo.svg";\n'
@@ -24716,6 +24920,23 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
     blackbox_asset_triage = {
         (item.get("method_hint"), item.get("host"), item.get("path")): (item.get("triage") or {})
         for item in blackbox_asset_map_sample.get("candidates", [])
+    }
+    blackbox_asset_profile_sample, blackbox_asset_profile_summary_sample = build_blackbox_profile_from_asset_candidates(
+        blackbox_asset_map_sample,
+        name="blackbox-asset-selftest",
+        display_name="Blackbox Asset Self-Test",
+        target="https://blackbox.test",
+        allowed_classes={"passive-page-route-review"},
+    )
+    blackbox_asset_profile_paths = {
+        cluster.get("path")
+        for cluster in blackbox_asset_profile_sample.get("clusters", [])
+    }
+    blackbox_asset_profile_text_sample = json.dumps(blackbox_asset_profile_sample, sort_keys=True)
+    blackbox_asset_profile_query_keys = {
+        key
+        for cluster in blackbox_asset_profile_sample.get("clusters", [])
+        for key in cluster.get("discovery", {}).get("query_keys", [])
     }
     blackbox_probe_ids_sample = [
         probe.id
@@ -24765,14 +24986,27 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_target_info_sample.get("health_path") is None
         and blackbox_target_info_sample.get("health_source") == "blackbox-burp-history"
         and blackbox_asset_map_sample.get("status") == "candidates-found"
+        and ("UNKNOWN", "blackbox.test", "/trade/BTCUSD?debug=&from=") in blackbox_asset_candidates
         and ("POST", "blackbox.test", "/api/orders?market=&token=") in blackbox_asset_candidates
         and ("WS", "quote.blackbox.test", "/ws/v1/quotes?symbol=") in blackbox_asset_candidates
         and ("GET", "blackbox.test", "/api/v1/markets") in blackbox_asset_candidates
+        and blackbox_asset_triage[("UNKNOWN", "blackbox.test", "/trade/BTCUSD?debug=&from=")].get("class") == "passive-page-route-review"
         and blackbox_asset_triage[("POST", "blackbox.test", "/api/orders?market=&token=")].get("class") == "state-changing-api-review"
         and blackbox_asset_triage[("POST", "blackbox.test", "/api/orders?market=&token=")].get("risk") == "high"
         and blackbox_asset_triage[("WS", "quote.blackbox.test", "/ws/v1/quotes?symbol=")].get("class") == "websocket-handshake-review"
         and blackbox_asset_triage[("GET", "blackbox.test", "/api/v1/markets")].get("class") == "api-read-candidate-review"
         and blackbox_asset_map_sample.get("summary", {}).get("triage_risk_counts", {}).get("high") == 1
+        and blackbox_asset_profile_summary_sample.get("status") == "generated"
+        and blackbox_asset_profile_summary_sample.get("generated_clusters") == 1
+        and blackbox_asset_profile_summary_sample.get("skipped", {}).get("other_host") == 1
+        and blackbox_asset_profile_summary_sample.get("skipped", {}).get("non_http") == 0
+        and blackbox_asset_profile_summary_sample.get("skipped", {}).get("triage_class") == 2
+        and blackbox_asset_profile_paths == {"/trade/BTCUSD"}
+        and blackbox_asset_profile_query_keys == {"debug", "from"}
+        and "/api/orders" not in blackbox_asset_profile_text_sample
+        and "/api/v1/markets" not in blackbox_asset_profile_text_sample
+        and "/ws/v1/quotes" not in blackbox_asset_profile_text_sample
+        and "homepage" not in blackbox_asset_profile_text_sample
         and all("/assets/logo.svg" != item.get("path") for item in blackbox_asset_map_sample.get("candidates", []))
         and all(check.get("status") == "not-applicable" for check in blackbox_source_context_checks)
         and any(probe_id.startswith("blackbox_") for probe_id in blackbox_probe_ids_sample)
@@ -28815,6 +29049,73 @@ def run_blackbox_profile(args: argparse.Namespace) -> int:
     return 0 if summary["status"] == "generated" and validation["status"] != "failed" else 1
 
 
+def run_blackbox_asset_profile(args: argparse.Namespace) -> int:
+    _base_profile, artifact_dir, target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    candidates_path = Path(args.candidates).resolve() if args.candidates else artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT
+    candidate_doc = load_optional_json(candidates_path)
+    if candidate_doc is None:
+        print(f"Missing asset candidate artifact: {candidates_path}")
+        print("Run blackbox-asset-map first, or pass --candidates with an existing blackbox-asset-candidates.json.")
+        return 2
+
+    parsed_target = urllib.parse.urlparse(target)
+    default_name = re.sub(r"[^A-Za-z0-9_-]+", "-", (parsed_target.netloc or "blackbox-target").lower()).strip("-")
+    name = args.name or f"{default_name or 'blackbox-target'}-asset-candidates"
+    display_name = args.display_name or f"{parsed_target.netloc or name} asset candidates"
+    allowed_classes = {
+        str(value).strip()
+        for value in (args.allow_triage_class or ["passive-page-route-review"])
+        if str(value).strip()
+    }
+    max_endpoints = args.max_endpoints if args.max_endpoints and args.max_endpoints > 0 else None
+    asset_profile, summary = build_blackbox_profile_from_asset_candidates(
+        candidate_doc,
+        name=name,
+        display_name=display_name,
+        target=target,
+        allowed_classes=allowed_classes,
+        max_endpoints=max_endpoints,
+    )
+
+    output_path = Path(args.output).resolve() if args.output else artifact_dir / BLACKBOX_ASSET_PROFILE_ARTIFACT
+    if output_path.exists() and not args.force:
+        print(f"Refusing to overwrite existing asset profile without --force: {output_path}")
+        return 2
+
+    write_json(output_path, asset_profile)
+    normalized = normalize_target_profile(asset_profile, profile_path=output_path)
+    source_root = resolve_repo_path(normalized.get("default_source_root") or ".")
+    clusters = build_clusters(normalized, source_root)
+    validation = build_profile_validation_artifact(normalized, clusters, source_root)
+    validation_path = artifact_dir / "blackbox-asset-profile-validation.json"
+    summary_path = artifact_dir / "blackbox-asset-profile-summary.json"
+    write_json(validation_path, validation)
+    write_json(summary_path, summary)
+
+    print(f"Asset input candidates: {summary['input_candidates']}")
+    print(f"Generated asset-profile clusters: {summary['generated_clusters']}")
+    print(f"Allowed triage classes: {', '.join(summary['allowed_triage_classes']) or '(none)'}")
+    print(f"Generated profile validation: {validation['status']}")
+    print(f"Wrote {output_path}")
+    print(f"Wrote {validation_path}")
+    print(f"Wrote {summary_path}")
+    print("Next: run plan --observed-only --no-write with this profile before any active probes.")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="blackbox-asset-profile",
+            output_paths=[
+                output_path,
+                validation_path,
+                summary_path,
+            ],
+        )
+    )
+    return 0 if summary["status"] == "generated" and validation["status"] != "failed" else 1
+
+
 def run_blackbox_asset_map(args: argparse.Namespace) -> int:
     _profile, artifact_dir, target, _source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -29771,6 +30072,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow overwriting an explicit --output profile path",
     )
     blackbox_profile.set_defaults(func=run_blackbox_profile)
+
+    blackbox_asset_profile = sub.add_parser(
+        "blackbox-asset-profile",
+        help="Promote reviewed low-risk black-box asset candidates into a profile without sending traffic",
+    )
+    blackbox_asset_profile.add_argument(
+        "--candidates",
+        help="Asset candidate artifact. Defaults to ARTIFACT_DIR/blackbox-asset-candidates.json.",
+    )
+    blackbox_asset_profile.add_argument(
+        "--output",
+        help="Where to write the generated asset profile. Defaults to ARTIFACT_DIR/blackbox-asset-profile.json.",
+    )
+    blackbox_asset_profile.add_argument(
+        "--name",
+        help="Profile machine name. Defaults to the target host plus asset-candidates",
+    )
+    blackbox_asset_profile.add_argument(
+        "--display-name",
+        help="Profile display name. Defaults to the target host plus asset candidates",
+    )
+    blackbox_asset_profile.add_argument(
+        "--max-endpoints",
+        type=positive_int,
+        default=20,
+        help="Maximum reviewed asset candidate paths to include. Defaults to 20.",
+    )
+    blackbox_asset_profile.add_argument(
+        "--allow-triage-class",
+        action="append",
+        help=(
+            "Triage class eligible for promotion. Repeat as needed. "
+            "Defaults to passive-page-route-review only."
+        ),
+    )
+    blackbox_asset_profile.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwriting an existing output asset profile.",
+    )
+    blackbox_asset_profile.set_defaults(func=run_blackbox_asset_profile)
 
     blackbox_asset_map = sub.add_parser(
         "blackbox-asset-map",

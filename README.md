@@ -137,6 +137,22 @@ Each candidate is triaged before it reaches the review queue:
 - `websocket-handshake-review`: at most one handshake-only connection after
   scope and message semantics are reviewed.
 
+After reviewing low-risk page-route candidates, promote only those candidates
+into a profile:
+
+```bash
+python3 scripts/inferforge.py --target https://in-scope.example \
+  --artifact-dir .greybox/in-scope-example \
+  blackbox-asset-profile \
+  --force
+```
+
+`blackbox-asset-profile` is profile-only and sends no HTTP traffic. By default
+it promotes only `passive-page-route-review` candidates, strips query values,
+keeps query parameter names, and leaves API, WebSocket, sensitive, and
+state-changing candidates in the review queue. Use `--allow-triage-class` only
+after a candidate class has a safe, read-only reproduction plan.
+
 The default resource caps are intentionally small: 4 same-origin script assets,
 256 KiB per fetched resource, and 80 retained candidates. Raise `--max-assets`,
 `--max-bytes`, or `--candidate-limit` only when the runner has enough memory and
