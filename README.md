@@ -342,6 +342,11 @@ declare its own provider variables or leave this empty:
 }
 ```
 
+`target_health_field` checks read only the fields named by the active profile
+from the target health JSON. Field lookup accepts exact keys and common
+snake_case/lowerCamelCase variants such as `provider_ready` and
+`providerReady`, including dotted nested fields.
+
 `discover-profile` copies `quote_intent` into the generated starter profile only
 when the seed profile passed with `--profile` explicitly declares complete
 `buy` and `sell` directions. It copies `quote_request`, `quote_response`, and

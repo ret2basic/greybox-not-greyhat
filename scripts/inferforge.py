@@ -1421,6 +1421,78 @@ def environment_readiness_config(profile: dict[str, Any] | None) -> dict[str, An
     return {"checks": []}
 
 
+def target_health_field_names(profile: dict[str, Any] | None) -> list[str]:
+    fields: list[str] = []
+    checks = environment_readiness_config(profile).get("checks", [])
+    if not isinstance(checks, list):
+        return fields
+    for check in checks:
+        if not isinstance(check, dict) or check.get("type") != "target_health_field":
+            continue
+        field = check.get("field")
+        normalized_field = field.strip() if isinstance(field, str) else ""
+        if normalized_field and normalized_field not in fields:
+            fields.append(normalized_field)
+    return fields
+
+
+def snake_to_lower_camel(value: str) -> str:
+    parts = [part for part in value.split("_") if part]
+    if not parts:
+        return value
+    return parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
+
+
+def camel_to_snake(value: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", value).lower()
+
+
+def target_health_field_aliases(field: str) -> list[str]:
+    aliases = [field]
+    if "_" in field:
+        aliases.append(snake_to_lower_camel(field))
+    snake = camel_to_snake(field)
+    if snake not in aliases:
+        aliases.append(snake)
+    return aliases
+
+
+def target_health_json_field_value(health_json: dict[str, Any] | None, field: str) -> Any:
+    if not isinstance(health_json, dict) or not field:
+        return None
+    current_values: list[Any] = [health_json]
+    for part in field.split("."):
+        next_values: list[Any] = []
+        for value in current_values:
+            if not isinstance(value, dict):
+                continue
+            for alias in target_health_field_aliases(part):
+                if alias in value:
+                    next_values.append(value[alias])
+                    break
+        if not next_values:
+            return None
+        current_values = next_values
+    return current_values[0] if current_values else None
+
+
+def collect_target_health_fields(
+    health_json: dict[str, Any] | None,
+    fields: list[str],
+) -> dict[str, Any]:
+    collected: dict[str, Any] = {}
+    for field in fields:
+        collected[field] = target_health_json_field_value(health_json, field)
+    return collected
+
+
+def target_info_health_field_value(target_info: dict[str, Any], field: str) -> Any:
+    health_fields = target_info.get("health_fields")
+    if isinstance(health_fields, dict) and field in health_fields:
+        return health_fields.get(field)
+    return target_health_json_field_value(target_info, field)
+
+
 def quote_readiness_required(profile: dict[str, Any] | None) -> bool:
     effective_profile = profile or default_target_profile()
     if not strategy_set_enabled(effective_profile, "quote-transaction-decoder"):
@@ -20074,6 +20146,7 @@ def build_capabilities(target: str, artifact_dir: Path, profile: dict[str, Any] 
     health_path = probe_target_path(profile, "health", "path", "/health")
     health = http_request(target, "GET", health_path)
     health_json = parse_json_object(health.get("body_text") or "")
+    health_fields = collect_target_health_fields(health_json, target_health_field_names(profile))
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
     history_status = (
         "ok_reads_builtin_browser_proxy_history"
@@ -20089,7 +20162,8 @@ def build_capabilities(target: str, artifact_dir: Path, profile: dict[str, Any] 
             "health_status": health["status"],
             "reachable": health["status"] == 200,
             "service": (health_json or {}).get("service"),
-            "m0_key_present": (health_json or {}).get("m0KeyPresent"),
+            "health_fields": health_fields,
+            "m0_key_present": health_fields.get("m0_key_present", (health_json or {}).get("m0KeyPresent")),
         },
         "burp": {
             "mcp_endpoint": mcp_endpoint,
@@ -20122,6 +20196,7 @@ def build_report_capabilities_placeholder(target: str, artifact_dir: Path) -> di
             "health_status": "unknown",
             "reachable": None,
             "service": None,
+            "health_fields": {},
             "m0_key_present": None,
         },
         "burp": {
@@ -20214,7 +20289,7 @@ def build_environment_readiness(
         elif check_type == "target_health_field":
             field = str(check.get("field") or "")
             expected = check.get("expected", True)
-            actual = target_info.get(field) if field else None
+            actual = target_info_health_field_value(target_info, field) if field else None
             evidence = {"field": field, "expected": expected, "actual": actual}
             status = "passed" if field and actual == expected else "blocked"
         else:
@@ -22564,6 +22639,47 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         profile=custom_readiness_profile,
         capabilities=readiness_capabilities,
     )
+    custom_health_fields = collect_target_health_fields(
+        {
+            "providerReady": True,
+            "nestedStatus": {
+                "quoteReady": True,
+            },
+        },
+        ["provider_ready", "nested_status.quote_ready"],
+    )
+    custom_health_readiness_profile = json_clone(non_quote_readiness_profile)
+    custom_health_readiness_profile["environment_readiness"] = {
+        "checks": [
+            {
+                "id": "health-provider-ready",
+                "type": "target_health_field",
+                "field": "provider_ready",
+                "expected": True,
+                "next_step": "Restart the target after provider readiness is true.",
+            },
+            {
+                "id": "health-nested-quote-ready",
+                "type": "target_health_field",
+                "field": "nested_status.quote_ready",
+                "expected": True,
+                "next_step": "Restart the target after nested quote readiness is true.",
+            },
+        ]
+    }
+    custom_health_readiness = build_environment_readiness(
+        "http://127.0.0.1:9995",
+        ROOT,
+        artifact_dir,
+        profile=custom_health_readiness_profile,
+        capabilities={
+            "target": {
+                "reachable": True,
+                "health_status": 200,
+                "health_fields": custom_health_fields,
+            }
+        },
+    )
     readiness_profile_passed = (
         non_quote_readiness.get("status") == "ready"
         and "m0-orchestration-key-configured" not in {item.get("id") for item in non_quote_readiness.get("checks", [])}
@@ -22571,6 +22687,18 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and custom_readiness.get("status") == "waiting-for-external-configuration"
         and "custom-provider-token-configured" in {item.get("id") for item in custom_readiness.get("checks", [])}
         and "Set INFERFORGE_SELFTEST_PROVIDER_TOKEN for this target." in custom_readiness.get("next_steps", [])
+        and custom_health_fields == {"provider_ready": True, "nested_status.quote_ready": True}
+        and custom_health_readiness.get("status") == "ready"
+        and {
+            "health-provider-ready",
+            "health-nested-quote-ready",
+        }.issubset(
+            {
+                item.get("id")
+                for item in custom_health_readiness.get("checks", [])
+                if item.get("status") == "passed"
+            }
+        )
     )
     unsafe_observation_profile = json_clone(test_profile)
     unsafe_observation_profile["burp_observation_plan"] = [
@@ -24073,6 +24201,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "custom_status": custom_readiness.get("status"),
             "custom_check_ids": [item.get("id") for item in custom_readiness.get("checks", [])],
             "custom_next_steps": custom_readiness.get("next_steps", []),
+            "custom_health_fields": custom_health_fields,
+            "custom_health_status": custom_health_readiness.get("status"),
+            "custom_health_check_ids": [item.get("id") for item in custom_health_readiness.get("checks", [])],
         },
         "response_delta_analysis": {
             "status": "passed" if response_delta_selftest_passed else "failed",
