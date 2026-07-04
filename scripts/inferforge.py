@@ -81,6 +81,7 @@ MAX_RESPONSE_BYTES = 256 * 1024
 MAX_BODY_SAMPLE_CHARS = 1200
 DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_BURP_HISTORY_INPUT_BYTES = 4 * 1024 * 1024
+DEFAULT_BURP_SYNC_COUNT = 50
 MAX_REQUEST_CONTEXTS_PER_ENDPOINT = 6
 REDACTED_VALUE = "[redacted]"
 GENERIC_HTTP_ROUTE_STRATEGY_SETS = {"nextjs-api-routes", "blackbox-http-observed"}
@@ -19471,7 +19472,7 @@ def review_candidate_command_templates(
             verification_command_for_profile(
                 reviewed_profile,
                 artifact_dir,
-                "burp-sync --observe --ws-upgrade --replace --count 80",
+                f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_BURP_SYNC_COUNT}",
             ),
             verification_command_for_profile(
                 reviewed_profile,
@@ -19494,7 +19495,7 @@ def promoted_observation_followup_commands(
         verification_command_for_profile(
             reviewed_profile,
             artifact_dir,
-            "burp-sync --observe --ws-upgrade --replace --count 80",
+            f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_BURP_SYNC_COUNT}",
         ),
         verification_command_for_profile(
             reviewed_profile,
@@ -21370,7 +21371,8 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             ),
             (
                 "python3 scripts/inferforge.py --profile .greybox/regression-discovered/reviewed-profile.json "
-                "--artifact-dir .greybox/regression-discovered burp-sync --observe --ws-upgrade --replace --count 80"
+                "--artifact-dir .greybox/regression-discovered "
+                f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_BURP_SYNC_COUNT}"
             ),
         ],
     }
@@ -25879,6 +25881,8 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
         *,
         mcp_client_cls: type[Any] | None = None,
         import_failure: bool = False,
+        allow_resource_warning: bool = True,
+        resource_snapshot_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         case_dir = root / case_id
         profile_path = root / f"{case_id}-profile.json"
@@ -25886,31 +25890,35 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
         source_root.mkdir(parents=True, exist_ok=True)
         write_json(profile_path, profile)
         parser = build_parser()
-        parsed_args = parser.parse_args(
-            [
-                "--profile",
-                str(profile_path),
-                "--artifact-dir",
-                str(case_dir),
-                "--target",
-                target,
-                "--source-root",
-                str(source_root),
-                "burp-sync",
-                "--mcp-url",
-                "http://127.0.0.1:9876",
-                "--count",
-                "1",
-                "--replace",
-            ]
-        )
+        command_args = [
+            "--profile",
+            str(profile_path),
+            "--artifact-dir",
+            str(case_dir),
+            "--target",
+            target,
+            "--source-root",
+            str(source_root),
+            "burp-sync",
+            "--mcp-url",
+            "http://127.0.0.1:9876",
+            "--count",
+            "1",
+            "--replace",
+        ]
+        if allow_resource_warning:
+            command_args.append("--allow-resource-warning")
+        parsed_args = parser.parse_args(command_args)
         original_mcp_sse_client = globals()["McpSseClient"]
         original_import_burp_history_inputs = globals()["import_burp_history_inputs"]
+        original_build_resource_snapshot = globals()["build_resource_snapshot"]
 
         def failing_import(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
             raise RuntimeError(sentinel)
 
         try:
+            if resource_snapshot_override is not None:
+                globals()["build_resource_snapshot"] = lambda **_kwargs: resource_snapshot_override
             if mcp_client_cls is not None:
                 globals()["McpSseClient"] = mcp_client_cls
             if import_failure:
@@ -25922,6 +25930,7 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
         finally:
             globals()["McpSseClient"] = original_mcp_sse_client
             globals()["import_burp_history_inputs"] = original_import_burp_history_inputs
+            globals()["build_resource_snapshot"] = original_build_resource_snapshot
 
         sync_path = case_dir / "burp-mcp-sync.json"
         sync_doc = json.loads(sync_path.read_text(encoding="utf-8")) if sync_path.exists() else {}
@@ -25947,7 +25956,22 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="inferforge-burp-sync-failure-selftest-") as temp_dir:
         root = Path(temp_dir)
+        warning_resource_snapshot = {
+            "generated_at": utc_now(),
+            "status": "warning",
+            "warnings": ["swap-usage-above-threshold"],
+            "memory": {"mem_available_mib": 1500, "swap_used_mib": 3500},
+            "watched_ports": {"3100": {"listening": False}, "2455": {"listening": True}},
+            "top_rss_processes": [],
+        }
         cases = {
+            "resource_gate": run_case(
+                root,
+                "resource-gate",
+                make_profile("/health"),
+                allow_resource_warning=False,
+                resource_snapshot_override=warning_resource_snapshot,
+            ),
             "profile_validation": run_case(
                 root,
                 "profile-validation",
@@ -26038,6 +26062,20 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
                 ],
                 "truncated": loose_burp_items[1].get("_burp_mcp_truncated") if len(loose_burp_items) > 1 else None,
             },
+        },
+        {
+            "id": "burp-sync-resource-warning-blocks-history-read",
+            "passed": (
+                cases["resource_gate"]["return_code"] == 2
+                and cases["resource_gate"]["sync"].get("status") == "blocked-resource-gate"
+                and cases["resource_gate"]["sync"].get("http_history") is None
+                and cases["resource_gate"]["raw_file_exists"] is False
+                and not cases["resource_gate"]["security_issues"]
+                and not cases["resource_gate"]["leaked_files"]
+                and not cases["resource_gate"]["stdout_leaked"]
+            ),
+            "expected": "burp-sync blocks MCP history reads by default when the current resource snapshot is warning",
+            "actual": cases["resource_gate"],
         },
         {
             "id": "profile-validation-failure-redacts-error",
@@ -26563,10 +26601,58 @@ def transaction_candidate_input_skip_reason(path: Path, max_input_bytes: int) ->
     return None
 
 
-def ensure_initial_audit_artifacts(artifact_dir: Path) -> None:
+def ensure_initial_audit_artifacts(artifact_dir: Path, *, target: str | None = None) -> list[Path]:
+    created: list[Path] = []
+    probe_results_path = artifact_dir / "probe-results.jsonl"
+    if not probe_results_path.exists():
+        probe_results_path.write_text("", encoding="utf-8")
+        created.append(probe_results_path)
+
+    warmup_path = artifact_dir / "warmup-results.json"
+    if not warmup_path.exists():
+        write_json(
+            warmup_path,
+            {
+                "generated_at": utc_now(),
+                "status": "not-run",
+                "ready": False,
+                "results": [],
+                "safety": "Placeholder only. Run audit to execute local warmup probes.",
+            },
+        )
+        created.append(warmup_path)
+
+    source_peek_path = artifact_dir / "source-peek-results.json"
+    if not source_peek_path.exists():
+        write_json(
+            source_peek_path,
+            {
+                "generated_at": utc_now(),
+                "status": "not-run",
+                "source_peeks": [],
+                "endpoint_resolver": {
+                    "status": "not-run",
+                    "observed_endpoint_count": 0,
+                    "matched": [],
+                    "unresolved": [],
+                },
+                "safety": "Placeholder only. Run audit or a source-peek refresh after observed traffic exists.",
+            },
+        )
+        created.append(source_peek_path)
+
+    capabilities_path = artifact_dir / "burp-capabilities.json"
+    if not capabilities_path.exists():
+        write_json(
+            capabilities_path,
+            build_report_capabilities_placeholder(target or DEFAULT_TARGET, artifact_dir),
+        )
+        created.append(capabilities_path)
+
     history_path = artifact_dir / "burp-history-observations.jsonl"
     if not history_path.exists():
         history_path.write_text("", encoding="utf-8")
+        created.append(history_path)
 
     observation_path = artifact_dir / "burp-observation-run.json"
     if not observation_path.exists():
@@ -26585,6 +26671,7 @@ def ensure_initial_audit_artifacts(artifact_dir: Path) -> None:
                 "safety": "Placeholder only. Run burp-sync --observe to collect Burp Proxy observations.",
             },
         )
+        created.append(observation_path)
 
     quote_collection_path = artifact_dir / "quote-collection.json"
     if not quote_collection_path.exists():
@@ -26601,6 +26688,8 @@ def ensure_initial_audit_artifacts(artifact_dir: Path) -> None:
                 "safety": "Placeholder only. No quote request was sent and no transaction payload was collected.",
             },
         )
+        created.append(quote_collection_path)
+    return created
 
 
 def collect_transaction_candidates(
@@ -28843,7 +28932,7 @@ def run_audit(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     ensure_burp_transaction_candidates_artifact(artifact_dir)
-    ensure_initial_audit_artifacts(artifact_dir)
+    ensure_initial_audit_artifacts(artifact_dir, target=target)
     write_target_profile_artifact(artifact_dir, profile, target, source_root)
 
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
@@ -33553,6 +33642,65 @@ def run_burp_sync(args: argparse.Namespace) -> int:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     write_target_profile_artifact(artifact_dir, profile, target, source_root)
 
+    resource_snapshot = build_resource_snapshot(
+        max_processes=8,
+        watch_ports=[3100, 2455],
+        warn_available_mib=2048,
+        warn_swap_used_mib=1024,
+    )
+    resource_status = artifact_summary_status(resource_snapshot)
+    if resource_status != "healthy" and not args.allow_resource_warning:
+        sync_path = artifact_dir / "burp-mcp-sync.json"
+        warnings = resource_snapshot.get("warnings", []) or []
+        write_json(
+            sync_path,
+            {
+                "generated_at": utc_now(),
+                "status": "blocked-resource-gate",
+                "profile": profile_summary(profile),
+                "target": target,
+                "mcp_url": args.mcp_url,
+                "history_regex": None,
+                "http_history": None,
+                "websocket_history": None,
+                "intercept": {
+                    "requested_off": not args.keep_intercept_state,
+                    "ok": None,
+                    "error": None,
+                },
+                "mcp_actions": [],
+                "resource_preflight": validation_resource_preflight_summary(resource_snapshot),
+                "resource_snapshot": resource_snapshot,
+                "observe_before_sync": bool(args.observe),
+                "next_step": (
+                    "Free memory or rerun with --allow-resource-warning and a small --count "
+                    "after explicit approval."
+                ),
+                "safety": [
+                    "No Burp MCP history was read because the local resource snapshot is not healthy.",
+                    "Does not run Burp Scanner, sign wallets, submit Solana transactions, or fuzz broadly.",
+                ],
+            },
+        )
+        print(
+            "Burp MCP sync blocked by resource gate: "
+            f"{resource_status} warnings={','.join(warnings) if warnings else 'none'}"
+        )
+        print("No MCP history was read.")
+        print(f"Wrote {sync_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="burp-sync",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    sync_path,
+                ],
+            )
+        )
+        return 2
+
     observe_result = None
     if args.observe:
         observe_result = run_burp_observe(args)
@@ -33670,6 +33818,7 @@ def run_burp_sync(args: argparse.Namespace) -> int:
             "error": None,
         },
         "mcp_actions": [],
+        "resource_preflight": validation_resource_preflight_summary(resource_snapshot),
         "raw_history_cleanup": raw_cleanup,
         "observe_before_sync": bool(args.observe),
         "safety": [
@@ -35179,6 +35328,8 @@ def run_regression_suite(args: argparse.Namespace) -> int:
         ]
         if args.allow_nonlocal_target:
             burp_args.append("--allow-nonlocal-target")
+        if args.allow_resource_warning:
+            burp_args.append("--allow-resource-warning")
         command = inferforge_cli_command(
             args,
             profile_path=default_profile_path,
@@ -35407,6 +35558,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
 def run_profile(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    initial_artifact_paths = ensure_initial_audit_artifacts(artifact_dir, target=target)
     profile_doc = write_target_profile_artifact(artifact_dir, profile, target, source_root)
     clusters = build_clusters(profile, source_root)
     validation = load_optional_json(artifact_dir / PROFILE_VALIDATION_ARTIFACT) or {}
@@ -35423,6 +35575,8 @@ def run_profile(args: argparse.Namespace) -> int:
     print(f"Wrote {artifact_dir / PROFILE_VALIDATION_ARTIFACT}")
     print(f"Wrote {artifact_dir / 'config.json'}")
     print(f"Wrote {artifact_dir / 'endpoint-clusters.json'}")
+    if initial_artifact_paths:
+        print(f"Initialized {len(initial_artifact_paths)} not-run artifact(s)")
     print_refreshed_manifests(
         refresh_current_artifact_manifest(
             artifact_dir=artifact_dir,
@@ -35431,6 +35585,7 @@ def run_profile(args: argparse.Namespace) -> int:
             output_paths=[
                 *target_profile_artifact_paths(artifact_dir),
                 artifact_dir / "endpoint-clusters.json",
+                *initial_artifact_paths,
             ],
         )
     )
@@ -37909,7 +38064,7 @@ def build_parser() -> argparse.ArgumentParser:
     burp_sync.add_argument(
         "--count",
         type=positive_int,
-        default=200,
+        default=DEFAULT_BURP_SYNC_COUNT,
         help="Maximum Burp history items to request from MCP",
     )
     burp_sync.add_argument(
@@ -37955,6 +38110,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--observed-only",
         action="store_true",
         help="Select only endpoint kinds seen in imported Burp observations",
+    )
+    burp_sync.add_argument(
+        "--allow-resource-warning",
+        action="store_true",
+        help="Allow Burp MCP history reads when the local memory/swap resource gate is warning.",
     )
     burp_sync.set_defaults(func=run_burp_sync)
 
@@ -38232,8 +38392,13 @@ def build_parser() -> argparse.ArgumentParser:
     regression_suite.add_argument(
         "--burp-count",
         type=positive_int,
-        default=80,
+        default=DEFAULT_BURP_SYNC_COUNT,
         help="Maximum Burp history items to request for each burp-sync step.",
+    )
+    regression_suite.add_argument(
+        "--allow-resource-warning",
+        action="store_true",
+        help="Pass --allow-resource-warning to burp-sync steps.",
     )
     regression_suite.add_argument(
         "--include-external",

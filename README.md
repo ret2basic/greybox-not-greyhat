@@ -894,6 +894,11 @@ managed artifact manifest. By default, raw MCP history is imported in memory and
 is not persisted; the sync artifact records raw history byte counts and SHA-256
 hashes instead. Use `--raw-output`, `--websocket-raw-output`, or
 `--keep-raw-history` only when an explicit offline raw-history file is needed.
+The default MCP history window is 50 items. `burp-sync` also performs a local
+memory/swap resource preflight before observation or history reads; when that
+gate is warning, it writes a `blocked-resource-gate` sync artifact and reads no
+MCP history unless `--allow-resource-warning` is passed explicitly with a small
+`--count`.
 The sync artifact includes `mcp_actions`, a compact audit log of Burp MCP tool
 calls with sensitive request bodies, regex values, tokens, and secrets hashed or
 redacted; MCP exception messages are summarized by type, length, and SHA-256
