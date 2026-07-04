@@ -906,6 +906,19 @@ def is_blackbox_assessment(profile: dict[str, Any] | None) -> bool:
     return assessment_mode(profile) == "blackbox"
 
 
+def is_blackbox_profile_like(profile: dict[str, Any] | None) -> bool:
+    if not isinstance(profile, dict):
+        return False
+    raw_path = profile.get("_profile_path") or profile.get("profile_path") or ""
+    strategy_sets = normalize_string_list(profile.get("strategy_sets"))
+    return bool(
+        is_blackbox_assessment(profile)
+        or profile.get("target_type") == "blackbox-web-app"
+        or "blackbox-http-observed" in strategy_sets
+        or Path(str(raw_path)).name in {BLACKBOX_PROFILE_ARTIFACT, BLACKBOX_ASSET_PROFILE_ARTIFACT}
+    )
+
+
 def is_blackbox_asset_candidate_profile(profile: dict[str, Any] | None) -> bool:
     if not isinstance(profile, dict):
         return False
@@ -16192,15 +16205,20 @@ def verification_command_for_profile(profile_path: str, artifact_dir: Path | Non
     return f"{' '.join(shlex.quote(part) for part in parts)} {subcommand}"
 
 
-def verification_audit_policy_for_asset_candidate(is_asset_candidate: bool) -> dict[str, str]:
-    if is_asset_candidate:
+def verification_audit_policy_for_asset_candidate(
+    is_asset_candidate: bool,
+    *,
+    is_blackbox: bool = False,
+) -> dict[str, str]:
+    if is_blackbox or is_asset_candidate:
+        profile_label = "blackbox-asset-profile" if is_asset_candidate else "blackbox-profile"
         return {
             "subcommand": BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND,
             "safety": (
-                "Bounded same-target black-box audit for reviewed asset routes. No external probes, "
+                "Bounded same-target black-box audit for observed routes. No external probes, "
                 "no WebSocket resource probes, no wallet signing, and no transaction submission."
             ),
-            "profile": "blackbox-asset-profile",
+            "profile": profile_label,
         }
     return {
         "subcommand": DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND,
@@ -16210,12 +16228,18 @@ def verification_audit_policy_for_asset_candidate(is_asset_candidate: bool) -> d
 
 
 def verification_audit_policy_for_profile(profile: dict[str, Any] | None) -> dict[str, str]:
-    return verification_audit_policy_for_asset_candidate(is_blackbox_asset_candidate_profile(profile))
+    return verification_audit_policy_for_asset_candidate(
+        is_blackbox_asset_candidate_profile(profile),
+        is_blackbox=is_blackbox_profile_like(profile),
+    )
 
 
 def verification_audit_policy_for_clusters(clusters: dict[str, Any]) -> dict[str, str]:
     profile_info = clusters.get("profile", {}) if isinstance(clusters.get("profile"), dict) else {}
-    return verification_audit_policy_for_asset_candidate(is_blackbox_asset_candidate_profile(profile_info))
+    return verification_audit_policy_for_asset_candidate(
+        is_blackbox_asset_candidate_profile(profile_info),
+        is_blackbox=is_blackbox_profile_like(profile_info),
+    )
 
 
 def review_candidate_command_templates(
@@ -27165,6 +27189,21 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         profile=blackbox_normalized_profile,
     )
     blackbox_rpc_method_policy_sample = build_rpc_method_policy(ROOT, [], profile=blackbox_normalized_profile)
+    blackbox_verification_queue_sample = build_verification_queue(
+        "http://blackbox.test",
+        blackbox_clusters_sample,
+        None,
+        {"gaps": []},
+        {"status": "covered"},
+        {"status": "no-reportable-findings", "external_blockers": [], "decisions": []},
+        {"status": "ready"},
+        ROOT / ".greybox/selftest",
+    )
+    blackbox_verification_command_text = "\n".join(
+        str(command)
+        for item in blackbox_verification_queue_sample.get("items", [])
+        for command in item.get("commands", [])
+    )
     with tempfile.TemporaryDirectory(prefix="inferforge-blackbox-target-info-selftest-") as blackbox_info_dir:
         blackbox_info_path = Path(blackbox_info_dir)
         append_jsonl(
@@ -27413,6 +27452,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_target_info_sample.get("health_status") == 404
         and blackbox_target_info_sample.get("health_path") is None
         and blackbox_target_info_sample.get("health_source") == "blackbox-burp-history"
+        and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_verification_command_text
+        and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_verification_command_text
         and blackbox_asset_map_sample.get("status") == "candidates-found"
         and blackbox_asset_map_sample.get("page", {}).get("script_urls_seen") == 2
         and blackbox_asset_map_sample.get("page", {}).get("same_origin_script_urls_seen") == 1
