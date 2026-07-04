@@ -2264,9 +2264,24 @@ def nextjs_pages_api_path(api_file: Path, source_root: Path) -> str | None:
     return None
 
 
+def extract_export_list_route_methods(source: str) -> set[str]:
+    methods: set[str] = set()
+    for match in re.finditer(r"\bexport\s+(?!type\b)\{([^}]+)\}(?:\s+from\b[^;]*)?", source, re.S):
+        for raw_item in match.group(1).split(","):
+            item = raw_item.strip()
+            if not item:
+                continue
+            alias_match = re.search(r"\bas\s+([A-Z]+)\b", item)
+            method = alias_match.group(1) if alias_match else item.split()[-1]
+            if method in HTTP_METHODS:
+                methods.add(method)
+    return methods
+
+
 def extract_route_methods(source: str) -> list[str]:
     methods = set(re.findall(r"export\s+(?:async\s+)?function\s+([A-Z]+)\b", source))
     methods.update(re.findall(r"export\s+const\s+([A-Z]+)\s*=", source))
+    methods.update(extract_export_list_route_methods(source))
     return sorted(method for method in methods if method in HTTP_METHODS)
 
 
@@ -23128,6 +23143,21 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for item in unsafe_observation_validation.get("issues", [])
         )
     )
+    route_method_export_list_samples = {
+        "handler_aliases": extract_route_methods(
+            "async function handler() { return Response.json({ ok: true }) }\n"
+            "export { handler as GET, handler as POST }\n"
+        ),
+        "direct_reexport": extract_route_methods("export { GET } from './handler'\n"),
+        "renamed_reexport": extract_route_methods("export { mutate as PATCH } from './handler'\n"),
+        "type_export_ignored": extract_route_methods("export type { GET } from './types'\n"),
+    }
+    route_method_export_list_passed = (
+        route_method_export_list_samples.get("handler_aliases") == ["GET", "POST"]
+        and route_method_export_list_samples.get("direct_reexport") == ["GET"]
+        and route_method_export_list_samples.get("renamed_reexport") == ["PATCH"]
+        and route_method_export_list_samples.get("type_export_ignored") == []
+    )
     with tempfile.TemporaryDirectory(prefix="inferforge-discovery-selftest-") as temp_dir:
         rewrite_source_root = Path(temp_dir) / "rewrite-app"
         (rewrite_source_root / "src/app/health").mkdir(parents=True)
@@ -23148,6 +23178,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         (rewrite_source_root / "src/app/(.)intercepted").mkdir(parents=True)
         (rewrite_source_root / "src/app/(.)intercepted/route.ts").write_text(
             "export async function GET() { return Response.json({ ok: true }) }\n",
+            encoding="utf-8",
+        )
+        (rewrite_source_root / "src/app/api/reexport").mkdir(parents=True)
+        (rewrite_source_root / "src/app/api/reexport/route.ts").write_text(
+            "async function handler() { return Response.json({ ok: true }) }\n"
+            "export { handler as GET, handler as POST }\n",
             encoding="utf-8",
         )
         (rewrite_source_root / "src/app/actions.ts").write_text(
@@ -23389,6 +23425,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             ),
             None,
         )
+        reexport_app_cluster = next(
+            (
+                cluster
+                for cluster in rewrite_clusters.get("clusters", [])
+                if cluster.get("id") == "route-api-reexport"
+            ),
+            None,
+        )
         server_action_entries = rewrite_inventory.get("server_actions", [])
         rewrite_cluster_candidates = (
             []
@@ -23538,6 +23582,20 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 match
                 for match in intercepted_resolution.get("matches", [])
                 if match.get("cluster_id") == "route-intercepted"
+            ),
+            None,
+        )
+        reexport_resolution = resolve_endpoint_sources(
+            rewrite_source_root,
+            "POST",
+            "/api/reexport",
+            rewrite_inventory,
+        )
+        reexport_resolution_match = next(
+            (
+                match
+                for match in reexport_resolution.get("matches", [])
+                if match.get("cluster_id") == "route-api-reexport"
             ),
             None,
         )
@@ -23840,7 +23898,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         rewrite_server_action_report_lines = rewrite_source_resolver_report.get("server_action_lines", [])
         rewrite_discovery_passed = (
             rewrite_inventory.get("summary", {}).get("rewrite_count") == 1
-            and rewrite_inventory.get("summary", {}).get("app_router_route_count") == 4
+            and rewrite_inventory.get("summary", {}).get("app_router_route_count") == 5
             and rewrite_inventory.get("summary", {}).get("pages_router_api_route_count") == 1
             and rewrite_inventory.get("summary", {}).get("middleware_count") == 1
             and rewrite_inventory.get("summary", {}).get("server_action_file_count") == 1
@@ -23923,6 +23981,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and str(intercepted_resolution_match.get("source_ref", "")).endswith(
                 "src/app/(.)intercepted/route.ts"
             )
+            and reexport_app_cluster is not None
+            and reexport_app_cluster.get("path") == "/api/reexport"
+            and set((reexport_app_cluster.get("match") or {}).get("methods", [])) == {"GET", "POST"}
+            and reexport_resolution_match is not None
+            and str(reexport_resolution_match.get("source_ref", "")).endswith("src/app/api/reexport/route.ts")
             and len(server_action_entries) == 1
             and {"updateWidget", "deleteWidget"}.issubset(set(server_action_entries[0].get("action_names", [])))
             and not any(str(cluster.get("id", "")).startswith("server_action") for cluster in rewrite_clusters.get("clusters", []))
@@ -24692,6 +24755,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and response_delta_selftest_passed
         and ws_resource_open_item_passed
         and unsafe_observation_validation_passed
+        and route_method_export_list_passed
         and rewrite_discovery_passed
         and profile_custom_ws_discovery_passed
         and configured_nextjs_runtime_passed
@@ -24736,6 +24800,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "gate_status": None if generic_gate_item is None else generic_gate_item.get("gate_status"),
             "source_refs": [] if generic_suspicion is None else generic_suspicion.get("source_refs", []),
             "hardening_note_ids": [item.get("id") for item in generic_hardening_notes],
+        },
+        "route_method_export_list": {
+            "status": "passed" if route_method_export_list_passed else "failed",
+            "samples": route_method_export_list_samples,
         },
         "quote_profile_hardening_attribution": {
             "status": "passed" if quote_profile_hardening_profile_passed else "failed",
