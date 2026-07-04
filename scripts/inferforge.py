@@ -9755,10 +9755,13 @@ def cluster_source_refs_by_id(clusters: dict[str, Any]) -> dict[str, list[str]]:
 def configured_source_peek_requests(
     source_peeks: dict[str, Any] | None,
     observed_cluster_ids: set[str],
+    clusters: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     requests = []
     for item in (source_peeks or {}).get("source_peeks", []) or []:
-        cluster_ids = [str(cluster_id) for cluster_id in item.get("cluster_ids", []) or []]
+        if not isinstance(item, dict):
+            continue
+        cluster_ids = sorted(source_peek_item_cluster_ids(item, clusters))
         if cluster_ids and observed_cluster_ids and not (set(cluster_ids) & observed_cluster_ids):
             continue
         endpoint = str(item.get("endpoint") or "profile source context")
@@ -9968,7 +9971,7 @@ def build_source_peek_requests(
     requests: list[dict[str, Any]] = []
     for item in [
         *endpoint_source_peek_requests(traffic_index, clusters, source_peeks),
-        *configured_source_peek_requests(source_peeks, observed_clusters),
+        *configured_source_peek_requests(source_peeks, observed_clusters, clusters),
         *suspicion_source_peek_requests(suspicions or []),
         *server_action_source_peek_requests(source_peeks),
         *evidence_gap_source_peek_requests(evidence_gaps, cluster_refs),
@@ -23871,11 +23874,22 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
     profile_source_peek_match_ids = source_peek_cluster_ids(profile_source_peek_match, clusters)
     profile_source_peek_legacy_ids = source_peek_cluster_ids(profile_source_peek_legacy_path, clusters)
     profile_source_context = source_peeks_for_cluster(profile_source_peek_match, "quote", clusters)
+    profile_source_peek_requests = configured_source_peek_requests(profile_source_peek_match, {"quote"}, clusters)
+    profile_source_peek_legacy_requests = configured_source_peek_requests(
+        profile_source_peek_legacy_path,
+        {"quote"},
+        clusters,
+    )
     source_peek_profile_match_passed = (
         profile_source_peek_match_ids == {"quote"}
         and "quote" not in profile_source_peek_legacy_ids
         and len(profile_source_context) == 1
         and profile_source_context[0].get("endpoint") == "POST /bridge/quote"
+    )
+    source_peek_request_profile_match_passed = (
+        len(profile_source_peek_requests) == 1
+        and profile_source_peek_requests[0].get("cluster_ids") == ["quote"]
+        and all("quote" not in item.get("cluster_ids", []) for item in profile_source_peek_legacy_requests)
     )
     generic_expected_row = json_clone(generic_unexpected_row)
     generic_expected_row.update(
@@ -24218,6 +24232,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and generic_attribution_passed
         and quote_profile_hardening_profile_passed
         and source_peek_profile_match_passed
+        and source_peek_request_profile_match_passed
         and response_delta_selftest_passed
         and ws_resource_open_item_passed
         and unsafe_observation_validation_passed
@@ -24271,6 +24286,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "matched_ids": sorted(profile_source_peek_match_ids),
             "legacy_ids": sorted(profile_source_peek_legacy_ids),
             "source_context": profile_source_context,
+        },
+        "source_peek_request_profile_match": {
+            "status": "passed" if source_peek_request_profile_match_passed else "failed",
+            "requests": profile_source_peek_requests,
+            "legacy_requests": profile_source_peek_legacy_requests,
         },
         "quote_intent_profile_routing": {
             "status": "passed" if quote_intent_profile_passed else "failed",
