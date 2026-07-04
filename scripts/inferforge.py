@@ -8432,6 +8432,11 @@ def hypothesis_from_rpc_method_policy(
         if isinstance(flow_artifact.get("server_credential_proxy_review"), dict)
         else {}
     )
+    deployment_provider = (
+        credential_proxy.get("deployment_credential_provider_review")
+        if isinstance(credential_proxy.get("deployment_credential_provider_review"), dict)
+        else {}
+    )
     flow_dataflows = [
         item for item in flow_artifact.get("dataflows", []) or [] if isinstance(item, dict)
     ]
@@ -8517,6 +8522,12 @@ def hypothesis_from_rpc_method_policy(
             ).get("missing_required_decisions", []),
             "server_credential_proxy_status": credential_proxy.get("status") or "missing",
             "server_credential_proxy_priority": credential_proxy.get("priority") or "info",
+            "deployment_credential_provider_status": deployment_provider.get("status") or "missing",
+            "deployment_credential_provider_missing": (
+                (deployment_provider.get("summary") or {}).get("missing_provider_evidence", [])
+                if isinstance(deployment_provider.get("summary"), dict)
+                else []
+            ),
             "server_credential_proxy_review_files": (
                 credential_proxy.get("summary") or {}
             ).get("files_needing_cost_review", 0),
@@ -8574,6 +8585,16 @@ def hypotheses_from_credential_proxy_review(
     )
     if review.get("status") != "needs-cost-abuse-review":
         return []
+    deployment_provider_review = (
+        review.get("deployment_credential_provider_review")
+        if isinstance(review.get("deployment_credential_provider_review"), dict)
+        else {}
+    )
+    deployment_provider_summary = (
+        deployment_provider_review.get("summary")
+        if isinstance(deployment_provider_review.get("summary"), dict)
+        else {}
+    )
     hypotheses = []
     for row in review.get("files", []) or []:
         if not isinstance(row, dict) or row.get("status") != "needs-cost-abuse-review":
@@ -8640,6 +8661,9 @@ def hypotheses_from_credential_proxy_review(
                     "route_bound_rate_limit_guard_ref_count": control_summary.get("route_bound_rate_limit_guard_refs", 0),
                     "unbound_auth_guard_ref_count": control_summary.get("unbound_auth_guard_refs", 0),
                     "unbound_rate_limit_guard_ref_count": control_summary.get("unbound_rate_limit_guard_refs", 0),
+                    "deployment_provider_status": deployment_provider_review.get("status"),
+                    "deployment_provider_missing": deployment_provider_summary.get("missing_provider_evidence", []),
+                    "deployment_provider_env_keys": deployment_provider_summary.get("provider_env_keys", []),
                     "required_evidence": review.get("required_evidence", []),
                     "review_question": row.get("review_question"),
                 },
@@ -15616,12 +15640,56 @@ def deployment_review_match_categories() -> dict[str, list[str]]:
             "ingress:",
             "annotations:",
         ],
+        "credential_provider_secret": [
+            "M0_ORCHESTRATION_API_KEY",
+            "m0OrchestrationApiKey",
+            "M0_QUOTE_API",
+            "gateway.m0.xyz",
+        ],
+        "credential_provider_quota_policy": [
+            "quota",
+            "usage limit",
+            "request limit",
+            "provider limit",
+            "account limit",
+        ],
+        "credential_provider_rate_limit_policy": [
+            "rate limit",
+            "rate-limit",
+            "429",
+            "too many requests",
+            "requests per",
+        ],
+        "credential_provider_billing_impact": [
+            "billing",
+            "billable",
+            "cost",
+            "credits",
+            "paid",
+        ],
+        "credential_provider_monitoring": [
+            "usage",
+            "monitor",
+            "alert",
+            "metrics",
+        ],
     }
 
 
 def deployment_review_token_matches(category: str, token: str, lowered_line: str) -> bool:
     if token.lower() not in lowered_line:
         return False
+    if category.startswith("credential_provider_") and category != "credential_provider_secret":
+        provider_context = [
+            "m0",
+            "orchestration",
+            "gateway.m0.xyz",
+            "quote",
+            "provider",
+            "api key",
+        ]
+        if not any(context in lowered_line for context in provider_context):
+            return False
     if category != "fallback_monitoring":
         return True
     resource_context = [
@@ -15740,9 +15808,130 @@ def build_deployment_resource_review(
         for key, refs in external_key_sources.items()
         if any(ref not in local_env_files for ref in refs)
     }
+    credential_provider_keys = {
+        "M0_ORCHESTRATION_API_KEY",
+    }
+    credential_provider_key_sources = {
+        key: refs
+        for key, refs in env_key_index.items()
+        if key in credential_provider_keys
+    }
+    credential_provider_local_keys = {
+        key: [ref for ref in refs if ref in local_env_files]
+        for key, refs in credential_provider_key_sources.items()
+        if any(ref in local_env_files for ref in refs)
+    }
+    credential_provider_template_keys = {
+        key: [ref for ref in refs if ref not in local_env_files]
+        for key, refs in credential_provider_key_sources.items()
+        if any(ref not in local_env_files for ref in refs)
+    }
 
     def category_status(category: str) -> str:
         return "evidence-present" if category_matches.get(category) else "missing-evidence"
+
+    credential_provider_decisions = [
+        {
+            "id": "credentialed-upstream-secret-injection",
+            "status": (
+                "present-local-key-only"
+                if credential_provider_local_keys and not credential_provider_template_keys
+                else "templated-or-deployed-secret"
+                if credential_provider_template_keys or category_matches["credential_provider_secret"]
+                else "missing-evidence"
+            ),
+            "evidence": category_matches["credential_provider_secret"][:8],
+            "env_keys": sorted(credential_provider_key_sources.keys()),
+            "local_env_key_only": sorted(credential_provider_local_keys.keys()),
+            "operator_evidence_needed": [
+                "Confirm whether this provider key is deployed in the target environment without exposing the secret value.",
+                "Confirm which provider account, quota pool, or billing allocation the deployed key consumes.",
+            ],
+        },
+        {
+            "id": "credentialed-upstream-quota-policy",
+            "status": category_status("credential_provider_quota_policy"),
+            "evidence": category_matches["credential_provider_quota_policy"][:8],
+            "operator_evidence_needed": [
+                "Confirm provider-side quota, usage caps, and account-level request limits for the credentialed upstream.",
+            ],
+        },
+        {
+            "id": "credentialed-upstream-rate-limit-policy",
+            "status": category_status("credential_provider_rate_limit_policy"),
+            "evidence": category_matches["credential_provider_rate_limit_policy"][:8],
+            "operator_evidence_needed": [
+                "Confirm whether unauthenticated application requests can consume provider rate limits or trigger provider-side 429s.",
+            ],
+        },
+        {
+            "id": "credentialed-upstream-billing-impact",
+            "status": category_status("credential_provider_billing_impact"),
+            "evidence": category_matches["credential_provider_billing_impact"][:8],
+            "operator_evidence_needed": [
+                "Confirm whether quote requests are billable, credit-consuming, or otherwise account-impacting.",
+            ],
+        },
+        {
+            "id": "credentialed-upstream-usage-monitoring",
+            "status": category_status("credential_provider_monitoring"),
+            "evidence": category_matches["credential_provider_monitoring"][:8],
+            "operator_evidence_needed": [
+                "Confirm monitoring or alerting for provider usage, quota depletion, billing spikes, or upstream availability errors.",
+            ],
+        },
+    ]
+    provider_decision_status_counts: dict[str, int] = {}
+    for decision in credential_provider_decisions:
+        increment_count(provider_decision_status_counts, str(decision.get("status") or "unknown"))
+    provider_secret_present = (
+        bool(credential_provider_key_sources)
+        or bool(category_matches["credential_provider_secret"])
+    )
+    provider_missing = [
+        str(decision.get("id"))
+        for decision in credential_provider_decisions
+        if decision.get("id") != "credentialed-upstream-secret-injection"
+        and decision.get("status") == "missing-evidence"
+    ]
+    if not provider_secret_present:
+        provider_review_status = "no-credentialed-upstream-provider-evidence"
+    elif provider_missing:
+        provider_review_status = "needs-provider-operator-evidence"
+    elif any(decision.get("status") == "missing-evidence" for decision in credential_provider_decisions):
+        provider_review_status = "partial-provider-evidence"
+    else:
+        provider_review_status = "provider-evidence-indexed"
+    credential_provider_review = {
+        "status": provider_review_status,
+        "summary": {
+            "decisions": len(credential_provider_decisions),
+            "decision_status_counts": dict(sorted(provider_decision_status_counts.items())),
+            "provider_secret_present": provider_secret_present,
+            "provider_env_keys": sorted(credential_provider_key_sources.keys()),
+            "missing_provider_evidence": provider_missing,
+            "evidence_counts": {
+                "secret": len(category_matches["credential_provider_secret"]),
+                "quota_policy": len(category_matches["credential_provider_quota_policy"]),
+                "rate_limit_policy": len(category_matches["credential_provider_rate_limit_policy"]),
+                "billing_impact": len(category_matches["credential_provider_billing_impact"]),
+                "usage_monitoring": len(category_matches["credential_provider_monitoring"]),
+            },
+        },
+        "decisions": credential_provider_decisions,
+        "required_evidence": [
+            "Provider/operator confirmation of quota, rate-limit, billing, credit, or account availability impact.",
+            "Evidence whether unauthenticated application requests consume that provider budget in production.",
+            "Monitoring or account telemetry that can validate impact without flooding, brute force, or stress traffic.",
+        ],
+        "reportability_gate": (
+            "Provider secret injection is not reportable by itself. Escalate only with concrete quota, billing, "
+            "availability, or account-impact evidence, and do not validate with high-volume traffic."
+        ),
+        "safety": (
+            "Offline deployment/provider evidence triage only. Secret values are redacted or omitted and no provider requests are sent."
+        ),
+    }
 
     decisions = [
         {
@@ -15795,6 +15984,7 @@ def build_deployment_resource_review(
                 "Confirm the actual environment values deployed for the target service without exposing secrets.",
             ],
         },
+        *credential_provider_decisions,
     ]
     decision_status_counts: dict[str, int] = {}
     for decision in decisions:
@@ -15825,6 +16015,10 @@ def build_deployment_resource_review(
             "decisions": len(decisions),
             "decision_status_counts": dict(sorted(decision_status_counts.items())),
             "critical_missing": critical_missing,
+            "credential_provider_review": credential_provider_review.get("status"),
+            "credential_provider_missing": (
+                credential_provider_review.get("summary") or {}
+            ).get("missing_provider_evidence", []),
             "category_match_counts": {
                 category: len(matches)
                 for category, matches in sorted(category_matches.items())
@@ -15838,11 +16032,17 @@ def build_deployment_resource_review(
         "files": files,
         "skipped": skipped,
         "decisions": decisions,
+        "credential_provider_review": credential_provider_review,
         "operator_evidence_still_required": [
             "Production external store configuration and health, with secret values redacted.",
             "Production proxy/header trust model for client IP selection.",
             "Rate-limit key TTL or eviction bounds for in-process memory fallback.",
             "Monitoring or alerting for external store fallback and resource pressure.",
+            *(
+                credential_provider_review.get("required_evidence", [])
+                if credential_provider_review.get("status") == "needs-provider-operator-evidence"
+                else []
+            ),
         ],
         "reportability_gate": (
             "This artifact is deployment evidence triage only. It does not prove resource exhaustion or availability "
@@ -16753,6 +16953,20 @@ def build_transaction_flow_review(
     policy_scaffold = build_transaction_intent_policy_scaffold(profile)
     quote_contract_review = build_quote_source_contract_review(refs_by_group, policy_scaffold)
     credential_proxy_review = build_server_credential_proxy_review(refs_by_group, source_root=source_root)
+    deployment_provider_review = build_deployment_resource_review(
+        source_root,
+        profile,
+        max_file_bytes=DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES,
+        max_files=32,
+    ).get("credential_provider_review", {})
+    if isinstance(deployment_provider_review, dict) and deployment_provider_review:
+        credential_proxy_review["deployment_credential_provider_review"] = deployment_provider_review
+        credential_proxy_review["required_evidence"] = ordered_unique_strings(
+            [
+                *(credential_proxy_review.get("required_evidence", []) or []),
+                *(deployment_provider_review.get("required_evidence", []) or []),
+            ]
+        )
     if quote_contract_review.get("status") == "quote-source-contract-indexed":
         contract_refs = []
         for decision in quote_contract_review.get("decisions", []) or []:
@@ -16842,6 +17056,9 @@ def build_transaction_flow_review(
             "server_quote_validation_refs": len(refs_by_group.get("server_quote_validation", []) or []),
             "quote_source_contract_status": quote_contract_review.get("status"),
             "server_credential_proxy_status": credential_proxy_review.get("status"),
+            "deployment_credential_provider_status": deployment_provider_review.get("status")
+            if isinstance(deployment_provider_review, dict)
+            else None,
             "server_credential_proxy_review_files": (
                 credential_proxy_review.get("summary") or {}
             ).get("files_needing_cost_review", 0),
@@ -33731,6 +33948,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
     )
     with tempfile.TemporaryDirectory(prefix="inferforge-discovery-selftest-") as temp_dir:
         rewrite_source_root = Path(temp_dir) / "rewrite-app"
+        rewrite_source_root.mkdir(parents=True, exist_ok=True)
+        (rewrite_source_root / ".env.template").write_text(
+            "M0_ORCHESTRATION_API_KEY=YOUR_M0_ORCHESTRATION_API_KEY_HERE\n",
+            encoding="utf-8",
+        )
         (rewrite_source_root / "src/app/health").mkdir(parents=True)
         (rewrite_source_root / "src/app/health/route.ts").write_text(
             "export async function GET() { return Response.json({ ok: true }) }\n",
@@ -34955,6 +35177,18 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "route_bound_auth_guard_ref_count"
             )
             == 0
+            and rewrite_credential_proxy_validation_item.get("credential_proxy_review", {}).get(
+                "deployment_provider_status"
+            )
+            == "needs-provider-operator-evidence"
+            and "credentialed-upstream-billing-impact"
+            in (
+                rewrite_credential_proxy_validation_item.get("credential_proxy_review", {}).get(
+                    "deployment_provider_missing",
+                    [],
+                )
+                or []
+            )
         )
         rate_limit_resource_review = rewrite_transaction_policy.get("rate_limit_resource_review", {})
         rate_limit_signal_ids = {
@@ -39962,6 +40196,12 @@ def run_deployment_review(args: argparse.Namespace) -> int:
         f"skipped={summary.get('skipped', 0)}, "
         f"critical_missing={','.join(summary.get('critical_missing', []) or []) or 'none'}"
     )
+    provider_missing = summary.get("credential_provider_missing", []) or []
+    print(
+        "Credential provider: "
+        f"status={summary.get('credential_provider_review') or 'missing'}, "
+        f"missing={','.join(provider_missing) if provider_missing else 'none'}"
+    )
     print(f"Decision statuses: {json.dumps(summary.get('decision_status_counts', {}), sort_keys=True)}")
     top_count = max(0, int(args.top))
     if top_count:
@@ -40057,6 +40297,13 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
             f"missing_required={len(source_contract_summary.get('missing_required_decisions', []) or [])}"
         )
     if credential_proxy:
+        provider_review = (
+            credential_proxy.get("deployment_credential_provider_review")
+            if isinstance(credential_proxy.get("deployment_credential_provider_review"), dict)
+            else {}
+        )
+        provider_summary = provider_review.get("summary", {}) if isinstance(provider_review.get("summary"), dict) else {}
+        provider_missing = provider_summary.get("missing_provider_evidence", []) or []
         print(
             "Credential proxy: "
             f"status={credential_proxy.get('status')}, "
@@ -40064,8 +40311,11 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
             f"credential_refs={credential_proxy_summary.get('credential_refs', 0)}, "
             f"upstream_refs={credential_proxy_summary.get('external_upstream_refs', 0)}, "
             f"needs_review_route_bound_auth={credential_proxy_summary.get('needs_review_route_bound_auth_guard_refs', 0)}, "
-            f"needs_review_route_bound_rate={credential_proxy_summary.get('needs_review_route_bound_rate_limit_guard_refs', 0)}"
+            f"needs_review_route_bound_rate={credential_proxy_summary.get('needs_review_route_bound_rate_limit_guard_refs', 0)}, "
+            f"provider={provider_review.get('status') or 'missing'}"
         )
+        if provider_missing:
+            print(f"Provider missing: {','.join(str(item) for item in provider_missing[:5])}")
     top_count = max(0, int(args.top))
     if top_count:
         print("Dataflows:")
@@ -40215,7 +40465,8 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         f"remote_signing_sinks={transaction_flow.get('remote_signing_sink_ref_count', 0)} "
                         f"policy_scaffold={transaction_flow.get('intent_policy_scaffold_status', 'missing')} "
                         f"quote_contract={transaction_flow.get('quote_source_contract_status', 'missing')} "
-                        f"credential_proxy={transaction_flow.get('server_credential_proxy_status', 'missing')}"
+                        f"credential_proxy={transaction_flow.get('server_credential_proxy_status', 'missing')} "
+                        f"provider={transaction_flow.get('deployment_credential_provider_status', 'missing')}"
                     )
                 resource_review = (
                     item.get("resource_abuse_review")
@@ -40244,8 +40495,12 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         f"rate_refs={credential_review.get('rate_limit_guard_ref_count', 0)} "
                         f"route_bound={credential_review.get('route_bound_control_status') or 'unknown'} "
                         f"unbound_auth={credential_review.get('unbound_auth_guard_ref_count', 0)} "
-                        f"unbound_rate={credential_review.get('unbound_rate_limit_guard_ref_count', 0)}"
+                        f"unbound_rate={credential_review.get('unbound_rate_limit_guard_ref_count', 0)} "
+                        f"provider={credential_review.get('deployment_provider_status') or 'missing'}"
                     )
+                    provider_missing = credential_review.get("deployment_provider_missing", []) or []
+                    if provider_missing:
+                        print(f"  provider_missing={','.join(str(item) for item in provider_missing[:5])}")
                 rewrite_review = item.get("rewrite_review") if isinstance(item.get("rewrite_review"), dict) else {}
                 source_guard = (
                     rewrite_review.get("source_guard_review")
