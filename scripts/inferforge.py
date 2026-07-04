@@ -14047,6 +14047,53 @@ def source_references(source_root: Path, patterns: list[str]) -> list[dict[str, 
     return refs
 
 
+def build_remote_transaction_signing_review(
+    *,
+    frontend_transaction_refs: list[dict[str, Any]],
+    remote_transaction_material_refs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if frontend_transaction_refs and remote_transaction_material_refs:
+        status = "needs-transaction-intent-corpus"
+        priority = "high"
+        next_step = (
+            "Capture one approved quote response, extract transaction payloads, and run decode-transactions "
+            "against the expected wallet, mint direction, amount, and allowed programs before any signing flow."
+        )
+    elif frontend_transaction_refs:
+        status = "frontend-signing-references-only"
+        priority = "medium"
+        next_step = "Review signing call sites and identify whether transactions are locally constructed or supplied by a remote service."
+    elif remote_transaction_material_refs:
+        status = "remote-transaction-material-only"
+        priority = "medium"
+        next_step = "Review where decoded transaction material flows and whether it can reach wallet signing APIs."
+    else:
+        status = "no-static-remote-signing-pattern"
+        priority = "info"
+        next_step = "No static remote-transaction signing pattern was found in the scanned source tree."
+    return {
+        "status": status,
+        "priority": priority,
+        "frontend_signing_ref_count": len(frontend_transaction_refs),
+        "remote_transaction_material_ref_count": len(remote_transaction_material_refs),
+        "reportability_gate": (
+            "Static remote-transaction signing flow evidence is not reportable by itself. "
+            "Escalate only with decoded transaction intent mismatch, unsafe signer/account/mint/program behavior, "
+            "or another concrete user-funds impact, without signing or submitting transactions."
+        ),
+        "next_step": next_step,
+        "required_evidence": [
+            "One approved quote response or transaction payload corpus collected without wallet signing.",
+            "decode-transactions output tied to expected wallet, sender, recipient, amount, mints, and allowed programs.",
+            "A finding-gate decision showing concrete transaction-integrity impact rather than source pattern presence.",
+        ],
+        "safety": (
+            "Offline source review only. Do not sign wallets, submit transactions, trade, or treat this static pattern "
+            "as a vulnerability finding without decoded intent evidence."
+        ),
+    }
+
+
 def parse_source_orca_whirlpools(source_root: Path) -> list[dict[str, str]]:
     path = source_root / "src/lib/partners/orca.ts"
     if not path.exists():
@@ -14195,6 +14242,13 @@ def build_rpc_method_policy(
                 "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS": os.environ.get("SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS"),
                 "SOLANA_RPC_PROXY_ALLOWED_METHODS_set": os.environ.get("SOLANA_RPC_PROXY_ALLOWED_METHODS") is not None,
             },
+            "frontend_transaction_dependency_refs": [],
+            "remote_transaction_material_refs": [],
+            "remote_transaction_signing_review": {
+                "status": "not-applicable-blackbox",
+                "priority": "info",
+                "next_step": "Pure black-box profile: collect approved Burp quote responses before transaction-intent decoding.",
+            },
             "transaction_probe_results": [],
             "safety": "Pure black-box profile: local Solana RPC source policy is not inspected.",
         }
@@ -14212,6 +14266,13 @@ def build_rpc_method_policy(
             "runner_environment": {
                 "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS": os.environ.get("SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS"),
                 "SOLANA_RPC_PROXY_ALLOWED_METHODS_set": os.environ.get("SOLANA_RPC_PROXY_ALLOWED_METHODS") is not None,
+            },
+            "frontend_transaction_dependency_refs": [],
+            "remote_transaction_material_refs": [],
+            "remote_transaction_signing_review": {
+                "status": "source-unavailable",
+                "priority": "info",
+                "next_step": "Source file was unavailable; use approved quote payload artifacts for transaction-intent review.",
             },
             "transaction_probe_results": [],
             "safety": "Source file was unavailable, so RPC method policy was not inferred from local source.",
@@ -14241,6 +14302,15 @@ def build_rpc_method_policy(
     frontend_transaction_refs = source_references(
         source_root,
         ["walletProvider.sendTransaction", "sendRawTransaction", "sendTransaction("],
+    )
+    remote_transaction_material_refs = source_references(
+        source_root,
+        [
+            "VersionedTransaction.deserialize",
+            "deserializeTransaction(",
+            "transactionBase64s",
+            "payload.data.transaction",
+        ],
     )
     proxy_connection_refs = source_references(
         source_root,
@@ -14272,6 +14342,11 @@ def build_rpc_method_policy(
             "SOLANA_RPC_PROXY_ALLOWED_METHODS_set": env_configured_methods is not None,
         },
         "frontend_transaction_dependency_refs": frontend_transaction_refs,
+        "remote_transaction_material_refs": remote_transaction_material_refs,
+        "remote_transaction_signing_review": build_remote_transaction_signing_review(
+            frontend_transaction_refs=frontend_transaction_refs,
+            remote_transaction_material_refs=remote_transaction_material_refs,
+        ),
         "proxy_connection_refs": proxy_connection_refs,
         "transaction_probe_results": transaction_probe_results,
         "policy_posture": posture,

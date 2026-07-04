@@ -1377,7 +1377,13 @@ SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS=true
 or by explicitly including them in `SOLANA_RPC_PROXY_ALLOWED_METHODS`. InferForge
 writes `.greybox/rpc-method-policy.json` to show the source default allowlist,
 the transaction-method gate, frontend transaction-send references, proxy
-connection references, and the observed high-impact method probe results.
+connection references, and the observed high-impact method probe results. The
+same artifact also records static remote-transaction material references, such
+as base64 transaction extraction or `VersionedTransaction.deserialize`, and
+adds a `remote_transaction_signing_review` gate when those references can flow
+toward wallet signing calls. This is only a prompt to collect and decode an
+approved transaction corpus; it is not reportable without decoded intent
+mismatch or equivalent user-funds impact evidence.
 
 ## Solana RPC WebSocket Hardening
 
