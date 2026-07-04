@@ -20,6 +20,7 @@ import io
 import ipaddress
 import json
 import os
+import pwd
 import re
 import shlex
 import socket
@@ -6763,6 +6764,16 @@ def parse_proc_status(pid: int) -> dict[str, Any] | None:
             parts = value.split()
             if parts and parts[0].isdigit():
                 parsed["rss_kib"] = int(parts[0])
+        elif key == "Uid":
+            parts = value.split()
+            if parts and parts[0].isdigit():
+                uid = int(parts[0])
+                parsed["uid"] = uid
+                try:
+                    parsed["user"] = pwd.getpwuid(uid).pw_name
+                except KeyError:
+                    parsed["user"] = str(uid)
+                parsed["current_user_can_signal"] = os.geteuid() == 0 or uid == os.geteuid()
     if "rss_kib" not in parsed:
         return None
     parsed["rss_mib"] = kib_to_mib(int(parsed["rss_kib"]))
@@ -6847,6 +6858,7 @@ def top_rss_processes(limit: int) -> list[dict[str, Any]]:
 
 def resource_release_candidates(processes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     candidates = []
+    current_uid = os.geteuid()
     for process in processes:
         rss_mib = numeric_resource_value(process.get("rss_mib"))
         if rss_mib is None or rss_mib < 256:
@@ -6857,6 +6869,16 @@ def resource_release_candidates(processes: list[dict[str, Any]]) -> list[dict[st
         lowered = f"{name} {command}".lower()
         if "codex" in lowered or ".vscode-server" in lowered:
             continue
+        process_uid = process.get("uid")
+        process_user = process.get("user")
+        if not process_user and isinstance(process_uid, int):
+            try:
+                process_user = pwd.getpwuid(process_uid).pw_name
+            except KeyError:
+                process_user = str(process_uid)
+        can_signal = process.get("current_user_can_signal")
+        if can_signal is None and isinstance(process_uid, int):
+            can_signal = current_uid == 0 or process_uid == current_uid
         if "burpsuite" in lowered or ("java" in name.lower() and "burp" in lowered):
             candidate_type = "burp-gui"
             recommendation = "Close idle Burp GUI before offline iteration; restart it only for an approved bounded observation."
@@ -6876,9 +6898,16 @@ def resource_release_candidates(processes: list[dict[str, Any]]) -> list[dict[st
                 "name": name,
                 "rss_mib": process.get("rss_mib"),
                 "type": candidate_type,
+                "uid": process.get("uid"),
+                "user": process_user,
+                "current_user_can_signal": bool(can_signal) if can_signal is not None else None,
                 "process_context": cgroup_context,
                 "recommendation": recommendation,
-                "safe_action": "Prefer graceful application shutdown; do not kill unknown user/session processes automatically.",
+                "safe_action": (
+                    "Prefer graceful application shutdown; do not kill unknown user/session processes automatically."
+                    if can_signal is not False
+                    else "Current user cannot signal this process; use the owning session or service manager for graceful shutdown."
+                ),
             }
         )
     return candidates
@@ -34785,6 +34814,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for ref in action.get("commands", []) or []
             if isinstance(ref, dict)
         )
+        selftest_uid = os.geteuid()
         resource_release_candidate_sample = resource_release_candidates(
             [
                 {
@@ -34792,18 +34822,21 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     "name": "java",
                     "rss_mib": 900.0,
                     "command_preview": "/opt/BurpSuite/jre/bin/java burpsuite.jar",
+                    "uid": selftest_uid,
                 },
                 {
                     "pid": 102,
                     "name": "firefox-bin",
                     "rss_mib": 420.0,
                     "command_preview": "firefox",
+                    "uid": selftest_uid,
                 },
                 {
                     "pid": 103,
                     "name": "python",
                     "rss_mib": 640.0,
                     "command_preview": "python -m app.cli --host 0.0.0.0 --port 2455",
+                    "uid": selftest_uid,
                     "cgroup_context": {
                         "scope": "container",
                         "runtime": "docker",
@@ -34829,6 +34862,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 item.get("pid") == 103
                 and (item.get("process_context") or {}).get("label") == "docker:8c59a6d0c9ef"
                 and "container" in str(item.get("recommendation") or "")
+                and item.get("current_user_can_signal") is True
                 for item in resource_release_candidate_sample
             )
         )
@@ -40829,6 +40863,8 @@ def run_resource_snapshot(args: argparse.Namespace) -> int:
             f"pid={candidate.get('pid')} "
             f"type={candidate.get('type')} "
             f"rss={candidate.get('rss_mib')}MiB "
+            f"user={candidate.get('user') or candidate.get('uid') or 'unknown'} "
+            f"can_signal={candidate.get('current_user_can_signal')} "
             f"context={process_context_label(candidate.get('process_context'))} "
             f"action={candidate.get('recommendation')}"
         )
@@ -41182,6 +41218,8 @@ def run_methodology_review(args: argparse.Namespace) -> int:
                 f"{candidate.get('type')} "
                 f"pid={candidate.get('pid')} "
                 f"rss={candidate.get('rss_mib')}MiB "
+                f"user={candidate.get('user') or candidate.get('uid') or 'unknown'} "
+                f"can_signal={candidate.get('current_user_can_signal')} "
                 f"context={process_context_label(candidate.get('process_context'))}"
             )
     print("Stages:")
@@ -41314,6 +41352,8 @@ def run_harness_loop(args: argparse.Namespace) -> int:
                 f"{candidate.get('type')} "
                 f"pid={candidate.get('pid')} "
                 f"rss={candidate.get('rss_mib')}MiB "
+                f"user={candidate.get('user') or candidate.get('uid') or 'unknown'} "
+                f"can_signal={candidate.get('current_user_can_signal')} "
                 f"context={process_context_label(candidate.get('process_context'))}"
             )
 
@@ -41859,6 +41899,8 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                 f"{candidate.get('type')} "
                 f"pid={candidate.get('pid')} "
                 f"rss={candidate.get('rss_mib')}MiB "
+                f"user={candidate.get('user') or candidate.get('uid') or 'unknown'} "
+                f"can_signal={candidate.get('current_user_can_signal')} "
                 f"context={process_context_label(candidate.get('process_context'))} "
                 f"action={inline_summary_text(candidate.get('recommendation'), max_chars=140)}"
             )
