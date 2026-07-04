@@ -20122,6 +20122,15 @@ def build_finding_gate(
     }
 
 
+def approval_sensitive_tool_statuses(history_status: str) -> dict[str, str]:
+    return {
+        "observed_get_proxy_http_history": history_status,
+        "observed_send_http1_request": "ok_after_target_request_approval",
+        "observed_create_repeater_tab": "ok_from_codex_tool_call",
+        "observed_set_proxy_intercept_state": "ok_disabled_for_automation",
+    }
+
+
 def build_capabilities(target: str, artifact_dir: Path, profile: dict[str, Any] | None = None) -> dict[str, Any]:
     codex = command_result(["codex", "mcp", "get", "burp"], timeout=10)
     script = ROOT / "scripts/check-burp-mcp.sh"
@@ -20173,12 +20182,7 @@ def build_capabilities(target: str, artifact_dir: Path, profile: dict[str, Any] 
             "codex_mcp_get_burp_ok": codex["ok"],
             "check_script_ok": script_check["ok"],
             "mcp_tool_inventory": mcp_tool_inventory,
-            "approval_sensitive_tools": {
-                "observed_get_proxy_http_history": history_status,
-                "observed_send_http1_request": "ok_after_127.0.0.1_3100_request_approval",
-                "observed_create_repeater_tab": "ok_from_codex_tool_call",
-                "observed_set_proxy_intercept_state": "ok_disabled_for_automation",
-            },
+            "approval_sensitive_tools": approval_sensitive_tool_statuses(history_status),
         },
         "artifacts": {
             "directory": str(artifact_dir),
@@ -22700,6 +22704,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             }
         )
     )
+    approval_statuses = approval_sensitive_tool_statuses("self-test-history-ok")
+    approval_status_profile_neutral_passed = (
+        approval_statuses.get("observed_get_proxy_http_history") == "self-test-history-ok"
+        and approval_statuses.get("observed_send_http1_request") == "ok_after_target_request_approval"
+        and "127.0.0.1_3100" not in json.dumps(approval_statuses, sort_keys=True)
+    )
     unsafe_observation_profile = json_clone(test_profile)
     unsafe_observation_profile["burp_observation_plan"] = [
         {
@@ -24097,6 +24107,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and profile_seeded_route_discovery_passed
         and discover_profile_seed_cli_passed
         and readiness_profile_passed
+        and approval_status_profile_neutral_passed
         and attack_strategy_status_passed
     )
 
@@ -24204,6 +24215,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "custom_health_fields": custom_health_fields,
             "custom_health_status": custom_health_readiness.get("status"),
             "custom_health_check_ids": [item.get("id") for item in custom_health_readiness.get("checks", [])],
+        },
+        "approval_status_profile_neutral": {
+            "status": "passed" if approval_status_profile_neutral_passed else "failed",
+            "approval_statuses": approval_statuses,
         },
         "response_delta_analysis": {
             "status": "passed" if response_delta_selftest_passed else "failed",
