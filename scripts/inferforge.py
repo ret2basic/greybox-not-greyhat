@@ -84,6 +84,7 @@ DEFAULT_BURP_HISTORY_INPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_BURP_SYNC_COUNT = 50
 DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES = 512 * 1024
 DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES = 256 * 1024
+DEFAULT_TRANSACTION_FLOW_REVIEW_MAX_FILE_BYTES = 512 * 1024
 DEFAULT_RESOURCE_WARN_AVAILABLE_MIB = 2048
 DEFAULT_RESOURCE_WARN_SWAP_USED_MIB = 1024
 DEFAULT_RESOURCE_WATCH_PORTS = [3100, 2455]
@@ -116,6 +117,7 @@ VALIDATION_PLAN_ARTIFACT = "validation-plan.json"
 ITERATION_DECISION_ARTIFACT = "iteration-decision.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT = "deployment-resource-review.json"
+TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -201,6 +203,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     ITERATION_DECISION_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
+    TRANSACTION_FLOW_REVIEW_ARTIFACT,
     "artifact-health.json",
     "regression-suite.json",
     "orca-baseline.json",
@@ -227,6 +230,7 @@ REPORT_FRESHNESS_INPUTS = [
     "response-delta-analysis.json",
     "source-peek-requests.json",
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
+    TRANSACTION_FLOW_REVIEW_ARTIFACT,
     "evidence-chain.json",
     "evidence-appendix.json",
     "adjudication.json",
@@ -289,6 +293,7 @@ INDEX_ARTIFACT_ORDER = [
     SCOPE_POLICY_ARTIFACT,
     WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT,
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
+    TRANSACTION_FLOW_REVIEW_ARTIFACT,
     "response-delta-analysis.json",
     "warmup-results.json",
     "traffic-index.json",
@@ -8993,6 +8998,7 @@ def build_hypothesis_matrix_run(
             "verification_queue": "verification-queue.json",
             "endpoint_clusters": "endpoint-clusters.json",
             "rpc_method_policy": "rpc-method-policy.json",
+            "transaction_flow_review": TRANSACTION_FLOW_REVIEW_ARTIFACT,
             "asset_candidates": BLACKBOX_ASSET_CANDIDATES_ARTIFACT,
             "resource_snapshot": RESOURCE_SNAPSHOT_ARTIFACT,
         },
@@ -9402,6 +9408,8 @@ def validation_allowed_commands(
     ]
     if hypothesis.get("type") == "resource-abuse-review" or hypothesis.get("impact") == "resource-exhaustion":
         allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
+    if hypothesis.get("type") == "transaction-flow-review" or hypothesis.get("impact") == "transaction-integrity":
+        allowed_now_commands.insert(3, command("transaction-flow-review --no-write --top 8"))
     allowed_after_gate_commands = [
         command("resource-snapshot --max-processes 8 --watch-port 3100 --watch-port 2455 --no-write --strict")
     ]
@@ -15265,6 +15273,389 @@ def build_remote_transaction_signing_review(
         "safety": (
             "Offline source review only. Do not sign wallets, submit transactions, trade, or treat this static pattern "
             "as a vulnerability finding without decoded intent evidence."
+        ),
+    }
+
+
+TRANSACTION_FLOW_SOURCE_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
+TRANSACTION_FLOW_SOURCE_SKIP_DIRS = {
+    ".git",
+    ".greybox",
+    ".next",
+    ".nuxt",
+    ".output",
+    ".turbo",
+    ".vercel",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "out",
+}
+
+
+def transaction_flow_match_categories() -> dict[str, list[str]]:
+    return {
+        "remote_transaction_sources": [
+            "transactionBase64s",
+            "payload.data.transaction",
+            "data.transaction",
+            "payloads.map",
+        ],
+        "transaction_deserializers": [
+            "VersionedTransaction.deserialize",
+            "deserializeTransaction(",
+            "Buffer.from(base64",
+        ],
+        "wallet_signing_sinks": [
+            "walletProvider.sendTransaction",
+            ".sendTransaction(tx",
+            ".sendTransaction(",
+        ],
+        "local_transaction_construction": [
+            "new Transaction().add",
+            "new Transaction(",
+            "tx.feePayer",
+        ],
+        "recent_blockhash_refresh": [
+            "getLatestBlockhash",
+            "recentBlockhash",
+        ],
+        "preview_wallet_inputs": [
+            "NEXT_PUBLIC_M0_QUOTE_PREVIEW_WALLET",
+            "previewWallet",
+            "fetchQuote(rawAmount, direction, previewWallet",
+        ],
+        "execution_wallet_inputs": [
+            "fetchQuote(requestedRawAmount, direction, solanaAddress",
+            "sender: walletAddress",
+            "recipient: walletAddress",
+        ],
+        "quote_request_fields": [
+            "amountIn",
+            "maxNumQuotes",
+            "route.source",
+            "route.destination",
+            "sender:",
+            "recipient:",
+        ],
+        "server_quote_validation": [
+            "allowed mints",
+            "recipient must match sender",
+            "MAX_AMOUNT_DIGITS",
+            "M0_ORCHESTRATION_API_KEY",
+            "Object.keys(body)",
+        ],
+    }
+
+
+def collect_transaction_flow_source_refs(
+    source_root: Path,
+    *,
+    max_file_bytes: int = DEFAULT_TRANSACTION_FLOW_REVIEW_MAX_FILE_BYTES,
+    max_files: int = 256,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]], list[dict[str, Any]]]:
+    refs_by_group: dict[str, list[dict[str, Any]]] = {
+        key: [] for key in transaction_flow_match_categories()
+    }
+    files: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    if not source_root.is_dir():
+        return refs_by_group, files, [{"file": repo_relative_or_absolute(source_root), "reason": "source-root-missing"}]
+
+    source_dir = source_root / "src"
+    roots = [source_dir] if source_dir.is_dir() else [source_root]
+    categories = transaction_flow_match_categories()
+    scanned = 0
+
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(
+                dirname
+                for dirname in dirnames
+                if dirname not in TRANSACTION_FLOW_SOURCE_SKIP_DIRS and not dirname.startswith(".")
+            )
+            for filename in sorted(filenames):
+                path = Path(dirpath) / filename
+                if path.suffix not in TRANSACTION_FLOW_SOURCE_SUFFIXES:
+                    continue
+                rel = source_root_relative_or_repo(path, source_root)
+                if scanned >= max(1, max_files):
+                    skipped.append({"file": rel, "reason": "max-files-reached", "max_files": max_files})
+                    return refs_by_group, files, skipped
+                try:
+                    stat = path.stat()
+                except OSError as error:
+                    skipped.append({"file": rel, "reason": "stat-failed", "error": redacted_error_summary(error)})
+                    continue
+                if stat.st_size > max_file_bytes:
+                    skipped.append(
+                        {
+                            "file": rel,
+                            "reason": "file-too-large",
+                            "bytes": stat.st_size,
+                            "max_file_bytes": max_file_bytes,
+                        }
+                    )
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except OSError as error:
+                    skipped.append({"file": rel, "reason": "read-failed", "error": redacted_error_summary(error)})
+                    continue
+
+                scanned += 1
+                file_match_count = 0
+                for line_no, line in enumerate(text.splitlines(), start=1):
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    for group, tokens in categories.items():
+                        for token in tokens:
+                            if token not in line:
+                                continue
+                            ref = {
+                                "file": rel,
+                                "line": line_no,
+                                "token": token,
+                                "sample": redact_text(stripped, max_chars=220) or "",
+                            }
+                            refs_by_group[group].append(ref)
+                            file_match_count += 1
+                            break
+
+                if file_match_count:
+                    files.append(
+                        {
+                            "file": rel,
+                            "bytes": stat.st_size,
+                            "match_count": file_match_count,
+                        }
+                    )
+
+    return refs_by_group, files, skipped
+
+
+def transaction_flow_refs_for_files(refs: list[dict[str, Any]], files: set[str]) -> list[dict[str, Any]]:
+    return [ref for ref in refs if str(ref.get("file") or "") in files]
+
+
+def transaction_flow_files_for_refs(refs: list[dict[str, Any]]) -> set[str]:
+    return {str(ref.get("file") or "") for ref in refs if ref.get("file")}
+
+
+def transaction_intent_review_summary(transaction_intent: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(transaction_intent, dict) or not transaction_intent:
+        return {
+            "status": "missing",
+            "candidates_seen": 0,
+            "decoded_transactions": 0,
+            "intent_policy_status": "missing",
+            "checks": 0,
+            "summary": "No transaction-intent artifact is available yet.",
+        }
+    policy_checks = (
+        transaction_intent.get("intent_policy_checks")
+        if isinstance(transaction_intent.get("intent_policy_checks"), dict)
+        else {}
+    )
+    checks = policy_checks.get("checks", []) if isinstance(policy_checks.get("checks"), list) else []
+    return {
+        "status": artifact_summary_status(transaction_intent),
+        "candidates_seen": transaction_intent.get("candidates_seen", 0),
+        "decoded_transactions": transaction_intent.get("decoded_transactions", 0),
+        "intent_policy_status": policy_checks.get("status") or "unknown",
+        "checks": len(checks),
+        "warnings": transaction_intent.get("warnings", [])[:6],
+    }
+
+
+def build_transaction_flow_review(
+    source_root: Path,
+    profile: dict[str, Any] | None = None,
+    *,
+    transaction_intent: dict[str, Any] | None = None,
+    rpc_method_policy: dict[str, Any] | None = None,
+    max_file_bytes: int = DEFAULT_TRANSACTION_FLOW_REVIEW_MAX_FILE_BYTES,
+    max_files: int = 256,
+) -> dict[str, Any]:
+    refs_by_group, files, skipped = collect_transaction_flow_source_refs(
+        source_root,
+        max_file_bytes=max_file_bytes,
+        max_files=max_files,
+    )
+    remote_refs = refs_by_group["remote_transaction_sources"]
+    deserializer_refs = refs_by_group["transaction_deserializers"]
+    signing_refs = refs_by_group["wallet_signing_sinks"]
+    local_construction_refs = refs_by_group["local_transaction_construction"]
+    recent_blockhash_refs = refs_by_group["recent_blockhash_refresh"]
+    preview_refs = refs_by_group["preview_wallet_inputs"]
+    execution_refs = refs_by_group["execution_wallet_inputs"]
+
+    remote_files = transaction_flow_files_for_refs([*remote_refs, *deserializer_refs])
+    local_files = transaction_flow_files_for_refs(local_construction_refs)
+    remote_signing_refs = transaction_flow_refs_for_files(signing_refs, remote_files)
+    local_signing_refs = transaction_flow_refs_for_files(signing_refs, local_files)
+
+    dataflows = []
+
+    def add_dataflow(
+        flow_id: str,
+        status: str,
+        priority: str,
+        summary: str,
+        refs: list[dict[str, Any]],
+        review_question: str,
+    ) -> None:
+        dataflows.append(
+            {
+                "id": flow_id,
+                "status": status,
+                "priority": priority,
+                "summary": summary,
+                "ref_count": len(refs),
+                "refs": refs[:10],
+                "review_question": review_question,
+            }
+        )
+
+    if remote_refs and deserializer_refs and remote_signing_refs:
+        add_dataflow(
+            "remote-payload-to-wallet-signing",
+            "needs-transaction-intent-corpus",
+            "high",
+            "Remote transaction payload material is deserialized in a file that also reaches a wallet signing sink.",
+            [*remote_refs[:4], *deserializer_refs[:4], *remote_signing_refs[:4]],
+            "Do decoded signer, writable account, mint, amount, and program IDs match the user's intended swap?",
+        )
+    elif remote_refs and deserializer_refs and signing_refs:
+        add_dataflow(
+            "remote-payload-and-wallet-signing-present",
+            "needs-manual-dataflow-confirmation",
+            "medium",
+            "Remote transaction deserialization and wallet signing both exist, but the bounded scanner did not tie them to one source file.",
+            [*remote_refs[:4], *deserializer_refs[:4], *signing_refs[:4]],
+            "Confirm whether remote payloads can reach any signing sink before treating this as a high-priority intent review.",
+        )
+    if local_construction_refs and local_signing_refs:
+        add_dataflow(
+            "local-constructed-transaction-signing",
+            "local-construction-reference",
+            "info",
+            "A wallet signing sink is also used for locally constructed transactions; keep this distinct from remote payload signing.",
+            [*local_construction_refs[:5], *local_signing_refs[:5]],
+            "Is the transaction built from local instructions under the app's control rather than supplied by the quote provider?",
+        )
+    if remote_refs and recent_blockhash_refs:
+        add_dataflow(
+            "client-recent-blockhash-rewrite",
+            "needs-decoded-post-rewrite-intent-review",
+            "medium",
+            "Client code refreshes recentBlockhash near remote transaction payload handling.",
+            recent_blockhash_refs[:8],
+            "After blockhash replacement, do decoded accounts, signers, programs, and token movement still match approved intent?",
+        )
+    if preview_refs and execution_refs:
+        add_dataflow(
+            "preview-wallet-vs-execution-wallet",
+            "needs-flow-confirmation",
+            "medium",
+            "Quote preview and execution paths reference different wallet inputs.",
+            [*preview_refs[:5], *execution_refs[:5]],
+            "Does execution fetch a fresh quote for the connected wallet rather than reusing preview wallet transaction material?",
+        )
+
+    dataflow_status_counts: dict[str, int] = {}
+    priority_counts: dict[str, int] = {}
+    for item in dataflows:
+        increment_count(dataflow_status_counts, str(item.get("status") or "unknown"))
+        increment_count(priority_counts, str(item.get("priority") or "info"))
+
+    intent_summary = transaction_intent_review_summary(transaction_intent)
+    rpc_review = (
+        rpc_method_policy.get("remote_transaction_signing_review")
+        if isinstance(rpc_method_policy, dict)
+        and isinstance(rpc_method_policy.get("remote_transaction_signing_review"), dict)
+        else {}
+    )
+    remote_flow_present = any(item.get("id") == "remote-payload-to-wallet-signing" for item in dataflows)
+    decoded_transactions = int(intent_summary.get("decoded_transactions") or 0)
+    if remote_flow_present and decoded_transactions <= 0:
+        status = "needs-transaction-intent-corpus"
+    elif remote_flow_present:
+        status = "needs-decoded-intent-review"
+    elif dataflows:
+        status = "transaction-flow-context-indexed"
+    elif skipped and not files:
+        status = "source-scan-incomplete"
+    else:
+        status = "no-transaction-flow-signals"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "profile": profile_summary(profile),
+        "source_root": repo_relative_or_absolute(source_root),
+        "summary": {
+            "files_with_matches": len(files),
+            "skipped": len(skipped),
+            "dataflows": len(dataflows),
+            "dataflow_status_counts": dict(sorted(dataflow_status_counts.items())),
+            "priority_counts": dict(sorted(priority_counts.items())),
+            "remote_transaction_source_refs": len(remote_refs),
+            "transaction_deserializer_refs": len(deserializer_refs),
+            "wallet_signing_sink_refs": len(signing_refs),
+            "remote_signing_sink_refs": len(remote_signing_refs),
+            "local_signing_sink_refs": len(local_signing_refs),
+        },
+        "resource_limits": {
+            "max_file_bytes": max_file_bytes,
+            "max_files": max_files,
+            "source_suffixes": sorted(TRANSACTION_FLOW_SOURCE_SUFFIXES),
+            "skip_dirs": sorted(TRANSACTION_FLOW_SOURCE_SKIP_DIRS),
+        },
+        "files": files,
+        "skipped": skipped,
+        "reference_groups": {
+            key: refs[:40]
+            for key, refs in refs_by_group.items()
+        },
+        "dataflows": dataflows,
+        "transaction_intent": intent_summary,
+        "rpc_method_policy_context": {
+            "status": rpc_review.get("status") or "missing",
+            "priority": rpc_review.get("priority") or "info",
+            "static_signal_count": (
+                rpc_review.get("static_intent_review", {}).get("signal_count", 0)
+                if isinstance(rpc_review.get("static_intent_review"), dict)
+                else 0
+            ),
+        },
+        "required_evidence": [
+            "One approved quote response or transaction payload corpus collected without wallet signing.",
+            "Decoded transaction signer accounts compared with the executing wallet.",
+            "Decoded source/destination mints, token accounts, and token movement compared with requested quote direction and amount.",
+            "Decoded instruction program IDs compared with the profile allowedPrograms policy.",
+            "A finding-gate decision showing concrete transaction-integrity or user-funds impact.",
+        ],
+        "forbidden": [
+            "Do not sign wallet prompts.",
+            "Do not submit transactions.",
+            "Do not trade or mutate funds.",
+            "Do not treat this static flow as reportable without decoded intent evidence.",
+        ],
+        "next_step": (
+            "Collect a single approved quote transaction corpus and run decode-transactions with an explicit intent policy."
+            if status in {"needs-transaction-intent-corpus", "needs-decoded-intent-review"}
+            else "Keep this artifact as source context for future quote transaction decoding."
+        ),
+        "reportability_gate": (
+            "This artifact is source-flow triage only. Escalate only with decoded intent mismatch, unsafe signer/account/"
+            "mint/program behavior, or another concrete user-funds impact, without signing or submitting transactions."
+        ),
+        "safety": (
+            "Offline bounded local source review only. It sends no requests, invokes no wallet, submits no transaction, "
+            "and does not run Burp Scanner, Intruder, or fuzzing."
         ),
     }
 
@@ -25282,6 +25673,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("hypothesis-matrix", "run_hypothesis_matrix"),
         refresh_expectation("rewrite-review", "run_rewrite_review"),
         refresh_expectation("deployment-review", "run_deployment_review"),
+        refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("validation-plan", "run_validation_plan"),
         refresh_expectation("iteration-decision", "run_iteration_decision"),
         refresh_expectation("collect", "run_collect"),
@@ -37942,6 +38334,79 @@ def run_deployment_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_transaction_flow_review(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {}
+    rpc_method_policy = load_optional_json(artifact_dir / "rpc-method-policy.json") or {}
+    review = build_transaction_flow_review(
+        source_root,
+        profile,
+        transaction_intent=transaction_intent,
+        rpc_method_policy=rpc_method_policy,
+        max_file_bytes=args.max_file_bytes,
+        max_files=args.max_files,
+    )
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(review))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="transaction-flow-review",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = review.get("summary", {}) or {}
+    intent = review.get("transaction_intent", {}) or {}
+    print(f"Transaction flow review: {review['status']}")
+    print(
+        "Source refs: "
+        f"files={summary.get('files_with_matches', 0)}, "
+        f"skipped={summary.get('skipped', 0)}, "
+        f"remote_tx_refs={summary.get('remote_transaction_source_refs', 0)}, "
+        f"deserializers={summary.get('transaction_deserializer_refs', 0)}, "
+        f"signing_sinks={summary.get('wallet_signing_sink_refs', 0)}"
+    )
+    print(
+        "Intent corpus: "
+        f"status={intent.get('status')}, "
+        f"candidates={intent.get('candidates_seen', 0)}, "
+        f"decoded={intent.get('decoded_transactions', 0)}, "
+        f"policy={intent.get('intent_policy_status')}"
+    )
+    top_count = max(0, int(args.top))
+    if top_count:
+        print("Dataflows:")
+        for item in (review.get("dataflows", []) or [])[:top_count]:
+            print(
+                f"- {item.get('priority')} {item.get('status')} {item.get('id')} "
+                f"refs={item.get('ref_count', 0)}"
+            )
+            print(f"  question={inline_summary_text(item.get('review_question'), max_chars=220)}")
+            for ref in (item.get("refs", []) or [])[:2]:
+                print(
+                    "  ref="
+                    f"{ref.get('file')}:{ref.get('line')} "
+                    f"{inline_summary_text(ref.get('sample'), max_chars=160)}"
+                )
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if review["status"] == "source-scan-incomplete":
+        return 1
+    if args.strict and review["status"] not in {"needs-transaction-intent-corpus", "needs-decoded-intent-review"}:
+        return 1
+    return 0
+
+
 def run_validation_plan(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -39909,6 +40374,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless all deployment evidence categories are indexed.",
     )
     deployment_review.set_defaults(func=run_deployment_review)
+
+    transaction_flow_review = sub.add_parser(
+        "transaction-flow-review",
+        help="Review quote transaction source flow without signing or submitting transactions",
+    )
+    transaction_flow_review.add_argument(
+        "--output",
+        help=f"Where to write {TRANSACTION_FLOW_REVIEW_ARTIFACT}. Defaults to --artifact-dir/{TRANSACTION_FLOW_REVIEW_ARTIFACT}.",
+    )
+    transaction_flow_review.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=DEFAULT_TRANSACTION_FLOW_REVIEW_MAX_FILE_BYTES,
+        help=(
+            "Maximum bytes to read per source file during transaction-flow review. "
+            f"Defaults to {DEFAULT_TRANSACTION_FLOW_REVIEW_MAX_FILE_BYTES}."
+        ),
+    )
+    transaction_flow_review.add_argument(
+        "--max-files",
+        type=positive_int,
+        default=256,
+        help="Maximum source files to scan. Defaults to 256.",
+    )
+    transaction_flow_review.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of dataflow rows to print.",
+    )
+    transaction_flow_review.add_argument(
+        "--no-write",
+        action="store_true",
+        help=f"Print transaction-flow review only; do not write {TRANSACTION_FLOW_REVIEW_ARTIFACT} or refreshed manifests.",
+    )
+    transaction_flow_review.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless a remote transaction signing flow needs intent-corpus review.",
+    )
+    transaction_flow_review.set_defaults(func=run_transaction_flow_review)
 
     validation_plan = sub.add_parser(
         "validation-plan",

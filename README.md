@@ -297,6 +297,19 @@ preview-wallet versus execution-wallet paths, remote payload deserialization,
 and client-side recent-blockhash refreshes. These signals only define what the
 decoded corpus must be compared against; they are not vulnerability findings on
 their own.
+Use `transaction-flow-review` for the dedicated low-memory source-flow pass:
+
+```bash
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  transaction-flow-review --no-write --top 8
+```
+
+It scans only bounded local TS/JS source files, skips dependency/build
+directories, and distinguishes remote quote transaction payloads flowing toward
+wallet signing from locally constructed transaction signing helpers. The output
+`.greybox/transaction-flow-review.json` lists dataflow refs, required decoded
+intent comparisons, and forbidden actions. It sends no requests, does not open a
+wallet, and never signs or submits transactions.
 When RPC source shows client-keyed in-memory rate-limit fallback behavior, the
 matrix can add a `resource-abuse-review` hypothesis. This is also offline-only:
 review deployment proxy header trust, external rate-limit store configuration,
