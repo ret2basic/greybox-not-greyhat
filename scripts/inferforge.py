@@ -11021,22 +11021,47 @@ def build_discovery_coverage_selftest(source_root: Path) -> dict[str, Any]:
     }
 
 
-def source_peek_cluster_ids(source_peeks: dict[str, Any] | None) -> set[str]:
+def source_peek_endpoint_candidates(endpoint: Any) -> list[tuple[str, str]]:
+    text = str(endpoint or "").strip()
+    if not text:
+        return []
+    parts = text.split()
+    method = parts[0].upper() if parts else ""
+    methods = [method] if method in {*HTTP_METHODS, "WS"} else [*sorted(HTTP_METHODS), "WS"]
+    paths = []
+    for raw_path in re.findall(r"/[^\s,;`'\")]+", text):
+        path = raw_path.rstrip(".:")
+        path = re.sub(r"\[([^/\]]+)\]", r"{\1}", path)
+        if path and path not in paths:
+            paths.append(path)
+    return [(candidate_method, path) for path in paths for candidate_method in methods]
+
+
+def source_peek_item_cluster_ids(item: dict[str, Any], clusters: dict[str, Any] | None) -> set[str]:
+    item_clusters = {
+        str(item_cluster_id)
+        for item_cluster_id in item.get("cluster_ids", []) or []
+        if item_cluster_id is not None and str(item_cluster_id)
+    }
+    cluster_items = (clusters or {}).get("clusters", []) or []
+    if not cluster_items:
+        return item_clusters
+    for method, path in source_peek_endpoint_candidates(item.get("endpoint")):
+        for cluster in cluster_items:
+            cluster_id = str(cluster.get("id") or "")
+            if not cluster_id:
+                continue
+            if cluster_matches_endpoint(cluster, method, path):
+                item_clusters.add(cluster_id)
+    return item_clusters
+
+
+def source_peek_cluster_ids(source_peeks: dict[str, Any] | None, clusters: dict[str, Any] | None = None) -> set[str]:
     observed: set[str] = set()
-    for item in (source_peeks or {}).get("source_peeks", []):
-        for cluster_id in item.get("cluster_ids", []):
-            observed.add(str(cluster_id))
-        endpoint = str(item.get("endpoint", ""))
-        if "/api/quote" in endpoint:
-            observed.add("quote")
-        if "/api/rpc" in endpoint and endpoint.upper().startswith("WS"):
-            observed.add("solana-rpc-ws")
-        elif "/api/rpc" in endpoint:
-            observed.add("solana-rpc-http")
-        if "/api/orca/pools" in endpoint:
-            observed.add("orca-pools")
-        if "/health" in endpoint:
-            observed.add("health")
+    for item in (source_peeks or {}).get("source_peeks", []) or []:
+        if not isinstance(item, dict):
+            continue
+        observed.update(source_peek_item_cluster_ids(item, clusters))
     return observed
 
 
@@ -11051,7 +11076,7 @@ def build_blackbox_coverage(
     transaction_decoder_selftest: dict[str, Any] | None,
 ) -> dict[str, Any]:
     burp_cluster_ids = observed_cluster_ids(build_traffic_index([], burp_history), clusters)
-    source_cluster_ids_seen = source_peek_cluster_ids(source_peeks)
+    source_cluster_ids_seen = source_peek_cluster_ids(source_peeks, clusters)
     observation_clusters = set((burp_observation_run or {}).get("summary", {}).get("clusters", []))
     observation_unexpected = int((burp_observation_run or {}).get("summary", {}).get("unexpected", 0) or 0)
     gap_ids = [gap.get("id") for gap in (evidence_gaps or {}).get("gaps", [])]
@@ -11224,21 +11249,16 @@ def build_blackbox_coverage(
     }
 
 
-def source_peeks_for_cluster(source_peeks: dict[str, Any] | None, cluster_id: str) -> list[dict[str, Any]]:
+def source_peeks_for_cluster(
+    source_peeks: dict[str, Any] | None,
+    cluster_id: str,
+    clusters: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     selected = []
-    for item in (source_peeks or {}).get("source_peeks", []):
-        endpoint = str(item.get("endpoint", ""))
-        item_clusters = {str(item_cluster_id) for item_cluster_id in item.get("cluster_ids", [])}
-        if "/api/quote" in endpoint:
-            item_clusters.add("quote")
-        if "/api/rpc" in endpoint and endpoint.upper().startswith("WS"):
-            item_clusters.add("solana-rpc-ws")
-        elif "/api/rpc" in endpoint:
-            item_clusters.add("solana-rpc-http")
-        if "/api/orca/pools" in endpoint:
-            item_clusters.add("orca-pools")
-        if "/health" in endpoint:
-            item_clusters.add("health")
+    for item in (source_peeks or {}).get("source_peeks", []) or []:
+        if not isinstance(item, dict):
+            continue
+        item_clusters = source_peek_item_cluster_ids(item, clusters)
         if cluster_id in item_clusters:
             selected.append(
                 {
@@ -11327,7 +11347,7 @@ def build_evidence_chain(
                         for row in probe_rows
                     ],
                 },
-                "source_context": source_peeks_for_cluster(source_peeks, cluster_id),
+                "source_context": source_peeks_for_cluster(source_peeks, cluster_id, clusters),
                 "coverage_checks": (coverage_by_cluster.get(cluster_id) or {}).get("checks", []),
                 "evidence_gaps": [
                     {
@@ -23828,6 +23848,35 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and "/api/quote" not in json.dumps(quote_profile_suspicion, sort_keys=True)
         and "infrafi-web/src" not in json.dumps(quote_profile_suspicion, sort_keys=True)
     )
+    profile_source_peek_match = {
+        "source_peeks": [
+            {
+                "endpoint": "POST /bridge/quote",
+                "files": ["selftest/src/app/bridge/quote/route.ts"],
+                "relevant_lines": {},
+                "conclusion": "self-test source context",
+            }
+        ]
+    }
+    profile_source_peek_legacy_path = {
+        "source_peeks": [
+            {
+                "endpoint": "POST /api/quote",
+                "files": ["selftest/src/app/api/quote/route.ts"],
+                "relevant_lines": {},
+                "conclusion": "legacy path should not match the synthetic profile quote route",
+            }
+        ]
+    }
+    profile_source_peek_match_ids = source_peek_cluster_ids(profile_source_peek_match, clusters)
+    profile_source_peek_legacy_ids = source_peek_cluster_ids(profile_source_peek_legacy_path, clusters)
+    profile_source_context = source_peeks_for_cluster(profile_source_peek_match, "quote", clusters)
+    source_peek_profile_match_passed = (
+        profile_source_peek_match_ids == {"quote"}
+        and "quote" not in profile_source_peek_legacy_ids
+        and len(profile_source_context) == 1
+        and profile_source_context[0].get("endpoint") == "POST /bridge/quote"
+    )
     generic_expected_row = json_clone(generic_unexpected_row)
     generic_expected_row.update(
         {
@@ -24168,6 +24217,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and not missing_paths
         and generic_attribution_passed
         and quote_profile_hardening_profile_passed
+        and source_peek_profile_match_passed
         and response_delta_selftest_passed
         and ws_resource_open_item_passed
         and unsafe_observation_validation_passed
@@ -24215,6 +24265,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         "quote_profile_hardening_attribution": {
             "status": "passed" if quote_profile_hardening_profile_passed else "failed",
             "suspicion": quote_profile_suspicion,
+        },
+        "source_peek_profile_match": {
+            "status": "passed" if source_peek_profile_match_passed else "failed",
+            "matched_ids": sorted(profile_source_peek_match_ids),
+            "legacy_ids": sorted(profile_source_peek_legacy_ids),
+            "source_context": profile_source_context,
         },
         "quote_intent_profile_routing": {
             "status": "passed" if quote_intent_profile_passed else "failed",
