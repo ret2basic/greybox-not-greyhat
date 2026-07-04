@@ -8064,16 +8064,35 @@ def hypothesis_from_cluster(
 ) -> list[dict[str, Any]]:
     cluster_id = str(cluster.get("id") or safe_hypothesis_id(cluster.get("method"), cluster.get("path")))
     path = cluster.get("path")
+    discovery = cluster.get("discovery") if isinstance(cluster.get("discovery"), dict) else {}
+    rewrites = discovery.get("rewrites", []) if isinstance(discovery.get("rewrites"), list) else []
+    fixed_upstreams = discovery.get("fixed_upstreams", []) if isinstance(discovery.get("fixed_upstreams"), list) else []
+    rewrite_proxy = cluster.get("kind") == "rewrite-proxy" or bool(rewrites)
     items = []
     for impact in cluster_impact_hypotheses(cluster):
         priority = hypothesis_priority_from_values(impact.get("priority"), cluster.get("priority"))
+        offline_only = rewrite_proxy and impact.get("impact") == "fixed-upstream-proxy-confusion"
+        next_step = (
+            "Review rewrite source, fixed upstream, catch-all path shape, and one approved read-only concrete path before probing."
+            if offline_only
+            else "Turn this into one minimal validation question; run only after resource and scope gates pass."
+        )
+        evidence_refs = ["endpoint-clusters.json", "attack-strategy.json", "verification-queue.json"]
+        if offline_only:
+            evidence_refs = compact_source_refs(
+                [
+                    "target-profile.json",
+                    "route-inventory.json",
+                    *[str(ref) for ref in cluster.get("source_refs", []) or []],
+                ]
+            )
         add_item = {
             "id": f"HYP-cluster-{safe_hypothesis_id(cluster_id, impact.get('impact'))}",
             "type": "cluster-strategy",
             "status": hypothesis_status_for_followup(
                 scope_decision="in-scope-explicit-host",
                 resource_gated=resource_gated,
-                offline_only=False,
+                offline_only=offline_only,
             ),
             "priority": priority,
             "host": target_host,
@@ -8081,16 +8100,45 @@ def hypothesis_from_cluster(
             "method": cluster.get("method"),
             "cluster_id": cluster_id,
             "strategy_set": cluster.get("strategy_set") or strategy_set_for_cluster(cluster),
+            "fixed_upstreams": fixed_upstreams,
+            "rewrite_review": (
+                {
+                    "rewrites": rewrites,
+                    "inference_reasons": discovery.get("inference_reasons", []),
+                    "review_observation_candidates": discovery.get("review_observation_candidates", []),
+                }
+                if offline_only
+                else None
+            ),
             "scope_decision": "in-scope-explicit-host",
             "impact_hypothesis": impact.get("question"),
             "impact": impact.get("impact"),
             "reportability_gate": "Requires concrete evidence of unauthorized action, sensitive-data exposure, funds/order impact, or equivalent program impact.",
-            "next_step": "Turn this into one minimal validation question; run only after resource and scope gates pass.",
-            "evidence_refs": ["endpoint-clusters.json", "attack-strategy.json", "verification-queue.json"],
+            "next_step": next_step,
+            "evidence_refs": evidence_refs,
             "safety": "Cluster-derived hypothesis. Prefer offline review and existing evidence before any target request.",
         }
         items.append(add_item)
     return items
+
+
+def endpoint_clusters_for_hypothesis_matrix(
+    *,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+) -> tuple[dict[str, Any], str]:
+    endpoint_clusters = load_optional_json(artifact_dir / "endpoint-clusters.json")
+    if endpoint_clusters:
+        return endpoint_clusters, "artifact"
+    profile_doc = profile if isinstance(profile, dict) else {}
+    if not profile_doc:
+        profile_doc = load_optional_json(artifact_dir / TARGET_PROFILE_ARTIFACT) or {}
+    if not profile_doc:
+        return {}, "missing"
+    source_root = resolve_repo_path(profile_doc.get("default_source_root") or DEFAULT_SOURCE_ROOT)
+    clusters = build_clusters(profile_doc, source_root)
+    clusters["source"] = "profile-fallback"
+    return clusters, "profile-fallback"
 
 
 def build_hypothesis_matrix_run(
@@ -8102,7 +8150,10 @@ def build_hypothesis_matrix_run(
     resource_snapshot = load_optional_json(artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT) or {}
     lead_portfolio = load_optional_json(artifact_dir / LEAD_PORTFOLIO_ARTIFACT) or {}
     verification_queue = load_optional_json(artifact_dir / "verification-queue.json") or {}
-    endpoint_clusters = load_optional_json(artifact_dir / "endpoint-clusters.json") or {}
+    endpoint_clusters, endpoint_clusters_source = endpoint_clusters_for_hypothesis_matrix(
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
     asset_candidates = load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT) or {}
     harness_loop = build_harness_loop_run(target=target, profile=profile, artifact_dir=artifact_dir)
 
@@ -8224,6 +8275,7 @@ def build_hypothesis_matrix_run(
             "type_counts": dict(sorted(type_counts.items())),
             "harness_loop": harness_loop.get("status"),
             "resource_snapshot": artifact_summary_status(resource_snapshot),
+            "endpoint_clusters_source": endpoint_clusters_source,
         },
         "hypotheses": deduped,
         "artifact_refs": {
@@ -9010,6 +9062,7 @@ def build_iteration_decision_from_plan(
     artifact_health_status = artifact_summary_status(artifact_health)
     allowed_command_summary = command_safety_summary([*offline, *resource_checks, *active_after_gate])
     blocked_command_summary = command_safety_summary(blocked)
+    artifact_health_blocks_active = artifact_health_status in {"failed", "needs-human-review"}
     resource_blocks_active = bool(active_after_gate and resource_status not in {"healthy", "not-run"})
 
     actions: list[dict[str, Any]] = []
@@ -9025,16 +9078,20 @@ def build_iteration_decision_from_plan(
             )
         )
     if active_after_gate:
+        active_status = "ready-after-resource-gate"
+        active_reason = "Active commands are constrained and still require the resource-check command immediately before execution."
+        if artifact_health_blocks_active:
+            active_status = "blocked-artifact-health"
+            active_reason = "Artifact health is not clean; refresh required artifacts before active validation commands."
+        elif resource_blocks_active:
+            active_status = "blocked-resource"
+            active_reason = "Current resource preflight is not healthy; do not run active validation commands."
         actions.append(
             iteration_action(
                 action_id="active-validation",
-                status="blocked-resource" if resource_blocks_active else "ready-after-resource-gate",
+                status=active_status,
                 kind="active-validation",
-                reason=(
-                    "Current resource preflight is not healthy; do not run active validation commands."
-                    if resource_blocks_active
-                    else "Active commands are constrained and still require the resource-check command immediately before execution."
-                ),
+                reason=active_reason,
                 commands=active_after_gate,
                 limit=limit,
             )
@@ -9062,12 +9119,12 @@ def build_iteration_decision_from_plan(
             )
         )
 
-    if artifact_health_status in {"failed", "needs-human-review"}:
+    if offline:
+        status = "ready-offline"
+    elif artifact_health_blocks_active:
         status = "blocked-artifact-health"
     elif blocked_command_summary.get("unsafe_template_count") or blocked_command_summary.get("blocked_external"):
         status = "blocked-command-safety"
-    elif offline:
-        status = "ready-offline"
     elif active_after_gate and resource_blocks_active:
         status = "blocked-resource"
     elif active_after_gate:
@@ -9092,6 +9149,7 @@ def build_iteration_decision_from_plan(
             "offline_commands": len(offline),
             "resource_check_commands": len(resource_checks),
             "active_after_resource_gate_commands": len(active_after_gate),
+            "artifact_health_blocked_active_commands": len(active_after_gate) if artifact_health_blocks_active else 0,
             "resource_blocked_active_commands": len(active_after_gate) if resource_blocks_active else 0,
             "blocked_commands": len(blocked),
             "command_safety": allowed_command_summary,
@@ -29224,6 +29282,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             artifact_dir=harness_loop_root,
             check_dirs=[harness_loop_run_dir],
         )
+        fallback_matrix_dir = harness_loop_root / "fallback"
+        fallback_matrix_dir.mkdir()
+        blackbox_profile_fallback_hypothesis_matrix_sample = build_hypothesis_matrix_run(
+            target="https://blackbox.test",
+            profile=blackbox_asset_profile_sample,
+            artifact_dir=fallback_matrix_dir,
+        )
         blackbox_hypothesis_matrix_text_sample = json.dumps(blackbox_hypothesis_matrix_sample, sort_keys=True)
         blackbox_validation_plan_sample = build_validation_plan_run(
             target="https://blackbox.test",
@@ -29471,6 +29536,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         )
         and blackbox_hypothesis_matrix_rollup_sample.get("summary", {}).get("runs") == 1
         and blackbox_hypothesis_matrix_rollup_sample.get("status") == "has-ranked-hypotheses"
+        and blackbox_profile_fallback_hypothesis_matrix_sample.get("summary", {}).get("endpoint_clusters_source") == "profile-fallback"
+        and blackbox_profile_fallback_hypothesis_matrix_sample.get("summary", {}).get("hypotheses", 0) >= 1
         and "top-secret" not in blackbox_hypothesis_matrix_text_sample
         and "AbC1234567890Token" not in blackbox_hypothesis_matrix_text_sample
         and blackbox_validation_plan_sample.get("status") in {"ready", "resource-gated"}
@@ -34828,6 +34895,7 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
         f"offline={summary.get('offline_commands', 0)} "
         f"resource_checks={summary.get('resource_check_commands', 0)} "
         f"active_after_gate={summary.get('active_after_resource_gate_commands', 0)} "
+        f"artifact_blocked_active={summary.get('artifact_health_blocked_active_commands', 0)} "
         f"resource_blocked_active={summary.get('resource_blocked_active_commands', 0)} "
         f"blocked={summary.get('blocked_commands', 0)}"
     )

@@ -281,6 +281,12 @@ python3 scripts/inferforge.py --artifact-dir .greybox/target-set \
 The matrix is not a finding list. It labels reportability gates, scope/resource
 gates, and impact hypotheses so the harness can choose whether to do offline
 review, wait for memory pressure to clear, or run one low-risk validation step.
+If `endpoint-clusters.json` has not been written yet, the matrix falls back to
+the active target profile or `target-profile.json`, so newly discovered profiles
+can still produce offline hypotheses before an audit run exists. Statically
+discovered rewrite proxies are ranked as offline review items first: review the
+source rewrite, fixed upstream, catch-all path shape, and one approved read-only
+concrete path before probing.
 
 Use `validation-plan` to turn the ranked hypotheses into explicit preconditions,
 allowed commands, required evidence, stop conditions, and forbidden actions:
