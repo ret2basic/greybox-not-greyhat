@@ -130,7 +130,8 @@ hosts, counts, hashes, and stripped paths as scope-review leads without fetching
 those external scripts.
 It also builds a passive runtime URL host map from the page and fetched
 same-origin assets so API, RPC, quote, prod, or testnet host references can be
-reviewed for scope before any request is sent to them.
+reviewed for scope before any request is sent to them. Service-like sibling
+hosts are prioritized above static/analytics-style hosts in the review queue.
 
 Each candidate is triaged before it reaches the review queue:
 

@@ -5187,6 +5187,60 @@ def config_url_review_ref(
     }
 
 
+CONFIG_HOST_PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
+
+
+def triage_config_host(host: str, scope_status: str, roles: dict[str, int]) -> dict[str, Any]:
+    role_set = set(roles)
+    if scope_status == "allowed-host":
+        return {
+            "class": "explicitly-allowed-runtime-host",
+            "priority": "info",
+            "review_required": False,
+            "reason": "Host is already in the explicit allowed host set for this run.",
+            "safe_next_step": "Use the existing profile and bounded probe workflow; do not expand scope from this entry alone.",
+        }
+
+    if role_set & {"rpc-reference", "api-or-service-reference", "websocket-reference"}:
+        priority = "high" if scope_status == "same-parent-domain-review" else "medium"
+        return {
+            "class": "runtime-service-host-review",
+            "priority": priority,
+            "review_required": True,
+            "reason": (
+                f"Runtime config references service-like host `{host}` with role(s): "
+                + ", ".join(sorted(role_set & {"rpc-reference", "api-or-service-reference", "websocket-reference"}))
+            ),
+            "safe_next_step": "Confirm bounty scope and read-only semantics before any DNS, HTTP, WebSocket, or API probing.",
+        }
+
+    if "testnet-reference" in role_set:
+        return {
+            "class": "testnet-boundary-review",
+            "priority": "medium",
+            "review_required": True,
+            "reason": f"Runtime config references testnet-like host `{host}`; production/testnet boundaries need scope review.",
+            "safe_next_step": "Do not probe until the program scope confirms testnet hosts and impact eligibility.",
+        }
+
+    if "static-asset-reference" in role_set:
+        return {
+            "class": "static-asset-host-review",
+            "priority": "low",
+            "review_required": scope_status != "allowed-host",
+            "reason": f"Runtime config references static asset host `{host}` outside the explicit allowed host set.",
+            "safe_next_step": "Review scope before fetching static assets; prefer local hashes and page references first.",
+        }
+
+    return {
+        "class": "runtime-host-scope-review",
+        "priority": "medium" if scope_status == "same-parent-domain-review" else "low",
+        "review_required": scope_status != "allowed-host",
+        "reason": f"Runtime config references `{host}` outside the explicit allowed host set.",
+        "safe_next_step": "Confirm bounty scope and impact hypothesis before any probing.",
+    }
+
+
 def build_config_host_map(
     *,
     target: str,
@@ -5269,6 +5323,17 @@ def build_config_host_map(
         for host, item in host_items.items()
         if item.get("scope_status") != "allowed-host"
     ]
+    triage_class_counts: dict[str, int] = {}
+    triage_priority_counts: dict[str, int] = {}
+    for item in host_items.values():
+        triage = triage_config_host(
+            str(item.get("host") or ""),
+            str(item.get("scope_status") or ""),
+            item.get("roles", {}) if isinstance(item.get("roles"), dict) else {},
+        )
+        item["triage"] = triage
+        increment_count(triage_class_counts, str(triage["class"]))
+        increment_count(triage_priority_counts, str(triage["priority"]))
     return {
         "generated_at": utc_now(),
         "status": "review-required" if review_hosts else "complete",
@@ -5282,10 +5347,16 @@ def build_config_host_map(
             "scope_status_counts": dict(sorted(scope_status_counts.items())),
             "role_counts": dict(sorted(role_counts.items())),
             "source_kind_counts": dict(sorted(source_kind_counts.items())),
+            "triage_class_counts": dict(sorted(triage_class_counts.items())),
+            "triage_priority_counts": dict(sorted(triage_priority_counts.items())),
         },
         "hosts": sorted(
             host_items.values(),
-            key=lambda item: (item.get("scope_status") == "allowed-host", str(item.get("host"))),
+            key=lambda item: (
+                CONFIG_HOST_PRIORITY_ORDER.get(str(item.get("triage", {}).get("priority")), 99),
+                item.get("scope_status") == "allowed-host",
+                str(item.get("host")),
+            ),
         ),
         "safety": "Passive URL host map only. Query values and response bodies are not stored, and referenced hosts are not requested by this artifact.",
     }
@@ -15349,11 +15420,20 @@ def build_verification_queue(
             for item in config_hosts_doc.get("hosts", []) or []
             if isinstance(item, dict) and item.get("scope_status") != "allowed-host"
         ]
+        prioritized_review_hosts = [
+            item
+            for item in review_hosts
+            if str((item.get("triage", {}) or {}).get("priority")) in {"high", "medium"}
+        ]
+        highest_config_priority = "high" if any(
+            str((item.get("triage", {}) or {}).get("priority")) == "high"
+            for item in review_hosts
+        ) else "medium"
         add_item(
             "REVIEW-blackbox-config-hosts",
             "Review runtime configuration hosts",
             "manual-review",
-            "medium",
+            highest_config_priority,
             (
                 f"{config_summary.get('review_host_count', 0)} runtime URL host(s) were referenced outside the explicit allowed host set. "
                 "They were recorded as leads only and were not requested by config-host mapping."
@@ -15367,6 +15447,7 @@ def build_verification_queue(
             safety="Scope review only. Runtime config host mapping is passive and does not request referenced hosts.",
             extra={
                 "config_host_summary": config_summary,
+                "prioritized_review_host_count": len(prioritized_review_hosts),
                 "review_hosts": [
                     {
                         "host": item.get("host"),
@@ -15374,9 +15455,10 @@ def build_verification_queue(
                         "scope_status": item.get("scope_status"),
                         "roles": item.get("roles"),
                         "schemes": item.get("schemes"),
+                        "triage": item.get("triage"),
                         "samples": item.get("samples", [])[:2],
                     }
-                    for item in review_hosts[:12]
+                    for item in (prioritized_review_hosts or review_hosts)[:12]
                 ],
             },
         )
@@ -25689,6 +25771,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         (item.get("method_hint"), item.get("host"), item.get("path")): (item.get("triage") or {})
         for item in blackbox_asset_map_sample.get("candidates", [])
     }
+    blackbox_config_host_triage = {
+        item.get("host"): item.get("triage", {})
+        for item in blackbox_asset_map_sample.get("config_hosts", {}).get("hosts", [])
+    }
     blackbox_asset_profile_sample, blackbox_asset_profile_summary_sample = build_blackbox_profile_from_asset_candidates(
         blackbox_asset_map_sample,
         name="blackbox-asset-selftest",
@@ -25776,6 +25862,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_asset_map_sample.get("summary", {}).get("config_host_count") == 3
         and blackbox_asset_map_sample.get("summary", {}).get("config_review_host_count") == 2
         and blackbox_asset_map_sample.get("config_hosts", {}).get("summary", {}).get("scope_status_counts", {}).get("same-parent-domain-review") == 2
+        and blackbox_asset_map_sample.get("config_hosts", {}).get("summary", {}).get("triage_priority_counts", {}).get("high") == 1
+        and blackbox_asset_map_sample.get("config_hosts", {}).get("summary", {}).get("triage_priority_counts", {}).get("low") == 1
+        and blackbox_asset_map_sample.get("config_hosts", {}).get("summary", {}).get("triage_priority_counts", {}).get("info") == 1
+        and blackbox_config_host_triage.get("api.blackbox.test", {}).get("class") == "runtime-service-host-review"
+        and blackbox_config_host_triage.get("api.blackbox.test", {}).get("priority") == "high"
+        and blackbox_config_host_triage.get("cdn.blackbox.test", {}).get("class") == "static-asset-host-review"
+        and blackbox_config_host_triage.get("quote.blackbox.test", {}).get("class") == "explicitly-allowed-runtime-host"
         and "top-secret" not in json.dumps(blackbox_asset_map_sample.get("config_hosts", {}), sort_keys=True)
         and "AbC1234567890Token" not in json.dumps(blackbox_asset_map_sample.get("config_hosts", {}), sort_keys=True)
         and "{token}" in json.dumps(blackbox_asset_map_sample.get("config_hosts", {}), sort_keys=True)
