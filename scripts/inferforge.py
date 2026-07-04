@@ -8051,7 +8051,10 @@ def entrypoint_match_reasons(
     match = entrypoint.get("match") or route_match_for_path(str(entrypoint.get("path") or ""), list(methods))
     reasons = []
     if methods:
-        reasons.append("method-match" if normalized_method in methods else "method-mismatch")
+        if "ANY" in methods:
+            reasons.append("method-any")
+        else:
+            reasons.append("method-match" if normalized_method in methods else "method-mismatch")
     else:
         reasons.append("method-unconstrained")
     if normalized_path in {str(item) for item in match.get("paths", [])}:
@@ -23163,6 +23166,19 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and route_method_export_list_samples.get("typed_const_export") == ["PUT"]
         and route_method_export_list_samples.get("type_export_ignored") == []
     )
+    any_method_match_reasons = entrypoint_match_reasons(
+        {
+            "path": "/any-method",
+            "methods": ["ANY"],
+            "match": {"methods": ["ANY"], "paths": ["/any-method"]},
+        },
+        "GET",
+        "/any-method",
+    )
+    any_method_match_reason_passed = (
+        "method-any" in any_method_match_reasons
+        and "method-mismatch" not in any_method_match_reasons
+    )
     with tempfile.TemporaryDirectory(prefix="inferforge-discovery-selftest-") as temp_dir:
         rewrite_source_root = Path(temp_dir) / "rewrite-app"
         (rewrite_source_root / "src/app/health").mkdir(parents=True)
@@ -24761,6 +24777,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and ws_resource_open_item_passed
         and unsafe_observation_validation_passed
         and route_method_export_list_passed
+        and any_method_match_reason_passed
         and rewrite_discovery_passed
         and profile_custom_ws_discovery_passed
         and configured_nextjs_runtime_passed
@@ -24809,6 +24826,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         "route_method_export_list": {
             "status": "passed" if route_method_export_list_passed else "failed",
             "samples": route_method_export_list_samples,
+        },
+        "any_method_match_reasons": {
+            "status": "passed" if any_method_match_reason_passed else "failed",
+            "reasons": any_method_match_reasons,
         },
         "quote_profile_hardening_attribution": {
             "status": "passed" if quote_profile_hardening_profile_passed else "failed",
