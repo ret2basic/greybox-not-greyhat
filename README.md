@@ -287,6 +287,11 @@ can still produce offline hypotheses before an audit run exists. Statically
 discovered rewrite proxies are ranked as offline review items first: review the
 source rewrite, fixed upstream, catch-all path shape, and one approved read-only
 concrete path before probing.
+When `.greybox/rpc-method-policy.json` or local source shows remotely supplied
+transaction material flowing toward wallet signing calls, the matrix adds a
+`transaction-flow-review` hypothesis. This is offline-only: the next step is to
+collect an approved transaction corpus and run `decode-transactions`, not to
+sign or submit a wallet transaction.
 
 Use `rewrite-review` for the dedicated fixed-upstream rewrite/proxy review:
 

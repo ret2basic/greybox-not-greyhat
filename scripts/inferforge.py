@@ -7846,9 +7846,9 @@ def build_harness_loop_rollup(
 
 HYPOTHESIS_PRIORITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 HYPOTHESIS_STATUS_RANK = {
-    "ready-for-low-risk-validation": 0,
-    "resource-gated": 1,
-    "ready-for-offline-review": 2,
+    "ready-for-offline-review": 0,
+    "ready-for-low-risk-validation": 1,
+    "resource-gated": 2,
     "needs-scope-review": 3,
     "parked-terminal-lead": 4,
 }
@@ -8123,6 +8123,100 @@ def hypothesis_from_cluster(
         }
         items.append(add_item)
     return items
+
+
+def rpc_method_policy_for_hypothesis_matrix(
+    *,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+) -> tuple[dict[str, Any], str]:
+    artifact = load_optional_json(artifact_dir / "rpc-method-policy.json")
+    if artifact:
+        return artifact, "artifact"
+    profile_doc = profile if isinstance(profile, dict) else {}
+    if not profile_doc:
+        profile_doc = load_optional_json(artifact_dir / TARGET_PROFILE_ARTIFACT) or {}
+    if not profile_doc:
+        return {}, "missing"
+    source_root = resolve_repo_path(profile_doc.get("default_source_root") or DEFAULT_SOURCE_ROOT)
+    if not is_blackbox_profile_like(profile_doc) and not source_root.exists():
+        return {}, "source-unavailable"
+    return build_rpc_method_policy(source_root, [], profile=profile_doc), "profile-fallback"
+
+
+def hypothesis_from_rpc_method_policy(
+    rpc_method_policy: dict[str, Any],
+    *,
+    target_host: str,
+) -> dict[str, Any] | None:
+    review = (
+        rpc_method_policy.get("remote_transaction_signing_review")
+        if isinstance(rpc_method_policy.get("remote_transaction_signing_review"), dict)
+        else {}
+    )
+    status = str(review.get("status") or "")
+    if status not in {
+        "needs-transaction-intent-corpus",
+        "frontend-signing-references-only",
+        "remote-transaction-material-only",
+    }:
+        return None
+    frontend_refs = [
+        item for item in rpc_method_policy.get("frontend_transaction_dependency_refs", []) or [] if isinstance(item, dict)
+    ]
+    remote_refs = [
+        item for item in rpc_method_policy.get("remote_transaction_material_refs", []) or [] if isinstance(item, dict)
+    ]
+    source_refs = [
+        f"{item.get('file')}:{item.get('line')}"
+        for item in [*frontend_refs[:5], *remote_refs[:5]]
+        if item.get("file") and item.get("line")
+    ]
+    return {
+        "id": f"HYP-transaction-flow-{safe_hypothesis_id(status, target_host)}",
+        "type": "transaction-flow-review",
+        "status": hypothesis_status_for_followup(
+            scope_decision="in-scope-explicit-host",
+            resource_gated=False,
+            offline_only=True,
+        ),
+        "priority": hypothesis_priority_from_values(review.get("priority"), "high"),
+        "host": target_host,
+        "path": "/api/quote",
+        "cluster_id": "quote",
+        "scope_decision": "in-scope-explicit-host",
+        "source_status": status,
+        "impact": "transaction-integrity",
+        "impact_hypothesis": (
+            "Can remotely supplied transaction material reach wallet signing with a sender, recipient, mint, amount, "
+            "program, or signer intent mismatch?"
+        ),
+        "reportability_gate": review.get("reportability_gate")
+        or "Static transaction-flow evidence is not reportable without decoded intent mismatch or user-funds impact.",
+        "next_step": review.get("next_step")
+        or "Collect one approved quote response and run decode-transactions before any signing flow.",
+        "evidence_refs": compact_source_refs(
+            [
+                "rpc-method-policy.json",
+                "transaction-intent.json",
+                "burp-transaction-candidates.json",
+                *source_refs,
+            ]
+        ),
+        "transaction_flow_review": {
+            "status": status,
+            "frontend_signing_ref_count": review.get("frontend_signing_ref_count", len(frontend_refs)),
+            "remote_transaction_material_ref_count": review.get(
+                "remote_transaction_material_ref_count",
+                len(remote_refs),
+            ),
+            "frontend_transaction_dependency_refs": frontend_refs[:5],
+            "remote_transaction_material_refs": remote_refs[:5],
+            "required_evidence": review.get("required_evidence", []),
+        },
+        "safety": review.get("safety")
+        or "Offline transaction-flow review only. Do not sign wallets or submit transactions.",
+    }
 
 
 def endpoint_clusters_for_hypothesis_matrix(
@@ -8591,6 +8685,10 @@ def build_hypothesis_matrix_run(
         profile=profile,
         artifact_dir=artifact_dir,
     )
+    rpc_method_policy, rpc_method_policy_source = rpc_method_policy_for_hypothesis_matrix(
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
     asset_candidates = load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT) or {}
     harness_loop = build_harness_loop_run(target=target, profile=profile, artifact_dir=artifact_dir)
 
@@ -8621,6 +8719,10 @@ def build_hypothesis_matrix_run(
             continue
         for hypothesis in hypothesis_from_cluster(cluster, target_host=target_host, resource_gated=resource_gated):
             add_hypothesis(hypotheses, hypothesis)
+
+    rpc_hypothesis = hypothesis_from_rpc_method_policy(rpc_method_policy, target_host=target_host)
+    if rpc_hypothesis:
+        add_hypothesis(hypotheses, rpc_hypothesis)
 
     config_hosts = asset_candidates.get("config_hosts", {}) if isinstance(asset_candidates.get("config_hosts"), dict) else {}
     for host_item in config_hosts.get("hosts", []) or []:
@@ -8713,6 +8815,7 @@ def build_hypothesis_matrix_run(
             "harness_loop": harness_loop.get("status"),
             "resource_snapshot": artifact_summary_status(resource_snapshot),
             "endpoint_clusters_source": endpoint_clusters_source,
+            "rpc_method_policy_source": rpc_method_policy_source,
         },
         "hypotheses": deduped,
         "artifact_refs": {
@@ -8720,6 +8823,7 @@ def build_hypothesis_matrix_run(
             "lead_portfolio": LEAD_PORTFOLIO_ARTIFACT,
             "verification_queue": "verification-queue.json",
             "endpoint_clusters": "endpoint-clusters.json",
+            "rpc_method_policy": "rpc-method-policy.json",
             "asset_candidates": BLACKBOX_ASSET_CANDIDATES_ARTIFACT,
             "resource_snapshot": RESOURCE_SNAPSHOT_ARTIFACT,
         },
@@ -8976,11 +9080,23 @@ def required_evidence_for_hypothesis(hypothesis: dict[str, Any]) -> list[str]:
             *common,
         ]
     if impact == "transaction-integrity":
-        return [
+        transaction_flow = (
+            hypothesis.get("transaction_flow_review")
+            if isinstance(hypothesis.get("transaction_flow_review"), dict)
+            else {}
+        )
+        flow_evidence = [
+            str(item)
+            for item in transaction_flow.get("required_evidence", []) or []
+            if str(item).strip()
+        ]
+        evidence = [
+            *flow_evidence,
             "Decoded transaction or quote intent showing an unexpected sender, recipient, mint, amount, program, or signer requirement.",
             "Evidence that the altered intent can affect user funds or orders before any signing/submission.",
             *common,
         ]
+        return ordered_unique_strings(evidence) if flow_evidence else evidence
     if impact == "rpc-proxy-abuse":
         return [
             "Evidence that a disallowed or sensitive RPC method is reachable, or that origin/rate controls are bypassed.",
@@ -9222,6 +9338,7 @@ def validation_item_from_hypothesis(
         "blocked_commands": blocked_commands,
         "command_replacements": command_replacements,
         "rewrite_review": rewrite_review_context,
+        "transaction_flow_review": hypothesis.get("transaction_flow_review"),
         "command_safety": command_summary,
         "blocked_command_safety": blocked_command_summary,
         "required_evidence": required_evidence_for_hypothesis(hypothesis),
@@ -14039,7 +14156,7 @@ def source_references(source_root: Path, patterns: list[str]) -> list[dict[str, 
             if any(pattern in line for pattern in patterns):
                 refs.append(
                     {
-                        "file": str(path.relative_to(ROOT)),
+                        "file": source_root_relative_or_repo(path, source_root),
                         "line": index,
                         "sample": line.strip()[:180],
                     }
@@ -14331,7 +14448,7 @@ def build_rpc_method_policy(
 
     return {
         "generated_at": utc_now(),
-        "source": str(rpc_path.relative_to(ROOT)),
+        "source": source_root_relative_or_repo(rpc_path, source_root),
         "default_allowed_methods": default_methods,
         "transaction_methods": transaction_methods,
         "high_impact_methods": high_impact_methods,
@@ -30074,6 +30191,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_coverage_sample.get("status") == "covered"
         and blackbox_coverage_sample.get("assessment_mode") == "blackbox"
         and blackbox_rpc_method_policy_sample.get("policy_posture") == "not-applicable-blackbox"
+        and blackbox_rpc_method_policy_sample.get("remote_transaction_signing_review", {}).get("status")
+        == "not-applicable-blackbox"
         and blackbox_target_info_sample.get("reachable") is True
         and blackbox_target_info_sample.get("health_status") == 404
         and blackbox_target_info_sample.get("health_path") is None
@@ -30176,6 +30295,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_hypothesis_matrix_sample.get("summary", {}).get("ready_hypotheses", 0) >= 1
         and any(
             item.get("type") == "cluster-strategy"
+            for item in blackbox_hypothesis_matrix_sample.get("hypotheses", [])
+        )
+        and not any(
+            item.get("type") == "transaction-flow-review"
             for item in blackbox_hypothesis_matrix_sample.get("hypotheses", [])
         )
         and blackbox_hypothesis_matrix_rollup_sample.get("summary", {}).get("runs") == 1
@@ -30305,6 +30428,68 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
 
                 export async function createUser(http: { post: (path: string) => Promise<unknown> }) {
                   return http.post('/users')
+                }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (rewrite_source_root / "src/app/api/rpc").mkdir(parents=True)
+        (rewrite_source_root / "src/app/api/rpc/_shared.ts").write_text(
+            textwrap.dedent(
+                """
+                const DEFAULT_ALLOWED_METHODS = new Set([
+                  'getHealth',
+                ])
+                const TRANSACTION_METHODS = new Set([
+                  'sendTransaction',
+                  'simulateTransaction',
+                ])
+                const ALLOW_TRANSACTION_METHODS = process.env.SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS === 'true'
+
+                export function getAllowedMethods() {
+                  const methods = new Set(DEFAULT_ALLOWED_METHODS)
+                  if (ALLOW_TRANSACTION_METHODS) {
+                    TRANSACTION_METHODS.forEach((method) => methods.add(method))
+                  }
+                  return methods
+                }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (rewrite_source_root / "src/lib").mkdir(parents=True)
+        (rewrite_source_root / "src/lib/remote-tx.ts").write_text(
+            textwrap.dedent(
+                """
+                import { VersionedTransaction } from '@solana/web3.js'
+
+                export function deserializeTransaction(base64: string) {
+                  const bytes = Buffer.from(base64, 'base64')
+                  return VersionedTransaction.deserialize(bytes)
+                }
+
+                export async function extractRemoteTransactions(payloads: Array<{ data?: { transaction?: string } }>) {
+                  const transactionBase64s = payloads.map((payload) => payload.data?.transaction).filter(Boolean)
+                  return transactionBase64s.map((item) => deserializeTransaction(item as string))
+                }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (rewrite_source_root / "src/hooks").mkdir(parents=True)
+        (rewrite_source_root / "src/hooks/useRemoteSwap.ts").write_text(
+            textwrap.dedent(
+                """
+                import { extractRemoteTransactions } from '@/lib/remote-tx'
+
+                export async function executeRemoteSwap(walletProvider, connection, payloads) {
+                  const txs = await extractRemoteTransactions(payloads)
+                  for (const tx of txs) {
+                    await walletProvider.sendTransaction(tx, connection)
+                  }
                 }
                 """
             ).strip()
@@ -30497,6 +30682,36 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             rewrite_normalized,
             rewrite_clusters,
             rewrite_source_root,
+        )
+        rewrite_transaction_policy = build_rpc_method_policy(rewrite_source_root, [], profile=rewrite_normalized)
+        rewrite_transaction_matrix_dir = Path(temp_dir) / "transaction-flow-artifacts"
+        rewrite_transaction_matrix_dir.mkdir()
+        rewrite_transaction_matrix = build_hypothesis_matrix_run(
+            target="http://127.0.0.1:9998",
+            profile=rewrite_normalized,
+            artifact_dir=rewrite_transaction_matrix_dir,
+        )
+        rewrite_transaction_hypothesis = next(
+            (
+                item
+                for item in rewrite_transaction_matrix.get("hypotheses", [])
+                if item.get("type") == "transaction-flow-review"
+            ),
+            None,
+        )
+        rewrite_transaction_validation_plan = build_validation_plan_run(
+            target="http://127.0.0.1:9998",
+            profile=rewrite_normalized,
+            artifact_dir=rewrite_transaction_matrix_dir,
+            limit=8,
+        )
+        rewrite_transaction_validation_item = next(
+            (
+                item
+                for item in rewrite_transaction_validation_plan.get("items", [])
+                if item.get("hypothesis_type") == "transaction-flow-review"
+            ),
+            None,
         )
         rewrite_cluster = next(
             (
@@ -31023,6 +31238,23 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rewrite_burp_rows.get("route-api-proxy-path", {}).get("status") == "needs-reviewed-observation-promotion"
             and rewrite_burp_rows.get("route-api-proxy-path", {}).get("review_candidate_count") == 1
             and rewrite_gap_id in rewrite_burp_rows.get("route-api-proxy-path", {}).get("evidence_gaps", [])
+        )
+        transaction_flow_hypothesis_passed = (
+            rewrite_transaction_policy.get("remote_transaction_signing_review", {}).get("status")
+            == "needs-transaction-intent-corpus"
+            and rewrite_transaction_policy.get("remote_transaction_signing_review", {}).get("priority") == "high"
+            and len(rewrite_transaction_policy.get("frontend_transaction_dependency_refs", []) or []) >= 1
+            and len(rewrite_transaction_policy.get("remote_transaction_material_refs", []) or []) >= 1
+            and rewrite_transaction_matrix.get("summary", {}).get("rpc_method_policy_source") == "profile-fallback"
+            and rewrite_transaction_hypothesis is not None
+            and rewrite_transaction_hypothesis.get("status") == "ready-for-offline-review"
+            and rewrite_transaction_hypothesis.get("impact") == "transaction-integrity"
+            and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("status")
+            == "needs-transaction-intent-corpus"
+            and rewrite_transaction_validation_item is not None
+            and rewrite_transaction_validation_item.get("status") == "ready-offline"
+            and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("status")
+            == "needs-transaction-intent-corpus"
         )
         rewrite_server_action_report_lines = rewrite_source_resolver_report.get("server_action_lines", [])
         rewrite_discovery_passed = (
@@ -31922,6 +32154,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_mode_samples_passed
         and any_method_match_reason_passed
         and rewrite_discovery_passed
+        and transaction_flow_hypothesis_passed
         and profile_custom_ws_discovery_passed
         and configured_nextjs_runtime_passed
         and initial_artifacts_passed
@@ -32234,6 +32467,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "artifact_status": rewrite_burp_observation_coverage.get("status"),
                 "summary": rewrite_burp_observation_coverage.get("summary", {}),
                 "clusters": rewrite_burp_observation_coverage.get("clusters", []),
+            },
+            "transaction_flow_hypothesis": {
+                "status": "passed" if transaction_flow_hypothesis_passed else "failed",
+                "policy_review": rewrite_transaction_policy.get("remote_transaction_signing_review", {}),
+                "matrix_summary": rewrite_transaction_matrix.get("summary", {}),
+                "hypothesis": rewrite_transaction_hypothesis,
+                "validation_item": rewrite_transaction_validation_item,
             },
             "source_resolver_report_summary": rewrite_source_resolver_report,
             "observation_clusters": sorted(rewrite_observation_clusters),
@@ -35601,6 +35841,18 @@ def run_validation_plan(args: argparse.Namespace) -> int:
             )
             print(f"  question={inline_summary_text(item.get('validation_question'), max_chars=220)}")
             if args.show_commands:
+                transaction_flow = (
+                    item.get("transaction_flow_review")
+                    if isinstance(item.get("transaction_flow_review"), dict)
+                    else {}
+                )
+                if transaction_flow:
+                    print(
+                        "  transaction_flow_review="
+                        f"{transaction_flow.get('status')} "
+                        f"frontend_refs={transaction_flow.get('frontend_signing_ref_count', 0)} "
+                        f"remote_tx_refs={transaction_flow.get('remote_transaction_material_ref_count', 0)}"
+                    )
                 rewrite_review = item.get("rewrite_review") if isinstance(item.get("rewrite_review"), dict) else {}
                 read_only_candidates = rewrite_review.get("read_only_path_candidates", []) or []
                 blocked_candidates = rewrite_review.get("blocked_path_candidates", []) or []
