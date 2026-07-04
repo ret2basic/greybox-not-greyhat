@@ -4401,13 +4401,15 @@ def build_discovered_profile(
     review_observation_candidates = build_discovered_review_observation_candidates(clusters)
     websocket_observation = None
     if "solana-rpc-ws" in {cluster.get("id") for cluster in clusters} or "solana-rpc-http" in {cluster.get("id") for cluster in clusters}:
-        websocket_observation = {
-            "id": "burp_observe_ws_upgrade",
-            "path": (probe_targets.get("solana-rpc-ws") or probe_targets.get("solana-rpc-http") or {}).get("path", "/api/rpc/solana/devnet"),
-            "cluster": "solana-rpc-ws",
-            "expected_statuses": [101],
-            "subscribe_method": "slotSubscribe",
-        }
+        websocket_path = (probe_targets.get("solana-rpc-ws") or probe_targets.get("solana-rpc-http") or {}).get("path")
+        if is_concrete_probe_path(websocket_path):
+            websocket_observation = {
+                "id": "burp_observe_ws_upgrade",
+                "path": websocket_path,
+                "cluster": "solana-rpc-ws",
+                "expected_statuses": [101],
+                "subscribe_method": "slotSubscribe",
+            }
 
     try:
         source_root_value = str(source_root.resolve().relative_to(ROOT))
@@ -22699,6 +22701,68 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         == "selftest-provider-config-missing"
         and "quote_provider" not in discovered_quote_no_seed_profile
     )
+    no_default_ws_path_inventory = {
+        "generated_at": utc_now(),
+        "status": "discovered",
+        "summary": {
+            "route_count": 0,
+            "app_router_route_count": 0,
+            "pages_router_api_route_count": 0,
+            "rewrite_count": 0,
+            "custom_server_entrypoint_count": 1,
+            "middleware_count": 0,
+            "server_action_file_count": 0,
+            "server_action_export_count": 0,
+            "redirect_count": 0,
+            "header_route_count": 0,
+            "route_policy_count": 0,
+            "entrypoint_count": 1,
+            "surface_count": 1,
+            "api_route_count": 0,
+            "strategy_sets": ["solana-json-rpc-proxy"],
+            "next_config_runtime": {
+                "base_path": None,
+                "trailing_slash": None,
+                "i18n_configured": False,
+                "locale_count": 0,
+            },
+        },
+        "next_config": {},
+        "routes": [],
+        "rewrites": [],
+        "custom_server_entrypoints": [
+            {
+                "cluster_id": "solana-rpc-ws",
+                "path": "",
+                "methods": ["WS"],
+                "file": "server.js",
+                "repo_file": "server.js",
+                "dynamic_segments": [],
+                "fixed_upstreams": [],
+                "strategy_set": "solana-json-rpc-proxy",
+                "kind": "websocket-json-rpc-proxy",
+                "priority": "high",
+                "inference_reasons": ["self-test-missing-websocket-path"],
+                "match": {"methods": ["WS"]},
+            }
+        ],
+        "middleware": [],
+        "server_actions": [],
+        "redirects": [],
+        "headers": [],
+    }
+    no_default_ws_path_profile = build_discovered_profile(
+        no_default_ws_path_inventory,
+        name="no-default-ws-path-selftest",
+        display_name="No Default WS Path Self-Test",
+        target="http://127.0.0.1:9995",
+        source_root=ROOT,
+    )
+    no_default_ws_path_passed = (
+        no_default_ws_path_profile.get("websocket_observation") is None
+        and not (no_default_ws_path_profile.get("probe_targets") or {}).get("solana-rpc-ws")
+        and "/api/rpc/solana/devnet" not in json.dumps(no_default_ws_path_profile, sort_keys=True)
+    )
     profile_seeded_route_discovery_passed = False
     profile_seeded_route_discovery: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(prefix="inferforge-profile-seeded-discovery-") as temp_dir:
@@ -24448,6 +24512,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and discovered_quote_request_passed
         and discovered_quote_response_passed
         and discovered_quote_provider_passed
+        and no_default_ws_path_passed
         and profile_seeded_route_discovery_passed
         and discover_profile_seed_cli_passed
         and readiness_profile_passed
@@ -24560,6 +24625,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "status": "passed" if discovered_quote_provider_passed else "failed",
             "seeded_quote_provider": discovered_quote_seed_profile.get("quote_provider"),
             "no_seed_has_quote_provider": "quote_provider" in discovered_quote_no_seed_profile,
+        },
+        "no_default_websocket_path": {
+            "status": "passed" if no_default_ws_path_passed else "failed",
+            "websocket_observation": no_default_ws_path_profile.get("websocket_observation"),
+            "probe_targets": no_default_ws_path_profile.get("probe_targets", {}),
+            "contains_default_ws_path": "/api/rpc/solana/devnet" in json.dumps(no_default_ws_path_profile, sort_keys=True),
         },
         "profile_seeded_route_discovery": {
             "status": "passed" if profile_seeded_route_discovery_passed else "failed",
