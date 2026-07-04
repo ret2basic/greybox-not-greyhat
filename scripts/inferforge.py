@@ -9852,6 +9852,136 @@ def iteration_action(
     }
 
 
+OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
+    TARGET_PROFILE_ARTIFACT: "profile",
+    STRATEGY_REGISTRY_ARTIFACT: "profile",
+    PROFILE_VALIDATION_ARTIFACT: "profile",
+    "config.json": "profile",
+    "endpoint-clusters.json": "plan",
+    "probe-plan.json": "plan",
+    "probe-ranking.json": "plan",
+    "response-delta-analysis.json": "response-deltas",
+    "traffic-index.json": "evidence-gaps",
+    "source-peek-requests.json": "source-peek-requests",
+    "burp-observation-coverage.json": "evidence-gaps",
+    "blackbox-coverage.json": "evidence-gaps",
+    "evidence-gaps.json": "evidence-gaps",
+    "evidence-chain.json": "evidence-chain",
+    "evidence-appendix.json": "evidence-appendix",
+    "verification-queue.json": "verification-queue",
+    "reproduction-steps.md": "verification-queue",
+    REVIEW_BLOCKERS_ARTIFACT: "review-blockers",
+    REVIEW_BLOCKERS_MARKDOWN_ARTIFACT: "review-blockers",
+    "finding-gate.json": "gate",
+    "adjudication.json": "adjudicate",
+    "findings.json": "adjudicate",
+    "hardening-notes.json": "adjudicate",
+    "report.md": "report",
+    "index.html": "report",
+    "transaction-intent.json": "decode-transactions",
+    "transaction-decoder-selftest.json": "self-test-transactions",
+}
+
+OFFLINE_STALE_REPAIR_COMMANDS = {
+    "derived-report-stale": "report",
+    "derived-reproduction-steps-stale": "verification-queue",
+    "derived-review-blockers-markdown-stale": "review-blockers",
+}
+
+ARTIFACT_REPAIR_COMMAND_ORDER = [
+    "profile",
+    "plan",
+    "response-deltas",
+    "source-peek-requests",
+    "evidence-gaps",
+    "evidence-chain",
+    "evidence-appendix",
+    "gate",
+    "adjudicate",
+    "verification-queue",
+    "review-blockers",
+    "report",
+    "decode-transactions",
+    "self-test-transactions",
+]
+
+
+def artifact_health_repair_commands(
+    artifact_health: dict[str, Any],
+    *,
+    profile: dict[str, Any] | None,
+    fallback_artifact_dir: Path,
+) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_repair_command(
+        *,
+        artifact_dir: Path,
+        subcommand: str,
+        source: str,
+        reason: str,
+        artifacts: list[str],
+    ) -> None:
+        command = validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile)
+        if command in seen:
+            return
+        ref = validation_command_ref(command, source=source, item_status="ready")
+        if ref.get("classification") != "ready":
+            return
+        seen.add(command)
+        ref["artifact_dir"] = repo_relative_or_absolute(artifact_dir)
+        ref["reason"] = reason
+        ref["repair_artifacts"] = ordered_unique_strings(artifacts)
+        refs.append(ref)
+
+    for directory in artifact_health.get("directories", []) or []:
+        if not isinstance(directory, dict):
+            continue
+        raw_dir = str(directory.get("artifact_dir") or "").strip()
+        artifact_dir = Path(raw_dir).resolve() if raw_dir else fallback_artifact_dir.resolve()
+        missing_by_command: dict[str, list[str]] = {}
+        for name in directory.get("missing_required", []) or []:
+            artifact_name = str(name)
+            subcommand = OFFLINE_ARTIFACT_REPAIR_COMMANDS.get(artifact_name)
+            if subcommand:
+                missing_by_command.setdefault(subcommand, []).append(artifact_name)
+        repair_rank = {subcommand: index for index, subcommand in enumerate(ARTIFACT_REPAIR_COMMAND_ORDER)}
+        for subcommand, names in sorted(
+            missing_by_command.items(),
+            key=lambda item: (repair_rank.get(item[0], len(repair_rank)), item[0]),
+        ):
+            add_repair_command(
+                artifact_dir=artifact_dir,
+                subcommand=subcommand,
+                source=f"artifact-health:{repo_relative_or_absolute(artifact_dir)}:missing:{subcommand}",
+                reason="Offline artifact refresh for missing required artifacts.",
+                artifacts=names,
+            )
+
+        stale_by_command: dict[str, list[str]] = {}
+        for issue in directory.get("stale_inputs", []) or []:
+            if not isinstance(issue, dict):
+                continue
+            subcommand = OFFLINE_STALE_REPAIR_COMMANDS.get(str(issue.get("reason") or ""))
+            if not subcommand:
+                continue
+            file_name = str(issue.get("file") or "unknown")
+            stale_by_command.setdefault(subcommand, []).append(file_name)
+        for subcommand, names in sorted(
+            stale_by_command.items(),
+            key=lambda item: (repair_rank.get(item[0], len(repair_rank)), item[0]),
+        ):
+            add_repair_command(
+                artifact_dir=artifact_dir,
+                subcommand=subcommand,
+                source=f"artifact-health:{repo_relative_or_absolute(artifact_dir)}:stale:{subcommand}",
+                reason="Offline artifact refresh for stale derived artifacts.",
+                artifacts=names,
+            )
+    return refs
+
+
 def build_iteration_decision_from_plan(
     *,
     target: str,
@@ -9870,7 +10000,12 @@ def build_iteration_decision_from_plan(
     resource_preflight = validation_resource_preflight_summary(current_resource_snapshot)
     resource_status = str(resource_preflight.get("status") or "not-run")
     artifact_health_status = artifact_summary_status(artifact_health)
-    allowed_command_summary = command_safety_summary([*offline, *resource_checks, *active_after_gate])
+    artifact_repair = artifact_health_repair_commands(
+        artifact_health,
+        profile=profile,
+        fallback_artifact_dir=artifact_dir,
+    )
+    allowed_command_summary = command_safety_summary([*artifact_repair, *offline, *resource_checks, *active_after_gate])
     blocked_command_summary = command_safety_summary(blocked)
     artifact_health_blocks_active = artifact_health_status in {"failed", "needs-human-review"}
     resource_blocks_active = bool(active_after_gate and resource_status not in {"healthy", "not-run"})
@@ -9884,6 +10019,17 @@ def build_iteration_decision_from_plan(
                 kind="offline",
                 reason="Read-only planning commands can run under current resource pressure.",
                 commands=offline,
+                limit=limit,
+            )
+        )
+    if artifact_health_blocks_active and artifact_repair:
+        actions.append(
+            iteration_action(
+                action_id="artifact-repair",
+                status="ready",
+                kind="artifact-repair",
+                reason="Artifact health is not clean; run offline artifact refresh commands before active validation.",
+                commands=artifact_repair,
                 limit=limit,
             )
         )
@@ -9929,7 +10075,7 @@ def build_iteration_decision_from_plan(
             )
         )
 
-    if offline:
+    if offline or artifact_repair:
         status = "ready-offline"
     elif artifact_health_blocks_active:
         status = "blocked-artifact-health"
@@ -9956,6 +10102,7 @@ def build_iteration_decision_from_plan(
             "artifact_health": artifact_health_status,
             "current_resource_snapshot": resource_status,
             "validation_items": len(validation_plan.get("items", []) or []),
+            "artifact_repair_commands": len(artifact_repair),
             "offline_commands": len(offline),
             "resource_check_commands": len(resource_checks),
             "active_after_resource_gate_commands": len(active_after_gate),
@@ -30699,6 +30846,48 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for ref in action.get("commands", []) or []
             if isinstance(ref, dict)
         )
+        artifact_repair_iteration_decision_sample = build_iteration_decision_from_plan(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_run_dir,
+            validation_plan={"generated_at": utc_now(), "status": "parked", "items": []},
+            artifact_health={
+                "generated_at": utc_now(),
+                "status": "failed",
+                "summary": {"artifact_dirs": 1, "status_counts": {"failed": 1}},
+                "directories": [
+                    {
+                        "artifact_dir": str(harness_loop_run_dir),
+                        "status": "failed",
+                        "missing_required": [
+                            "verification-queue.json",
+                            "report.md",
+                            "index.html",
+                            "probe-results.jsonl",
+                        ],
+                        "stale_inputs": [
+                            {
+                                "file": "report.md",
+                                "reason": "derived-report-stale",
+                            }
+                        ],
+                    }
+                ],
+            },
+            current_resource_snapshot={
+                "generated_at": utc_now(),
+                "status": "warning",
+                "warnings": ["swap-usage-above-threshold"],
+            },
+            limit=5,
+        )
+        artifact_repair_iteration_command_text_sample = "\n".join(
+            str(ref.get("command") or "")
+            for action in artifact_repair_iteration_decision_sample.get("actions", [])
+            if action.get("id") == "artifact-repair"
+            for ref in action.get("commands", []) or []
+            if isinstance(ref, dict)
+        )
     blackbox_asset_profile_paths = {
         cluster.get("path")
         for cluster in blackbox_asset_profile_sample.get("clusters", [])
@@ -30941,6 +31130,15 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_iteration_command_text_sample
         and "top-secret" not in blackbox_iteration_command_text_sample
         and "AbC1234567890Token" not in blackbox_iteration_command_text_sample
+        and artifact_repair_iteration_decision_sample.get("status") == "ready-offline"
+        and artifact_repair_iteration_decision_sample.get("summary", {}).get("artifact_repair_commands") == 2
+        and any(
+            action.get("id") == "artifact-repair" and action.get("status") == "ready"
+            for action in artifact_repair_iteration_decision_sample.get("actions", [])
+        )
+        and "verification-queue" in artifact_repair_iteration_command_text_sample
+        and " report" in artifact_repair_iteration_command_text_sample
+        and "audit " not in artifact_repair_iteration_command_text_sample
         and blackbox_asset_clusters_sample.get("profile", {}).get("asset_candidate_profile") is True
         and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_verification_command_text
         and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_asset_verification_command_text
@@ -36799,6 +36997,7 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
         )
     print(
         "Commands: "
+        f"artifact_repair={summary.get('artifact_repair_commands', 0)} "
         f"offline={summary.get('offline_commands', 0)} "
         f"resource_checks={summary.get('resource_check_commands', 0)} "
         f"active_after_gate={summary.get('active_after_resource_gate_commands', 0)} "
