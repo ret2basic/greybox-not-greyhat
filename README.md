@@ -304,6 +304,9 @@ HTTP `GET` / `HEAD` path literals and maps them to local rewrite paths as
 reviewable read-only candidates. Dynamic templates such as ``/users/${id}`` and
 non-read-only methods such as `POST` are listed as blocked candidates instead;
 they are never promoted into unattended validation traffic by this review step.
+To keep rollups usable on small VPS hosts, this client-code scan runs only when
+a catch-all rewrite review surface exists and prunes dependency, build,
+coverage, and hidden directories while walking source files.
 
 Use `validation-plan` to turn the ranked hypotheses into explicit preconditions,
 allowed commands, required evidence, stop conditions, and forbidden actions:

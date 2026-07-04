@@ -8161,48 +8161,93 @@ CLIENT_HTTP_LITERAL_RE = re.compile(
     r"(?P<quote>['\"`])(?P<path>/[^'\"`?#\n)]*)",
     re.IGNORECASE,
 )
+CLIENT_HTTP_SOURCE_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
+CLIENT_HTTP_SOURCE_SKIP_DIRS = {
+    ".git",
+    ".greybox",
+    ".next",
+    ".nuxt",
+    ".output",
+    ".turbo",
+    ".vercel",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "out",
+}
+
+
+def sorted_client_http_path_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        candidates,
+        key=lambda item: (str(item.get("method")), str(item.get("path")), str(item.get("source_ref"))),
+    )
 
 
 def collect_client_http_path_candidates(source_root: Path, *, limit: int = 200) -> list[dict[str, Any]]:
-    roots = [source_root / "src"] if (source_root / "src").exists() else [source_root]
+    if not source_root.is_dir():
+        return []
+    roots = [source_root / "src"] if (source_root / "src").is_dir() else [source_root]
     candidates: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str, int]] = set()
     for root in roots:
-        for path in sorted(root.rglob("*")):
-            if len(candidates) >= limit:
-                return candidates
-            if not path.is_file() or path.suffix not in {".js", ".jsx", ".ts", ".tsx"}:
-                continue
-            if any(part in {"node_modules", ".next"} for part in path.parts):
-                continue
-            try:
-                source = read_text(path)
-            except (UnicodeDecodeError, OSError):
-                continue
-            for match in CLIENT_HTTP_LITERAL_RE.finditer(source):
-                method = str(match.group("method") or "").upper()
-                api_path = str(match.group("path") or "")
-                if not api_path or api_path.startswith("//"):
-                    continue
-                line = line_number_for_offset(source, match.start())
-                source_ref = f"{source_root_relative_or_repo(path, source_root)}:{line}"
-                key = (method, api_path, source_ref, line)
-                if key in seen:
-                    continue
-                seen.add(key)
-                candidates.append(
-                    {
-                        "method": method,
-                        "path": api_path,
-                        "receiver": match.group("receiver"),
-                        "source_ref": source_ref,
-                        "line": line,
-                    }
-                )
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(
+                dirname
+                for dirname in dirnames
+                if dirname not in CLIENT_HTTP_SOURCE_SKIP_DIRS and not dirname.startswith(".")
+            )
+            for filename in sorted(filenames):
                 if len(candidates) >= limit:
-                    return candidates
-    candidates.sort(key=lambda item: (str(item.get("method")), str(item.get("path")), str(item.get("source_ref"))))
-    return candidates
+                    return sorted_client_http_path_candidates(candidates)
+                path = Path(dirpath) / filename
+                if path.suffix not in CLIENT_HTTP_SOURCE_SUFFIXES:
+                    continue
+                try:
+                    source = read_text(path)
+                except (UnicodeDecodeError, OSError):
+                    continue
+                for match in CLIENT_HTTP_LITERAL_RE.finditer(source):
+                    method = str(match.group("method") or "").upper()
+                    api_path = str(match.group("path") or "")
+                    if not api_path or api_path.startswith("//"):
+                        continue
+                    line = line_number_for_offset(source, match.start())
+                    source_ref = f"{source_root_relative_or_repo(path, source_root)}:{line}"
+                    key = (method, api_path, source_ref, line)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(
+                        {
+                            "method": method,
+                            "path": api_path,
+                            "receiver": match.group("receiver"),
+                            "source_ref": source_ref,
+                            "line": line,
+                        }
+                    )
+                    if len(candidates) >= limit:
+                        return sorted_client_http_path_candidates(candidates)
+    return sorted_client_http_path_candidates(candidates)
+
+
+def cluster_needs_client_http_path_candidates(cluster: dict[str, Any]) -> bool:
+    discovery = cluster.get("discovery") if isinstance(cluster.get("discovery"), dict) else {}
+    rewrites = discovery.get("rewrites", []) if isinstance(discovery.get("rewrites"), list) else []
+    kind = str(cluster.get("kind") or "")
+    strategy_set = str(cluster.get("strategy_set") or strategy_set_for_cluster(cluster) or "")
+    if kind not in {"rewrite-proxy", "fixed-upstream-proxy"} and strategy_set != "fixed-upstream-proxy" and not rewrites:
+        return False
+    path = str(cluster.get("path") or "")
+    if catchall_prefix_for_path(path):
+        return True
+    return any(
+        ":path*" in str(rewrite.get("source") or "") or "{path*" in str(rewrite.get("source_pattern") or "")
+        for rewrite in rewrites
+        if isinstance(rewrite, dict)
+    )
 
 
 def rewrite_path_candidates_for_cluster(
@@ -8368,12 +8413,14 @@ def build_rewrite_review_run(
         profile=profile,
         artifact_dir=artifact_dir,
     )
-    source_root = source_root_for_review_artifact(profile, artifact_dir)
-    client_candidates = collect_client_http_path_candidates(source_root)
+    clusters = [cluster for cluster in endpoint_clusters.get("clusters", []) or [] if isinstance(cluster, dict)]
+    client_candidates: list[dict[str, Any]] = []
+    if any(cluster_needs_client_http_path_candidates(cluster) for cluster in clusters):
+        source_root = source_root_for_review_artifact(profile, artifact_dir)
+        client_candidates = collect_client_http_path_candidates(source_root)
     items = [
         item
-        for cluster in endpoint_clusters.get("clusters", []) or []
-        if isinstance(cluster, dict)
+        for cluster in clusters
         for item in [rewrite_review_item_for_cluster(cluster, client_candidates=client_candidates)]
         if item is not None
     ]
