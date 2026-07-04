@@ -2854,20 +2854,56 @@ def custom_server_files(source_root: Path) -> list[Path]:
     return [source_root / name for name in names if (source_root / name).is_file()]
 
 
-def custom_ws_cluster_id_for_prefix(prefix: str) -> str:
+def cluster_declares_websocket(cluster: dict[str, Any]) -> bool:
+    match = cluster.get("match") or {}
+    methods = {
+        str(cluster.get("method") or "").upper(),
+        *{str(method).upper() for method in match.get("methods", []) or []},
+    }
+    return "WS" in methods or "websocket" in str(cluster.get("kind") or "").lower()
+
+
+def profile_ws_cluster_for_prefix(prefix: str, profile: dict[str, Any] | None) -> dict[str, Any] | None:
+    normalized = prefix if prefix.endswith("/") else prefix + "/"
+    candidate_path = normalized + "devnet"
+    for cluster in (profile or {}).get("clusters", []) or []:
+        if not cluster.get("id") or not cluster_declares_websocket(cluster):
+            continue
+        if cluster_matches_endpoint(cluster, "WS", candidate_path):
+            return cluster
+    return None
+
+
+def custom_ws_cluster_id_for_prefix(prefix: str, profile: dict[str, Any] | None = None) -> str:
+    profile_cluster = profile_ws_cluster_for_prefix(prefix, profile)
+    if profile_cluster is not None:
+        return str(profile_cluster["id"])
     if prefix.startswith("/api/rpc/solana/"):
         return "solana-rpc-ws"
     return f"custom-ws-{safe_probe_id(prefix.strip('/') or 'root')}"
 
 
-def custom_ws_path_for_prefix(prefix: str) -> str:
+def custom_ws_path_for_prefix(prefix: str, profile: dict[str, Any] | None = None) -> str:
     normalized = prefix if prefix.endswith("/") else prefix + "/"
+    profile_cluster = profile_ws_cluster_for_prefix(prefix, profile)
+    if profile_cluster is not None:
+        for value in [
+            profile_cluster.get("path"),
+            *((profile_cluster.get("match") or {}).get("path_patterns", []) or []),
+            *((profile_cluster.get("match") or {}).get("paths", []) or []),
+        ]:
+            text = str(value or "")
+            if text.startswith("/"):
+                return text
     if normalized.startswith("/api/rpc/solana/"):
         return normalized + "{cluster}"
     return normalized + "{path*}"
 
 
-def discover_custom_server_entrypoints(source_root: Path) -> list[dict[str, Any]]:
+def discover_custom_server_entrypoints(
+    source_root: Path,
+    profile: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     entrypoints: list[dict[str, Any]] = []
     for server_file in custom_server_files(source_root):
         try:
@@ -2890,8 +2926,8 @@ def discover_custom_server_entrypoints(source_root: Path) -> list[dict[str, Any]
                 continue
             if f"startsWith({const_name})" not in source:
                 continue
-            path = custom_ws_path_for_prefix(value)
-            cluster_id = custom_ws_cluster_id_for_prefix(value)
+            path = custom_ws_path_for_prefix(value, profile)
+            cluster_id = custom_ws_cluster_id_for_prefix(value, profile)
             line_patterns = {
                 "path_prefix_const": const_name,
                 "upgrade_handler": ["server.on('upgrade'", 'server.on("upgrade"'],
@@ -3613,7 +3649,7 @@ def discover_nextjs_routes(source_root: Path, profile: dict[str, Any] | None = N
     routes = []
     runtime_config = discover_next_config_runtime(source_root)
     rewrites = discover_nextjs_rewrites(source_root, runtime_config)
-    custom_server_entrypoints = discover_custom_server_entrypoints(source_root)
+    custom_server_entrypoints = discover_custom_server_entrypoints(source_root, profile)
     middleware_entries = discover_nextjs_middleware(source_root, runtime_config)
     server_actions = discover_nextjs_server_actions(source_root)
     route_policies = discover_next_config_route_policies(source_root, runtime_config)
@@ -22979,6 +23015,43 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             target="http://127.0.0.1:9998",
             source_root=rewrite_source_root,
         )
+        profile_ws_source_root = Path(temp_dir) / "profile-ws-app"
+        profile_ws_source_root.mkdir()
+        (profile_ws_source_root / "server.js").write_text(
+            textwrap.dedent(
+                """
+                import http from 'node:http'
+                import { WebSocketServer } from 'ws'
+
+                const SELFTEST_WS_PREFIX = '/ws/solana/'
+                const wss = new WebSocketServer({ noServer: true })
+
+                function handleSelftestWs(cluster, req, socket, head) {
+                  wss.handleUpgrade(req, socket, head, () => {})
+                }
+
+                const server = http.createServer()
+                server.on('upgrade', (req, socket, head) => {
+                  const pathname = new URL(req.url || '/', 'http://localhost').pathname
+                  if (pathname.startsWith(SELFTEST_WS_PREFIX)) {
+                    handleSelftestWs(pathname.slice(SELFTEST_WS_PREFIX.length), req, socket, head)
+                  }
+                })
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        profile_ws_inventory = discover_nextjs_routes(profile_ws_source_root, test_profile)
+        profile_ws_entry = next(iter(profile_ws_inventory.get("custom_server_entrypoints", []) or []), None)
+        profile_custom_ws_discovery_passed = (
+            profile_ws_entry is not None
+            and profile_ws_entry.get("cluster_id") == "solana-rpc-ws"
+            and profile_ws_entry.get("path") == "/ws/solana/{cluster}"
+            and profile_ws_entry.get("strategy_set") == "solana-json-rpc-proxy"
+            and profile_ws_entry.get("kind") == "websocket-json-rpc-proxy"
+            and not str(profile_ws_entry.get("cluster_id") or "").startswith("custom-ws-")
+        )
         rewrite_observation_clusters = {
             str(item.get("cluster"))
             for item in rewrite_profile.get("burp_observation_plan", [])
@@ -24264,6 +24337,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and ws_resource_open_item_passed
         and unsafe_observation_validation_passed
         and rewrite_discovery_passed
+        and profile_custom_ws_discovery_passed
         and configured_nextjs_runtime_passed
         and initial_artifacts_passed
         and target_lock_passed
@@ -24489,6 +24563,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "classification_check_path": "/api/proxy/users/42",
             "endpoint_resolution": rewrite_resolution,
             "websocket_endpoint_resolution": ws_resolution,
+            "profile_custom_websocket": {
+                "status": "passed" if profile_custom_ws_discovery_passed else "failed",
+                "entrypoint": profile_ws_entry,
+                "inventory_summary": profile_ws_inventory.get("summary", {}),
+            },
             "pages_api_endpoint_resolution": pages_api_resolution,
             "middleware_context": {
                 "rewrite": rewrite_middleware_context,
