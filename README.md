@@ -196,10 +196,11 @@ whitespace are profile-validation errors. Keep unresolved paths in
 `review_observation_candidates` until one reviewed concrete path is promoted.
 
 When a separate profile file omits target-specific fields such as `clusters`,
-`probe_targets`, `quote_intent`, `burp_observation_plan`, or
-`websocket_observation`, InferForge uses neutral empty defaults and emits
-profile-validation warnings. It does not borrow `infrafi-web` clusters, probe
-paths, or quote mint intent for another target. Quote collection and
+`probe_targets`, `quote_intent`, `environment_readiness`,
+`burp_observation_plan`, or `websocket_observation`, InferForge uses neutral
+empty defaults and emits profile-validation warnings. It does not borrow
+`infrafi-web` clusters, probe paths, quote mint intent, or external readiness
+checks for another target. Quote collection and
 direction-derived transaction policy checks read mint direction from the target
 profile:
 
@@ -221,6 +222,34 @@ profile:
         "destinationMint": "DESTINATION_MINT_FOR_SELL"
       }
     }
+  }
+}
+```
+
+External dependency readiness is profile-owned as well. The default
+`infrafi-web` profile declares M0-specific checks, but a different target should
+declare its own provider variables or leave this empty:
+
+```json
+{
+  "environment_readiness": {
+    "checks": [
+      {
+        "id": "provider-token-configured",
+        "type": "env",
+        "key": "PROVIDER_TOKEN",
+        "secret": true,
+        "next_step": "Set PROVIDER_TOKEN and restart the target server."
+      },
+      {
+        "id": "health-reports-provider-ready",
+        "type": "target_health_field",
+        "field": "provider_ready",
+        "expected": true,
+        "next_step": "Restart the target after configuring provider credentials."
+      }
+    ],
+    "quote_collection_next_step": "Rerun collect-quote after provider configuration is ready."
   }
 }
 ```
@@ -401,8 +430,8 @@ checks. Use `--no-write` to preview these checks without refreshing capability
 artifacts.
 
 `readiness` writes `.greybox/environment-readiness.json`, combining target
-health, redacted environment configuration state, the last quote collection
-diagnosis, and transaction-corpus status, then refreshes the managed artifact
+health, profile-declared redacted environment checks, and quote corpus status
+only when a quote cluster is active, then refreshes the managed artifact
 manifest. `self-test-transactions` writes
 `.greybox/transaction-decoder-selftest.json`; it generates a synthetic local
 Solana versioned transaction to prove the candidate extractor, decoder, and

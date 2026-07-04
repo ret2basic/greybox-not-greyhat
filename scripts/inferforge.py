@@ -454,6 +454,32 @@ def default_target_profile() -> dict[str, Any]:
                 },
             },
         },
+        "environment_readiness": {
+            "checks": [
+                {
+                    "id": "m0-orchestration-key-configured",
+                    "type": "env",
+                    "key": "M0_ORCHESTRATION_API_KEY",
+                    "secret": True,
+                    "next_step": "Set a real M0_ORCHESTRATION_API_KEY and restart the target server.",
+                },
+                {
+                    "id": "health-reports-m0-key-present",
+                    "type": "target_health_field",
+                    "field": "m0_key_present",
+                    "expected": True,
+                    "next_step": "Set a real M0_ORCHESTRATION_API_KEY and restart the target server.",
+                },
+                {
+                    "id": "m0-preview-wallet-configured",
+                    "type": "env",
+                    "key": "NEXT_PUBLIC_M0_QUOTE_PREVIEW_WALLET",
+                    "secret": False,
+                    "next_step": "Set NEXT_PUBLIC_M0_QUOTE_PREVIEW_WALLET to a real Solana wallet address for quote previews.",
+                },
+            ],
+            "quote_collection_next_step": "Rerun collect-quote after M0 configuration is ready; decode only, with no signing or submission.",
+        },
         "clusters": [
             {
                 "id": "health",
@@ -708,6 +734,7 @@ def neutral_target_profile_defaults(
         },
         "probe_targets": {},
         "quote_intent": {},
+        "environment_readiness": {"checks": []},
         "clusters": [],
         "source_peeks": [],
         "burp_observation_plan": [],
@@ -749,6 +776,7 @@ def normalize_target_profile(profile: dict[str, Any], *, profile_path: Path | No
         "safety",
         "probe_targets",
         "quote_intent",
+        "environment_readiness",
         "clusters",
         "source_peeks",
         "burp_observation_plan",
@@ -1005,6 +1033,26 @@ def quote_allowed_programs(profile: dict[str, Any] | None, direction: str | None
     return []
 
 
+def environment_readiness_config(profile: dict[str, Any] | None) -> dict[str, Any]:
+    configured = (profile or {}).get("environment_readiness")
+    if isinstance(configured, dict):
+        return json_clone(configured)
+    if uses_builtin_target_defaults(profile):
+        return json_clone(default_target_profile().get("environment_readiness", {"checks": []}))
+    return {"checks": []}
+
+
+def quote_readiness_required(profile: dict[str, Any] | None) -> bool:
+    effective_profile = profile or default_target_profile()
+    if not strategy_set_enabled(effective_profile, "quote-transaction-decoder"):
+        return False
+    for cluster in effective_profile.get("clusters", []) or []:
+        if str(cluster.get("id") or "") != "quote":
+            continue
+        return strategy_set_enabled(effective_profile, strategy_set_for_cluster(cluster))
+    return False
+
+
 def is_concrete_probe_path(path: str | None) -> bool:
     return bool(path and str(path).startswith("/") and "{" not in str(path) and "}" not in str(path))
 
@@ -1099,6 +1147,7 @@ def build_profile_validation_artifact(
     if profile.get("_profile_loaded_from") == "file":
         for key in sorted(set(defaulted_keys) & {
             "clusters",
+            "environment_readiness",
             "probe_targets",
             "quote_intent",
             "source_peeks",
@@ -1113,6 +1162,57 @@ def build_profile_validation_artifact(
                         f"Profile did not declare `{key}`; InferForge used a neutral empty default "
                         "instead of the regression target defaults."
                     ),
+                }
+            )
+
+    readiness_config = environment_readiness_config(profile)
+    readiness_checks = readiness_config.get("checks", [])
+    if not isinstance(readiness_checks, list):
+        warnings.append(
+            {
+                "id": "environment-readiness:checks-not-array",
+                "severity": "warning",
+                "message": "`environment_readiness.checks` should be an array of readiness check objects.",
+            }
+        )
+        readiness_checks = []
+    for check_index, check in enumerate(readiness_checks):
+        if not isinstance(check, dict):
+            warnings.append(
+                {
+                    "id": f"environment-readiness:check-{check_index}:not-object",
+                    "severity": "warning",
+                    "message": "Environment readiness checks should be JSON objects.",
+                }
+            )
+            continue
+        check_id = str(check.get("id") or f"check-{check_index}")
+        check_type = str(check.get("type") or "")
+        if check_type not in {"env", "target_health_field"}:
+            warnings.append(
+                {
+                    "id": f"environment-readiness:{check_id}:unknown-type",
+                    "severity": "warning",
+                    "message": (
+                        f"Environment readiness check `{check_id}` has unsupported type `{check_type}`. "
+                        "Supported types are `env` and `target_health_field`."
+                    ),
+                }
+            )
+        if check_type == "env" and not check.get("key"):
+            warnings.append(
+                {
+                    "id": f"environment-readiness:{check_id}:missing-key",
+                    "severity": "warning",
+                    "message": f"Environment readiness env check `{check_id}` is missing `key`.",
+                }
+            )
+        if check_type == "target_health_field" and not check.get("field"):
+            warnings.append(
+                {
+                    "id": f"environment-readiness:{check_id}:missing-field",
+                    "severity": "warning",
+                    "message": f"Environment readiness target health check `{check_id}` is missing `field`.",
                 }
             )
 
@@ -16915,6 +17015,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     review_candidates_stdout_text = "\n".join(review_candidates_stdout)
     plan_stdout_text = "\n".join(plan_stdout)
     capabilities_stdout_text = "\n".join(capabilities_stdout)
+    readiness_stdout_text = "\n".join(readiness_stdout)
     attack_strategy_stdout_text = "\n".join(attack_strategy_stdout)
     verification_queue_stdout_text = "\n".join(verification_queue_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
@@ -17375,8 +17476,9 @@ def build_no_write_selftest() -> dict[str, Any]:
         {
             "id": "readiness-no-write-skips-artifacts",
             "passed": (
-                readiness_return_code == 1
-                and "Readiness: waiting-for-external-configuration" in readiness_stdout
+                readiness_return_code == 0
+                and "Readiness: ready" in readiness_stdout
+                and "Checks: 1 total" in readiness_stdout_text
                 and "No files written (--no-write)." in readiness_stdout
                 and not any(output_paths[key] for key in ["readiness_dir", "readiness_capabilities_json", "readiness_json", "readiness_manifest"])
                 and not any(line.startswith("Refreshed ") for line in readiness_stdout)
@@ -19259,6 +19361,7 @@ def build_environment_readiness(
     source_root: Path,
     artifact_dir: Path,
     *,
+    profile: dict[str, Any] | None = None,
     capabilities: dict[str, Any] | None = None,
     quote_collection: dict[str, Any] | None = None,
     transaction_intent: dict[str, Any] | None = None,
@@ -19280,9 +19383,11 @@ def build_environment_readiness(
     quote_diagnosis = (quote_collection or {}).get("diagnosis", {})
     tx_candidates = int((transaction_intent or {}).get("candidates_seen", 0) or 0)
     decoded_transactions = int((transaction_intent or {}).get("decoded_transactions", 0) or 0)
-    m0_key = env_status("M0_ORCHESTRATION_API_KEY", secret=True)
-    preview_wallet = env_status("NEXT_PUBLIC_M0_QUOTE_PREVIEW_WALLET", secret=False)
     target_info = (capabilities or {}).get("target", {})
+    readiness_config = environment_readiness_config(profile)
+    configured_checks = readiness_config.get("checks", [])
+    if not isinstance(configured_checks, list):
+        configured_checks = []
 
     checks = [
         {
@@ -19293,35 +19398,52 @@ def build_environment_readiness(
                 "health_status": target_info.get("health_status"),
             },
         },
-        {
-            "id": "m0-orchestration-key-configured",
-            "status": "passed" if m0_key.get("status") == "configured" else "blocked",
-            "evidence": m0_key,
-        },
-        {
-            "id": "health-reports-m0-key-present",
-            "status": "passed" if target_info.get("m0_key_present") is True else "blocked",
-            "evidence": target_info.get("m0_key_present"),
-        },
-        {
-            "id": "m0-preview-wallet-configured",
-            "status": "passed" if preview_wallet.get("status") == "configured" else "blocked",
-            "evidence": preview_wallet,
-        },
-        {
-            "id": "quote-collection-ready",
-            "status": "passed" if quote_diagnosis.get("classification") == "quote-payload-collected" else "blocked",
-            "evidence": quote_diagnosis or "quote-collection.json not available",
-        },
-        {
-            "id": "transaction-corpus-present",
-            "status": "passed" if tx_candidates > 0 and decoded_transactions > 0 else "blocked",
-            "evidence": {
-                "candidates_seen": tx_candidates,
-                "decoded_transactions": decoded_transactions,
-            },
-        },
     ]
+    for check_index, check in enumerate(configured_checks):
+        if not isinstance(check, dict):
+            continue
+        check_id = str(check.get("id") or f"profile-readiness-{check_index}")
+        check_type = str(check.get("type") or "")
+        if check_type == "env":
+            key = str(check.get("key") or "")
+            evidence = env_status(key, secret=bool(check.get("secret"))) if key else {"status": "missing-key"}
+            status = "passed" if evidence.get("status") == "configured" else "blocked"
+        elif check_type == "target_health_field":
+            field = str(check.get("field") or "")
+            expected = check.get("expected", True)
+            actual = target_info.get(field) if field else None
+            evidence = {"field": field, "expected": expected, "actual": actual}
+            status = "passed" if field and actual == expected else "blocked"
+        else:
+            evidence = {"type": check_type or None, "status": "unsupported-check-type"}
+            status = "blocked"
+        checks.append(
+            {
+                "id": check_id,
+                "status": status,
+                "evidence": evidence,
+            }
+        )
+    if quote_readiness_required(profile):
+        checks.extend(
+            [
+                {
+                    "id": "quote-collection-ready",
+                    "status": "passed"
+                    if quote_diagnosis.get("classification") == "quote-payload-collected"
+                    else "blocked",
+                    "evidence": quote_diagnosis or "quote-collection.json not available",
+                },
+                {
+                    "id": "transaction-corpus-present",
+                    "status": "passed" if tx_candidates > 0 and decoded_transactions > 0 else "blocked",
+                    "evidence": {
+                        "candidates_seen": tx_candidates,
+                        "decoded_transactions": decoded_transactions,
+                    },
+                },
+            ]
+        )
     blocked = [check for check in checks if check["status"] == "blocked"]
     failed = [check for check in checks if check["status"] == "failed"]
     if failed:
@@ -19332,12 +19454,21 @@ def build_environment_readiness(
         status = "ready"
 
     next_steps = []
-    if m0_key.get("status") != "configured":
-        next_steps.append("Set a real M0_ORCHESTRATION_API_KEY and restart the target server.")
-    if preview_wallet.get("status") != "configured":
-        next_steps.append("Set NEXT_PUBLIC_M0_QUOTE_PREVIEW_WALLET to a real Solana wallet address for quote previews.")
-    if quote_diagnosis.get("classification") != "quote-payload-collected":
-        next_steps.append("Rerun collect-quote after M0 configuration is ready; decode only, with no signing or submission.")
+
+    def add_next_step(step: Any) -> None:
+        if isinstance(step, str) and step and step not in next_steps:
+            next_steps.append(step)
+
+    blocked_ids = {str(check.get("id")) for check in blocked}
+    for check in configured_checks:
+        if not isinstance(check, dict) or str(check.get("id") or "") not in blocked_ids:
+            continue
+        add_next_step(check.get("next_step"))
+    if quote_readiness_required(profile) and quote_diagnosis.get("classification") != "quote-payload-collected":
+        add_next_step(
+            readiness_config.get("quote_collection_next_step")
+            or "Rerun collect-quote after quote provider configuration is ready; decode only, with no signing or submission."
+        )
 
     return {
         "generated_at": utc_now(),
@@ -20506,6 +20637,7 @@ def run_audit(args: argparse.Namespace) -> int:
         target,
         source_root,
         artifact_dir,
+        profile=profile,
         capabilities=capabilities,
         quote_collection=quote_collection_for_readiness,
         transaction_intent=transaction_intent,
@@ -21369,6 +21501,49 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and quote_direction_mints(discovered_quote_seed_profile, "sell")
         == ("11111111111111111111111111111111", "So11111111111111111111111111111111111111112")
         and "quote_intent" not in discovered_quote_no_seed_profile
+    )
+    readiness_capabilities = {"target": {"reachable": True, "health_status": 200}}
+    non_quote_readiness_profile = json_clone(test_profile)
+    non_quote_readiness_profile["strategy_sets"] = [
+        item for item in non_quote_readiness_profile.get("strategy_sets", []) if item != "quote-transaction-decoder"
+    ]
+    non_quote_readiness_profile["clusters"] = [
+        item for item in non_quote_readiness_profile.get("clusters", []) if item.get("id") != "quote"
+    ]
+    non_quote_readiness_profile["environment_readiness"] = {"checks": []}
+    non_quote_readiness = build_environment_readiness(
+        "http://127.0.0.1:9995",
+        ROOT,
+        artifact_dir,
+        profile=non_quote_readiness_profile,
+        capabilities=readiness_capabilities,
+    )
+    custom_readiness_profile = json_clone(non_quote_readiness_profile)
+    custom_readiness_profile["environment_readiness"] = {
+        "checks": [
+            {
+                "id": "custom-provider-token-configured",
+                "type": "env",
+                "key": "INFERFORGE_SELFTEST_PROVIDER_TOKEN",
+                "secret": True,
+                "next_step": "Set INFERFORGE_SELFTEST_PROVIDER_TOKEN for this target.",
+            }
+        ]
+    }
+    custom_readiness = build_environment_readiness(
+        "http://127.0.0.1:9995",
+        ROOT,
+        artifact_dir,
+        profile=custom_readiness_profile,
+        capabilities=readiness_capabilities,
+    )
+    readiness_profile_passed = (
+        non_quote_readiness.get("status") == "ready"
+        and "m0-orchestration-key-configured" not in {item.get("id") for item in non_quote_readiness.get("checks", [])}
+        and "quote-collection-ready" not in {item.get("id") for item in non_quote_readiness.get("checks", [])}
+        and custom_readiness.get("status") == "waiting-for-external-configuration"
+        and "custom-provider-token-configured" in {item.get("id") for item in custom_readiness.get("checks", [])}
+        and "Set INFERFORGE_SELFTEST_PROVIDER_TOKEN for this target." in custom_readiness.get("next_steps", [])
     )
     unsafe_observation_profile = json_clone(test_profile)
     unsafe_observation_profile["burp_observation_plan"] = [
@@ -22651,6 +22826,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and target_lock_passed
         and quote_intent_profile_passed
         and discovered_quote_intent_passed
+        and readiness_profile_passed
         and attack_strategy_status_passed
     )
 
@@ -22698,6 +22874,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "status": "passed" if discovered_quote_intent_passed else "failed",
             "seeded_quote_intent": discovered_quote_seed_profile.get("quote_intent"),
             "no_seed_has_quote_intent": "quote_intent" in discovered_quote_no_seed_profile,
+        },
+        "environment_readiness_profile_routing": {
+            "status": "passed" if readiness_profile_passed else "failed",
+            "non_quote_status": non_quote_readiness.get("status"),
+            "non_quote_check_ids": [item.get("id") for item in non_quote_readiness.get("checks", [])],
+            "custom_status": custom_readiness.get("status"),
+            "custom_check_ids": [item.get("id") for item in custom_readiness.get("checks", [])],
+            "custom_next_steps": custom_readiness.get("next_steps", []),
         },
         "response_delta_analysis": {
             "status": "passed" if response_delta_selftest_passed else "failed",
@@ -24996,6 +25180,7 @@ def run_readiness(args: argparse.Namespace) -> int:
         target,
         source_root,
         artifact_dir,
+        profile=profile,
         capabilities=capabilities,
         quote_collection=quote_collection,
         transaction_intent=transaction_intent,
@@ -25386,6 +25571,7 @@ def run_collect_quote(args: argparse.Namespace) -> int:
         target,
         source_root,
         artifact_dir,
+        profile=profile,
         capabilities=capabilities,
         quote_collection=quote_collection,
         transaction_intent=transaction_intent,

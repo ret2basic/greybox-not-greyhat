@@ -67,6 +67,32 @@
       }
     }
   },
+  "environment_readiness": {
+    "checks": [
+      {
+        "id": "m0-orchestration-key-configured",
+        "type": "env",
+        "key": "M0_ORCHESTRATION_API_KEY",
+        "secret": true,
+        "next_step": "Set a real M0_ORCHESTRATION_API_KEY and restart the target server."
+      },
+      {
+        "id": "health-reports-m0-key-present",
+        "type": "target_health_field",
+        "field": "m0_key_present",
+        "expected": true,
+        "next_step": "Set a real M0_ORCHESTRATION_API_KEY and restart the target server."
+      },
+      {
+        "id": "m0-preview-wallet-configured",
+        "type": "env",
+        "key": "NEXT_PUBLIC_M0_QUOTE_PREVIEW_WALLET",
+        "secret": false,
+        "next_step": "Set NEXT_PUBLIC_M0_QUOTE_PREVIEW_WALLET to a real Solana wallet address for quote previews."
+      }
+    ],
+    "quote_collection_next_step": "Rerun collect-quote after M0 configuration is ready; decode only, with no signing or submission."
+  },
   "clusters": [
     {
       "id": "health",
