@@ -4705,6 +4705,7 @@ STATIC_ASSET_EXTENSIONS = {
     ".woff",
     ".woff2",
 }
+LOCALE_ROUTE_PREFIX_RE = re.compile(r"^/([a-z]{2}(?:-[A-Za-z]{2})?)/(.*)$")
 
 
 def blackbox_profile_path(raw_path: Any) -> str:
@@ -4733,6 +4734,26 @@ def blackbox_cluster_id_for_path(path: str) -> str:
     path_hash = hashlib.sha1(path.encode("utf-8")).hexdigest()[:8]
     prefix = safe_probe_id(path.strip("/") or "root")[:48]
     return f"blackbox-{prefix}-{path_hash}"
+
+
+def blackbox_route_family(path: str) -> tuple[str, str | None]:
+    normalized = blackbox_profile_path(path)
+    match = LOCALE_ROUTE_PREFIX_RE.match(normalized)
+    if not match or not match.group(2):
+        return normalized, None
+    return "/" + match.group(2), match.group(1)
+
+
+def blackbox_route_variant_rank(path: str) -> tuple[int, str]:
+    _family_path, locale = blackbox_route_family(path)
+    if locale is None:
+        return (0, path)
+    locale_lower = locale.lower()
+    if locale_lower == "en-us":
+        return (1, path)
+    if locale_lower.startswith("en"):
+        return (2, path)
+    return (3, path)
 
 
 def blackbox_endpoint_kind(path: str, methods: set[str], content_types: set[str]) -> str:
@@ -5446,6 +5467,7 @@ def build_blackbox_profile_from_asset_candidates(
     target: str,
     allowed_classes: set[str],
     max_endpoints: int | None = None,
+    collapse_route_variants: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     target_netloc = urllib.parse.urlparse(target).netloc.lower()
     by_path: dict[str, dict[str, Any]] = {}
@@ -5455,6 +5477,7 @@ def build_blackbox_profile_from_asset_candidates(
         "triage_class": 0,
         "unsafe_method": 0,
         "static_asset": 0,
+        "route_family_duplicate": 0,
     }
 
     for candidate in candidate_doc.get("candidates", []) or []:
@@ -5515,6 +5538,50 @@ def build_blackbox_profile_from_asset_candidates(
             item["path"],
         ),
     )
+    route_families: list[dict[str, Any]] = []
+    if collapse_route_variants:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for item in rows:
+            family_path, _locale = blackbox_route_family(str(item["path"]))
+            grouped.setdefault(family_path, []).append(item)
+
+        collapsed_rows: list[dict[str, Any]] = []
+        for family_path in sorted(grouped):
+            items = grouped[family_path]
+            representative = sorted(items, key=lambda item: blackbox_route_variant_rank(str(item["path"])))[0]
+            variants = sorted(str(item["path"]) for item in items)
+            locales = sorted(
+                locale
+                for item in items
+                for _family, locale in [blackbox_route_family(str(item["path"]))]
+                if locale
+            )
+            merged = {
+                "path": str(representative["path"]),
+                "methods": set().union(*(set(item["methods"]) for item in items)),
+                "hosts": set().union(*(set(item["hosts"]) for item in items)),
+                "query_keys": set().union(*(set(item["query_keys"]) for item in items)),
+                "source_candidate_ids": [],
+                "triage_classes": set().union(*(set(item["triage_classes"]) for item in items)),
+                "triage_risks": set().union(*(set(item["triage_risks"]) for item in items)),
+                "source_count": sum(int(item["source_count"]) for item in items),
+                "route_family": {
+                    "family_path": family_path,
+                    "representative_path": str(representative["path"]),
+                    "variants": variants,
+                    "locales": locales,
+                    "collapsed_variant_count": max(0, len(items) - 1),
+                },
+            }
+            for item in items:
+                for candidate_id in item["source_candidate_ids"]:
+                    if candidate_id not in merged["source_candidate_ids"]:
+                        merged["source_candidate_ids"].append(candidate_id)
+            collapsed_rows.append(merged)
+            skipped["route_family_duplicate"] += max(0, len(items) - 1)
+            if len(items) > 1:
+                route_families.append(merged["route_family"])
+        rows = collapsed_rows
     if max_endpoints is not None:
         rows = rows[:max_endpoints]
 
@@ -5548,6 +5615,7 @@ def build_blackbox_profile_from_asset_candidates(
                 "triage_classes": sorted(str(value) for value in item["triage_classes"]),
                 "triage_risks": sorted(str(value) for value in item["triage_risks"]),
                 "source_count": int(item["source_count"]),
+                "route_family": item.get("route_family"),
                 "notes": [
                     "Generated from reviewed static asset candidates.",
                     "Only low-risk page-route candidates are promoted by default.",
@@ -5566,6 +5634,7 @@ def build_blackbox_profile_from_asset_candidates(
                 "query_keys": query_keys,
                 "source_candidate_ids": item["source_candidate_ids"],
                 "triage_classes": sorted(str(value) for value in item["triage_classes"]),
+                "route_family": item.get("route_family"),
             }
         )
 
@@ -5608,6 +5677,7 @@ def build_blackbox_profile_from_asset_candidates(
             "observed_endpoint_count": 0,
             "asset_endpoint_count": len(clusters),
             "max_endpoints": max_endpoints,
+            "collapse_route_variants": collapse_route_variants,
             "skipped": skipped,
             "workflow": [
                 "Run blackbox-asset-map to refresh static asset candidates.",
@@ -5626,6 +5696,7 @@ def build_blackbox_profile_from_asset_candidates(
         "generated_clusters": len(clusters),
         "allowed_triage_classes": sorted(allowed_classes),
         "skipped": skipped,
+        "route_families": route_families,
         "endpoints": endpoint_summaries,
         "safety": "Profile generation is read-only over static asset candidates and does not send HTTP requests.",
     }
@@ -24909,6 +24980,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "status": 200,
                 "text": (
                     'const tradeRoute = "/trade/BTCUSD?from=homepage&debug=1";\n'
+                    'const tradeDeRoute = "/de-DE/trade/BTCUSD?lang=de";\n'
                     "/* padding keeps unrelated method hints outside the literal analysis window. */\n"
                     + ("x" * 200)
                     + "\n"
@@ -25015,10 +25087,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_target_info_sample.get("health_source") == "blackbox-burp-history"
         and blackbox_asset_map_sample.get("status") == "candidates-found"
         and ("UNKNOWN", "blackbox.test", "/trade/BTCUSD?debug=&from=") in blackbox_asset_candidates
+        and ("UNKNOWN", "blackbox.test", "/de-DE/trade/BTCUSD?lang=") in blackbox_asset_candidates
         and ("POST", "blackbox.test", "/api/orders?market=&token=") in blackbox_asset_candidates
         and ("WS", "quote.blackbox.test", "/ws/v1/quotes?symbol=") in blackbox_asset_candidates
         and ("GET", "blackbox.test", "/api/v1/markets") in blackbox_asset_candidates
         and blackbox_asset_triage[("UNKNOWN", "blackbox.test", "/trade/BTCUSD?debug=&from=")].get("class") == "passive-page-route-review"
+        and blackbox_asset_triage[("UNKNOWN", "blackbox.test", "/de-DE/trade/BTCUSD?lang=")].get("class") == "passive-page-route-review"
         and blackbox_asset_triage[("POST", "blackbox.test", "/api/orders?market=&token=")].get("class") == "state-changing-api-review"
         and blackbox_asset_triage[("POST", "blackbox.test", "/api/orders?market=&token=")].get("risk") == "high"
         and blackbox_asset_triage[("WS", "quote.blackbox.test", "/ws/v1/quotes?symbol=")].get("class") == "websocket-handshake-review"
@@ -25029,8 +25103,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_asset_profile_summary_sample.get("skipped", {}).get("other_host") == 1
         and blackbox_asset_profile_summary_sample.get("skipped", {}).get("non_http") == 0
         and blackbox_asset_profile_summary_sample.get("skipped", {}).get("triage_class") == 2
+        and blackbox_asset_profile_summary_sample.get("skipped", {}).get("route_family_duplicate") == 1
         and blackbox_asset_profile_paths == {"/trade/BTCUSD"}
-        and blackbox_asset_profile_query_keys == {"debug", "from"}
+        and blackbox_asset_profile_query_keys == {"debug", "from", "lang"}
+        and blackbox_asset_profile_summary_sample.get("route_families", [{}])[0].get("representative_path") == "/trade/BTCUSD"
+        and set(blackbox_asset_profile_summary_sample.get("route_families", [{}])[0].get("variants", []))
+        == {"/de-DE/trade/BTCUSD", "/trade/BTCUSD"}
         and blackbox_asset_observed_selection_sample.get("selected_cluster_ids") == []
         and "asset-candidate profile" in str(blackbox_asset_observed_notice_sample)
         and "/api/orders" not in blackbox_asset_profile_text_sample
@@ -29110,6 +29188,7 @@ def run_blackbox_asset_profile(args: argparse.Namespace) -> int:
         target=target,
         allowed_classes=allowed_classes,
         max_endpoints=max_endpoints,
+        collapse_route_variants=not args.include_route_variants,
     )
 
     output_path = Path(args.output).resolve() if args.output else artifact_dir / BLACKBOX_ASSET_PROFILE_ARTIFACT
@@ -30140,6 +30219,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Triage class eligible for promotion. Repeat as needed. "
             "Defaults to passive-page-route-review only."
         ),
+    )
+    blackbox_asset_profile.add_argument(
+        "--include-route-variants",
+        action="store_true",
+        help="Keep every locale/path route variant instead of promoting one representative per route family.",
     )
     blackbox_asset_profile.add_argument(
         "--force",

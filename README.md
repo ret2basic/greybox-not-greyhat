@@ -152,6 +152,10 @@ it promotes only `passive-page-route-review` candidates, strips query values,
 keeps query parameter names, and leaves API, WebSocket, sensitive, and
 state-changing candidates in the review queue. Use `--allow-triage-class` only
 after a candidate class has a safe, read-only reproduction plan.
+Locale-style route variants such as `/de-DE/trade/BTCUSD` and
+`/en-US/trade/BTCUSD` are collapsed to one representative route family by
+default to keep low-resource probe plans small; pass `--include-route-variants`
+only when scope and runner capacity justify probing every variant.
 
 Preview the promoted route probes without sending them:
 
