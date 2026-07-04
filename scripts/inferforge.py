@@ -100,6 +100,7 @@ HOST_TAKEOVER_BASELINE_ARTIFACT = "host-takeover-baseline.json"
 RESOURCE_SNAPSHOT_ARTIFACT = "resource-snapshot.json"
 SCOPE_POLICY_ARTIFACT = "scope-policy.json"
 WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT = "websocket-candidate-review.json"
+LEAD_PORTFOLIO_ARTIFACT = "lead-portfolio.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -178,6 +179,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     "burp-transaction-candidates.json",
     "collection-summary.json",
     "environment-readiness.json",
+    LEAD_PORTFOLIO_ARTIFACT,
     "artifact-health.json",
     "regression-suite.json",
     "orca-baseline.json",
@@ -6972,6 +6974,254 @@ def build_websocket_candidate_review(
         "safety": (
             "WebSocket candidate review only. Handshake baselines, when requested, perform one HTTP Upgrade "
             "attempt per in-scope candidate and send no WebSocket frames, subscriptions, wallet payloads, or trade messages."
+        ),
+    }
+
+
+def lead_priority_from_values(*values: Any) -> str:
+    order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    best = "info"
+    best_rank = order[best]
+    for value in values:
+        text = str(value or "").lower()
+        if text in order and order[text] < best_rank:
+            best = text
+            best_rank = order[text]
+    return best
+
+
+def lead_status_from_scope(scope_decision: str, *, default: str = "needs-review") -> str:
+    if scope_decision == "out-of-scope-by-default":
+        return "out-of-scope-by-default"
+    if scope_decision in {"", "missing-policy-decision", "needs-scope-review"}:
+        return "needs-scope-review"
+    return default
+
+
+def build_lead_portfolio(
+    *,
+    target: str,
+    asset_candidates_doc: dict[str, Any] | None,
+    scope_policy: dict[str, Any] | None,
+    asset_profile: dict[str, Any] | None = None,
+    websocket_candidate_review: dict[str, Any] | None = None,
+    host_takeover_baseline: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    doc = asset_candidates_doc if isinstance(asset_candidates_doc, dict) else {}
+    scope_decisions = scope_policy_decision_map(scope_policy)
+    promoted_candidate_ids = {
+        str(candidate_id)
+        for cluster in (asset_profile or {}).get("clusters", []) or []
+        if isinstance(cluster, dict)
+        for candidate_id in (cluster.get("discovery", {}) or {}).get("source_candidate_ids", []) or []
+    }
+    ws_review_by_id = {
+        str(item.get("id") or ""): item
+        for item in (websocket_candidate_review or {}).get("candidates", []) or []
+        if isinstance(item, dict)
+    }
+    takeover_by_host = {
+        normalize_scope_host(item.get("host")): item
+        for item in (host_takeover_baseline or {}).get("hosts", []) or []
+        if isinstance(item, dict) and normalize_scope_host(item.get("host"))
+    }
+    leads: list[dict[str, Any]] = []
+
+    def add_lead(lead: dict[str, Any]) -> None:
+        lead["id"] = str(lead.get("id") or f"lead-{len(leads) + 1}")
+        lead["evidence_refs"] = compact_source_refs(lead.get("evidence_refs", []) or [])
+        lead["safety"] = str(
+            lead.get("safety")
+            or "Lead portfolio is passive artifact triage only. Do not report or probe without explicit evidence and scope."
+        )
+        leads.append(lead)
+
+    for candidate in doc.get("candidates", []) or []:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get("id") or safe_probe_id(f"{candidate.get('host')}-{candidate.get('path')}"))
+        host = normalize_scope_host(candidate.get("host"))
+        triage = candidate.get("triage") if isinstance(candidate.get("triage"), dict) else {}
+        triage_class = str(triage.get("class") or "unclassified")
+        scope_decision = scope_decisions.get(host) or "missing-policy-decision"
+        if candidate_id in promoted_candidate_ids:
+            status = "promoted-to-asset-profile"
+            next_step = "Use generated asset-profile probes and Burp observation evidence; keep reportability gated on concrete impact."
+        elif triage_class == "websocket-handshake-review":
+            ws_review = ws_review_by_id.get(candidate_id, {})
+            decision = str(ws_review.get("decision") or "")
+            if isinstance(ws_review.get("baseline"), dict):
+                status = "websocket-baseline-complete"
+                next_step = "Treat handshake result as coverage only; do not send frames without a reviewed message-level plan."
+            elif decision == "handshake-baseline-ready":
+                status = "ready-for-handshake-baseline"
+                next_step = "Run at most one handshake-only baseline if scope and resource budget remain acceptable."
+            else:
+                status = lead_status_from_scope(scope_decision, default="manual-websocket-review")
+                next_step = "Confirm scope and message semantics before any WebSocket handshake or frame."
+        elif triage_class == "passive-page-route-review":
+            status = lead_status_from_scope(scope_decision, default="ready-for-reviewed-asset-profile")
+            next_step = "Promote only reviewed low-risk page routes into an asset profile; prefer HEAD observations."
+        else:
+            status = lead_status_from_scope(scope_decision, default="manual-review")
+            next_step = "Review authentication, mutation risk, and reportability gate before any request."
+        add_lead(
+            {
+                "id": f"asset-candidate:{candidate_id}",
+                "type": "asset-candidate",
+                "status": status,
+                "priority": lead_priority_from_values(triage.get("priority"), triage.get("risk")),
+                "host": host,
+                "path": candidate.get("path"),
+                "method_hint": candidate.get("method_hint"),
+                "scope_decision": scope_decision,
+                "triage_class": triage_class,
+                "risk": triage.get("risk"),
+                "reportability_gate": triage.get("reportability_gate") or "Lead only until concrete in-scope impact is demonstrated.",
+                "next_step": next_step,
+                "evidence_refs": [BLACKBOX_ASSET_CANDIDATES_ARTIFACT, SCOPE_POLICY_ARTIFACT],
+                "safety": "Static asset candidate triage only. Candidate endpoints are not requested by lead-portfolio.",
+            }
+        )
+
+    config_hosts = doc.get("config_hosts", {}) if isinstance(doc.get("config_hosts"), dict) else {}
+    for item in config_hosts.get("hosts", []) or []:
+        if not isinstance(item, dict):
+            continue
+        host = normalize_scope_host(item.get("host"))
+        triage = item.get("triage") if isinstance(item.get("triage"), dict) else {}
+        scope_decision = scope_decisions.get(host) or "missing-policy-decision"
+        triage_class = str(triage.get("class") or "")
+        status = lead_status_from_scope(scope_decision, default="runtime-host-review")
+        if scope_decision == "in-scope-explicit-host" and triage_class == "explicitly-allowed-runtime-host":
+            status = "scope-covered-reference"
+        add_lead(
+            {
+                "id": f"runtime-host:{host}",
+                "type": "runtime-config-host",
+                "status": status,
+                "priority": lead_priority_from_values(triage.get("priority")),
+                "host": host,
+                "scope_decision": scope_decision,
+                "roles": item.get("roles", {}),
+                "schemes": item.get("schemes", {}),
+                "triage_class": triage_class,
+                "impact_hypotheses": triage.get("impact_hypotheses", []),
+                "reportability_gate": triage.get("reportability_gate") or "A configuration reference is not reportable without a concrete PoC.",
+                "next_step": (
+                    "Do not request this host from automation unless scope changes."
+                    if scope_decision == "out-of-scope-by-default"
+                    else (
+                        "No action from the configuration reference alone; use host-specific runs for concrete evidence."
+                        if status == "scope-covered-reference"
+                        else "Confirm scope and concrete user, funds, order, sensitive-data, or takeover impact before probing."
+                    )
+                ),
+                "sample_paths": item.get("samples", [])[:2],
+                "evidence_refs": [BLACKBOX_ASSET_CANDIDATES_ARTIFACT, SCOPE_POLICY_ARTIFACT],
+                "safety": "Runtime host mapping is passive. lead-portfolio does not request referenced hosts.",
+            }
+        )
+
+    external_scripts = doc.get("external_scripts", {}) if isinstance(doc.get("external_scripts"), dict) else {}
+    for host, count in (external_scripts.get("host_counts", {}) or {}).items():
+        normalized_host = normalize_scope_host(host)
+        scope_decision = scope_decisions.get(normalized_host) or "missing-policy-decision"
+        add_lead(
+            {
+                "id": f"external-script-host:{normalized_host}",
+                "type": "external-script-host",
+                "status": lead_status_from_scope(scope_decision, default="external-script-review"),
+                "priority": "low",
+                "host": normalized_host,
+                "scope_decision": scope_decision,
+                "script_url_count": int(count or 0),
+                "reportability_gate": "External script reference is not reportable without confirmed scope and persistent target-app content impact.",
+                "next_step": (
+                    "Do not fetch this host from automation unless explicit scope changes."
+                    if scope_decision == "out-of-scope-by-default"
+                    else "Confirm whether the script host is an in-scope static asset source before fetching."
+                ),
+                "evidence_refs": [BLACKBOX_ASSET_CANDIDATES_ARTIFACT, SCOPE_POLICY_ARTIFACT],
+                "safety": "External script host lead only. lead-portfolio does not fetch external scripts.",
+            }
+        )
+
+    for host, item in takeover_by_host.items():
+        status = str(item.get("status") or "unknown")
+        add_lead(
+            {
+                "id": f"takeover-baseline:{host}",
+                "type": "host-takeover-baseline",
+                "status": status,
+                "priority": "high" if status != "no-takeover-signal" else "info",
+                "host": host,
+                "scope_decision": scope_decisions.get(host) or "missing-policy-decision",
+                "provider_hints": item.get("provider_hints", []),
+                "fingerprints": item.get("fingerprints", []),
+                "reportability_gate": "Report only with a confirmed takeover signal on an in-scope host.",
+                "next_step": "No action if no takeover signal; review provider hints only when fingerprints indicate dangling resources.",
+                "evidence_refs": [HOST_TAKEOVER_BASELINE_ARTIFACT, SCOPE_POLICY_ARTIFACT],
+                "safety": "Host takeover baseline evidence only. Do not claim or modify third-party resources.",
+            }
+        )
+
+    terminal_statuses = {
+        "out-of-scope-by-default",
+        "no-takeover-signal",
+        "promoted-to-asset-profile",
+        "scope-covered-reference",
+        "websocket-baseline-complete",
+    }
+    priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    leads.sort(
+        key=lambda item: (
+            1 if str(item.get("status") or "") in terminal_statuses else 0,
+            0 if str(item.get("scope_decision") or "") == "in-scope-explicit-host" else 1,
+            priority_order.get(str(item.get("priority") or "info"), 9),
+            str(item.get("status") or ""),
+            str(item.get("type") or ""),
+            str(item.get("host") or ""),
+            str(item.get("path") or ""),
+        )
+    )
+    status_counts: dict[str, int] = {}
+    priority_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
+    scope_counts: dict[str, int] = {}
+    actionable_count = 0
+    for lead in leads:
+        status = str(lead.get("status") or "unknown")
+        increment_count(status_counts, status)
+        increment_count(priority_counts, str(lead.get("priority") or "info"))
+        increment_count(type_counts, str(lead.get("type") or "unknown"))
+        increment_count(scope_counts, str(lead.get("scope_decision") or "missing-policy-decision"))
+        if status not in terminal_statuses:
+            actionable_count += 1
+
+    return {
+        "generated_at": utc_now(),
+        "status": "has-actionable-leads" if actionable_count else ("leads-indexed" if leads else "no-leads"),
+        "target": target,
+        "summary": {
+            "leads": len(leads),
+            "actionable_leads": actionable_count,
+            "status_counts": dict(sorted(status_counts.items())),
+            "priority_counts": dict(sorted(priority_counts.items())),
+            "type_counts": dict(sorted(type_counts.items())),
+            "scope_decision_counts": dict(sorted(scope_counts.items())),
+        },
+        "leads": leads,
+        "artifact_refs": {
+            "asset_candidates": BLACKBOX_ASSET_CANDIDATES_ARTIFACT,
+            "scope_policy": SCOPE_POLICY_ARTIFACT,
+            "asset_profile": BLACKBOX_ASSET_PROFILE_ARTIFACT,
+            "websocket_candidate_review": WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT,
+            "host_takeover_baseline": HOST_TAKEOVER_BASELINE_ARTIFACT,
+        },
+        "safety": (
+            "Lead portfolio is passive triage over existing local artifacts. It sends no requests, "
+            "does not prove impact, and must not be treated as a reportable finding without a concrete PoC."
         ),
     }
 
@@ -26827,6 +27077,38 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         target="https://blackbox.test",
         allowed_classes={"passive-page-route-review"},
     )
+    blackbox_scope_policy_sample = build_scope_policy(
+        target="https://blackbox.test",
+        allowed_hosts={"blackbox.test", "quote.blackbox.test"},
+        asset_candidates_doc=blackbox_asset_map_sample,
+        deny_unlisted_hosts=True,
+        source_label="self-test-scope",
+    )
+    blackbox_ws_review_sample = build_websocket_candidate_review(
+        target="https://blackbox.test",
+        asset_candidates_doc=blackbox_asset_map_sample,
+        scope_policy=blackbox_scope_policy_sample,
+    )
+    blackbox_takeover_baseline_sample = {
+        "status": "complete",
+        "hosts": [
+            {
+                "host": "blackbox.test",
+                "status": "no-takeover-signal",
+                "provider_hints": [],
+                "fingerprints": [],
+            }
+        ],
+    }
+    blackbox_lead_portfolio_sample = build_lead_portfolio(
+        target="https://blackbox.test",
+        asset_candidates_doc=blackbox_asset_map_sample,
+        scope_policy=blackbox_scope_policy_sample,
+        asset_profile=blackbox_asset_profile_sample,
+        websocket_candidate_review=blackbox_ws_review_sample,
+        host_takeover_baseline=blackbox_takeover_baseline_sample,
+    )
+    blackbox_lead_portfolio_text_sample = json.dumps(blackbox_lead_portfolio_sample, sort_keys=True)
     blackbox_asset_profile_paths = {
         cluster.get("path")
         for cluster in blackbox_asset_profile_sample.get("clusters", [])
@@ -26975,6 +27257,15 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_asset_profile_summary_sample.get("route_families", [{}])[0].get("representative_path") == "/trade/BTCUSD"
         and set(blackbox_asset_profile_summary_sample.get("route_families", [{}])[0].get("variants", []))
         == {"/de-DE/trade/BTCUSD", "/trade/BTCUSD"}
+        and blackbox_lead_portfolio_sample.get("status") == "has-actionable-leads"
+        and blackbox_lead_portfolio_sample.get("summary", {}).get("type_counts", {}).get("asset-candidate") == 5
+        and blackbox_lead_portfolio_sample.get("summary", {}).get("type_counts", {}).get("runtime-config-host") == 3
+        and blackbox_lead_portfolio_sample.get("summary", {}).get("type_counts", {}).get("external-script-host") == 1
+        and blackbox_lead_portfolio_sample.get("summary", {}).get("type_counts", {}).get("host-takeover-baseline") == 1
+        and blackbox_lead_portfolio_sample.get("summary", {}).get("status_counts", {}).get("ready-for-handshake-baseline") == 1
+        and blackbox_lead_portfolio_sample.get("summary", {}).get("scope_decision_counts", {}).get("out-of-scope-by-default") == 3
+        and "top-secret" not in blackbox_lead_portfolio_text_sample
+        and "AbC1234567890Token" not in blackbox_lead_portfolio_text_sample
         and blackbox_asset_clusters_sample.get("profile", {}).get("asset_candidate_profile") is True
         and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_verification_command_text
         and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_asset_verification_command_text
@@ -31781,6 +32072,61 @@ def run_websocket_candidate_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_lead_portfolio(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    if not args.no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    portfolio = build_lead_portfolio(
+        target=target,
+        asset_candidates_doc=load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT),
+        scope_policy=load_optional_json(artifact_dir / SCOPE_POLICY_ARTIFACT),
+        asset_profile=load_optional_json(artifact_dir / BLACKBOX_ASSET_PROFILE_ARTIFACT),
+        websocket_candidate_review=load_optional_json(artifact_dir / WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT),
+        host_takeover_baseline=load_optional_json(artifact_dir / HOST_TAKEOVER_BASELINE_ARTIFACT),
+    )
+    output_path = artifact_dir / LEAD_PORTFOLIO_ARTIFACT
+    if not args.no_write:
+        write_json(output_path, portfolio)
+    summary = portfolio.get("summary", {}) or {}
+    print(f"Lead portfolio: {portfolio['status']}")
+    print(
+        "Leads: "
+        f"{summary.get('leads', 0)} total, "
+        f"actionable={summary.get('actionable_leads', 0)}, "
+        f"types={json.dumps(summary.get('type_counts', {}), sort_keys=True)}"
+    )
+    print(f"Statuses: {json.dumps(summary.get('status_counts', {}), sort_keys=True)}")
+    print(f"Scope decisions: {json.dumps(summary.get('scope_decision_counts', {}), sort_keys=True)}")
+    top_count = max(0, int(args.top))
+    if top_count:
+        print("Top leads:")
+        for lead in portfolio.get("leads", [])[:top_count]:
+            print(
+                f"- {lead.get('priority')} {lead.get('type')} {lead.get('status')} "
+                f"host={lead.get('host')} path={lead.get('path') or '-'} "
+                f"scope={lead.get('scope_decision')}"
+            )
+    if args.no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="lead-portfolio",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    output_path,
+                ],
+            )
+        )
+    if args.strict and portfolio["status"] == "has-actionable-leads":
+        return 1
+    return 0
+
+
 def run_decode_transactions(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -33166,6 +33512,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless review is complete or baselines are complete.",
     )
     websocket_candidate_review.set_defaults(func=run_websocket_candidate_review)
+
+    lead_portfolio = sub.add_parser(
+        "lead-portfolio",
+        help="Build a passive prioritized portfolio from black-box asset, scope, WebSocket, and takeover leads",
+    )
+    lead_portfolio.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of top leads to print in the CLI summary.",
+    )
+    lead_portfolio.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print lead summary only; do not write lead-portfolio.json or refresh manifests.",
+    )
+    lead_portfolio.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero when actionable leads remain.",
+    )
+    lead_portfolio.set_defaults(func=run_lead_portfolio)
 
     decode = sub.add_parser(
         "decode-transactions",

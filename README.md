@@ -227,6 +227,25 @@ queues use this artifact to avoid turning passive runtime config or external
 script references into manual blockers when the explicit scope already excludes
 them.
 
+Use `lead-portfolio` to turn the passive black-box leads into one prioritized
+local artifact before deciding what to validate next:
+
+```bash
+python3 scripts/inferforge.py --target https://in-scope.example \
+  --artifact-dir .greybox/in-scope-example \
+  lead-portfolio
+python3 scripts/inferforge.py --target https://in-scope.example \
+  --artifact-dir .greybox/in-scope-example \
+  lead-portfolio --no-write
+```
+
+`lead-portfolio` reads existing local artifacts only. It combines static asset
+endpoint candidates, WebSocket handshake candidates, runtime configuration
+hosts, external script hosts, scope-policy decisions, generated asset profiles,
+handshake review results, and takeover baselines. The output is a triage queue,
+not evidence of impact: every entry keeps a reportability gate and a safe next
+step, and no endpoint, host, or script is requested by this command.
+
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:
 
