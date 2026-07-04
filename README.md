@@ -303,6 +303,24 @@ review deployment proxy header trust, external rate-limit store configuration,
 and bounded key/TTL evidence. Do not validate it with rate-limit stress, flood,
 or DoS testing.
 
+Use `deployment-review` to collect that deployment/resource-control context
+without traffic:
+
+```bash
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  deployment-review --no-write --top 8
+```
+
+It scans only allowlisted local config/deployment files such as `.env.template`,
+Dockerfile, docker-compose files, `vercel.json`, root README, and Helm chart
+YAML under `helm/`. If `.env.local` or `.env` exists, it records key names only:
+values and file hashes are not written to the artifact. The output
+`.greybox/deployment-resource-review.json` summarizes external rate-limit store
+configuration, proxy/header trust evidence, key/TTL bounds, fallback monitoring,
+and deployment env injection. Missing categories remain operator-evidence
+requirements; this artifact is triage, not a reportable resource-exhaustion
+finding.
+
 Use `rewrite-review` for the dedicated fixed-upstream rewrite/proxy review:
 
 ```bash

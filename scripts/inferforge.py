@@ -83,6 +83,7 @@ DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_BURP_HISTORY_INPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_BURP_SYNC_COUNT = 50
 DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES = 512 * 1024
+DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES = 256 * 1024
 DEFAULT_RESOURCE_WARN_AVAILABLE_MIB = 2048
 DEFAULT_RESOURCE_WARN_SWAP_USED_MIB = 1024
 DEFAULT_RESOURCE_WATCH_PORTS = [3100, 2455]
@@ -114,6 +115,7 @@ HYPOTHESIS_MATRIX_ARTIFACT = "hypothesis-matrix.json"
 VALIDATION_PLAN_ARTIFACT = "validation-plan.json"
 ITERATION_DECISION_ARTIFACT = "iteration-decision.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
+DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT = "deployment-resource-review.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -198,6 +200,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     VALIDATION_PLAN_ARTIFACT,
     ITERATION_DECISION_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
+    DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     "artifact-health.json",
     "regression-suite.json",
     "orca-baseline.json",
@@ -223,6 +226,7 @@ REPORT_FRESHNESS_INPUTS = [
     DISCOVERY_COVERAGE_ARTIFACT,
     "response-delta-analysis.json",
     "source-peek-requests.json",
+    DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     "evidence-chain.json",
     "evidence-appendix.json",
     "adjudication.json",
@@ -284,6 +288,7 @@ INDEX_ARTIFACT_ORDER = [
     RESOURCE_SNAPSHOT_ARTIFACT,
     SCOPE_POLICY_ARTIFACT,
     WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT,
+    DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     "response-delta-analysis.json",
     "warmup-results.json",
     "traffic-index.json",
@@ -9395,6 +9400,8 @@ def validation_allowed_commands(
         ),
         command("verification-queue --no-write"),
     ]
+    if hypothesis.get("type") == "resource-abuse-review" or hypothesis.get("impact") == "resource-exhaustion":
+        allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
     allowed_after_gate_commands = [
         command("resource-snapshot --max-processes 8 --watch-port 3100 --watch-port 2455 --no-write --strict")
     ]
@@ -14853,6 +14860,337 @@ def build_rate_limit_resource_review(
     }
 
 
+def deployment_review_candidate_paths(source_root: Path, *, include_local_env_keys: bool = True) -> list[Path]:
+    candidates: list[Path] = []
+    for rel in [
+        ".env.template",
+        ".env.example",
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "vercel.json",
+        "README.md",
+    ]:
+        path = source_root / rel
+        if path.exists() and path.is_file():
+            candidates.append(path)
+
+    if include_local_env_keys:
+        for rel in [".env.local", ".env"]:
+            path = source_root / rel
+            if path.exists() and path.is_file():
+                candidates.append(path)
+
+    helm_root = source_root / "helm"
+    if helm_root.is_dir():
+        for path in sorted(helm_root.rglob("*.yaml")):
+            if not path.is_file() or "node_modules" in path.parts:
+                continue
+            if path.name in {"values.yaml", "deployment.yaml", "ingress.yaml", "service.yaml"}:
+                candidates.append(path)
+            elif "templates" in path.parts:
+                candidates.append(path)
+    seen: set[str] = set()
+    unique = []
+    for path in candidates:
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def env_keys_from_text(text: str) -> list[str]:
+    keys = []
+    for line in text.splitlines():
+        match = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        if match:
+            keys.append(match.group(1))
+    return sorted(set(keys))
+
+
+def redact_deployment_line(line: str) -> str:
+    env_match = re.match(r"(\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=).*$", line)
+    if env_match:
+        return f"{env_match.group(1)}[redacted]"
+    value_match = re.match(r"(\s*(?:value|secretKey|secretName|key|token|password)\s*:\s*).+$", line, re.I)
+    if value_match:
+        return f"{value_match.group(1)}[redacted]"
+    return redact_text(line.strip(), max_chars=220) or ""
+
+
+def deployment_review_match_categories() -> dict[str, list[str]]:
+    return {
+        "external_rate_limit_store": [
+            "UPSTASH_REDIS_REST_URL",
+            "UPSTASH_REDIS_REST_TOKEN",
+            "KV_REST_API_URL",
+            "KV_REST_API_TOKEN",
+            "REDIS_URL",
+            "RATE_LIMIT_REDIS",
+        ],
+        "proxy_header_trust": [
+            "x-forwarded-for",
+            "cf-connecting-ip",
+            "x-real-ip",
+            "forwarded",
+            "proxy-real-ip-cidr",
+            "use-forwarded-headers",
+            "externalTrafficPolicy",
+            "trust proxy",
+            "cloudflare",
+        ],
+        "rate_limit_bounds": [
+            "BURST_LIMIT",
+            "SUSTAINED_LIMIT",
+            "RATE_LIMIT",
+            "WINDOW",
+            "TTL",
+            "MAX_REQUEST",
+            "MAX_CONNECTION",
+        ],
+        "fallback_monitoring": [
+            "fallback",
+            "alert",
+            "monitor",
+            "metrics",
+            "prometheus",
+            "livenessProbe",
+            "readinessProbe",
+        ],
+        "deployment_env_injection": [
+            "env:",
+            ".Values.env",
+            "secretKeyRef",
+            "ConfigMap",
+            "Secret",
+            "RUN rm -f .env",
+            "ingress:",
+            "annotations:",
+        ],
+    }
+
+
+def build_deployment_resource_review(
+    source_root: Path,
+    profile: dict[str, Any] | None = None,
+    *,
+    max_file_bytes: int = DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES,
+    max_files: int = 32,
+) -> dict[str, Any]:
+    files = []
+    category_matches: dict[str, list[dict[str, Any]]] = {
+        category: [] for category in deployment_review_match_categories()
+    }
+    env_key_index: dict[str, list[str]] = {}
+    skipped = []
+    categories = deployment_review_match_categories()
+
+    for path in deployment_review_candidate_paths(source_root)[: max(1, max_files)]:
+        rel = source_root_relative_or_repo(path, source_root)
+        local_env_keys_only = path.name in {".env.local", ".env"}
+        try:
+            stat = path.stat()
+        except OSError as error:
+            skipped.append({"file": rel, "reason": "stat-failed", "error": redacted_error_summary(error)})
+            continue
+        if stat.st_size > max_file_bytes:
+            skipped.append(
+                {
+                    "file": rel,
+                    "reason": "file-too-large",
+                    "bytes": stat.st_size,
+                    "max_file_bytes": max_file_bytes,
+                }
+            )
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            skipped.append({"file": rel, "reason": "read-failed", "error": redacted_error_summary(error)})
+            continue
+
+        env_keys = env_keys_from_text(text)
+        for key in env_keys:
+            env_key_index.setdefault(key, []).append(rel)
+
+        file_matches = []
+        if not local_env_keys_only:
+            lowered_lines = [(index, line, line.lower()) for index, line in enumerate(text.splitlines(), start=1)]
+            for category, tokens in categories.items():
+                for line_no, line, lowered in lowered_lines:
+                    for token in tokens:
+                        if token.lower() not in lowered:
+                            continue
+                        match = {
+                            "category": category,
+                            "token": token,
+                            "file": rel,
+                            "line": line_no,
+                            "excerpt": redact_deployment_line(line),
+                        }
+                        file_matches.append(match)
+                        if len(category_matches[category]) < 12:
+                            category_matches[category].append(match)
+                        break
+
+        files.append(
+            {
+                "file": rel,
+                "mode": "env-keys-only" if local_env_keys_only else "bounded-redacted-scan",
+                "bytes": stat.st_size,
+                "sha256": None if local_env_keys_only else hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest(),
+                "env_keys": env_keys[:80],
+                "env_value_redaction": "values-not-written-to-artifact" if local_env_keys_only else "env-assignment-values-redacted",
+                "match_count": len(file_matches),
+                "matches": file_matches[:20],
+            }
+        )
+
+    external_keys = {
+        "UPSTASH_REDIS_REST_URL",
+        "UPSTASH_REDIS_REST_TOKEN",
+        "KV_REST_API_URL",
+        "KV_REST_API_TOKEN",
+        "REDIS_URL",
+        "RATE_LIMIT_REDIS",
+    }
+    local_env_files = {
+        file["file"]
+        for file in files
+        if file.get("mode") == "env-keys-only"
+    }
+    external_key_sources = {
+        key: refs
+        for key, refs in env_key_index.items()
+        if key in external_keys
+    }
+    external_local_keys = {
+        key: [ref for ref in refs if ref in local_env_files]
+        for key, refs in external_key_sources.items()
+        if any(ref in local_env_files for ref in refs)
+    }
+    external_template_keys = {
+        key: [ref for ref in refs if ref not in local_env_files]
+        for key, refs in external_key_sources.items()
+        if any(ref not in local_env_files for ref in refs)
+    }
+
+    def category_status(category: str) -> str:
+        return "evidence-present" if category_matches.get(category) else "missing-evidence"
+
+    decisions = [
+        {
+            "id": "external-rate-limit-store-config",
+            "status": (
+                "present-local-key-only"
+                if external_local_keys
+                else "templated"
+                if external_template_keys
+                else "missing-evidence"
+            ),
+            "evidence": category_matches["external_rate_limit_store"][:8],
+            "env_keys": sorted(external_key_sources.keys()),
+            "local_env_key_only": sorted(external_local_keys.keys()),
+            "operator_evidence_needed": [
+                "Confirm the external store is configured in the production deployment, not only local/dev.",
+                "Confirm failover behavior, health checks, and alerts when the external store is unavailable.",
+            ],
+        },
+        {
+            "id": "proxy-header-trust-model",
+            "status": category_status("proxy_header_trust"),
+            "evidence": category_matches["proxy_header_trust"][:8],
+            "operator_evidence_needed": [
+                "Confirm whether x-forwarded-for, cf-connecting-ip, or x-real-ip is overwritten by a trusted edge.",
+                "Confirm ingress or platform settings that prevent clients from spoofing the selected IP key.",
+            ],
+        },
+        {
+            "id": "rate-limit-bounds",
+            "status": category_status("rate_limit_bounds"),
+            "evidence": category_matches["rate_limit_bounds"][:8],
+            "operator_evidence_needed": [
+                "Confirm burst/sustained limits, window length, TTL, and memory eviction behavior for rate-limit keys.",
+            ],
+        },
+        {
+            "id": "fallback-monitoring-alerts",
+            "status": category_status("fallback_monitoring"),
+            "evidence": category_matches["fallback_monitoring"][:8],
+            "operator_evidence_needed": [
+                "Confirm monitoring or alerting when memory fallback is used or external store operations fail.",
+            ],
+        },
+        {
+            "id": "deployment-env-injection",
+            "status": category_status("deployment_env_injection"),
+            "evidence": category_matches["deployment_env_injection"][:8],
+            "operator_evidence_needed": [
+                "Confirm the actual environment values deployed for the target service without exposing secrets.",
+            ],
+        },
+    ]
+    decision_status_counts: dict[str, int] = {}
+    for decision in decisions:
+        increment_count(decision_status_counts, str(decision.get("status") or "unknown"))
+    critical_missing = [
+        decision["id"]
+        for decision in decisions
+        if decision["id"] in {"external-rate-limit-store-config", "proxy-header-trust-model", "rate-limit-bounds"}
+        and decision.get("status") == "missing-evidence"
+    ]
+    if not files:
+        status = "no-deployment-files"
+    elif critical_missing:
+        status = "needs-operator-evidence"
+    elif any(decision.get("status") == "missing-evidence" for decision in decisions):
+        status = "partial-deployment-evidence"
+    else:
+        status = "deployment-evidence-indexed"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "profile": profile_summary(profile),
+        "source_root": repo_relative_or_absolute(source_root),
+        "summary": {
+            "files": len(files),
+            "skipped": len(skipped),
+            "decisions": len(decisions),
+            "decision_status_counts": dict(sorted(decision_status_counts.items())),
+            "critical_missing": critical_missing,
+            "category_match_counts": {
+                category: len(matches)
+                for category, matches in sorted(category_matches.items())
+            },
+        },
+        "resource_limits": {
+            "max_file_bytes": max_file_bytes,
+            "max_files": max_files,
+            "allowlisted_paths_only": True,
+        },
+        "files": files,
+        "skipped": skipped,
+        "decisions": decisions,
+        "operator_evidence_still_required": [
+            "Production external store configuration and health, with secret values redacted.",
+            "Production proxy/header trust model for client IP selection.",
+            "Rate-limit key TTL or eviction bounds for in-process memory fallback.",
+            "Monitoring or alerting for external store fallback and resource pressure.",
+        ],
+        "reportability_gate": (
+            "This artifact is deployment evidence triage only. It does not prove resource exhaustion or availability "
+            "impact and must not be validated with stress, flood, or DoS traffic."
+        ),
+        "safety": (
+            "Offline allowlisted deployment/config scan only. .env.local/.env values are not written, raw secrets are "
+            "redacted, no network requests are sent, and no target resource pressure is generated."
+        ),
+    }
+
+
 def build_remote_transaction_signing_review(
     *,
     frontend_transaction_refs: list[dict[str, Any]],
@@ -16121,6 +16459,7 @@ def build_evidence_gaps(
     quote_collection: dict[str, Any] | None = None,
     source_peeks: dict[str, Any] | None = None,
     profile: dict[str, Any] | None = None,
+    deployment_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     burp_cluster_ids = observed_cluster_ids(build_traffic_index([], burp_history), clusters)
     results_by_cluster: dict[str, list[dict[str, Any]]] = {}
@@ -16314,6 +16653,23 @@ def build_evidence_gaps(
         else {}
     )
     if rate_limit_review.get("status") == "needs-deployment-review":
+        deployment_review_summary = deployment_review.get("summary", {}) if isinstance(deployment_review, dict) else {}
+        deployment_decisions = deployment_review.get("decisions", []) if isinstance(deployment_review, dict) else []
+        deployment_decision_refs = [
+            {
+                "id": decision.get("id"),
+                "status": decision.get("status"),
+                "evidence_count": len(decision.get("evidence", []) or []),
+                "operator_evidence_needed": decision.get("operator_evidence_needed", [])[:3],
+            }
+            for decision in deployment_decisions
+            if isinstance(decision, dict)
+        ]
+        deployment_status = (
+            deployment_review.get("status")
+            if isinstance(deployment_review, dict) and deployment_review
+            else "not-run"
+        )
         source_refs = compact_source_refs(
             [
                 f"{ref.get('file')}:{ref.get('line')}"
@@ -16353,6 +16709,12 @@ def build_evidence_gaps(
                         if isinstance(signal, dict)
                     ],
                     "required_evidence": rate_limit_review.get("required_evidence", []),
+                    "deployment_review": {
+                        "artifact": DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
+                        "status": deployment_status,
+                        "summary": deployment_review_summary,
+                        "decisions": deployment_decision_refs,
+                    },
                 }
             ],
         )
@@ -24904,6 +25266,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("harness-loop", "run_harness_loop"),
         refresh_expectation("hypothesis-matrix", "run_hypothesis_matrix"),
         refresh_expectation("rewrite-review", "run_rewrite_review"),
+        refresh_expectation("deployment-review", "run_deployment_review"),
         refresh_expectation("validation-plan", "run_validation_plan"),
         refresh_expectation("iteration-decision", "run_iteration_decision"),
         refresh_expectation("collect", "run_collect"),
@@ -29429,6 +29792,8 @@ def run_audit(args: argparse.Namespace) -> int:
     write_json(artifact_dir / "transaction-decoder-selftest.json", transaction_decoder_selftest)
     rpc_method_policy = build_rpc_method_policy(source_root, results, profile=profile)
     write_json(artifact_dir / "rpc-method-policy.json", sanitize_artifact_samples(rpc_method_policy))
+    deployment_review = build_deployment_resource_review(source_root, profile)
+    write_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT, sanitize_artifact_samples(deployment_review))
     orca_baseline_path = artifact_dir / "orca-baseline.json"
     orca_baseline = json.loads(read_text(orca_baseline_path)) if orca_baseline_path.exists() else None
     quote_collection_path = artifact_dir / "quote-collection.json"
@@ -29468,6 +29833,7 @@ def run_audit(args: argparse.Namespace) -> int:
         quote_collection,
         source_peeks,
         profile=profile,
+        deployment_review=deployment_review,
     )
     write_json(artifact_dir / "evidence-gaps.json", evidence_gaps)
     burp_observation_run = load_optional_json(artifact_dir / "burp-observation-run.json")
@@ -34823,6 +35189,12 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
     )
     rpc_method_policy_path = artifact_dir / "rpc-method-policy.json"
     write_json(rpc_method_policy_path, sanitize_artifact_samples(rpc_method_policy))
+    deployment_review = load_optional_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT) or build_deployment_resource_review(
+        source_root,
+        profile,
+    )
+    deployment_review_path = artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT
+    write_json(deployment_review_path, sanitize_artifact_samples(deployment_review))
     orca_baseline = load_optional_json(artifact_dir / "orca-baseline.json")
     quote_collection = load_optional_json(artifact_dir / "quote-collection.json")
     evidence_gaps = build_evidence_gaps(
@@ -34835,6 +35207,7 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
         quote_collection,
         source_peeks,
         profile=profile,
+        deployment_review=deployment_review,
     )
     evidence_gaps_path = artifact_dir / "evidence-gaps.json"
     write_json(evidence_gaps_path, evidence_gaps)
@@ -34885,8 +35258,9 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
             output_paths=[
                 *target_profile_artifact_paths(artifact_dir),
                 traffic_index_path,
-                rpc_method_policy_path,
-                evidence_gaps_path,
+                    rpc_method_policy_path,
+                    deployment_review_path,
+                    evidence_gaps_path,
                 burp_observation_coverage_path,
                 blackbox_coverage_path,
                 source_peek_requests_path,
@@ -37494,6 +37868,65 @@ def run_rewrite_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_deployment_review(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    review = build_deployment_resource_review(
+        source_root,
+        profile,
+        max_file_bytes=args.max_file_bytes,
+        max_files=args.max_files,
+    )
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(review))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="deployment-review",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = review.get("summary", {}) or {}
+    print(f"Deployment review: {review['status']}")
+    print(
+        "Files: "
+        f"{summary.get('files', 0)} scanned, "
+        f"skipped={summary.get('skipped', 0)}, "
+        f"critical_missing={','.join(summary.get('critical_missing', []) or []) or 'none'}"
+    )
+    print(f"Decision statuses: {json.dumps(summary.get('decision_status_counts', {}), sort_keys=True)}")
+    top_count = max(0, int(args.top))
+    if top_count:
+        print("Decisions:")
+        for decision in (review.get("decisions", []) or [])[:top_count]:
+            print(
+                f"- {decision.get('status')} {decision.get('id')} "
+                f"evidence={len(decision.get('evidence', []) or [])}"
+            )
+            for evidence in (decision.get("evidence", []) or [])[:2]:
+                print(
+                    "  evidence="
+                    f"{evidence.get('file')}:{evidence.get('line')} "
+                    f"{inline_summary_text(evidence.get('token'), max_chars=80)}"
+                )
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if review["status"] == "no-deployment-files":
+        return 1
+    if args.strict and review["status"] != "deployment-evidence-indexed":
+        return 1
+    return 0
+
+
 def run_validation_plan(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -38124,6 +38557,11 @@ def run_collect_quote(args: argparse.Namespace) -> int:
         if rpc_policy_path.exists()
         else build_rpc_method_policy(source_root, results, profile=profile)
     )
+    deployment_review = load_optional_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT) or build_deployment_resource_review(
+        source_root,
+        profile,
+    )
+    write_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT, sanitize_artifact_samples(deployment_review))
     orca_baseline_path = artifact_dir / "orca-baseline.json"
     orca_baseline = json.loads(read_text(orca_baseline_path)) if orca_baseline_path.exists() else None
     source_peeks = load_optional_json(artifact_dir / "source-peek-results.json") or build_source_peeks(source_root, profile, [])
@@ -38137,6 +38575,7 @@ def run_collect_quote(args: argparse.Namespace) -> int:
         quote_collection,
         source_peeks,
         profile=profile,
+        deployment_review=deployment_review,
     )
     write_json(artifact_dir / "evidence-gaps.json", evidence_gaps)
     transaction_decoder_selftest = build_transaction_decoder_selftest(
@@ -38182,6 +38621,7 @@ def run_collect_quote(args: argparse.Namespace) -> int:
         artifact_dir / "transaction-intent-policy.json",
         artifact_dir / "quote-collection.json",
         artifact_dir / "transaction-intent.json",
+        artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
         artifact_dir / "evidence-gaps.json",
         artifact_dir / "transaction-decoder-selftest.json",
         artifact_dir / "burp-capabilities.json",
@@ -38254,6 +38694,11 @@ def run_collect_orca_baseline(args: argparse.Namespace) -> int:
         if rpc_policy_path.exists()
         else build_rpc_method_policy(source_root, results, profile=profile)
     )
+    deployment_review = load_optional_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT) or build_deployment_resource_review(
+        source_root,
+        profile,
+    )
+    write_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT, sanitize_artifact_samples(deployment_review))
     quote_collection_path = artifact_dir / "quote-collection.json"
     quote_collection = json.loads(read_text(quote_collection_path)) if quote_collection_path.exists() else None
     source_peeks = load_optional_json(artifact_dir / "source-peek-results.json") or build_source_peeks(source_root, profile, [])
@@ -38267,6 +38712,7 @@ def run_collect_orca_baseline(args: argparse.Namespace) -> int:
         quote_collection,
         source_peeks,
         profile=profile,
+        deployment_review=deployment_review,
     )
     write_json(artifact_dir / "evidence-gaps.json", evidence_gaps)
 
@@ -38285,6 +38731,7 @@ def run_collect_orca_baseline(args: argparse.Namespace) -> int:
             output_paths=[
                 *target_profile_artifact_paths(artifact_dir),
                 artifact_dir / "orca-baseline.json",
+                artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
                 artifact_dir / "evidence-gaps.json",
             ],
         )
@@ -39409,6 +39856,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless fixed-upstream rewrite/proxy review items are present.",
     )
     rewrite_review.set_defaults(func=run_rewrite_review)
+
+    deployment_review = sub.add_parser(
+        "deployment-review",
+        help="Review deployment resource-control evidence from allowlisted local config files",
+    )
+    deployment_review.add_argument(
+        "--output",
+        help=f"Where to write {DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT}. Defaults to --artifact-dir/{DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT}.",
+    )
+    deployment_review.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES,
+        help=f"Maximum bytes to read per allowlisted deployment file. Defaults to {DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES}.",
+    )
+    deployment_review.add_argument(
+        "--max-files",
+        type=positive_int,
+        default=32,
+        help="Maximum allowlisted deployment files to scan. Defaults to 32.",
+    )
+    deployment_review.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of decision rows to print.",
+    )
+    deployment_review.add_argument(
+        "--no-write",
+        action="store_true",
+        help=f"Print deployment review only; do not write {DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT} or refreshed manifests.",
+    )
+    deployment_review.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless all deployment evidence categories are indexed.",
+    )
+    deployment_review.set_defaults(func=run_deployment_review)
 
     validation_plan = sub.add_parser(
         "validation-plan",
