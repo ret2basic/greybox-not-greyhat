@@ -79,6 +79,7 @@ DEFAULT_QUOTE_RESPONSE_CANDIDATE_PATHS = [
 ]
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_BODY_SAMPLE_CHARS = 1200
+DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES = 4 * 1024 * 1024
 MAX_REQUEST_CONTEXTS_PER_ENDPOINT = 6
 REDACTED_VALUE = "[redacted]"
 GENERIC_HTTP_ROUTE_STRATEGY_SETS = {"nextjs-api-routes", "blackbox-http-observed"}
@@ -25902,6 +25903,23 @@ def ensure_burp_transaction_candidates_artifact(artifact_dir: Path) -> None:
     )
 
 
+def transaction_candidate_input_skip_reason(path: Path, max_input_bytes: int) -> str | None:
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        error_summary = redacted_error_summary(error)
+        return (
+            f"Skipped {path.name}: could not inspect input size "
+            f"({error_summary['type']} sha256={error_summary['message_sha256']})."
+        )
+    if size > max_input_bytes:
+        return (
+            f"Skipped {path.name}: input size {size} bytes exceeds "
+            f"max_transaction_candidate_input_bytes={max_input_bytes}."
+        )
+    return None
+
+
 def ensure_initial_audit_artifacts(artifact_dir: Path) -> None:
     history_path = artifact_dir / "burp-history-observations.jsonl"
     if not history_path.exists():
@@ -25947,11 +25965,15 @@ def collect_transaction_candidates(
     results: list[dict[str, Any]],
     extra_inputs: list[Path] | None = None,
     profile: dict[str, Any] | None = None,
+    *,
+    warnings: list[str] | None = None,
+    max_input_bytes: int = DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
     candidate_paths = quote_response_candidate_paths(profile)
     quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
+    candidate_warnings = warnings if warnings is not None else []
 
     for row in results:
         if row.get("category") != "quote" and row.get("path") != quote_path:
@@ -25978,21 +26000,42 @@ def collect_transaction_candidates(
     for path in sidecars:
         if not path.exists() or not path.is_file():
             continue
+        skip_reason = transaction_candidate_input_skip_reason(path, max_input_bytes)
+        if skip_reason:
+            candidate_warnings.append(skip_reason)
+            continue
         if path.suffix == ".jsonl":
-            for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-                if not line.strip():
-                    continue
-                extract_transaction_candidates_from_text(
-                    line,
-                    source=f"{path.name}:{index}",
-                    probe_id=None,
-                    candidates=candidates,
-                    seen=seen,
-                    candidate_paths=candidate_paths,
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    for index, line in enumerate(handle, start=1):
+                        if not line.strip():
+                            continue
+                        extract_transaction_candidates_from_text(
+                            line,
+                            source=f"{path.name}:{index}",
+                            probe_id=None,
+                            candidates=candidates,
+                            seen=seen,
+                            candidate_paths=candidate_paths,
+                        )
+            except OSError as error:
+                error_summary = redacted_error_summary(error)
+                candidate_warnings.append(
+                    f"Skipped {path.name}: could not read JSONL input "
+                    f"({error_summary['type']} sha256={error_summary['message_sha256']})."
                 )
         else:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as error:
+                error_summary = redacted_error_summary(error)
+                candidate_warnings.append(
+                    f"Skipped {path.name}: could not read input "
+                    f"({error_summary['type']} sha256={error_summary['message_sha256']})."
+                )
+                continue
             extract_transaction_candidates_from_text(
-                read_text(path),
+                text,
                 source=path.name,
                 probe_id=None,
                 candidates=candidates,
@@ -26499,8 +26542,17 @@ def build_transaction_intent(
     intent_wallet: str | None = None,
     intent_amount_in: str | None = None,
     intent_allowed_programs: list[str] | None = None,
+    max_input_bytes: int = DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
 ) -> dict[str, Any]:
-    candidates = collect_transaction_candidates(artifact_dir, results, extra_inputs, profile)
+    warnings: list[str] = []
+    candidates = collect_transaction_candidates(
+        artifact_dir,
+        results,
+        extra_inputs,
+        profile,
+        warnings=warnings,
+        max_input_bytes=max_input_bytes,
+    )
     summaries = [
         {key: value for key, value in candidate.items() if key != "base64"}
         for candidate in candidates
@@ -26508,12 +26560,12 @@ def build_transaction_intent(
 
     if candidates:
         decoded = node_decode_transactions(candidates, node, source_root)
-        warnings: list[str] = []
     else:
         decoded = {"decoder": {"mode": "none"}, "transactions": []}
-        warnings = [
-            "No transaction payload candidates found in quote probe responses, Burp-derived candidates, or transaction-payloads sidecars."
-        ]
+        warnings.insert(
+            0,
+            "No transaction payload candidates found in quote probe responses, Burp-derived candidates, or transaction-payloads sidecars.",
+        )
 
     transactions = decoded.get("transactions", [])
     decoded_count = sum(1 for item in transactions if item.get("decoded"))
@@ -26537,6 +26589,9 @@ def build_transaction_intent(
             "transaction-payloads.jsonl",
             "transaction-payloads.txt",
         ],
+        "resource_limits": {
+            "max_transaction_candidate_input_bytes": max_input_bytes,
+        },
         "candidates_seen": len(candidates),
         "decoded_transactions": decoded_count,
         "candidate_summaries": summaries,
@@ -26687,7 +26742,30 @@ def build_transaction_decoder_selftest(
     )
     policy_checks = build_transaction_intent_checks(transactions, policy)
     decoded_count = sum(1 for item in transactions if item.get("decoded"))
-    status = "passed" if decoded_count == 1 and policy_checks.get("status") == "passed" else "failed"
+    with tempfile.TemporaryDirectory() as temp_dir:
+        guard_artifact_dir = Path(temp_dir) / "transaction-sidecar-guard"
+        guard_artifact_dir.mkdir()
+        oversized_input = Path(temp_dir) / "oversized-transaction-payloads.txt"
+        oversized_input.write_text("A" * 64, encoding="utf-8")
+        sidecar_guard_intent = build_transaction_intent(
+            guard_artifact_dir,
+            [],
+            node,
+            source_root,
+            profile=profile,
+            extra_inputs=[oversized_input],
+            max_input_bytes=32,
+        )
+    sidecar_guard_passed = (
+        sidecar_guard_intent.get("candidates_seen") == 0
+        and sidecar_guard_intent.get("resource_limits", {}).get("max_transaction_candidate_input_bytes") == 32
+        and any("exceeds max_transaction_candidate_input_bytes=32" in item for item in sidecar_guard_intent.get("warnings", []))
+    )
+    status = (
+        "passed"
+        if decoded_count == 1 and policy_checks.get("status") == "passed" and sidecar_guard_passed
+        else "failed"
+    )
     return {
         "generated_at": utc_now(),
         "status": status,
@@ -26705,6 +26783,11 @@ def build_transaction_decoder_selftest(
         "decoded_transactions": decoded_count,
         "decoder": decoded.get("decoder", {}),
         "intent_policy_checks": policy_checks,
+        "sidecar_input_guard": {
+            "status": "passed" if sidecar_guard_passed else "failed",
+            "resource_limits": sidecar_guard_intent.get("resource_limits", {}),
+            "warnings": sidecar_guard_intent.get("warnings", []),
+        },
         "transactions": transactions,
         "note": "This self-test proves decoder mechanics only; it does not satisfy GAP-quote-transaction-corpus.",
     }
@@ -36032,6 +36115,7 @@ def run_decode_transactions(args: argparse.Namespace) -> int:
         intent_wallet=args.intent_wallet,
         intent_amount_in=args.intent_amount_in,
         intent_allowed_programs=args.intent_allowed_program or None,
+        max_input_bytes=args.max_input_bytes,
     )
     output_path = artifact_dir / "transaction-intent.json"
     write_json(output_path, transaction_intent)
@@ -37676,6 +37760,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--input",
         action="append",
         help="Additional JSON, JSONL, or text file containing base64 transaction payloads",
+    )
+    decode.add_argument(
+        "--max-input-bytes",
+        type=positive_int,
+        default=DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+        help=(
+            "Maximum bytes to read from each transaction candidate sidecar input. "
+            f"Defaults to {DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES}."
+        ),
     )
     add_intent_policy_args(decode)
     decode.set_defaults(func=run_decode_transactions)

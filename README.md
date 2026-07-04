@@ -794,7 +794,11 @@ base64 Solana transaction payloads, then uses the app's `@solana/web3.js`
 dependency to decode account keys, signer/writable flags, recent blockhash, and
 compiled instruction metadata. It can also compare decoded payloads against an
 expected swap intent. It never signs or submits transactions. Extra payload
-files can be supplied as JSON, JSONL, or text:
+files can be supplied as JSON, JSONL, or text. Each sidecar input is capped at
+4 MiB by default so large Burp exports or response dumps do not create a memory
+spike; skipped inputs are recorded in `transaction-intent.json.warnings`, and
+the cap can be changed with `--max-input-bytes` when the input is explicitly
+approved:
 
 When the active profile declares `quote_response.transaction_candidate_paths`,
 those simple JSON paths are applied before the generic recursive/base64 scan so
@@ -802,6 +806,7 @@ candidate summaries retain the provider-specific response location.
 
 ```bash
 python3 scripts/inferforge.py decode-transactions --input .greybox/transaction-payloads.jsonl
+python3 scripts/inferforge.py decode-transactions --input ./approved-payloads.jsonl --max-input-bytes 1048576
 ```
 
 Intent checks can be supplied on the command line:
