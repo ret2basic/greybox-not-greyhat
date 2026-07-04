@@ -5119,6 +5119,74 @@ def method_hint_near_literal(source: str, start: int, end: int) -> str | None:
     return None
 
 
+def triage_blackbox_asset_candidate(candidate: dict[str, Any], method_hint: str | None) -> dict[str, Any]:
+    method = "WS" if candidate.get("kind") == "websocket-candidate" else (method_hint or "UNKNOWN")
+    path = str(candidate.get("path_without_query") or candidate.get("path") or "/")
+    lower_path = path.lower()
+    api_like = lower_path.startswith(("/api", "/v1", "/v2", "/v3", "/graphql"))
+    state_tokens = {
+        "order",
+        "orders",
+        "trade",
+        "position",
+        "positions",
+        "account",
+        "wallet",
+        "withdraw",
+        "deposit",
+        "transfer",
+        "auth",
+        "login",
+        "session",
+    }
+    path_words = set(re.findall(r"[a-z0-9]+", lower_path))
+    sensitive_tokens = sorted(path_words & state_tokens)
+
+    if method == "WS":
+        return {
+            "class": "websocket-handshake-review",
+            "risk": "medium",
+            "active_probe_policy": "handshake-only-after-review",
+            "reason": "WebSocket candidate extracted from static assets; review scope and message semantics before sending frames.",
+            "safe_next_step": "If in scope, perform at most one handshake-only connection without subscriptions or messages.",
+        }
+
+    if method in {"POST", "PUT", "PATCH", "DELETE"}:
+        return {
+            "class": "state-changing-api-review",
+            "risk": "high",
+            "active_probe_policy": "manual-review-required",
+            "reason": f"Method hint `{method}` may mutate state or touch business operations.",
+            "safe_next_step": "Do not probe automatically; review auth, account, order, and transaction semantics first.",
+        }
+
+    if api_like and sensitive_tokens:
+        return {
+            "class": "sensitive-api-review",
+            "risk": "high",
+            "active_probe_policy": "manual-review-required",
+            "reason": f"API-like path contains sensitive token(s): {', '.join(sensitive_tokens)}.",
+            "safe_next_step": "Do not probe automatically; derive a read-only reproduction plan before any request.",
+        }
+
+    if api_like:
+        return {
+            "class": "api-read-candidate-review",
+            "risk": "medium",
+            "active_probe_policy": "head-or-get-after-review",
+            "reason": "API-like candidate without a state-changing method hint still needs scope and auth-context review.",
+            "safe_next_step": "Promote only if the endpoint is known read-only and in scope; prefer HEAD before GET.",
+        }
+
+    return {
+        "class": "passive-page-route-review",
+        "risk": "low",
+        "active_probe_policy": "head-or-get-after-review",
+        "reason": "Page-route-like candidate without API or mutation method hints.",
+        "safe_next_step": "After scope review, this can usually be promoted as a low-risk HEAD/GET page-route candidate.",
+    }
+
+
 def add_asset_candidate(
     candidates: dict[tuple[str, str, str], dict[str, Any]],
     *,
@@ -5131,6 +5199,7 @@ def add_asset_candidate(
 ) -> None:
     method = "WS" if candidate.get("kind") == "websocket-candidate" else (method_hint or "UNKNOWN")
     key = (method, str(candidate.get("host") or ""), str(candidate.get("path") or "/"))
+    triage = triage_blackbox_asset_candidate(candidate, method_hint)
     item = candidates.setdefault(
         key,
         {
@@ -5143,6 +5212,7 @@ def add_asset_candidate(
             "kind": candidate.get("kind"),
             "sources": [],
             "risk": "review-required",
+            "triage": triage,
             "review_note": "Static asset candidate only. Do not probe until scope, auth context, and business impact are reviewed.",
         },
     )
@@ -5320,6 +5390,12 @@ def build_blackbox_asset_map(
             }
         )
     candidates = merge_asset_candidates(candidate_lists)
+    triage_class_counts: dict[str, int] = {}
+    triage_risk_counts: dict[str, int] = {}
+    for candidate in candidates:
+        triage = candidate.get("triage", {}) if isinstance(candidate.get("triage"), dict) else {}
+        increment_count(triage_class_counts, str(triage.get("class") or "unknown"))
+        increment_count(triage_risk_counts, str(triage.get("risk") or candidate.get("risk") or "unknown"))
     page_headers = page_fetch.get("headers", {}) if isinstance(page_fetch, dict) and isinstance(page_fetch.get("headers"), dict) else {}
     return {
         "generated_at": utc_now(),
@@ -5345,6 +5421,8 @@ def build_blackbox_asset_map(
             "review_required": len(candidates),
             "candidate_limit": candidate_limit,
             "candidate_limit_reached": candidate_limit is not None and len(candidates) >= candidate_limit,
+            "triage_class_counts": triage_class_counts,
+            "triage_risk_counts": triage_risk_counts,
         },
         "candidates": candidates,
         "safety": [
@@ -14386,11 +14464,14 @@ def build_verification_queue(
                 "host": item.get("host"),
                 "path": item.get("path"),
                 "kind": item.get("kind"),
+                "triage_class": (item.get("triage", {}) or {}).get("class") if isinstance(item.get("triage"), dict) else None,
+                "triage_risk": (item.get("triage", {}) or {}).get("risk") if isinstance(item.get("triage"), dict) else None,
                 "source_count": len(item.get("sources", []) or []),
             }
             for item in asset_candidates[:12]
             if isinstance(item, dict)
         ]
+        asset_summary = (asset_candidates_doc or {}).get("summary", {}) or {}
         add_item(
             "REVIEW-blackbox-asset-candidates",
             "Review static asset endpoint candidates",
@@ -14415,6 +14496,10 @@ def build_verification_queue(
             safety="Static asset lead review only. Candidate endpoints are not requested by blackbox-asset-map.",
             extra={
                 "asset_candidate_count": len(asset_candidates),
+                "asset_candidate_triage": {
+                    "class_counts": asset_summary.get("triage_class_counts", {}),
+                    "risk_counts": asset_summary.get("triage_risk_counts", {}),
+                },
                 "asset_candidate_preview": candidate_preview,
             },
         )
@@ -24628,6 +24713,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         (item.get("method_hint"), item.get("host"), item.get("path"))
         for item in blackbox_asset_map_sample.get("candidates", [])
     }
+    blackbox_asset_triage = {
+        (item.get("method_hint"), item.get("host"), item.get("path")): (item.get("triage") or {})
+        for item in blackbox_asset_map_sample.get("candidates", [])
+    }
     blackbox_probe_ids_sample = [
         probe.id
         for probe in build_probe_plan(
@@ -24679,6 +24768,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and ("POST", "blackbox.test", "/api/orders?market=&token=") in blackbox_asset_candidates
         and ("WS", "quote.blackbox.test", "/ws/v1/quotes?symbol=") in blackbox_asset_candidates
         and ("GET", "blackbox.test", "/api/v1/markets") in blackbox_asset_candidates
+        and blackbox_asset_triage[("POST", "blackbox.test", "/api/orders?market=&token=")].get("class") == "state-changing-api-review"
+        and blackbox_asset_triage[("POST", "blackbox.test", "/api/orders?market=&token=")].get("risk") == "high"
+        and blackbox_asset_triage[("WS", "quote.blackbox.test", "/ws/v1/quotes?symbol=")].get("class") == "websocket-handshake-review"
+        and blackbox_asset_triage[("GET", "blackbox.test", "/api/v1/markets")].get("class") == "api-read-candidate-review"
+        and blackbox_asset_map_sample.get("summary", {}).get("triage_risk_counts", {}).get("high") == 1
         and all("/assets/logo.svg" != item.get("path") for item in blackbox_asset_map_sample.get("candidates", []))
         and all(check.get("status") == "not-applicable" for check in blackbox_source_context_checks)
         and any(probe_id.startswith("blackbox_") for probe_id in blackbox_probe_ids_sample)

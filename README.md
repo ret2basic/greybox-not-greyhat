@@ -124,11 +124,23 @@ does not persist raw HTML or JavaScript. The output
 `blackbox-asset-candidates.json` stores path candidates, query parameter names,
 source URLs, and source hashes; query values are stripped. Candidate endpoints
 are added to verification/review blockers as leads, not as findings, until
-scope, authentication context, and business-operation risk are reviewed. The
-default resource caps are intentionally small: 4 same-origin script assets,
-256 KiB per fetched resource, and 80 retained candidates. Raise
-`--max-assets`, `--max-bytes`, or `--candidate-limit` only when the runner has
-enough memory and the target scope permits the extra page-asset requests.
+scope, authentication context, and business-operation risk are reviewed.
+
+Each candidate is triaged before it reaches the review queue:
+
+- `passive-page-route-review`: page-route-like leads that may be suitable for
+  reviewed `HEAD` / `GET` promotion.
+- `api-read-candidate-review`: API-like leads without mutation hints; review
+  auth and read-only semantics before probing.
+- `state-changing-api-review` and `sensitive-api-review`: do not probe
+  automatically.
+- `websocket-handshake-review`: at most one handshake-only connection after
+  scope and message semantics are reviewed.
+
+The default resource caps are intentionally small: 4 same-origin script assets,
+256 KiB per fetched resource, and 80 retained candidates. Raise `--max-assets`,
+`--max-bytes`, or `--candidate-limit` only when the runner has enough memory and
+the target scope permits the extra page-asset requests.
 
 Review program scope, authentication context, and endpoint criticality before
 any active probes:
