@@ -5052,7 +5052,7 @@ def script_url_review_ref(url: str, *, allowed_hosts: set[str]) -> dict[str, Any
         {key for key, _value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if key}
     )
     stripped_query = urllib.parse.urlencode([(key, "") for key in query_keys])
-    path = urllib.parse.urlunparse(("", "", parsed.path or "/", "", stripped_query, ""))
+    path = urllib.parse.urlunparse(("", "", redact_url_path(parsed.path or "/"), "", stripped_query, ""))
     return {
         "host": parsed.netloc,
         "path": path,
@@ -5091,6 +5091,203 @@ def external_script_review_summary(
             for url in external_urls[:sample_limit]
         ],
         "safety": "External script URLs are recorded for scope review only; blackbox-asset-map does not fetch them.",
+    }
+
+
+ABSOLUTE_URL_RE = re.compile(r"\b(?:https?|wss?)://[^\s\"'<>]+")
+
+
+def trim_absolute_url_candidate(value: str) -> str:
+    return value.rstrip("),.;]}")
+
+
+def redact_url_path(path: str) -> str:
+    segments = []
+    for segment in (path or "/").split("/"):
+        decoded = urllib.parse.unquote(segment)
+        if (
+            len(decoded) >= 16
+            and re.fullmatch(r"[A-Za-z0-9_-]+", decoded)
+            and re.search(r"[A-Za-z]", decoded)
+            and re.search(r"[0-9]", decoded)
+        ):
+            segments.append("{token}")
+        else:
+            segments.append(segment)
+    redacted = "/".join(segments)
+    return redacted if redacted.startswith("/") else "/" + redacted
+
+
+def parent_domain_for_host(host: str) -> str:
+    parts = [part for part in host.lower().strip(".").split(".") if part]
+    if len(parts) <= 2:
+        return ".".join(parts)
+    return ".".join(parts[-2:])
+
+
+def config_host_scope_status(host: str, *, allowed_hosts: set[str], target_host: str) -> str:
+    host = host.lower().strip(".")
+    if host in allowed_hosts:
+        return "allowed-host"
+    parent = parent_domain_for_host(target_host)
+    if parent and host.endswith("." + parent):
+        return "same-parent-domain-review"
+    return "external-host-review"
+
+
+def config_host_role(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if parsed.scheme in {"ws", "wss"}:
+        return "websocket-reference"
+    if "testnet" in host or "testnet" in path:
+        return "testnet-reference"
+    if "rpc" in host or "/rpc" in path:
+        return "rpc-reference"
+    if "quote" in host or "api" in host or "/api" in path:
+        return "api-or-service-reference"
+    if "static" in host or "cdn" in host or path.endswith((".js", ".mjs", ".css")):
+        return "static-asset-reference"
+    return "absolute-url-reference"
+
+
+def config_url_review_ref(
+    raw_url: str,
+    *,
+    source_url: str,
+    source_kind: str,
+    source_sha256: str,
+    line: int | None,
+    allowed_hosts: set[str],
+    target_host: str,
+) -> dict[str, Any] | None:
+    value = trim_absolute_url_candidate(html.unescape(str(raw_url or "").strip()))
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in {"http", "https", "ws", "wss"} or not parsed.netloc:
+        return None
+    query_keys = sorted(
+        {key for key, _value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if key}
+    )
+    stripped_query = urllib.parse.urlencode([(key, "") for key in query_keys])
+    path = urllib.parse.urlunparse(("", "", redact_url_path(parsed.path or "/"), "", stripped_query, ""))
+    host = parsed.netloc.lower().strip(".")
+    return {
+        "scheme": parsed.scheme,
+        "host": host,
+        "path": path,
+        "query_keys": query_keys,
+        "role": config_host_role(value),
+        "scope_status": config_host_scope_status(host, allowed_hosts=allowed_hosts, target_host=target_host),
+        "source_url": source_url,
+        "source_kind": source_kind,
+        "source_sha256": source_sha256,
+        "line": line,
+        "raw_url_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+    }
+
+
+def build_config_host_map(
+    *,
+    target: str,
+    sources: list[dict[str, Any]],
+    allowed_hosts: set[str],
+    sample_limit_per_host: int = 4,
+) -> dict[str, Any]:
+    target_host = urllib.parse.urlparse(target).netloc.lower()
+    host_items: dict[str, dict[str, Any]] = {}
+    total_urls = 0
+    scheme_counts: dict[str, int] = {}
+    scope_status_counts: dict[str, int] = {}
+    role_counts: dict[str, int] = {}
+    source_kind_counts: dict[str, int] = {}
+
+    for source in sources:
+        text = str(source.get("text") or "")
+        source_url = str(source.get("source_url") or source.get("url") or "")
+        source_kind = str(source.get("source_kind") or source.get("kind") or "unknown")
+        source_sha256 = str(
+            source.get("source_sha256")
+            or source.get("sha256")
+            or hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+        )
+        for match in ABSOLUTE_URL_RE.finditer(text):
+            line = text.count("\n", 0, match.start()) + 1
+            ref = config_url_review_ref(
+                match.group(0),
+                source_url=source_url,
+                source_kind=source_kind,
+                source_sha256=source_sha256,
+                line=line,
+                allowed_hosts=allowed_hosts,
+                target_host=target_host,
+            )
+            if ref is None:
+                continue
+            total_urls += 1
+            increment_count(scheme_counts, str(ref["scheme"]))
+            increment_count(scope_status_counts, str(ref["scope_status"]))
+            increment_count(role_counts, str(ref["role"]))
+            increment_count(source_kind_counts, str(ref["source_kind"]))
+            host = str(ref["host"])
+            item = host_items.setdefault(
+                host,
+                {
+                    "host": host,
+                    "count": 0,
+                    "scope_status": ref["scope_status"],
+                    "roles": {},
+                    "schemes": {},
+                    "source_kinds": {},
+                    "samples": [],
+                },
+            )
+            item["count"] += 1
+            increment_count(item["roles"], str(ref["role"]))
+            increment_count(item["schemes"], str(ref["scheme"]))
+            increment_count(item["source_kinds"], str(ref["source_kind"]))
+            sample = {
+                key: ref[key]
+                for key in [
+                    "scheme",
+                    "path",
+                    "query_keys",
+                    "role",
+                    "scope_status",
+                    "source_url",
+                    "source_kind",
+                    "source_sha256",
+                    "line",
+                    "raw_url_sha256",
+                ]
+            }
+            if len(item["samples"]) < sample_limit_per_host and sample not in item["samples"]:
+                item["samples"].append(sample)
+
+    review_hosts = [
+        host
+        for host, item in host_items.items()
+        if item.get("scope_status") != "allowed-host"
+    ]
+    return {
+        "generated_at": utc_now(),
+        "status": "review-required" if review_hosts else "complete",
+        "target": target,
+        "allowed_hosts": sorted(allowed_hosts),
+        "summary": {
+            "absolute_url_count": total_urls,
+            "host_count": len(host_items),
+            "review_host_count": len(review_hosts),
+            "scheme_counts": dict(sorted(scheme_counts.items())),
+            "scope_status_counts": dict(sorted(scope_status_counts.items())),
+            "role_counts": dict(sorted(role_counts.items())),
+            "source_kind_counts": dict(sorted(source_kind_counts.items())),
+        },
+        "hosts": sorted(
+            host_items.values(),
+            key=lambda item: (item.get("scope_status") == "allowed-host", str(item.get("host"))),
+        ),
+        "safety": "Passive URL host map only. Query values and response bodies are not stored, and referenced hosts are not requested by this artifact.",
     }
 
 
@@ -5646,6 +5843,28 @@ def build_blackbox_asset_map(
         page_url=page_url,
         allowed_hosts=allowed_hosts,
     )
+    config_sources = [
+        {
+            "text": page_text,
+            "source_url": page_url,
+            "source_kind": "html",
+            "source_sha256": hashlib.sha256(page_text.encode("utf-8", errors="replace")).hexdigest(),
+        }
+    ]
+    for asset in assets:
+        config_sources.append(
+            {
+                "text": str(asset.get("text") or ""),
+                "source_url": str(asset.get("url") or ""),
+                "source_kind": "script",
+                "source_sha256": str(asset.get("sha256") or ""),
+            }
+        )
+    config_hosts = build_config_host_map(
+        target=target,
+        sources=config_sources,
+        allowed_hosts=allowed_hosts,
+    )
     candidate_lists = [
         extract_blackbox_asset_candidates_from_text(
             page_text,
@@ -5712,6 +5931,7 @@ def build_blackbox_asset_map(
         "allowed_hosts": sorted(allowed_hosts),
         "assets": asset_summaries,
         "external_scripts": external_scripts,
+        "config_hosts": config_hosts,
         "summary": {
             "assets_fetched": len(assets),
             "candidates": len(candidates),
@@ -5722,6 +5942,8 @@ def build_blackbox_asset_map(
             "external_script_urls_seen": external_scripts["total"],
             "external_script_hosts": len(external_scripts["host_counts"]),
             "external_script_review_required": bool(external_scripts["review_required"]),
+            "config_host_count": config_hosts["summary"]["host_count"],
+            "config_review_host_count": config_hosts["summary"]["review_host_count"],
             "candidate_limit": candidate_limit,
             "candidate_limit_reached": candidate_limit is not None and len(candidates) >= candidate_limit,
             "triage_class_counts": triage_class_counts,
@@ -15117,6 +15339,45 @@ def build_verification_queue(
                 "external_script_host_counts": external_scripts_doc.get("host_counts", {}),
                 "external_script_scope_status_counts": external_scripts_doc.get("scope_status_counts", {}),
                 "external_script_samples": external_scripts_doc.get("samples", [])[:8],
+            },
+        )
+    config_hosts_doc = (asset_candidates_doc or {}).get("config_hosts", {}) if isinstance(asset_candidates_doc, dict) else {}
+    config_summary = config_hosts_doc.get("summary", {}) if isinstance(config_hosts_doc, dict) else {}
+    if isinstance(config_hosts_doc, dict) and config_summary.get("review_host_count", 0):
+        review_hosts = [
+            item
+            for item in config_hosts_doc.get("hosts", []) or []
+            if isinstance(item, dict) and item.get("scope_status") != "allowed-host"
+        ]
+        add_item(
+            "REVIEW-blackbox-config-hosts",
+            "Review runtime configuration hosts",
+            "manual-review",
+            "medium",
+            (
+                f"{config_summary.get('review_host_count', 0)} runtime URL host(s) were referenced outside the explicit allowed host set. "
+                "They were recorded as leads only and were not requested by config-host mapping."
+            ),
+            evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT],
+            prerequisites=[
+                "Review whether each runtime host is in bounty scope before using it as a target.",
+                "Prioritize hosts tied to API, RPC, quote, prod, or testnet roles; ignore analytics/CDN-only hosts unless they carry an in-scope impact.",
+                "Do not probe sibling or external hosts until scope and impact are confirmed.",
+            ],
+            safety="Scope review only. Runtime config host mapping is passive and does not request referenced hosts.",
+            extra={
+                "config_host_summary": config_summary,
+                "review_hosts": [
+                    {
+                        "host": item.get("host"),
+                        "count": item.get("count"),
+                        "scope_status": item.get("scope_status"),
+                        "roles": item.get("roles"),
+                        "schemes": item.get("schemes"),
+                        "samples": item.get("samples", [])[:2],
+                    }
+                    for item in review_hosts[:12]
+                ],
             },
         )
     if asset_candidates:
@@ -25406,6 +25667,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     + "\n"
                     'fetch("/api/orders?token=secret-value&market=ETH-USD", { method: "POST" });\n'
                     'const socket = new WebSocket("wss://quote.blackbox.test/ws/v1/quotes?symbol=BTC-USD");\n'
+                    'const runtimeApi = "https://api.blackbox.test/v1/AbC1234567890Token/config?secret=top-secret&market=BTC";\n'
                     'const ignored = "/assets/logo.svg";\n'
                     'axios.get("api/v1/markets");\n'
                 ),
@@ -25511,6 +25773,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_asset_map_sample.get("page", {}).get("external_script_urls_seen") == 1
         and blackbox_asset_map_sample.get("summary", {}).get("external_script_review_required") is True
         and blackbox_asset_map_sample.get("external_scripts", {}).get("host_counts", {}).get("cdn.blackbox.test") == 1
+        and blackbox_asset_map_sample.get("summary", {}).get("config_host_count") == 3
+        and blackbox_asset_map_sample.get("summary", {}).get("config_review_host_count") == 2
+        and blackbox_asset_map_sample.get("config_hosts", {}).get("summary", {}).get("scope_status_counts", {}).get("same-parent-domain-review") == 2
+        and "top-secret" not in json.dumps(blackbox_asset_map_sample.get("config_hosts", {}), sort_keys=True)
+        and "AbC1234567890Token" not in json.dumps(blackbox_asset_map_sample.get("config_hosts", {}), sort_keys=True)
+        and "{token}" in json.dumps(blackbox_asset_map_sample.get("config_hosts", {}), sort_keys=True)
         and ("UNKNOWN", "blackbox.test", "/trade/BTCUSD?debug=&from=") in blackbox_asset_candidates
         and ("UNKNOWN", "blackbox.test", "/de-DE/trade/BTCUSD?lang=") in blackbox_asset_candidates
         and ("POST", "blackbox.test", "/api/orders?market=&token=") in blackbox_asset_candidates
