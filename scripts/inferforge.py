@@ -9340,6 +9340,8 @@ def validation_allowed_commands(
         command("harness-loop --no-write"),
         command("hypothesis-matrix --no-write --show-next"),
         command("rewrite-review --no-write --show-next"),
+        command("source-peek-requests --no-write --top 8"),
+        command("source-peek --no-write --top 8"),
         *rewrite_review_promotion_preview_commands(
             artifact_dir=artifact_dir,
             profile=profile,
