@@ -125,6 +125,9 @@ does not persist raw HTML or JavaScript. The output
 source URLs, and source hashes; query values are stripped. Candidate endpoints
 are added to verification/review blockers as leads, not as findings, until
 scope, authentication context, and business-operation risk are reviewed.
+Live page and asset fetches are blocked by the local resource gate while memory
+or swap pressure is warning; use `--input-html` for offline parsing, or pass
+`--allow-resource-warning` only after explicit review with narrow limits.
 If the page references script assets on other hosts, the tool records their
 hosts, counts, hashes, and stripped paths as scope-review leads without fetching
 those external scripts.
@@ -407,7 +410,10 @@ python3 scripts/inferforge.py --target https://in-scope.example \
 `websocket-candidate-review` opens at most one HTTP Upgrade attempt per
 in-scope candidate, sends no WebSocket frames, subscriptions, wallet payloads,
 or trading messages, and records only response headers plus a hash of the random
-`Sec-WebSocket-Key`. It is coverage evidence, not a vulnerability finding.
+`Sec-WebSocket-Key`. Handshake baselines are blocked by the local resource gate
+while memory or swap pressure is warning unless `--allow-resource-warning` is
+passed after explicit review. It is coverage evidence, not a vulnerability
+finding.
 
 For takeover-oriented Web/App scope checks, keep the host list explicit:
 
@@ -421,7 +427,10 @@ python3 scripts/inferforge.py --target https://in-scope.example \
 `host-takeover-baseline` checks only the configured target host and any repeated
 `--host` values. It collects DNS CNAME/A/AAAA records and a bounded HTTPS root
 response hash for known dangling-provider fingerprints; it does not enumerate
-subdomains, claim third-party resources, or store response bodies.
+subdomains, claim third-party resources, or store response bodies. DNS and
+HTTPS baseline checks are blocked by the local resource gate while memory or
+swap pressure is warning unless `--allow-resource-warning` is passed after
+explicit review.
 
 The default resource caps are intentionally small: 4 same-origin script assets,
 256 KiB per fetched resource, and 80 retained candidates. Raise `--max-assets`,
@@ -444,15 +453,18 @@ default local target application port for the checked-in profile, not Burp's
 proxy or Burp's built-in browser. Keep it closed unless a local app regression
 actually needs the dev server.
 
-`burp-sync`, `audit`, `collect-quote`, `collect-orca-baseline`,
-`validation-plan`, `iteration-decision`, and `regression-suite` also take an
+`burp-sync`, `audit`, `blackbox-asset-map`, `websocket-candidate-review`
+handshake baselines, `host-takeover-baseline`, `collect-quote`,
+`collect-orca-baseline`, `validation-plan`, `iteration-decision`, and
+`regression-suite` also take an
 internal current-resource preflight before memory-sensitive work. The internal
 gate is intentionally conservative (`MemAvailable` below 2048 MiB or used swap
 above 1024 MiB is a warning). When an active command hits that gate, it writes a
 resource-gate artifact and exits before active probes, Burp history reads, quote
-or Orca baseline requests, Node transaction decoding, or the full regression
-step schedule. Use `--allow-resource-warning` only after reviewing local
-pressure and narrowing the command with limits or skip flags.
+or Orca baseline requests, black-box page/script fetches, WebSocket handshake
+baselines, DNS/HTTPS takeover baselines, Node transaction decoding, or the full
+regression step schedule. Use `--allow-resource-warning` only after reviewing
+local pressure and narrowing the command with limits or skip flags.
 
 Review program scope, authentication context, and endpoint criticality before
 any active probes:

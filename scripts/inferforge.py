@@ -37705,7 +37705,7 @@ def run_blackbox_asset_profile(args: argparse.Namespace) -> int:
 
 
 def run_blackbox_asset_map(args: argparse.Namespace) -> int:
-    _profile, artifact_dir, target, _source_root = resolve_run_context(args)
+    profile, artifact_dir, target, _source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     parsed_target = urllib.parse.urlparse(target)
     page_url = urllib.parse.urljoin(target.rstrip("/") + "/", str(args.path or "/").lstrip("/"))
@@ -37727,6 +37727,42 @@ def run_blackbox_asset_map(args: argparse.Namespace) -> int:
         script_urls = []
         fetched_assets: list[dict[str, Any]] = []
     else:
+        resource_snapshot = build_default_resource_snapshot(max_processes=8)
+        resource_status = artifact_summary_status(resource_snapshot)
+        if resource_status != "healthy" and not args.allow_resource_warning:
+            resource_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
+            blocked_path = artifact_dir / "blackbox-asset-map-resource-gate.json"
+            write_json(resource_path, resource_snapshot)
+            write_json(
+                blocked_path,
+                resource_gate_blocked_artifact(
+                    command="blackbox-asset-map",
+                    target=target,
+                    profile=profile,
+                    resource_snapshot=resource_snapshot,
+                    blocked_actions=[
+                        "target page GET request",
+                        "same-origin script asset GET requests",
+                        "static asset candidate refresh from live responses",
+                    ],
+                ),
+            )
+            print(
+                "Black-box asset map blocked by resource gate: "
+                f"{resource_status} warnings={resource_gate_warnings_text(resource_snapshot)}"
+            )
+            print("No page or script asset requests were run.")
+            print(f"Wrote {resource_path}")
+            print(f"Wrote {blocked_path}")
+            print_refreshed_manifests(
+                refresh_current_artifact_manifest(
+                    artifact_dir=artifact_dir,
+                    target=target,
+                    command="blackbox-asset-map",
+                    output_paths=[resource_path, blocked_path],
+                )
+            )
+            return 2
         try:
             with TargetProbeLock(target, purpose="blackbox-asset-map"):
                 page_fetch = http_get_url_text_limited(
@@ -37818,12 +37854,48 @@ def run_blackbox_asset_map(args: argparse.Namespace) -> int:
 
 
 def run_host_takeover_baseline(args: argparse.Namespace) -> int:
-    _profile, artifact_dir, target, _source_root = resolve_run_context(args)
+    profile, artifact_dir, target, _source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     try:
         hosts = normalize_explicit_hosts(target, args.host, max_hosts=args.max_hosts)
     except ValueError as error:
         print(f"Invalid host list: {error}")
+        return 2
+    resource_snapshot = build_default_resource_snapshot(max_processes=8)
+    resource_status = artifact_summary_status(resource_snapshot)
+    if resource_status != "healthy" and not args.allow_resource_warning:
+        resource_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
+        blocked_path = artifact_dir / "host-takeover-baseline-resource-gate.json"
+        write_json(resource_path, resource_snapshot)
+        write_json(
+            blocked_path,
+            resource_gate_blocked_artifact(
+                command="host-takeover-baseline",
+                target=target,
+                profile=profile,
+                resource_snapshot=resource_snapshot,
+                blocked_actions=[
+                    "DNS takeover fingerprint lookups",
+                    "bounded HTTPS root response checks",
+                    "takeover baseline refresh from live host state",
+                ],
+            ),
+        )
+        print(
+            "Host takeover baseline blocked by resource gate: "
+            f"{resource_status} warnings={resource_gate_warnings_text(resource_snapshot)}"
+        )
+        print("No DNS or HTTPS takeover baseline checks were run.")
+        print(f"Wrote {resource_path}")
+        print(f"Wrote {blocked_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="host-takeover-baseline",
+                output_paths=[resource_path, blocked_path],
+            )
+        )
         return 2
     baseline = build_host_takeover_baseline(
         target=target,
@@ -38191,6 +38263,50 @@ def run_websocket_candidate_review(args: argparse.Namespace) -> int:
     if args.handshake_baseline:
         if not args.allow_nonlocal_target and not is_loopback_target(target):
             print("websocket-candidate-review refuses non-loopback handshake baselines unless --allow-nonlocal-target is set")
+            return 2
+        resource_snapshot = build_default_resource_snapshot(max_processes=8)
+        resource_status = artifact_summary_status(resource_snapshot)
+        if resource_status != "healthy" and not args.allow_resource_warning:
+            resource_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
+            blocked_path = artifact_dir / "websocket-candidate-review-resource-gate.json"
+            if not args.no_write:
+                write_json(resource_path, resource_snapshot)
+                write_json(
+                    blocked_path,
+                    resource_gate_blocked_artifact(
+                        command="websocket-candidate-review",
+                        target=target,
+                        profile=profile,
+                        resource_snapshot=resource_snapshot,
+                        blocked_actions=[
+                            "HTTP Upgrade handshake baselines",
+                            "Burp-proxied WebSocket candidate coverage checks",
+                            "baseline result refresh from live target state",
+                        ],
+                    ),
+                )
+            print(
+                "WebSocket candidate review blocked by resource gate: "
+                f"{resource_status} warnings={resource_gate_warnings_text(resource_snapshot)}"
+            )
+            print("No WebSocket handshake baselines were run.")
+            if args.no_write:
+                print("No resource-gate files written (--no-write).")
+            else:
+                print(f"Wrote {resource_path}")
+                print(f"Wrote {blocked_path}")
+                print_refreshed_manifests(
+                    refresh_current_artifact_manifest(
+                        artifact_dir=artifact_dir,
+                        target=target,
+                        command="websocket-candidate-review",
+                        output_paths=[
+                            *target_profile_artifact_paths(artifact_dir),
+                            resource_path,
+                            blocked_path,
+                        ],
+                    )
+                )
             return 2
         baseline_results = []
         try:
@@ -39990,6 +40106,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow overwriting an existing output artifact.",
     )
+    blackbox_asset_map.add_argument(
+        "--allow-resource-warning",
+        action="store_true",
+        help="Allow live page and script asset fetches when the local memory/swap resource gate is warning.",
+    )
     blackbox_asset_map.set_defaults(func=run_blackbox_asset_map)
 
     host_takeover = sub.add_parser(
@@ -40027,6 +40148,11 @@ def build_parser() -> argparse.ArgumentParser:
     host_takeover.add_argument(
         "--output",
         help="Where to write the baseline artifact. Defaults to ARTIFACT_DIR/host-takeover-baseline.json.",
+    )
+    host_takeover.add_argument(
+        "--allow-resource-warning",
+        action="store_true",
+        help="Allow DNS and HTTPS takeover baseline checks when the local memory/swap resource gate is warning.",
     )
     host_takeover.set_defaults(func=run_host_takeover_baseline)
 
@@ -40710,6 +40836,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-write",
         action="store_true",
         help="Print review summary only; do not write websocket-candidate-review.json or refresh manifests.",
+    )
+    websocket_candidate_review.add_argument(
+        "--allow-resource-warning",
+        action="store_true",
+        help="Allow handshake baselines when the local memory/swap resource gate is warning.",
     )
     websocket_candidate_review.add_argument(
         "--strict",
