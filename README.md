@@ -174,6 +174,11 @@ Locale-style route variants such as `/de-DE/trade/BTCUSD` and
 `/en-US/trade/BTCUSD` are collapsed to one representative route family by
 default to keep low-resource probe plans small; pass `--include-route-variants`
 only when scope and runner capacity justify probing every variant.
+Verification queues generated from this asset-candidate profile use a
+conservative audit replay by default: `audit --max-probes 6 --no-ws`. They do
+not add `--include-external` or `--ws-resource-probes`, and promoted
+`reviewed-profile.json` follow-up commands inherit the same restriction from
+the profile's asset-candidate safety marker.
 
 Preview the promoted route probes without sending them:
 

@@ -94,6 +94,8 @@ DISCOVERED_PROFILE_ARTIFACT = "discovered-profile.json"
 BLACKBOX_PROFILE_ARTIFACT = "blackbox-profile.json"
 BLACKBOX_ASSET_CANDIDATES_ARTIFACT = "blackbox-asset-candidates.json"
 BLACKBOX_ASSET_PROFILE_ARTIFACT = "blackbox-asset-profile.json"
+DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND = "audit --include-external --ws-resource-probes"
+BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND = "audit --max-probes 6 --no-ws"
 HOST_TAKEOVER_BASELINE_ARTIFACT = "host-takeover-baseline.json"
 RESOURCE_SNAPSHOT_ARTIFACT = "resource-snapshot.json"
 SCOPE_POLICY_ARTIFACT = "scope-policy.json"
@@ -899,6 +901,21 @@ def assessment_mode(profile: dict[str, Any] | None) -> str:
 
 def is_blackbox_assessment(profile: dict[str, Any] | None) -> bool:
     return assessment_mode(profile) == "blackbox"
+
+
+def is_blackbox_asset_candidate_profile(profile: dict[str, Any] | None) -> bool:
+    if not isinstance(profile, dict):
+        return False
+    raw_path = profile.get("_profile_path") or profile.get("profile_path") or ""
+    if Path(str(raw_path)).name == BLACKBOX_ASSET_PROFILE_ARTIFACT:
+        return True
+    safety = profile.get("safety") if isinstance(profile.get("safety"), dict) else {}
+    blackbox = profile.get("blackbox") if isinstance(profile.get("blackbox"), dict) else {}
+    return bool(
+        profile.get("asset_candidate_profile")
+        or safety.get("asset_candidates_profile")
+        or blackbox.get("asset_candidate_profile")
+    )
 
 
 def default_strategy_set_for_cluster(cluster_id: str) -> str | None:
@@ -6387,16 +6404,20 @@ def profile_display_name(profile: dict[str, Any] | None) -> str:
 def profile_summary(profile: dict[str, Any] | None) -> dict[str, Any]:
     if not profile:
         return {}
-    return {
+    summary = {
         "schema_version": profile.get("schema_version"),
         "name": profile.get("name"),
         "display_name": profile.get("display_name"),
+        "assessment_mode": assessment_mode(profile),
         "target_type": profile.get("target_type"),
         "frameworks": profile.get("frameworks", []),
         "strategy_sets": profile.get("strategy_sets", []),
         "profile_path": profile.get("_profile_path"),
         "loaded_from": profile.get("_profile_loaded_from"),
     }
+    if is_blackbox_asset_candidate_profile(profile):
+        summary["asset_candidate_profile"] = True
+    return summary
 
 
 def resolve_target(args: argparse.Namespace, profile: dict[str, Any]) -> str:
@@ -15745,6 +15766,32 @@ def verification_command_for_profile(profile_path: str, artifact_dir: Path | Non
     return f"{' '.join(shlex.quote(part) for part in parts)} {subcommand}"
 
 
+def verification_audit_policy_for_asset_candidate(is_asset_candidate: bool) -> dict[str, str]:
+    if is_asset_candidate:
+        return {
+            "subcommand": BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND,
+            "safety": (
+                "Bounded same-target black-box audit for reviewed asset routes. No external probes, "
+                "no WebSocket resource probes, no wallet signing, and no transaction submission."
+            ),
+            "profile": "blackbox-asset-profile",
+        }
+    return {
+        "subcommand": DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND,
+        "safety": "No signing, no transaction submission, and no broad fuzzing.",
+        "profile": "default",
+    }
+
+
+def verification_audit_policy_for_profile(profile: dict[str, Any] | None) -> dict[str, str]:
+    return verification_audit_policy_for_asset_candidate(is_blackbox_asset_candidate_profile(profile))
+
+
+def verification_audit_policy_for_clusters(clusters: dict[str, Any]) -> dict[str, str]:
+    profile_info = clusters.get("profile", {}) if isinstance(clusters.get("profile"), dict) else {}
+    return verification_audit_policy_for_asset_candidate(is_blackbox_asset_candidate_profile(profile_info))
+
+
 def review_candidate_command_templates(
     candidate: dict[str, Any],
     clusters: dict[str, Any],
@@ -15756,6 +15803,7 @@ def review_candidate_command_templates(
     if not candidate_id:
         return []
     reviewed_profile = verification_artifact_path(artifact_dir, "reviewed-profile.json")
+    audit_policy = verification_audit_policy_for_clusters(clusters)
     return [
         cmd
         for cmd in [
@@ -15788,15 +15836,21 @@ def review_candidate_command_templates(
             verification_command_for_profile(
                 reviewed_profile,
                 artifact_dir,
-                "audit --include-external --ws-resource-probes",
+                audit_policy["subcommand"],
             ),
         ]
         if cmd
     ]
 
 
-def promoted_observation_followup_commands(output_path: Path, artifact_dir: Path | None) -> list[str]:
+def promoted_observation_followup_commands(
+    output_path: Path,
+    artifact_dir: Path | None,
+    *,
+    source_profile: dict[str, Any] | None = None,
+) -> list[str]:
     reviewed_profile = repo_relative_or_absolute(output_path)
+    audit_policy = verification_audit_policy_for_profile(source_profile)
     return [
         verification_command_for_profile(
             reviewed_profile,
@@ -15806,7 +15860,7 @@ def promoted_observation_followup_commands(output_path: Path, artifact_dir: Path
         verification_command_for_profile(
             reviewed_profile,
             artifact_dir,
-            "audit --include-external --ws-resource-probes",
+            audit_policy["subcommand"],
         ),
     ]
 
@@ -15854,6 +15908,7 @@ def build_verification_queue(
 ) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     cmd = lambda subcommand: verification_command(clusters, artifact_dir, subcommand)
+    audit_policy = verification_audit_policy_for_clusters(clusters)
 
     def add_item(
         item_id: str,
@@ -15889,7 +15944,7 @@ def build_verification_queue(
         "ready",
         "high",
         "Refreshes probes, source peeks, coverage, adjudication, and reports in one deterministic pass.",
-        commands=[cmd("audit --include-external --ws-resource-probes")],
+        commands=[cmd(audit_policy["subcommand"])],
         evidence_refs=[
             "probe-results.jsonl",
             "blackbox-coverage.json",
@@ -15897,6 +15952,10 @@ def build_verification_queue(
             "evidence-appendix.json",
             "adjudication.json",
         ],
+        safety=audit_policy["safety"],
+        extra={
+            "audit_command_profile": audit_policy["profile"],
+        },
     )
     add_item(
         "VERIFY-reportability-gates",
@@ -26753,6 +26812,28 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         profile_path=ROOT / "scripts/inferforge.py",
     )
     blackbox_asset_clusters_sample = build_clusters(blackbox_asset_normalized_profile, ROOT)
+    blackbox_asset_verification_queue_sample = build_verification_queue(
+        "https://blackbox.test",
+        blackbox_asset_clusters_sample,
+        None,
+        {"gaps": []},
+        {"status": "covered"},
+        {"status": "no-reportable-findings", "external_blockers": [], "decisions": []},
+        {"status": "ready"},
+        ROOT / ".greybox/selftest",
+    )
+    blackbox_asset_verification_command_text = "\n".join(
+        str(command)
+        for item in blackbox_asset_verification_queue_sample.get("items", [])
+        for command in item.get("commands", [])
+    )
+    blackbox_asset_followup_command_text = "\n".join(
+        promoted_observation_followup_commands(
+            ROOT / ".greybox/selftest/reviewed-profile.json",
+            ROOT / ".greybox/selftest",
+            source_profile=blackbox_asset_normalized_profile,
+        )
+    )
     blackbox_asset_observed_selection_sample = select_cluster_ids(
         {"endpoints": []},
         blackbox_asset_clusters_sample,
@@ -26863,6 +26944,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_asset_profile_summary_sample.get("route_families", [{}])[0].get("representative_path") == "/trade/BTCUSD"
         and set(blackbox_asset_profile_summary_sample.get("route_families", [{}])[0].get("variants", []))
         == {"/de-DE/trade/BTCUSD", "/trade/BTCUSD"}
+        and blackbox_asset_clusters_sample.get("profile", {}).get("asset_candidate_profile") is True
+        and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_verification_command_text
+        and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_asset_verification_command_text
+        and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_followup_command_text
+        and "--include-external" not in blackbox_asset_followup_command_text
+        and "--ws-resource-probes" not in blackbox_asset_followup_command_text
         and blackbox_asset_observed_selection_sample.get("selected_cluster_ids") == []
         and "asset-candidate profile" in str(blackbox_asset_observed_notice_sample)
         and "/api/orders" not in blackbox_asset_profile_text_sample
@@ -30813,7 +30900,7 @@ def run_promote_observation_candidate(args: argparse.Namespace) -> int:
     )
     clusters = build_clusters(normalized, source_root)
     validation = build_profile_validation_artifact(normalized, clusters, source_root)
-    followup_commands = promoted_observation_followup_commands(output_path, artifact_dir)
+    followup_commands = promoted_observation_followup_commands(output_path, artifact_dir, source_profile=profile)
     if no_write:
         print(f"Promotion preview: {args.candidate_id}")
         print(f"Observation: {observation['method']} {observation['path']} cluster={observation['cluster']}")
