@@ -6756,6 +6756,41 @@ def top_rss_processes(limit: int) -> list[dict[str, Any]]:
     return processes[:limit]
 
 
+def resource_release_candidates(processes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates = []
+    for process in processes:
+        rss_mib = numeric_resource_value(process.get("rss_mib"))
+        if rss_mib is None or rss_mib < 256:
+            continue
+        name = str(process.get("name") or "")
+        command = str(process.get("command_preview") or "")
+        lowered = f"{name} {command}".lower()
+        if "codex" in lowered or ".vscode-server" in lowered:
+            continue
+        if "burpsuite" in lowered or ("java" in name.lower() and "burp" in lowered):
+            candidate_type = "burp-gui"
+            recommendation = "Close idle Burp GUI before offline iteration; restart it only for an approved bounded observation."
+        elif any(token in lowered for token in ["firefox", "chrome", "chromium", "playwright"]):
+            candidate_type = "browser"
+            recommendation = "Close idle browsers or browser automation before active target work."
+        elif "--port 3100" in lowered or "--port 2455" in lowered or "next dev" in lowered:
+            candidate_type = "local-service"
+            recommendation = "Review whether this local service is still needed before continuing memory-sensitive work."
+        else:
+            continue
+        candidates.append(
+            {
+                "pid": process.get("pid"),
+                "name": name,
+                "rss_mib": process.get("rss_mib"),
+                "type": candidate_type,
+                "recommendation": recommendation,
+                "safe_action": "Prefer graceful application shutdown; do not kill unknown user/session processes automatically.",
+            }
+        )
+    return candidates
+
+
 def listening_tcp_ports() -> list[int]:
     ports: set[int] = set()
     for path in [Path("/proc/net/tcp"), Path("/proc/net/tcp6")]:
@@ -6821,6 +6856,8 @@ def build_resource_snapshot(
         str(port): {"listening": port in listening_ports}
         for port in sorted(set(watch_ports))
     }
+    top_processes = top_rss_processes(max(max_processes, 8))
+    resource_budget = build_resource_budget(status, warnings, memory)
     return {
         "generated_at": utc_now(),
         "status": status,
@@ -6832,9 +6869,10 @@ def build_resource_snapshot(
             "critical_swap_used_pct": DEFAULT_RESOURCE_CRITICAL_SWAP_USED_PCT,
         },
         "memory": memory,
-        "resource_budget": build_resource_budget(status, warnings, memory),
+        "resource_budget": resource_budget,
         "watched_ports": watched_ports,
-        "top_rss_processes": top_rss_processes(max_processes),
+        "top_rss_processes": top_processes[:max_processes],
+        "release_candidates": resource_release_candidates(top_processes),
         "safety": (
             "Local /proc snapshot only. Command lines are shortened and secret-like "
             "tokens are redacted; no network requests or target probes are performed."
@@ -15369,6 +15407,145 @@ def parse_typescript_string_set(source: str, const_name: str) -> list[str]:
     return re.findall(r"['\"]([^'\"]+)['\"]", match.group(1))
 
 
+def split_env_csv(value: str | None) -> list[str]:
+    if value is None:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def source_ref_labels(refs: list[dict[str, Any]]) -> list[str]:
+    return compact_source_refs(
+        [
+            f"{ref.get('file')}:{ref.get('line')}"
+            for ref in refs
+            if isinstance(ref, dict) and ref.get("file") and ref.get("line")
+        ]
+    )
+
+
+def build_rpc_transaction_method_exposure_review(
+    *,
+    default_methods: list[str],
+    transaction_methods: list[str],
+    high_impact_methods: list[str],
+    blocked_methods: list[str],
+    rpc_source: str,
+    source_ref_groups: dict[str, list[dict[str, Any]]],
+    env_configured_methods: str | None,
+    env_allow_transaction_methods: str | None,
+) -> dict[str, Any]:
+    configured_method_override_present = "SOLANA_RPC_PROXY_ALLOWED_METHODS" in rpc_source
+    explicit_gate_present = "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS" in rpc_source
+    transaction_method_candidates = sorted(set(transaction_methods) | set(high_impact_methods))
+    default_transaction_methods = sorted(set(default_methods) & set(transaction_method_candidates))
+    runner_configured_method_set = set(split_env_csv(env_configured_methods))
+    runner_configured_transaction_methods = sorted(
+        runner_configured_method_set & set(transaction_method_candidates)
+    )
+    runner_flag_enabled_transaction_methods = (
+        sorted(set(transaction_methods or high_impact_methods))
+        if env_allow_transaction_methods == "true"
+        else []
+    )
+    runner_enabled_transaction_methods = sorted(
+        set(runner_configured_transaction_methods) | set(runner_flag_enabled_transaction_methods)
+    )
+    env_gate_adds_transaction_methods = (
+        explicit_gate_present
+        and bool(transaction_methods)
+        and "ALLOW_TRANSACTION_METHODS" in rpc_source
+        and "TRANSACTION_METHODS.forEach" in rpc_source
+    )
+    blocked_high_cost_methods = sorted(
+        set(blocked_methods)
+        & {
+            "getProgramAccounts",
+            "getSignaturesForAddress",
+            "getConfirmedSignaturesForAddress2",
+        }
+    )
+    blocked_transaction_methods = sorted(set(blocked_methods) & set(transaction_method_candidates))
+
+    if default_transaction_methods:
+        status = "transaction-methods-default-allowed"
+        priority = "medium"
+        posture = "high-impact-methods-default-allowed"
+        next_step = (
+            "Review whether transaction RPC methods should remain in the default browser-reachable allowlist; "
+            "positive-path testing still requires explicit approval and must never submit a valid signed transaction."
+        )
+    elif runner_enabled_transaction_methods:
+        status = "transaction-methods-runner-env-enabled"
+        priority = "medium"
+        posture = "high-impact-methods-explicitly-enabled-in-runner-env"
+        next_step = (
+            "The current runner environment enables transaction RPC methods. Review the deployment decision and "
+            "only use invalid unsigned payload checks after resource-snapshot --strict is healthy."
+        )
+    elif env_gate_adds_transaction_methods or configured_method_override_present:
+        status = "transaction-methods-env-gated"
+        priority = "low"
+        posture = "high-impact-methods-explicit-opt-in"
+        next_step = (
+            "Collect redacted deployment evidence for SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS and "
+            "SOLANA_RPC_PROXY_ALLOWED_METHODS before planning any transaction-method probe."
+        )
+    elif transaction_method_candidates:
+        status = "no-transaction-methods-default"
+        priority = "info"
+        posture = "no-high-impact-methods-default-allowed"
+        next_step = "No default transaction RPC method exposure was inferred from source."
+    else:
+        status = "transaction-method-policy-unclear"
+        priority = "info"
+        posture = "high-impact-method-policy-unclear"
+        next_step = "Review RPC method construction manually; no static transaction-method set was found."
+
+    source_refs = compact_source_refs(
+        [
+            *source_ref_labels(source_ref_groups.get("default_allowed_method_refs", [])),
+            *source_ref_labels(source_ref_groups.get("transaction_method_gate_refs", [])),
+            *source_ref_labels(source_ref_groups.get("configured_method_override_refs", [])),
+            *source_ref_labels(source_ref_groups.get("blocked_method_refs", [])),
+        ]
+    )
+    return {
+        "status": status,
+        "priority": priority,
+        "policy_posture": posture,
+        "default_transaction_methods": default_transaction_methods,
+        "env_gated_transaction_methods": (
+            sorted(set(transaction_methods)) if env_gate_adds_transaction_methods else []
+        ),
+        "runner_enabled_transaction_methods": runner_enabled_transaction_methods,
+        "configured_method_override_present": configured_method_override_present,
+        "configured_method_override_ref_count": len(
+            source_ref_groups.get("configured_method_override_refs", [])
+        ),
+        "configured_method_override_runner_env_set": env_configured_methods is not None,
+        "runner_configured_transaction_methods": runner_configured_transaction_methods,
+        "explicit_transaction_method_gate_present": explicit_gate_present,
+        "blocked_methods": blocked_methods,
+        "blocked_high_cost_methods": blocked_high_cost_methods,
+        "blocked_transaction_methods": blocked_transaction_methods,
+        "source_refs": source_refs[:12],
+        "deployment_evidence_required": [
+            "Redacted production value or absence of SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS.",
+            "Redacted production value or absence of SOLANA_RPC_PROXY_ALLOWED_METHODS.",
+            "Operator decision showing whether browser clients should ever reach sendTransaction or simulateTransaction.",
+        ],
+        "reportability_gate": (
+            "Transaction-method source configurability is not reportable by itself. Escalate only with concrete "
+            "reachable exposure plus user, funds, availability, or sensitive-data impact."
+        ),
+        "next_step": next_step,
+        "safety": (
+            "Offline source/deployment review first. Do not send valid signed transactions, submit transactions, "
+            "or run transaction-method probes while resource-snapshot --strict is unhealthy."
+        ),
+    }
+
+
 def grouped_source_references(
     source_root: Path,
     pattern_groups: dict[str, list[str]],
@@ -17254,11 +17431,24 @@ def build_rpc_method_policy(
             "default_allowed_methods": [],
             "transaction_methods": [],
             "high_impact_methods": high_impact_methods,
+            "blocked_methods": [],
             "default_high_impact_methods": [],
+            "default_transaction_methods": [],
             "explicit_transaction_method_gate_present": False,
             "runner_environment": {
                 "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS": os.environ.get("SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS"),
                 "SOLANA_RPC_PROXY_ALLOWED_METHODS_set": os.environ.get("SOLANA_RPC_PROXY_ALLOWED_METHODS") is not None,
+            },
+            "transaction_method_exposure_review": {
+                "status": "not-applicable-blackbox",
+                "priority": "info",
+                "policy_posture": "not-applicable-blackbox",
+                "default_transaction_methods": [],
+                "env_gated_transaction_methods": [],
+                "runner_enabled_transaction_methods": [],
+                "configured_method_override_present": False,
+                "blocked_high_cost_methods": [],
+                "next_step": "Pure black-box profile: infer RPC method exposure only from approved observations.",
             },
             "frontend_transaction_dependency_refs": [],
             "remote_transaction_material_refs": [],
@@ -17284,11 +17474,24 @@ def build_rpc_method_policy(
             "default_allowed_methods": [],
             "transaction_methods": [],
             "high_impact_methods": high_impact_methods,
+            "blocked_methods": [],
             "default_high_impact_methods": [],
+            "default_transaction_methods": [],
             "explicit_transaction_method_gate_present": False,
             "runner_environment": {
                 "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS": os.environ.get("SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS"),
                 "SOLANA_RPC_PROXY_ALLOWED_METHODS_set": os.environ.get("SOLANA_RPC_PROXY_ALLOWED_METHODS") is not None,
+            },
+            "transaction_method_exposure_review": {
+                "status": "source-unavailable",
+                "priority": "info",
+                "policy_posture": "source-unavailable",
+                "default_transaction_methods": [],
+                "env_gated_transaction_methods": [],
+                "runner_enabled_transaction_methods": [],
+                "configured_method_override_present": False,
+                "blocked_high_cost_methods": [],
+                "next_step": "Source file was unavailable; review approved observations and deployment config manually.",
             },
             "frontend_transaction_dependency_refs": [],
             "remote_transaction_material_refs": [],
@@ -17308,6 +17511,7 @@ def build_rpc_method_policy(
     rpc_source = read_text(rpc_path)
     default_methods = parse_typescript_string_set(rpc_source, "DEFAULT_ALLOWED_METHODS")
     transaction_methods = parse_typescript_string_set(rpc_source, "TRANSACTION_METHODS")
+    blocked_methods = parse_typescript_string_set(rpc_source, "BLOCKED_METHODS")
     transaction_probe_ids = {
         "rpc_send_transaction_invalid_payload",
         "rpc_simulate_transaction_invalid_payload",
@@ -17350,10 +17554,31 @@ def build_rpc_method_policy(
             ],
             "recent_blockhash_refs": ["getLatestBlockhash", "recentBlockhash"],
             "quote_amount_refs": ["quote.amountIn", "quote.amountOut", "requestedRawAmount"],
+            "default_allowed_method_refs": ["DEFAULT_ALLOWED_METHODS"],
+            "transaction_method_gate_refs": [
+                "TRANSACTION_METHODS",
+                "ALLOW_TRANSACTION_METHODS",
+                "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS",
+            ],
+            "configured_method_override_refs": [
+                "SOLANA_RPC_PROXY_ALLOWED_METHODS",
+                "configuredMethods",
+            ],
+            "blocked_method_refs": ["BLOCKED_METHODS"],
+            "origin_control_refs": [
+                "isAllowedRequestSource",
+                "ALLOW_MISSING_ORIGIN",
+                "SOLANA_RPC_PROXY_ALLOWED_ORIGINS",
+            ],
             "memory_rate_limit_refs": ["memoryRateLimits", "incrementWithMemory", "new Map<string"],
             "client_ip_header_refs": ["x-forwarded-for", "cf-connecting-ip", "x-real-ip", "getClientIp"],
             "external_rate_limit_store_refs": ["UPSTASH_REDIS_REST_URL", "KV_REST_API_URL", "incrementWithUpstash"],
-            "rate_limit_guard_refs": ["BURST_LIMIT", "SUSTAINED_LIMIT", "checkRateLimit"],
+            "rate_limit_guard_refs": [
+                "BURST_LIMIT",
+                "SUSTAINED_LIMIT",
+                "checkRateLimit",
+                "!IS_PRODUCTION",
+            ],
         },
     )
     frontend_transaction_refs = source_ref_groups["frontend_transaction_refs"]
@@ -17374,17 +17599,17 @@ def build_rpc_method_policy(
         rate_limit_guard_refs=source_ref_groups["rate_limit_guard_refs"],
     )
 
-    if default_high_impact:
-        posture = "high-impact-methods-default-allowed"
-    elif env_allow_transaction_methods == "true" or (
-        env_configured_methods
-        and any(method in {item.strip() for item in env_configured_methods.split(",")} for method in high_impact_methods)
-    ):
-        posture = "high-impact-methods-explicitly-enabled-in-runner-env"
-    elif explicit_gate_present and transaction_methods:
-        posture = "high-impact-methods-explicit-opt-in"
-    else:
-        posture = "high-impact-method-policy-unclear"
+    transaction_method_exposure_review = build_rpc_transaction_method_exposure_review(
+        default_methods=default_methods,
+        transaction_methods=transaction_methods,
+        high_impact_methods=high_impact_methods,
+        blocked_methods=blocked_methods,
+        rpc_source=rpc_source,
+        source_ref_groups=source_ref_groups,
+        env_configured_methods=env_configured_methods,
+        env_allow_transaction_methods=env_allow_transaction_methods,
+    )
+    posture = transaction_method_exposure_review.get("policy_posture", "high-impact-method-policy-unclear")
 
     return {
         "generated_at": utc_now(),
@@ -17392,12 +17617,15 @@ def build_rpc_method_policy(
         "default_allowed_methods": default_methods,
         "transaction_methods": transaction_methods,
         "high_impact_methods": high_impact_methods,
+        "blocked_methods": blocked_methods,
         "default_high_impact_methods": default_high_impact,
+        "default_transaction_methods": transaction_method_exposure_review.get("default_transaction_methods", []),
         "explicit_transaction_method_gate_present": explicit_gate_present,
         "runner_environment": {
             "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS": env_allow_transaction_methods,
             "SOLANA_RPC_PROXY_ALLOWED_METHODS_set": env_configured_methods is not None,
         },
+        "transaction_method_exposure_review": transaction_method_exposure_review,
         "frontend_transaction_dependency_refs": frontend_transaction_refs,
         "remote_transaction_material_refs": remote_transaction_material_refs,
         "remote_transaction_signing_review": build_remote_transaction_signing_review(
@@ -17410,8 +17638,8 @@ def build_rpc_method_policy(
         "transaction_probe_results": transaction_probe_results,
         "policy_posture": posture,
         "recommendation": (
-            "Keep transaction methods out of DEFAULT_ALLOWED_METHODS. Enable them only with an explicit deployment decision "
-            "and continue to require origin/rate-limit controls and transaction-intent review for returned quote payloads."
+            "Keep transaction methods out of DEFAULT_ALLOWED_METHODS. If deployment config enables them, record the "
+            "operator decision and continue to require origin/rate-limit controls and transaction-intent review."
         ),
     }
 
@@ -18068,10 +18296,10 @@ def build_attack_strategy(
         },
         {
             "id": "NEXT-rpc-high-impact-negative-probes",
-            "title": "Exercise high-impact Solana RPC methods with invalid transaction payloads",
+            "title": "Gate high-impact Solana RPC method checks on exposure review",
             "applies_to": ["solana-rpc-http"],
-            "reason": "sendTransaction and simulateTransaction are high-impact allowlisted methods; safe negative probes should prove invalid, unsigned payloads do not succeed or leak internals.",
-            "status": "implemented-via-invalid-transaction-rpc-probes",
+            "reason": "sendTransaction and simulateTransaction should be probed only when source or deployment evidence shows they are intentionally reachable.",
+            "status": "implemented-for-explicit-transaction-method-exposure",
         },
     ]
     cluster_rows = clusters.get("clusters", []) or []
@@ -18577,6 +18805,46 @@ def build_evidence_gaps(
             ],
         )
 
+    transaction_method_review = (
+        rpc_method_policy.get("transaction_method_exposure_review")
+        if isinstance((rpc_method_policy or {}).get("transaction_method_exposure_review"), dict)
+        else {}
+    )
+    transaction_method_status = str(transaction_method_review.get("status") or "")
+    if transaction_method_status == "transaction-methods-env-gated":
+        add_gap(
+            "GAP-rpc-transaction-method-deployment-decision",
+            "solana-rpc-http",
+            "RPC transaction methods are deployment-gated",
+            "medium",
+            (
+                "Source review keeps sendTransaction and simulateTransaction out of the default allowlist, but deployment "
+                "configuration can enable transaction methods through an explicit flag or configured allowlist override."
+            ),
+            (
+                "Review redacted production values for SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS and "
+                "SOLANA_RPC_PROXY_ALLOWED_METHODS, plus the operator decision for browser-reachable transaction RPC methods."
+            ),
+            (
+                "Deployment/source review only; do not run transaction-method probes unless production config proves these "
+                "methods are intentionally enabled and resource-snapshot --strict is healthy."
+            ),
+            review_candidates=[
+                {
+                    "id": "review_rpc_transaction_method_deployment",
+                    "type": "deployment-rpc-transaction-method-review",
+                    "status": "manual-review",
+                    "source_refs": transaction_method_review.get("source_refs", [])[:8],
+                    "default_transaction_methods": transaction_method_review.get("default_transaction_methods", []),
+                    "env_gated_transaction_methods": transaction_method_review.get("env_gated_transaction_methods", []),
+                    "configured_method_override_present": transaction_method_review.get(
+                        "configured_method_override_present"
+                    ),
+                    "required_evidence": transaction_method_review.get("deployment_evidence_required", []),
+                }
+            ],
+        )
+
     rpc_rows = results_by_cluster.get("solana-rpc-http", [])
     if rpc_rows:
         high_impact_rows = [
@@ -18589,26 +18857,36 @@ def build_evidence_gaps(
             }
         ]
         high_impact_passed = high_impact_rows and all(row.get("expected") for row in high_impact_rows)
-        rpc_posture = (rpc_method_policy or {}).get("policy_posture")
-        if rpc_posture == "high-impact-methods-explicit-opt-in" and high_impact_rows:
-            pass
-        elif high_impact_passed:
+        high_impact_reachable_postures = {
+            "transaction-methods-default-allowed",
+            "transaction-methods-runner-env-enabled",
+        }
+        high_impact_reachable = transaction_method_status in high_impact_reachable_postures
+        if high_impact_reachable and high_impact_passed:
+            exposure_reason = (
+                "the default unauthenticated allowlist exposes high-impact transaction methods"
+                if transaction_method_status == "transaction-methods-default-allowed"
+                else "the current runner environment explicitly enables high-impact transaction methods"
+            )
             add_gap(
                 "GAP-rpc-high-impact-policy-decision",
                 "solana-rpc-http",
                 "High-impact allowed RPC methods need an explicit exposure decision",
                 "medium",
-                "Invalid-payload negative probes for sendTransaction and simulateTransaction passed, but the default unauthenticated allowlist still exposes high-impact transaction methods to browser clients.",
-                "Decide whether sendTransaction and simulateTransaction should remain in the default allowlist, require authentication, or move behind transaction-intent policy checks.",
+                (
+                    "Invalid-payload negative probes for sendTransaction and simulateTransaction passed, but "
+                    f"{exposure_reason} to browser clients."
+                ),
+                "Decide whether sendTransaction and simulateTransaction should remain reachable, require authentication, or move behind transaction-intent policy checks.",
                 "Any future positive-path test must use explicit approval and must not submit a real signed transaction automatically.",
             )
-        else:
+        elif high_impact_reachable:
             add_gap(
                 "GAP-rpc-high-impact-allowed-methods",
                 "solana-rpc-http",
                 "High-impact allowed RPC methods need safe negative probes",
                 "high",
-                "Source policy allows sendTransaction and simulateTransaction, but this run does not yet prove invalid, unsigned payloads fail safely.",
+                "Source or runner policy enables sendTransaction and simulateTransaction, but this run does not yet prove invalid, unsigned payloads fail safely.",
                 "Add bounded negative probes using invalid transaction payloads, then decide whether these methods should require authentication, be removed from the default allowlist, or be constrained by transaction intent checks.",
                 "Use invalid, unsigned payloads only; never submit a valid signed transaction.",
             )
@@ -30806,15 +31084,37 @@ def generate_report(
     ]
     for warning in transaction_intent.get("warnings", []):
         transaction_lines.append(f"- Warning: {warning}")
+    rpc_exposure_review = (
+        (rpc_method_policy or {}).get("transaction_method_exposure_review")
+        if isinstance((rpc_method_policy or {}).get("transaction_method_exposure_review"), dict)
+        else {}
+    )
     rpc_policy_lines = [
         f"- Policy posture: `{(rpc_method_policy or {}).get('policy_posture', 'unknown')}`",
+        f"- Transaction method exposure: `{rpc_exposure_review.get('status', 'unknown')}`",
         (
             "- Default high-impact methods: "
             f"`{', '.join((rpc_method_policy or {}).get('default_high_impact_methods', [])) or 'none'}`"
         ),
         (
+            "- Default transaction methods: "
+            f"`{', '.join(rpc_exposure_review.get('default_transaction_methods', [])) or 'none'}`"
+        ),
+        (
+            "- Env-gated transaction methods: "
+            f"`{', '.join(rpc_exposure_review.get('env_gated_transaction_methods', [])) or 'none'}`"
+        ),
+        (
             "- Transaction method gate present: "
             f"`{(rpc_method_policy or {}).get('explicit_transaction_method_gate_present', 'unknown')}`"
+        ),
+        (
+            "- Configured method override present: "
+            f"`{rpc_exposure_review.get('configured_method_override_present', 'unknown')}`"
+        ),
+        (
+            "- Blocked high-cost methods: "
+            f"`{', '.join(rpc_exposure_review.get('blocked_high_cost_methods', [])) or 'none'}`"
         ),
         (
             "- Transaction method probe results: "
@@ -33664,6 +33964,41 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for ref in action.get("commands", []) or []
             if isinstance(ref, dict)
         )
+        resource_release_candidate_sample = resource_release_candidates(
+            [
+                {
+                    "pid": 101,
+                    "name": "java",
+                    "rss_mib": 900.0,
+                    "command_preview": "/opt/BurpSuite/jre/bin/java burpsuite.jar",
+                },
+                {
+                    "pid": 102,
+                    "name": "firefox-bin",
+                    "rss_mib": 420.0,
+                    "command_preview": "firefox",
+                },
+                {
+                    "pid": 103,
+                    "name": "python",
+                    "rss_mib": 640.0,
+                    "command_preview": "python -m app.cli --host 0.0.0.0 --port 2455",
+                },
+                {
+                    "pid": 104,
+                    "name": "codex",
+                    "rss_mib": 500.0,
+                    "command_preview": "/path/to/codex",
+                },
+            ]
+        )
+        resource_release_candidate_types = {
+            item.get("type") for item in resource_release_candidate_sample
+        }
+        resource_release_candidates_passed = (
+            resource_release_candidate_types == {"burp-gui", "browser", "local-service"}
+            and {item.get("pid") for item in resource_release_candidate_sample} == {101, 102, 103}
+        )
     blackbox_asset_profile_paths = {
         cluster.get("path")
         for cluster in blackbox_asset_profile_sample.get("clusters", [])
@@ -34028,6 +34363,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                   'sendTransaction',
                   'simulateTransaction',
                 ])
+                const BLOCKED_METHODS = new Set(['getProgramAccounts', 'getSignaturesForAddress'])
                 const ALLOW_TRANSACTION_METHODS = process.env.SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS === 'true'
                 const BURST_LIMIT = 30
                 const SUSTAINED_LIMIT = 600
@@ -34503,6 +34839,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 gap
                 for gap in rewrite_resource_evidence_gaps.get("gaps", [])
                 if gap.get("id") == "GAP-rpc-resource-control-deployment-review"
+            ),
+            None,
+        )
+        rewrite_rpc_transaction_gap = next(
+            (
+                gap
+                for gap in rewrite_resource_evidence_gaps.get("gaps", [])
+                if gap.get("id") == "GAP-rpc-transaction-method-deployment-decision"
             ),
             None,
         )
@@ -35218,6 +35562,28 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and any(
                 candidate.get("type") == "deployment-resource-control-review"
                 for candidate in rewrite_resource_queue_item.get("review_candidates", []) or []
+            )
+        )
+        transaction_method_exposure_review = rewrite_transaction_policy.get(
+            "transaction_method_exposure_review",
+            {},
+        )
+        transaction_method_exposure_passed = (
+            transaction_method_exposure_review.get("status") == "transaction-methods-env-gated"
+            and transaction_method_exposure_review.get("priority") == "low"
+            and rewrite_transaction_policy.get("policy_posture") == "high-impact-methods-explicit-opt-in"
+            and rewrite_transaction_policy.get("default_high_impact_methods") == []
+            and transaction_method_exposure_review.get("default_transaction_methods") == []
+            and set(transaction_method_exposure_review.get("env_gated_transaction_methods", []))
+            == {"sendTransaction", "simulateTransaction"}
+            and transaction_method_exposure_review.get("configured_method_override_present") is False
+            and set(transaction_method_exposure_review.get("blocked_high_cost_methods", []))
+            == {"getProgramAccounts", "getSignaturesForAddress"}
+            and rewrite_rpc_transaction_gap is not None
+            and rewrite_rpc_transaction_gap.get("priority") == "medium"
+            and any(
+                candidate.get("type") == "deployment-rpc-transaction-method-review"
+                for candidate in rewrite_rpc_transaction_gap.get("review_candidates", []) or []
             )
         )
         rewrite_server_action_report_lines = rewrite_source_resolver_report.get("server_action_lines", [])
@@ -36164,9 +36530,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_mode_samples_passed
         and any_method_match_reason_passed
         and rewrite_discovery_passed
-        and transaction_flow_hypothesis_passed
-        and rate_limit_resource_review_passed
-        and profile_custom_ws_discovery_passed
+            and transaction_flow_hypothesis_passed
+            and rate_limit_resource_review_passed
+            and transaction_method_exposure_passed
+            and profile_custom_ws_discovery_passed
         and configured_nextjs_runtime_passed
         and initial_artifacts_passed
         and target_lock_passed
@@ -36185,10 +36552,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and discover_profile_seed_cli_passed
         and readiness_profile_passed
         and approval_status_profile_neutral_passed
-        and missing_profile_fallback_passed
-        and attack_strategy_status_passed
-        and empty_replay_queue_passed
-    )
+            and missing_profile_fallback_passed
+            and attack_strategy_status_passed
+            and empty_replay_queue_passed
+            and resource_release_candidates_passed
+        )
 
     artifact = {
         "generated_at": utc_now(),
@@ -36423,6 +36791,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "summary": empty_replay_queue.get("summary", {}),
             "item_ids": empty_replay_queue_item_ids,
         },
+        "resource_release_candidates": {
+            "status": "passed" if resource_release_candidates_passed else "failed",
+            "candidates": resource_release_candidate_sample,
+        },
         "active_observation_validation": {
             "status": "passed" if unsafe_observation_validation_passed else "failed",
             "validation_status": unsafe_observation_validation.get("status"),
@@ -36500,6 +36872,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "validation_item": rewrite_resource_validation_item,
                 "evidence_gap": rewrite_resource_gap,
                 "queue_item": rewrite_resource_queue_item,
+            },
+            "transaction_method_exposure_review": {
+                "status": "passed" if transaction_method_exposure_passed else "failed",
+                "policy_review": transaction_method_exposure_review,
+                "evidence_gap": rewrite_rpc_transaction_gap,
             },
             "source_resolver_report_summary": rewrite_source_resolver_report,
             "observation_clusters": sorted(rewrite_observation_clusters),
@@ -39523,6 +39900,14 @@ def run_resource_snapshot(args: argparse.Namespace) -> int:
             f"pid={process.get('pid')} "
             f"rss={process.get('rss_mib')}MiB "
             f"name={process.get('name')}"
+        )
+    for candidate in snapshot.get("release_candidates", [])[:3]:
+        print(
+            "Release candidate: "
+            f"pid={candidate.get('pid')} "
+            f"type={candidate.get('type')} "
+            f"rss={candidate.get('rss_mib')}MiB "
+            f"action={candidate.get('recommendation')}"
         )
     if no_write:
         print("No files written (--no-write).")
