@@ -118,6 +118,7 @@ SCOPE_POLICY_ARTIFACT = "scope-policy.json"
 WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT = "websocket-candidate-review.json"
 LEAD_PORTFOLIO_ARTIFACT = "lead-portfolio.json"
 HARNESS_LOOP_ARTIFACT = "harness-loop.json"
+METHODOLOGY_REVIEW_ARTIFACT = "methodology-review.json"
 HYPOTHESIS_MATRIX_ARTIFACT = "hypothesis-matrix.json"
 VALIDATION_PLAN_ARTIFACT = "validation-plan.json"
 ITERATION_DECISION_ARTIFACT = "iteration-decision.json"
@@ -7780,6 +7781,7 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
         "hypothesis-matrix --no-write --show-next",
     ],
     "issue-validation": [
+        "methodology-review --no-write --limit 8",
         "evidence-gaps --no-write",
         "validation-plan --no-write --limit 8 --show-commands",
         "deployment-review --no-write --top 8",
@@ -7791,6 +7793,44 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
         "report --no-write",
     ],
 }
+
+METHODOLOGY_RESEARCH_SOURCES = [
+    {
+        "id": "pkqs91-codex-web3-bounty",
+        "title": "How I Made $200k With Codex in 3 Months",
+        "url": "https://x.com/pkqs91/status/2070157806104457395",
+        "role": "user-requested-reference",
+        "takeaway": "Use Codex as a persistent bounty harness that moves from Web3/codebase context to concrete validation and PoC evidence.",
+    },
+    {
+        "id": "openai-harness-engineering",
+        "title": "Harness engineering: leveraging Codex in an agent-first world",
+        "url": "https://openai.com/index/harness-engineering/",
+        "role": "harness-engineering-reference",
+        "takeaway": "Keep repository state, feedback loops, and legible artifacts as the system of record while humans steer and agents execute.",
+    },
+    {
+        "id": "anthropic-effective-agents",
+        "title": "Building effective agents",
+        "url": "https://www.anthropic.com/engineering/building-effective-agents",
+        "role": "agent-pattern-reference",
+        "takeaway": "Prefer simple, composable workflows before adding autonomy; make each stage explicit and inspectable.",
+    },
+    {
+        "id": "barbatei-smart-contract-harness-notes",
+        "title": "Notes on building a smart contract security auditing harness",
+        "url": "https://www.linkedin.com/posts/alin-mihai-barbatei-27772b54_notes-on-building-a-smart-contract-security-activity-7476636721527455744-favn",
+        "role": "stage-pattern-reference",
+        "takeaway": "A practical security harness tends to converge on discovery/recon, lead generation, finding identification, issue validation, and PoC/reporting.",
+    },
+    {
+        "id": "anthropic-mythos-preview",
+        "title": "Assessing Claude Mythos Preview's cybersecurity capabilities",
+        "url": "https://www.anthropic.com/research/mythos-preview",
+        "role": "validation-depth-reference",
+        "takeaway": "Logic bugs require comparing intended security model with implemented behavior; reportability needs concrete validation, not static suspicion alone.",
+    },
+]
 
 
 def list_count(value: Any) -> int:
@@ -8192,6 +8232,228 @@ def build_harness_loop_run(
         "safety": (
             "Read-only harness loop summary. It sends no HTTP requests, invokes no Burp tools, "
             "runs no scanners, signs no wallets, and submits no transactions."
+        ),
+    }
+
+
+def methodology_stage_objective(stage_id: str) -> str:
+    return {
+        "discovery-recon": "Build enough codebase and traffic context to avoid blind probing.",
+        "lead-generation": "Turn context into prioritized, in-scope candidate leads.",
+        "finding-identification": "Convert leads into concrete vulnerability hypotheses with impact questions.",
+        "issue-validation": "Close evidence gaps with the smallest safe validation step and explicit stop conditions.",
+        "poc-reporting": "Only write PoC/report artifacts after a reportable finding is validated.",
+    }.get(stage_id, "Keep the harness stage explicit, reviewable, and evidence-driven.")
+
+
+def methodology_gap_lines(stage: dict[str, Any], resource_status: str) -> list[str]:
+    status = str(stage.get("status") or "")
+    summary = stage.get("summary") if isinstance(stage.get("summary"), dict) else {}
+    gaps: list[str] = []
+    if status.startswith("needs"):
+        gaps.append(f"stage status is {status}")
+    if status.startswith("blocked"):
+        gaps.append(f"stage is blocked: {status}")
+    if stage.get("stage") == "issue-validation" and int(summary.get("evidence_gaps", 0) or 0):
+        gaps.append(f"{summary.get('evidence_gaps')} evidence gap(s) remain")
+    if stage.get("stage") == "lead-generation" and int(summary.get("external_probe_commands", 0) or 0):
+        gaps.append(f"{summary.get('external_probe_commands')} external probe command(s) require gating")
+    if stage.get("stage") == "finding-identification" and str(summary.get("response_deltas") or "") in {"missing", "no-probe-results"}:
+        gaps.append("response deltas are not available for anomaly-based finding identification")
+    if stage.get("stage") == "poc-reporting" and status == "report-artifacts-present":
+        gaps.append("report artifacts exist, but no Medium/High/Critical reportable finding is validated yet")
+    if resource_status not in {"healthy", "not-run"}:
+        gaps.append(f"resource gate is {resource_status}; active validation remains blocked")
+    return ordered_unique_strings(gaps) or ["no immediate methodology gap detected for this stage"]
+
+
+def methodology_command_refs(
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    stage_id: str,
+) -> list[dict[str, Any]]:
+    commands = []
+    for index, subcommand in enumerate(HARNESS_STAGE_OFFLINE_FOLLOWUPS.get(stage_id, []), start=1):
+        ref = validation_command_ref(
+            validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile),
+            source=f"methodology-review:{stage_id}:{index}",
+        )
+        if ref.get("classification") == "ready":
+            commands.append(ref)
+    return commands
+
+
+def methodology_blocker_for_hypothesis(item: dict[str, Any]) -> str:
+    impact = str(item.get("impact") or "")
+    hypothesis_type = str(item.get("type") or item.get("hypothesis_type") or "")
+    transaction_flow = item.get("transaction_flow_review") if isinstance(item.get("transaction_flow_review"), dict) else {}
+    credential_review = item.get("credential_proxy_review") if isinstance(item.get("credential_proxy_review"), dict) else {}
+    resource_review = item.get("resource_abuse_review") if isinstance(item.get("resource_abuse_review"), dict) else {}
+    if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
+        if transaction_flow.get("status") == "needs-transaction-intent-corpus":
+            return "needs one approved quote transaction corpus and decode-transactions intent-policy review"
+        return "needs decoded transaction intent evidence before reportability"
+    if impact == "credentialed-upstream-cost-abuse" or hypothesis_type == "credential-proxy-review":
+        missing = credential_review.get("deployment_provider_missing", []) or []
+        if missing:
+            return "needs provider/operator evidence: " + ",".join(str(value) for value in missing[:4])
+        return "needs concrete provider quota, billing, availability, or account-abuse impact evidence"
+    if impact == "resource-exhaustion" or hypothesis_type == "resource-abuse-review":
+        if resource_review:
+            return "needs deployment proxy/header trust, external rate-limit store, and rate-limit bound evidence"
+        return "needs operator evidence before any resource-abuse reportability claim"
+    if str(item.get("status") or "").startswith("blocked"):
+        return f"blocked by {item.get('status')}"
+    return "needs concrete impact evidence and a validated finding gate decision"
+
+
+def methodology_next_command_for_hypothesis(
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    item: dict[str, Any],
+) -> dict[str, Any] | None:
+    impact = str(item.get("impact") or "")
+    hypothesis_type = str(item.get("type") or item.get("hypothesis_type") or "")
+    if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
+        subcommand = "transaction-flow-review --no-write --top 8"
+    elif impact in {"credentialed-upstream-cost-abuse", "resource-exhaustion"} or hypothesis_type in {
+        "credential-proxy-review",
+        "resource-abuse-review",
+    }:
+        subcommand = "deployment-review --no-write --top 8"
+    elif impact == "fixed-upstream-proxy-confusion":
+        subcommand = "rewrite-review --no-write --show-next"
+    else:
+        subcommand = "validation-plan --no-write --limit 8 --show-commands"
+    ref = validation_command_ref(
+        validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile),
+        source=f"methodology-review:hypothesis:{item.get('id') or hypothesis_type or impact}",
+    )
+    return ref if ref.get("classification") == "ready" else None
+
+
+def build_methodology_review(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    current_resource_snapshot: dict[str, Any] | None = None,
+    limit: int = 8,
+) -> dict[str, Any]:
+    resource_snapshot = current_resource_snapshot or build_default_resource_snapshot(max_processes=8)
+    resource_status = artifact_summary_status(resource_snapshot)
+    harness_loop = build_harness_loop_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        current_resource_snapshot=resource_snapshot,
+    )
+    hypothesis_matrix = build_hypothesis_matrix_run(target=target, profile=profile, artifact_dir=artifact_dir)
+    validation_plan = build_validation_plan_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        limit=max(1, int(limit)),
+        current_resource_snapshot=resource_snapshot,
+    )
+
+    stage_reviews = []
+    for stage in harness_loop.get("stages", []) or []:
+        if not isinstance(stage, dict):
+            continue
+        stage_id = str(stage.get("stage") or "")
+        commands = methodology_command_refs(artifact_dir, profile, stage_id)
+        stage_reviews.append(
+            {
+                "stage": stage_id,
+                "status": stage.get("status"),
+                "objective": methodology_stage_objective(stage_id),
+                "current_gap": methodology_gap_lines(stage, resource_status),
+                "next_step": stage.get("next_step"),
+                "artifact_refs": stage.get("artifact_refs", []),
+                "offline_commands": commands,
+                "command_safety": command_safety_summary(commands),
+            }
+        )
+
+    high_value_threads = []
+    for item in validation_plan.get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        priority = str(item.get("priority") or "")
+        if priority not in {"critical", "high", "medium"}:
+            continue
+        hypothesis_type = str(item.get("hypothesis_type") or item.get("type") or "")
+        if hypothesis_type == "verification-queue":
+            continue
+        command_ref = methodology_next_command_for_hypothesis(artifact_dir, profile, item)
+        high_value_threads.append(
+            {
+                "id": item.get("id") or item.get("hypothesis_id"),
+                "priority": priority,
+                "status": item.get("status"),
+                "type": hypothesis_type,
+                "impact": item.get("impact"),
+                "host": item.get("host"),
+                "path": item.get("path"),
+                "validation_question": item.get("validation_question"),
+                "current_blocker": methodology_blocker_for_hypothesis(item),
+                "reportability_gate": item.get("reportability_gate"),
+                "next_offline_command": command_ref,
+                "required_evidence": item.get("required_evidence", []),
+                "forbidden": item.get("forbidden", []),
+            }
+        )
+
+    focus = harness_loop.get("focus") if isinstance(harness_loop.get("focus"), dict) else {}
+    resource_budget = resource_budget_for_snapshot(resource_snapshot)
+    summary = {
+        "harness_status": harness_loop.get("status"),
+        "focus_stage": focus.get("stage"),
+        "focus_status": focus.get("status"),
+        "unattended_policy": focus.get("unattended_policy"),
+        "resource_status": resource_status,
+        "resource_budget_mode": resource_budget.get("mode") or resource_status,
+        "hypotheses": (hypothesis_matrix.get("summary", {}) or {}).get("hypotheses", 0),
+        "ready_hypotheses": (hypothesis_matrix.get("summary", {}) or {}).get("ready_hypotheses", 0),
+        "validation_items": (validation_plan.get("summary", {}) or {}).get("items", 0),
+        "high_value_threads": len(high_value_threads),
+    }
+    status = "has-reportable-finding" if harness_loop.get("status") == "reportable-findings" else "needs-methodology-deepening"
+    if resource_status not in {"healthy", "not-run"}:
+        status = "offline-only-resource-gated"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": str(artifact_dir),
+        "summary": summary,
+        "research_sources": METHODOLOGY_RESEARCH_SOURCES,
+        "stage_reviews": stage_reviews,
+        "high_value_threads": high_value_threads[: max(1, int(limit))],
+        "resource_preflight": validation_resource_preflight_summary(resource_snapshot),
+        "artifact_refs": {
+            "harness_loop": HARNESS_LOOP_ARTIFACT,
+            "hypothesis_matrix": HYPOTHESIS_MATRIX_ARTIFACT,
+            "validation_plan": VALIDATION_PLAN_ARTIFACT,
+            "transaction_flow_review": TRANSACTION_FLOW_REVIEW_ARTIFACT,
+            "deployment_review": DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
+        },
+        "stop_conditions": [
+            "Do not run active target traffic until resource-snapshot --strict is healthy.",
+            "Do not escalate static source suspicions without decoded, observed, or operator impact evidence.",
+            "Do not perform wallet signing, transaction submission, trading, fuzzing, stress testing, scanner, or Intruder actions.",
+            "Stop after the smallest evidence-changing step and refresh methodology-review before broadening.",
+        ],
+        "methodology": (
+            "Offline research-to-harness alignment: convert external harness lessons into concrete local stage gaps, "
+            "high-value hypotheses, safe next commands, and reportability blockers."
+        ),
+        "safety": (
+            "Read-only methodology review. It reads local artifacts and /proc resource state only; it sends no target traffic, "
+            "invokes no Burp tools, runs no scanners, signs no wallets, and submits no transactions."
         ),
     }
 
@@ -27662,6 +27924,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("scope-policy", "run_scope_policy"),
         refresh_expectation("websocket-candidate-review", "run_websocket_candidate_review", min_refreshes=2, min_prints=2),
         refresh_expectation("lead-portfolio", "run_lead_portfolio"),
+        refresh_expectation("methodology-review", "run_methodology_review"),
         refresh_expectation("harness-loop", "run_harness_loop"),
         refresh_expectation("hypothesis-matrix", "run_hypothesis_matrix"),
         refresh_expectation("rewrite-review", "run_rewrite_review"),
@@ -27907,6 +28170,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         source_peek_requests_output_dir = root / "source-peek-requests-output"
         evidence_gaps_output_dir = root / "evidence-gaps-output"
         report_output_dir = root / "report-output"
+        methodology_review_output_dir = root / "methodology-review-output"
         promote_output_dir = root / "promote-output"
         invalid_promote_output_dir = root / "invalid-promote-output"
         import_history_output_dir = root / "import-history-output"
@@ -28056,6 +28320,21 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--no-write",
                 ]
             )
+            methodology_review_return_code, methodology_review_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(methodology_review_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "methodology-review",
+                    "--no-write",
+                    "--show-commands",
+                ]
+            )
             promote_return_code, promote_stdout = run_cli(
                 [
                     "--profile",
@@ -28178,6 +28457,12 @@ def build_no_write_selftest() -> dict[str, Any]:
             "report_markdown": (report_output_dir / "report.md").exists(),
             "report_index": (report_output_dir / "index.html").exists(),
             "report_manifest": (report_output_dir / MANIFEST_NAME).exists(),
+            "methodology_review_dir": methodology_review_output_dir.exists(),
+            "methodology_review_target_profile_json": (
+                methodology_review_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "methodology_review_json": (methodology_review_output_dir / METHODOLOGY_REVIEW_ARTIFACT).exists(),
+            "methodology_review_manifest": (methodology_review_output_dir / MANIFEST_NAME).exists(),
             "promote_dir": promote_output_dir.exists(),
             "promote_reviewed_profile": (promote_output_dir / "reviewed-profile.json").exists(),
             "promote_validation": (promote_output_dir / "reviewed-profile-validation.json").exists(),
@@ -28209,6 +28494,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     source_peek_requests_stdout_text = "\n".join(source_peek_requests_stdout)
     evidence_gaps_stdout_text = "\n".join(evidence_gaps_stdout)
     report_stdout_text = "\n".join(report_stdout)
+    methodology_review_stdout_text = "\n".join(methodology_review_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
     invalid_promote_stdout_text = "\n".join(invalid_promote_stdout)
     import_history_limit_stdout_text = "\n".join(import_history_limit_stdout)
@@ -28749,6 +29035,31 @@ def build_no_write_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "methodology-review-no-write-skips-artifacts",
+            "passed": (
+                methodology_review_return_code == 0
+                and "Methodology review:" in methodology_review_stdout_text
+                and "High-value threads:" in methodology_review_stdout
+                and "No files written (--no-write)." in methodology_review_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "methodology_review_dir",
+                        "methodology_review_target_profile_json",
+                        "methodology_review_json",
+                        "methodology_review_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in methodology_review_stdout)
+            ),
+            "expected": "methodology-review --no-write prints methodology alignment without writing artifacts or manifests",
+            "actual": {
+                "return_code": methodology_review_return_code,
+                "stdout": methodology_review_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
             "id": "harness-offline-followups-parse",
             "passed": not harness_followup_parse_errors,
             "expected": "every harness offline follow-up command parses, including --no-write previews",
@@ -29063,6 +29374,10 @@ def build_no_write_selftest() -> dict[str, Any]:
             "report": {
                 "return_code": report_return_code,
                 "stdout": report_stdout,
+            },
+            "methodology_review": {
+                "return_code": methodology_review_return_code,
+                "stdout": methodology_review_stdout,
             },
             "outputs_exist": output_paths,
         },
@@ -40755,6 +41070,81 @@ def run_lead_portfolio(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_methodology_review(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    current_resource_snapshot = None
+    if not getattr(args, "skip_current_resource_check", False):
+        current_resource_snapshot = build_default_resource_snapshot(max_processes=8)
+    review = build_methodology_review(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        current_resource_snapshot=current_resource_snapshot,
+        limit=max(1, int(args.limit)),
+    )
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / METHODOLOGY_REVIEW_ARTIFACT
+    if not no_write:
+        write_json(output_path, review)
+
+    summary = review.get("summary", {}) or {}
+    resource_preflight = review.get("resource_preflight", {}) or {}
+    print(f"Methodology review: {review['status']}")
+    print(
+        "Loop: "
+        f"harness={summary.get('harness_status')} "
+        f"focus={summary.get('focus_stage') or '-'} "
+        f"policy={summary.get('unattended_policy') or '-'} "
+        f"resource={summary.get('resource_budget_mode') or summary.get('resource_status') or '-'} "
+        f"high_value_threads={summary.get('high_value_threads', 0)}"
+    )
+    if resource_preflight and resource_preflight.get("status") != "not-run":
+        for candidate in (resource_preflight.get("release_candidates", []) or [])[:2]:
+            print(
+                "  release_candidate="
+                f"{candidate.get('type')} "
+                f"pid={candidate.get('pid')} "
+                f"rss={candidate.get('rss_mib')}MiB "
+                f"context={process_context_label(candidate.get('process_context'))}"
+            )
+    print("Stages:")
+    for stage in (review.get("stage_reviews", []) or [])[: max(1, int(args.top_stages))]:
+        gaps = stage.get("current_gap", []) or []
+        print(
+            f"- {stage.get('stage')}: {stage.get('status')} "
+            f"gap={inline_summary_text('; '.join(str(gap) for gap in gaps[:2]), max_chars=220)}"
+        )
+        if args.show_commands:
+            for ref in (stage.get("offline_commands", []) or [])[:2]:
+                print(f"    - {format_command_ref_label(ref)} {inline_summary_text(ref.get('command'), max_chars=420)}")
+    print("High-value threads:")
+    for thread in (review.get("high_value_threads", []) or [])[: max(0, int(args.limit))]:
+        print(
+            f"- {thread.get('priority')} {thread.get('status')} {thread.get('type')} "
+            f"path={thread.get('path') or '-'} impact={thread.get('impact') or '-'}"
+        )
+        print(f"  blocker={inline_summary_text(thread.get('current_blocker'), max_chars=260)}")
+        command_ref = thread.get("next_offline_command") if isinstance(thread.get("next_offline_command"), dict) else None
+        if args.show_commands and command_ref:
+            print(f"    - {format_command_ref_label(command_ref)} {inline_summary_text(command_ref.get('command'), max_chars=420)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="methodology-review",
+                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+            )
+        )
+    return 0
+
+
 def run_harness_loop(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -43309,6 +43699,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero when actionable leads remain.",
     )
     lead_portfolio.set_defaults(func=run_lead_portfolio)
+
+    methodology_review = sub.add_parser(
+        "methodology-review",
+        help="Map external harness methodology to current local evidence gaps and safe next commands",
+    )
+    methodology_review.add_argument(
+        "--output",
+        help="Where to write methodology-review.json. Defaults to --artifact-dir/methodology-review.json.",
+    )
+    methodology_review.add_argument(
+        "--limit",
+        type=positive_int,
+        default=8,
+        help="Number of high-value threads and validation items to review.",
+    )
+    methodology_review.add_argument(
+        "--top-stages",
+        type=positive_int,
+        default=5,
+        help="Number of methodology stages to print.",
+    )
+    methodology_review.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print safe offline command previews for stage gaps and high-value threads.",
+    )
+    methodology_review.add_argument(
+        "--skip-current-resource-check",
+        action="store_true",
+        help="Use artifact resource snapshots instead of checking current /proc memory.",
+    )
+    methodology_review.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print methodology review only; do not write methodology-review.json or refreshed manifests.",
+    )
+    methodology_review.set_defaults(func=run_methodology_review)
 
     harness_loop = sub.add_parser(
         "harness-loop",
