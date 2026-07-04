@@ -8310,6 +8310,11 @@ def hypothesis_from_rpc_method_policy(
         if isinstance(flow_artifact.get("quote_source_contract_review"), dict)
         else {}
     )
+    credential_proxy = (
+        flow_artifact.get("server_credential_proxy_review")
+        if isinstance(flow_artifact.get("server_credential_proxy_review"), dict)
+        else {}
+    )
     flow_dataflows = [
         item for item in flow_artifact.get("dataflows", []) or [] if isinstance(item, dict)
     ]
@@ -8393,9 +8398,15 @@ def hypothesis_from_rpc_method_policy(
             "quote_source_contract_missing_required": (
                 quote_contract.get("summary") or {}
             ).get("missing_required_decisions", []),
+            "server_credential_proxy_status": credential_proxy.get("status") or "missing",
+            "server_credential_proxy_priority": credential_proxy.get("priority") or "info",
+            "server_credential_proxy_review_files": (
+                credential_proxy.get("summary") or {}
+            ).get("files_needing_cost_review", 0),
             "static_signal_count": static_intent_review.get("signal_count", 0),
             "static_intent_review": static_intent_review,
             "quote_source_contract_review": quote_contract,
+            "server_credential_proxy_review": credential_proxy,
             "dataflows": flow_dataflows[:5],
             "frontend_transaction_dependency_refs": frontend_refs[:5],
             "remote_transaction_material_refs": remote_refs[:5],
@@ -9117,7 +9128,11 @@ def transaction_flow_review_for_hypothesis_matrix(
     rpc_method_policy: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
     artifact = load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT)
-    if isinstance(artifact, dict) and isinstance(artifact.get("quote_source_contract_review"), dict):
+    if (
+        isinstance(artifact, dict)
+        and isinstance(artifact.get("quote_source_contract_review"), dict)
+        and isinstance(artifact.get("server_credential_proxy_review"), dict)
+    ):
         return artifact, "artifact"
 
     profile_doc = profile if isinstance(profile, dict) else {}
@@ -15688,6 +15703,38 @@ def transaction_flow_match_categories() -> dict[str, list[str]]:
             "M0_ORCHESTRATION_API_KEY",
             "Object.keys(body)",
         ],
+        "server_credential_sources": [
+            "getM0OrchestrationApiKey",
+            "M0_ORCHESTRATION_API_KEY",
+            "x-api-key",
+            "authorization: `Bearer ${config.token}`",
+            "process.env.UPSTASH_REDIS_REST_TOKEN",
+            "process.env.KV_REST_API_TOKEN",
+        ],
+        "server_external_upstreams": [
+            "https://gateway.m0.xyz",
+            "M0_QUOTE_API",
+            "fetch(M0_QUOTE_API",
+            "fetch(`${config.url}/pipeline`",
+        ],
+        "server_auth_guards": [
+            "getServerSession",
+            "auth(",
+            "requireAuth",
+            "verifyAuth",
+            "req.headers.get('authorization')",
+            "req.headers.get(\"authorization\")",
+            "cookies()",
+        ],
+        "server_rate_limit_guards": [
+            "checkRateLimit(",
+            "rateLimit",
+            "429",
+            "Too many requests",
+            "RATE_LIMIT",
+            "BURST_LIMIT",
+            "SUSTAINED_LIMIT",
+        ],
     }
 
 
@@ -16059,6 +16106,97 @@ def build_quote_source_contract_review(
     }
 
 
+def build_server_credential_proxy_review(refs_by_group: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    credential_refs = refs_by_group.get("server_credential_sources", []) or []
+    upstream_refs = refs_by_group.get("server_external_upstreams", []) or []
+    auth_refs = refs_by_group.get("server_auth_guards", []) or []
+    rate_refs = refs_by_group.get("server_rate_limit_guards", []) or []
+    validation_refs = refs_by_group.get("server_quote_validation", []) or []
+
+    candidate_files = sorted(transaction_flow_files_for_refs([*credential_refs, *upstream_refs]))
+
+    def refs_for_file(refs: list[dict[str, Any]], file_name: str) -> list[dict[str, Any]]:
+        return [ref for ref in refs if str(ref.get("file") or "") == file_name]
+
+    files = []
+    file_status_counts: dict[str, int] = {}
+    for file_name in candidate_files:
+        file_credential_refs = refs_for_file(credential_refs, file_name)
+        file_upstream_refs = refs_for_file(upstream_refs, file_name)
+        file_auth_refs = refs_for_file(auth_refs, file_name)
+        file_rate_refs = refs_for_file(rate_refs, file_name)
+        file_validation_refs = refs_for_file(validation_refs, file_name)
+        if file_credential_refs and file_upstream_refs:
+            if file_auth_refs or file_rate_refs:
+                status = "credential-proxy-controls-indexed"
+            else:
+                status = "needs-cost-abuse-review"
+        elif file_credential_refs or file_upstream_refs:
+            status = "partial-credential-proxy-context"
+        else:
+            status = "no-credential-proxy-evidence"
+        increment_count(file_status_counts, status)
+        files.append(
+            {
+                "file": file_name,
+                "status": status,
+                "credential_refs": file_credential_refs[:8],
+                "external_upstream_refs": file_upstream_refs[:8],
+                "auth_guard_refs": file_auth_refs[:8],
+                "rate_limit_guard_refs": file_rate_refs[:8],
+                "request_validation_refs": file_validation_refs[:8],
+                "review_question": (
+                    "Can unauthenticated users consume a server-side credentialed upstream, quota, or billed provider "
+                    "through this route without per-user authorization or rate controls?"
+                ),
+            }
+        )
+
+    if any(row.get("status") == "needs-cost-abuse-review" for row in files):
+        status = "needs-cost-abuse-review"
+        priority = "medium"
+    elif any(row.get("status") == "credential-proxy-controls-indexed" for row in files):
+        status = "credential-proxy-controls-indexed"
+        priority = "info"
+    elif files:
+        status = "partial-credential-proxy-context"
+        priority = "low"
+    else:
+        status = "no-server-credential-proxy-evidence"
+        priority = "info"
+
+    return {
+        "status": status,
+        "priority": priority,
+        "summary": {
+            "files": len(files),
+            "files_needing_cost_review": sum(1 for row in files if row.get("status") == "needs-cost-abuse-review"),
+            "credential_refs": len(credential_refs),
+            "external_upstream_refs": len(upstream_refs),
+            "auth_guard_refs": len(auth_refs),
+            "rate_limit_guard_refs": len(rate_refs),
+            "file_status_counts": dict(sorted(file_status_counts.items())),
+        },
+        "files": files,
+        "required_evidence": [
+            "Provider or operator evidence for quota, billing, rate limits, or account-impact severity of the credentialed upstream.",
+            "Evidence that attacker-controlled unauthenticated requests can consume that upstream without signing wallets or submitting transactions.",
+            "A finding-gate decision showing concrete cost, quota, availability, or credential-abuse impact without high-volume traffic.",
+        ],
+        "reportability_gate": (
+            "A server-side credentialed upstream proxy is not reportable by itself. Escalate only with concrete provider quota, "
+            "billing, availability, or account-abuse impact evidence, and do not validate with flooding or stress traffic."
+        ),
+        "next_step": (
+            "Review deployment/provider quota and rate-limit evidence for each needs-cost-abuse-review file. "
+            "Use at most one approved request after the resource gate is healthy."
+        ),
+        "safety": (
+            "Offline source review only. It sends no upstream requests, does not brute force quotas, and does not expose secret values."
+        ),
+    }
+
+
 def build_transaction_flow_review(
     source_root: Path,
     profile: dict[str, Any] | None = None,
@@ -16156,6 +16294,7 @@ def build_transaction_flow_review(
 
     policy_scaffold = build_transaction_intent_policy_scaffold(profile)
     quote_contract_review = build_quote_source_contract_review(refs_by_group, policy_scaffold)
+    credential_proxy_review = build_server_credential_proxy_review(refs_by_group)
     if quote_contract_review.get("status") == "quote-source-contract-indexed":
         contract_refs = []
         for decision in quote_contract_review.get("decisions", []) or []:
@@ -16171,6 +16310,22 @@ def build_transaction_flow_review(
             "Client quote request shape and server quote validation policy are indexed for decode-time comparison.",
             contract_refs[:12],
             "Do decoded executable transactions match the source contract for wallet, amountIn, mint direction, quote count, and allowed programs?",
+        )
+    if credential_proxy_review.get("status") == "needs-cost-abuse-review":
+        credential_refs = []
+        for row in credential_proxy_review.get("files", []) or []:
+            if not isinstance(row, dict) or row.get("status") != "needs-cost-abuse-review":
+                continue
+            credential_refs.extend(row.get("credential_refs", []) or [])
+            credential_refs.extend(row.get("external_upstream_refs", []) or [])
+            credential_refs.extend(row.get("request_validation_refs", []) or [])
+        add_dataflow(
+            "server-credential-proxy-cost-review",
+            "needs-cost-abuse-review",
+            "medium",
+            "A route can call a credentialed external upstream from server-side code without same-file auth or rate-limit evidence.",
+            [ref for ref in credential_refs if isinstance(ref, dict)][:12],
+            "Can unauthenticated requests consume provider quota, billing, or availability through this server-side credential proxy?",
         )
 
     dataflow_status_counts: dict[str, int] = {}
@@ -16199,6 +16354,16 @@ def build_transaction_flow_review(
     else:
         status = "no-transaction-flow-signals"
 
+    required_evidence = [
+        "One approved quote response or transaction payload corpus collected without wallet signing.",
+        "Decoded transaction signer accounts compared with the executing wallet.",
+        "Decoded source/destination mints, token accounts, and token movement compared with requested quote direction and amount.",
+        "Decoded instruction program IDs compared with the profile allowedPrograms policy.",
+        "A finding-gate decision showing concrete transaction-integrity or user-funds impact.",
+    ]
+    if credential_proxy_review.get("status") == "needs-cost-abuse-review":
+        required_evidence.extend(credential_proxy_review.get("required_evidence", []) or [])
+
     return {
         "generated_at": utc_now(),
         "status": status,
@@ -16218,6 +16383,10 @@ def build_transaction_flow_review(
             "quote_request_field_refs": len(refs_by_group.get("quote_request_fields", []) or []),
             "server_quote_validation_refs": len(refs_by_group.get("server_quote_validation", []) or []),
             "quote_source_contract_status": quote_contract_review.get("status"),
+            "server_credential_proxy_status": credential_proxy_review.get("status"),
+            "server_credential_proxy_review_files": (
+                credential_proxy_review.get("summary") or {}
+            ).get("files_needing_cost_review", 0),
         },
         "resource_limits": {
             "max_file_bytes": max_file_bytes,
@@ -16235,6 +16404,7 @@ def build_transaction_flow_review(
         "transaction_intent": intent_summary,
         "intent_policy_scaffold": policy_scaffold,
         "quote_source_contract_review": quote_contract_review,
+        "server_credential_proxy_review": credential_proxy_review,
         "rpc_method_policy_context": {
             "status": rpc_review.get("status") or "missing",
             "priority": rpc_review.get("priority") or "info",
@@ -16244,13 +16414,7 @@ def build_transaction_flow_review(
                 else 0
             ),
         },
-        "required_evidence": [
-            "One approved quote response or transaction payload corpus collected without wallet signing.",
-            "Decoded transaction signer accounts compared with the executing wallet.",
-            "Decoded source/destination mints, token accounts, and token movement compared with requested quote direction and amount.",
-            "Decoded instruction program IDs compared with the profile allowedPrograms policy.",
-            "A finding-gate decision showing concrete transaction-integrity or user-funds impact.",
-        ],
+        "required_evidence": ordered_unique_strings(required_evidence),
         "forbidden": [
             "Do not sign wallet prompts.",
             "Do not submit transactions.",
@@ -33224,6 +33388,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 const ROUTE_ENDPOINT_KEYS = new Set(['chain', 'address'])
                 const MAX_AMOUNT_IN_DIGITS = 30
                 const M0_ORCHESTRATION_API_KEY = 'selftest-key'
+                const M0_QUOTE_API = 'https://gateway.m0.xyz/v1/orchestration/quote'
 
                 function unexpectedKeys(record: Record<string, unknown>, allowed: Set<string>) {
                   return Object.keys(record).filter((key) => !allowed.has(key))
@@ -33254,6 +33419,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     throw new Error('maxNumQuotes must be 1')
                   }
                   return M0_ORCHESTRATION_API_KEY
+                }
+
+                export function postQuoteContractSelftest(body: unknown) {
+                  return fetch(M0_QUOTE_API, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'x-api-key': M0_ORCHESTRATION_API_KEY,
+                    },
+                    body: JSON.stringify(body),
+                  })
                 }
                 """
             ).strip()
@@ -33534,6 +33710,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             {
                 "status": "needs-transaction-intent-corpus",
                 "summary": {"remote_signing_sink_refs": 1},
+                "quote_source_contract_review": {"status": "quote-source-contract-indexed"},
             },
         )
         rewrite_transaction_stale_matrix = build_hypothesis_matrix_run(
@@ -34182,8 +34359,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rewrite_transaction_flow_review.get("intent_policy_scaffold", {}).get("configured_direction_count", 0) >= 2
             and rewrite_transaction_flow_review.get("quote_source_contract_review", {}).get("status")
             == "quote-source-contract-indexed"
+            and rewrite_transaction_flow_review.get("server_credential_proxy_review", {}).get("status")
+            == "needs-cost-abuse-review"
             and "remote-payload-to-wallet-signing" in transaction_flow_review_dataflow_ids
             and "quote-source-contract-indexed" in transaction_flow_review_dataflow_ids
+            and "server-credential-proxy-cost-review" in transaction_flow_review_dataflow_ids
             and rewrite_transaction_matrix.get("summary", {}).get("rpc_method_policy_source") == "profile-fallback"
             and rewrite_transaction_matrix.get("summary", {}).get("transaction_flow_review_source") == "artifact"
             and rewrite_transaction_stale_matrix.get("summary", {}).get("transaction_flow_review_source")
@@ -34191,6 +34371,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rewrite_transaction_stale_hypothesis is not None
             and rewrite_transaction_stale_hypothesis.get("transaction_flow_review", {}).get("quote_source_contract_status")
             == "quote-source-contract-indexed"
+            and rewrite_transaction_stale_hypothesis.get("transaction_flow_review", {}).get(
+                "server_credential_proxy_status"
+            )
+            == "needs-cost-abuse-review"
             and rewrite_transaction_hypothesis is not None
             and rewrite_transaction_hypothesis.get("status") == "ready-for-offline-review"
             and rewrite_transaction_hypothesis.get("impact") == "transaction-integrity"
@@ -34208,6 +34392,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             >= 2
             and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("quote_source_contract_status")
             == "quote-source-contract-indexed"
+            and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("server_credential_proxy_status")
+            == "needs-cost-abuse-review"
+            and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get(
+                "server_credential_proxy_review_files",
+                0,
+            )
+            >= 1
             and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
             and TRANSACTION_FLOW_REVIEW_ARTIFACT in (rewrite_transaction_hypothesis.get("evidence_refs", []) or [])
             and rewrite_transaction_validation_item is not None
@@ -34222,6 +34413,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             >= 1
             and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("quote_source_contract_status")
             == "quote-source-contract-indexed"
+            and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get(
+                "server_credential_proxy_status"
+            )
+            == "needs-cost-abuse-review"
             and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
         )
         rate_limit_resource_review = rewrite_transaction_policy.get("rate_limit_resource_review", {})
@@ -39265,6 +39460,12 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
     scaffold = review.get("intent_policy_scaffold", {}) or {}
     source_contract = review.get("quote_source_contract_review") if isinstance(review.get("quote_source_contract_review"), dict) else {}
     source_contract_summary = source_contract.get("summary", {}) if isinstance(source_contract.get("summary"), dict) else {}
+    credential_proxy = (
+        review.get("server_credential_proxy_review")
+        if isinstance(review.get("server_credential_proxy_review"), dict)
+        else {}
+    )
+    credential_proxy_summary = credential_proxy.get("summary", {}) if isinstance(credential_proxy.get("summary"), dict) else {}
     print(f"Transaction flow review: {review['status']}")
     print(
         "Source refs: "
@@ -39292,6 +39493,14 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
             f"status={source_contract.get('status')}, "
             f"decisions={source_contract_summary.get('decisions', 0)}, "
             f"missing_required={len(source_contract_summary.get('missing_required_decisions', []) or [])}"
+        )
+    if credential_proxy:
+        print(
+            "Credential proxy: "
+            f"status={credential_proxy.get('status')}, "
+            f"files_needing_review={credential_proxy_summary.get('files_needing_cost_review', 0)}, "
+            f"credential_refs={credential_proxy_summary.get('credential_refs', 0)}, "
+            f"upstream_refs={credential_proxy_summary.get('external_upstream_refs', 0)}"
         )
     top_count = max(0, int(args.top))
     if top_count:
@@ -39439,7 +39648,8 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         f"dataflows={transaction_flow.get('dataflow_count', 0)} "
                         f"remote_signing_sinks={transaction_flow.get('remote_signing_sink_ref_count', 0)} "
                         f"policy_scaffold={transaction_flow.get('intent_policy_scaffold_status', 'missing')} "
-                        f"quote_contract={transaction_flow.get('quote_source_contract_status', 'missing')}"
+                        f"quote_contract={transaction_flow.get('quote_source_contract_status', 'missing')} "
+                        f"credential_proxy={transaction_flow.get('server_credential_proxy_status', 'missing')}"
                     )
                 resource_review = (
                     item.get("resource_abuse_review")

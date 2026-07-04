@@ -318,10 +318,13 @@ intent comparisons, forbidden actions, and an intent-policy scaffold derived
 from profile `quote_intent` directions. It also indexes source-backed quote
 intent contract evidence: client request shape, server request-key allowlists,
 mint/direction constraints, sender/recipient binding, amount bounds, quote-count
-bounds, and executable payload extraction. The scaffold records which buy/sell
-mint pairs and `allowedPrograms` are already known and which runtime values
-still need an approved quote corpus, wallet, and raw `amountIn`. It sends no
-requests, does not open a wallet, and never signs or submits transactions.
+bounds, and executable payload extraction. When source shows a server-side
+credentialed upstream proxy, it also adds a cost/quota review that requires
+provider or operator impact evidence before reportability. The scaffold records
+which buy/sell mint pairs and `allowedPrograms` are already known and which
+runtime values still need an approved quote corpus, wallet, and raw `amountIn`.
+It sends no requests, does not open a wallet, and never signs or submits
+transactions.
 When RPC source shows client-keyed in-memory rate-limit fallback behavior, the
 matrix can add a `resource-abuse-review` hypothesis. This is also offline-only:
 review deployment proxy header trust, external rate-limit store configuration,
