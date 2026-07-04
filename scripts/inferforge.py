@@ -21202,6 +21202,18 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         build_clusters(missing_quote_intent_profile, ROOT),
         ROOT,
     )
+    missing_quote_body_error = None
+    try:
+        build_quote_collection_body(missing_quote_intent_profile, "buy", DEFAULT_TEST_WALLET, "1000000")
+    except ValueError as error:
+        missing_quote_body_error = redacted_error_summary(error)
+    missing_quote_payload = generate_synthetic_transaction_payload(
+        "node",
+        ROOT,
+        profile=missing_quote_intent_profile,
+        direction="buy",
+        wallet=DEFAULT_TEST_WALLET,
+    )
     quote_intent_profile_passed = (
         quote_body_sample["route"]["source"]["address"] == "So11111111111111111111111111111111111111112"
         and quote_body_sample["route"]["destination"]["address"] == "11111111111111111111111111111111"
@@ -21215,6 +21227,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "cluster:quote:missing-buy-quote-intent",
             "cluster:quote:missing-sell-quote-intent",
         }.issubset({str(item.get("id")) for item in missing_quote_intent_validation.get("warnings", [])})
+        and (missing_quote_body_error or {}).get("message_redacted") is True
+        and missing_quote_payload.get("ok") is False
+        and ((missing_quote_payload.get("error") or {}).get("message_redacted") is True)
     )
     quote_discovery_inventory = {
         "generated_at": utc_now(),
@@ -22606,6 +22621,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "status": missing_quote_intent_validation.get("status"),
                 "warning_ids": [item.get("id") for item in missing_quote_intent_validation.get("warnings", [])],
             },
+            "missing_quote_body_error": missing_quote_body_error,
+            "missing_quote_payload_error": missing_quote_payload.get("error"),
         },
         "discovered_quote_intent_seed_routing": {
             "status": "passed" if discovered_quote_intent_passed else "failed",
