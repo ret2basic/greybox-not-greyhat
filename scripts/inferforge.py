@@ -8692,7 +8692,7 @@ def cluster_matches_endpoint(cluster: dict[str, Any], method: str, path: str) ->
 
     methods = {str(item).upper() for item in match.get("methods", [])}
     exclude_methods = {str(item).upper() for item in match.get("exclude_methods", [])}
-    if methods and normalized_method not in methods:
+    if methods and "ANY" not in methods and normalized_method not in methods:
         return False
     if exclude_methods and normalized_method in exclude_methods:
         return False
@@ -22828,6 +22828,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "export async function GET() { return Response.json({ ok: true }) }\n",
             encoding="utf-8",
         )
+        (seeded_source_root / "src/app/any/method").mkdir(parents=True)
+        (seeded_source_root / "src/app/any/method/route.ts").write_text(
+            "export async function GET() { return Response.json({ ok: true }) }\n",
+            encoding="utf-8",
+        )
         profile_seed = json_clone(test_profile)
         profile_seed["probe_targets"]["quote"]["path"] = "/bridge/swap"
         profile_seed.setdefault("clusters", []).append(
@@ -22839,6 +22844,18 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "priority": "medium",
                 "strategy_set": "nextjs-api-routes",
                 "match": {"paths": ["/method/strict"]},
+                "source_refs": [],
+            }
+        )
+        profile_seed.setdefault("clusters", []).append(
+            {
+                "id": "profile-any-method-route",
+                "method": "ANY",
+                "path": "/any/method",
+                "kind": "api-route",
+                "priority": "medium",
+                "strategy_set": "nextjs-api-routes",
+                "match": {"methods": ["ANY"], "paths": ["/any/method"]},
                 "source_refs": [],
             }
         )
@@ -22889,6 +22906,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             (route for route in neutral_inventory.get("routes", []) if route.get("source_path") == "/method/strict"),
             None,
         )
+        seeded_any_method_route = next(
+            (route for route in seeded_inventory.get("routes", []) if route.get("source_path") == "/any/method"),
+            None,
+        )
+        neutral_any_method_route = next(
+            (route for route in neutral_inventory.get("routes", []) if route.get("source_path") == "/any/method"),
+            None,
+        )
         seeded_profile = build_discovered_profile(
             seeded_inventory,
             name="profile-seeded-route-discovery",
@@ -22931,6 +22956,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and seeded_method_strict_route.get("cluster_id") != "profile-post-only-route"
             and neutral_method_strict_route is not None
             and neutral_method_strict_route.get("cluster_id") == "route-method-strict"
+            and seeded_any_method_route is not None
+            and seeded_any_method_route.get("cluster_id") == "profile-any-method-route"
+            and neutral_any_method_route is not None
+            and neutral_any_method_route.get("cluster_id") == "route-any-method"
             and "quote_provider" not in neutral_profile
         )
         profile_seeded_route_discovery = {
@@ -22942,6 +22971,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "neutral_rpc_route": neutral_rpc_route,
             "seeded_method_strict_route": seeded_method_strict_route,
             "neutral_method_strict_route": neutral_method_strict_route,
+            "seeded_any_method_route": seeded_any_method_route,
+            "neutral_any_method_route": neutral_any_method_route,
             "seeded_probe_targets": seeded_profile.get("probe_targets"),
             "neutral_strategy_sets": neutral_profile.get("strategy_sets", []),
             "neutral_has_quote_provider": "quote_provider" in neutral_profile,
