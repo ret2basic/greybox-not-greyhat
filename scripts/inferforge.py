@@ -18774,13 +18774,20 @@ def build_command_safety_selftest() -> dict[str, Any]:
             "commands": ["python3 scripts/inferforge.py audit && python3 scripts/inferforge.py manifest"],
         },
         {
+            "id": "READY_EXTERNAL",
+            "status": "ready",
+            "commands": ["python3 scripts/inferforge.py audit --include-external"],
+        },
+        {
             "id": "EXTERNAL",
             "status": "blocked-external",
             "commands": ["python3 scripts/inferforge.py decode-transactions --input .greybox/transaction-payloads.json"],
         },
     ]
     queue_summary = annotate_verification_queue_commands(queue_items)
+    apply_verification_queue_command_statuses(queue_items)
     queue_counts = queue_summary.get("classification_counts", {})
+    queue_status_by_id = {item["id"]: item.get("status") for item in queue_items}
     queue_safety_text = format_command_safety_summary(queue_summary)
     exit_code_cases = [
         {
@@ -18824,6 +18831,12 @@ def build_command_safety_selftest() -> dict[str, Any]:
             "actual": queue_counts.get("review-gated"),
         },
         {
+            "id": "queue-external-probe-count",
+            "passed": queue_counts.get("external-probe") == 1,
+            "expected": 1,
+            "actual": queue_counts.get("external-probe"),
+        },
+        {
             "id": "queue-unsafe-template-count",
             "passed": queue_summary.get("unsafe_template_count") == 1,
             "expected": 1,
@@ -18831,8 +18844,8 @@ def build_command_safety_selftest() -> dict[str, Any]:
         },
         {
             "id": "queue-blocked-external-count",
-            "passed": queue_summary.get("blocked_external") == 2,
-            "expected": 2,
+            "passed": queue_summary.get("blocked_external") == 3,
+            "expected": 3,
             "actual": queue_summary.get("blocked_external"),
         },
         {
@@ -18844,16 +18857,28 @@ def build_command_safety_selftest() -> dict[str, Any]:
         {
             "id": "queue-summary-text-is-actionable",
             "passed": (
-                "commands=7" in queue_safety_text
+                "commands=8" in queue_safety_text
                 and "runnable=1" in queue_safety_text
                 and "manual=5" in queue_safety_text
-                and "external=2" in queue_safety_text
+                and "external=3" in queue_safety_text
                 and "unsafe=1" in queue_safety_text
                 and f'"{PLACEHOLDER_APPROVED_CONCRETE_PATH}": 1' in queue_safety_text
                 and f'"{PLACEHOLDER_REAL_WALLET}": 1' in queue_safety_text
             ),
             "expected": "summary text includes runnable/manual/external/unsafe counts and placeholders",
             "actual": queue_safety_text,
+        },
+        {
+            "id": "queue-ready-external-status-is-blocked-external",
+            "passed": queue_status_by_id.get("READY_EXTERNAL") == "blocked-external",
+            "expected": "blocked-external",
+            "actual": queue_status_by_id.get("READY_EXTERNAL"),
+        },
+        {
+            "id": "queue-unsafe-status-is-blocked-command-safety",
+            "passed": queue_status_by_id.get("UNSAFE") == "blocked-command-safety",
+            "expected": "blocked-command-safety",
+            "actual": queue_status_by_id.get("UNSAFE"),
         },
     ]
     for case in exit_code_cases:
@@ -18932,6 +18957,22 @@ def annotate_verification_queue_commands(items: list[dict[str, Any]]) -> dict[st
                 }
 
     return command_safety_summary(command_refs)
+
+
+def apply_verification_queue_command_statuses(items: list[dict[str, Any]]) -> None:
+    for item in items:
+        if item.get("status") != "ready":
+            continue
+        command_summary = (item.get("command_safety", {}) or {}).get("summary", {}) or {}
+        if command_summary.get("unsafe_template_count", 0):
+            item["status"] = "blocked-command-safety"
+            item["command_status_reason"] = "One or more command templates are unsafe."
+        elif command_summary.get("blocked_external", 0):
+            item["status"] = "blocked-external"
+            item["command_status_reason"] = "One or more commands require external probing or explicit evidence collection."
+        elif command_summary.get("commands", 0) and not command_summary.get("runnable", 0):
+            item["status"] = "blocked-command-safety"
+            item["command_status_reason"] = "No command templates are runnable under the current command-safety policy."
 
 
 def verification_command_for_profile(profile_path: str, artifact_dir: Path | None, subcommand: str) -> str:
@@ -19738,18 +19779,19 @@ def build_verification_queue(
             },
         )
 
+    command_safety = annotate_verification_queue_commands(items)
+    apply_verification_queue_command_statuses(items)
     status_counts: dict[str, int] = {}
     for item in items:
         status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
-    if status_counts.get("blocked") or status_counts.get("manual-review"):
+    if command_safety.get("unsafe_template_count"):
+        status = "invalid-command-templates"
+    elif status_counts.get("blocked") or status_counts.get("manual-review") or status_counts.get("blocked-command-safety"):
         status = "needs-human-review"
     elif status_counts.get("blocked-external"):
         status = "ready-with-external-blockers"
     else:
         status = "ready"
-    command_safety = annotate_verification_queue_commands(items)
-    if command_safety.get("unsafe_template_count"):
-        status = "invalid-command-templates"
 
     return {
         "generated_at": utc_now(),
@@ -24897,11 +24939,11 @@ def build_no_write_selftest() -> dict[str, Any]:
             "id": "verification-queue-no-write-skips-artifacts",
             "passed": (
                 verification_queue_return_code == 0
-                and "Verification queue: ready" in verification_queue_stdout
-                and "Items: 4 total" in verification_queue_stdout_text
+                and "Verification queue: ready-with-external-blockers" in verification_queue_stdout
+                and 'status_counts={"blocked-external": 1, "ready": 3}' in verification_queue_stdout_text
                 and "Queue items:" in verification_queue_stdout
                 and "Command previews:" in verification_queue_stdout
-                and "- VERIFY-safe-audit-loop:" in verification_queue_stdout
+                and "- VERIFY-safe-audit-loop: blocked-external" in verification_queue_stdout_text
                 and "[ready]" in verification_queue_stdout_text
                 and "audit --include-external --ws-resource-probes" in verification_queue_stdout_text
                 and "No files written (--no-write)." in verification_queue_stdout
