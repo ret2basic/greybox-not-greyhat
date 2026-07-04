@@ -8332,6 +8332,22 @@ def methodology_next_command_for_hypothesis(
     return ref if ref.get("classification") == "ready" else None
 
 
+def methodology_thread_rank(thread: dict[str, Any]) -> tuple[int, int, int, str]:
+    impact_rank = {
+        "transaction-integrity": 0,
+        "credentialed-upstream-cost-abuse": 1,
+        "resource-exhaustion": 2,
+        "rpc-proxy-abuse": 3,
+        "unauthorized-state-change": 4,
+        "fixed-upstream-proxy-confusion": 5,
+    }
+    priority_rank = {"critical": 0, "high": 1, "medium": 2}.get(str(thread.get("priority") or ""), 9)
+    status = str(thread.get("status") or "")
+    status_rank = 1 if status.startswith("blocked") else 0
+    impact = str(thread.get("impact") or "")
+    return (status_rank, impact_rank.get(impact, 9), priority_rank, str(thread.get("id") or thread.get("path") or ""))
+
+
 def build_methodology_review(
     *,
     target: str,
@@ -8404,6 +8420,7 @@ def build_methodology_review(
                 "forbidden": item.get("forbidden", []),
             }
         )
+    high_value_threads.sort(key=methodology_thread_rank)
 
     focus = harness_loop.get("focus") if isinstance(harness_loop.get("focus"), dict) else {}
     resource_budget = resource_budget_for_snapshot(resource_snapshot)
