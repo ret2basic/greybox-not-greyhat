@@ -8305,6 +8305,11 @@ def hypothesis_from_rpc_method_policy(
         if isinstance(flow_artifact.get("intent_policy_scaffold"), dict)
         else {}
     )
+    quote_contract = (
+        flow_artifact.get("quote_source_contract_review")
+        if isinstance(flow_artifact.get("quote_source_contract_review"), dict)
+        else {}
+    )
     flow_dataflows = [
         item for item in flow_artifact.get("dataflows", []) or [] if isinstance(item, dict)
     ]
@@ -8383,8 +8388,14 @@ def hypothesis_from_rpc_method_policy(
             "local_signing_sink_ref_count": flow_summary.get("local_signing_sink_refs", 0),
             "intent_policy_scaffold_status": policy_scaffold.get("status") or "missing",
             "configured_intent_direction_count": policy_scaffold.get("configured_direction_count", 0),
+            "quote_source_contract_status": quote_contract.get("status") or "missing",
+            "quote_source_contract_decision_count": (quote_contract.get("summary") or {}).get("decisions", 0),
+            "quote_source_contract_missing_required": (
+                quote_contract.get("summary") or {}
+            ).get("missing_required_decisions", []),
             "static_signal_count": static_intent_review.get("signal_count", 0),
             "static_intent_review": static_intent_review,
+            "quote_source_contract_review": quote_contract,
             "dataflows": flow_dataflows[:5],
             "frontend_transaction_dependency_refs": frontend_refs[:5],
             "remote_transaction_material_refs": remote_refs[:5],
@@ -15605,17 +15616,34 @@ def transaction_flow_match_categories() -> dict[str, list[str]]:
             "recipient: walletAddress",
         ],
         "quote_request_fields": [
+            "route:",
+            "source:",
+            "destination:",
             "amountIn",
             "maxNumQuotes",
             "route.source",
             "route.destination",
             "sender:",
             "recipient:",
+            "sender: walletAddress",
+            "recipient: walletAddress",
+            "maxNumQuotes: 1",
         ],
         "server_quote_validation": [
-            "allowed mints",
+            "QUOTE_TOP_LEVEL_KEYS",
+            "ROUTE_KEYS",
+            "ROUTE_ENDPOINT_KEYS",
+            "unexpectedKeys(",
+            "ALLOWED_MINTS",
+            "USDC_MINT",
+            "USDTEL_MINT",
+            "route must swap between",
             "recipient must match sender",
-            "MAX_AMOUNT_DIGITS",
+            "normalizedSender !== normalizedRecipient",
+            "MAX_AMOUNT_IN_DIGITS",
+            "amountIn.length",
+            "positive integer string",
+            "maxNumQuotes must be 1",
             "M0_ORCHESTRATION_API_KEY",
             "Object.keys(body)",
         ],
@@ -15813,6 +15841,183 @@ def build_transaction_intent_policy_scaffold(profile: dict[str, Any] | None) -> 
     }
 
 
+def build_quote_source_contract_review(
+    refs_by_group: dict[str, list[dict[str, Any]]],
+    intent_policy_scaffold: dict[str, Any],
+) -> dict[str, Any]:
+    request_refs = refs_by_group.get("quote_request_fields", []) or []
+    validation_refs = refs_by_group.get("server_quote_validation", []) or []
+    remote_refs = refs_by_group.get("remote_transaction_sources", []) or []
+
+    def refs_for_tokens(refs: list[dict[str, Any]], tokens: set[str]) -> list[dict[str, Any]]:
+        return [
+            ref
+            for ref in refs
+            if str(ref.get("token") or "") in tokens
+        ]
+
+    request_shape_refs = refs_for_tokens(
+        request_refs,
+        {
+            "route:",
+            "source:",
+            "destination:",
+            "amountIn",
+            "amountIn:",
+            "sender:",
+            "recipient:",
+            "maxNumQuotes",
+            "maxNumQuotes: 1",
+        },
+    )
+    request_wallet_binding_refs = refs_for_tokens(
+        request_refs,
+        {"sender: walletAddress", "recipient: walletAddress", "sender:", "recipient:"},
+    )
+    server_key_allowlist_refs = refs_for_tokens(
+        validation_refs,
+        {"QUOTE_TOP_LEVEL_KEYS", "ROUTE_KEYS", "ROUTE_ENDPOINT_KEYS", "unexpectedKeys("},
+    )
+    server_mint_policy_refs = refs_for_tokens(
+        validation_refs,
+        {"ALLOWED_MINTS", "USDC_MINT", "USDTEL_MINT", "route must swap between"},
+    )
+    server_sender_recipient_refs = refs_for_tokens(
+        validation_refs,
+        {"recipient must match sender", "normalizedSender !== normalizedRecipient"},
+    )
+    server_amount_bound_refs = refs_for_tokens(
+        validation_refs,
+        {"MAX_AMOUNT_IN_DIGITS", "amountIn.length", "positive integer string"},
+    )
+    server_quote_count_refs = refs_for_tokens(
+        validation_refs,
+        {"maxNumQuotes must be 1", "maxNumQuotes"},
+    )
+    payload_extraction_refs = refs_for_tokens(
+        remote_refs,
+        {"transactionBase64s", "payload.data.transaction", "data.transaction", "payloads.map"},
+    )
+
+    def decision(
+        decision_id: str,
+        evidence: list[dict[str, Any]],
+        question: str,
+        *,
+        present_status: str = "evidence-present",
+    ) -> dict[str, Any]:
+        return {
+            "id": decision_id,
+            "status": present_status if evidence else "missing-evidence",
+            "evidence": evidence[:8],
+            "review_question": question,
+        }
+
+    configured_directions = int(intent_policy_scaffold.get("configured_direction_count") or 0)
+    profile_policy_refs = [
+        {
+            "file": "target-profile",
+            "line": None,
+            "token": "quote_intent.directions",
+            "sample": f"configured_directions={configured_directions}",
+        }
+    ] if configured_directions else []
+    decisions = [
+        decision(
+            "client-quote-request-shape",
+            request_shape_refs,
+            "Does client quote construction include direction, amountIn, sender, recipient, and maxNumQuotes fields?",
+        ),
+        decision(
+            "client-wallet-binding",
+            request_wallet_binding_refs,
+            "Does the client set sender and recipient from the same wallet value before requesting executable payloads?",
+        ),
+        decision(
+            "server-request-key-allowlist",
+            server_key_allowlist_refs,
+            "Does the server reject unexpected top-level, route, and route endpoint fields before proxying the quote?",
+        ),
+        decision(
+            "server-mint-direction-policy",
+            server_mint_policy_refs,
+            "Does the server constrain source and destination mints to the approved swap pair and direction family?",
+        ),
+        decision(
+            "server-sender-recipient-binding",
+            server_sender_recipient_refs,
+            "Does the server require recipient to match sender before requesting executable payloads?",
+        ),
+        decision(
+            "server-amount-bound",
+            server_amount_bound_refs,
+            "Does the server require a positive bounded raw amountIn string?",
+        ),
+        decision(
+            "server-quote-count-bound",
+            server_quote_count_refs,
+            "Does the server constrain quote count to one executable quote path?",
+        ),
+        decision(
+            "response-payload-extraction",
+            payload_extraction_refs,
+            "Which response fields are treated as executable Solana transaction material?",
+        ),
+        decision(
+            "profile-quote-intent-directions",
+            profile_policy_refs,
+            "Are buy/sell source and destination mints indexed in the target profile for decode-time comparison?",
+            present_status="profile-indexed",
+        ),
+    ]
+    decision_status_counts: dict[str, int] = {}
+    for row in decisions:
+        increment_count(decision_status_counts, str(row.get("status") or "unknown"))
+
+    required_decisions = {
+        "client-quote-request-shape",
+        "server-request-key-allowlist",
+        "server-mint-direction-policy",
+        "server-sender-recipient-binding",
+        "server-amount-bound",
+        "server-quote-count-bound",
+        "profile-quote-intent-directions",
+    }
+    missing_required = [
+        str(row.get("id"))
+        for row in decisions
+        if row.get("id") in required_decisions and row.get("status") == "missing-evidence"
+    ]
+    if not request_refs and not validation_refs and not configured_directions:
+        status = "no-quote-source-contract-evidence"
+    elif missing_required:
+        status = "partial-quote-source-contract"
+    else:
+        status = "quote-source-contract-indexed"
+
+    return {
+        "status": status,
+        "summary": {
+            "request_field_refs": len(request_refs),
+            "server_validation_refs": len(validation_refs),
+            "payload_extraction_refs": len(payload_extraction_refs),
+            "decisions": len(decisions),
+            "decision_status_counts": dict(sorted(decision_status_counts.items())),
+            "missing_required_decisions": missing_required,
+        },
+        "decisions": decisions,
+        "required_evidence": [
+            "Approved quote corpus whose request body matches this source contract.",
+            "Decoded transaction intent compared against profile mints, wallet, amountIn, and allowed program policy.",
+            "Manual review for any missing source-contract decision before treating decoded mismatch as reportable.",
+        ],
+        "safety": (
+            "Offline source contract review only. It sends no quote requests, decodes no live payloads, "
+            "and never signs or submits transactions."
+        ),
+    }
+
+
 def build_transaction_flow_review(
     source_root: Path,
     profile: dict[str, Any] | None = None,
@@ -15908,6 +16113,25 @@ def build_transaction_flow_review(
             "Does execution fetch a fresh quote for the connected wallet rather than reusing preview wallet transaction material?",
         )
 
+    policy_scaffold = build_transaction_intent_policy_scaffold(profile)
+    quote_contract_review = build_quote_source_contract_review(refs_by_group, policy_scaffold)
+    if quote_contract_review.get("status") == "quote-source-contract-indexed":
+        contract_refs = []
+        for decision in quote_contract_review.get("decisions", []) or []:
+            if not isinstance(decision, dict):
+                continue
+            for ref in decision.get("evidence", []) or []:
+                if isinstance(ref, dict) and ref.get("file") != "target-profile":
+                    contract_refs.append(ref)
+        add_dataflow(
+            "quote-source-contract-indexed",
+            "source-policy-indexed",
+            "info",
+            "Client quote request shape and server quote validation policy are indexed for decode-time comparison.",
+            contract_refs[:12],
+            "Do decoded executable transactions match the source contract for wallet, amountIn, mint direction, quote count, and allowed programs?",
+        )
+
     dataflow_status_counts: dict[str, int] = {}
     priority_counts: dict[str, int] = {}
     for item in dataflows:
@@ -15915,7 +16139,6 @@ def build_transaction_flow_review(
         increment_count(priority_counts, str(item.get("priority") or "info"))
 
     intent_summary = transaction_intent_review_summary(transaction_intent)
-    policy_scaffold = build_transaction_intent_policy_scaffold(profile)
     rpc_review = (
         rpc_method_policy.get("remote_transaction_signing_review")
         if isinstance(rpc_method_policy, dict)
@@ -15951,6 +16174,9 @@ def build_transaction_flow_review(
             "wallet_signing_sink_refs": len(signing_refs),
             "remote_signing_sink_refs": len(remote_signing_refs),
             "local_signing_sink_refs": len(local_signing_refs),
+            "quote_request_field_refs": len(refs_by_group.get("quote_request_fields", []) or []),
+            "server_quote_validation_refs": len(refs_by_group.get("server_quote_validation", []) or []),
+            "quote_source_contract_status": quote_contract_review.get("status"),
         },
         "resource_limits": {
             "max_file_bytes": max_file_bytes,
@@ -15967,6 +16193,7 @@ def build_transaction_flow_review(
         "dataflows": dataflows,
         "transaction_intent": intent_summary,
         "intent_policy_scaffold": policy_scaffold,
+        "quote_source_contract_review": quote_contract_review,
         "rpc_method_policy_context": {
             "status": rpc_review.get("status") or "missing",
             "priority": rpc_review.get("priority") or "info",
@@ -32945,6 +33172,53 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             + "\n",
             encoding="utf-8",
         )
+        (rewrite_source_root / "src/lib/quote-contract-selftest.ts").write_text(
+            textwrap.dedent(
+                """
+                const USDC_MINT = 'USDC111111111111111111111111111111111111111'
+                const USDTEL_MINT = 'USDTEL11111111111111111111111111111111111'
+                const ALLOWED_MINTS = new Set([USDC_MINT, USDTEL_MINT])
+                const QUOTE_TOP_LEVEL_KEYS = new Set(['route', 'amountIn', 'sender', 'recipient', 'maxNumQuotes'])
+                const ROUTE_KEYS = new Set(['source', 'destination'])
+                const ROUTE_ENDPOINT_KEYS = new Set(['chain', 'address'])
+                const MAX_AMOUNT_IN_DIGITS = 30
+                const M0_ORCHESTRATION_API_KEY = 'selftest-key'
+
+                function unexpectedKeys(record: Record<string, unknown>, allowed: Set<string>) {
+                  return Object.keys(record).filter((key) => !allowed.has(key))
+                }
+
+                export function validateQuoteContractSelftest(
+                  normalizedSender: string,
+                  normalizedRecipient: string,
+                  amountIn: string,
+                  maxNumQuotes: number,
+                ) {
+                  unexpectedKeys({}, QUOTE_TOP_LEVEL_KEYS)
+                  unexpectedKeys({}, ROUTE_KEYS)
+                  unexpectedKeys({}, ROUTE_ENDPOINT_KEYS)
+                  if (!ALLOWED_MINTS.has(USDC_MINT) || !ALLOWED_MINTS.has(USDTEL_MINT)) {
+                    throw new Error('route must swap between USDC and USD.tel')
+                  }
+                  if (normalizedSender !== normalizedRecipient) {
+                    throw new Error('recipient must match sender')
+                  }
+                  if (!/^[1-9]\\d*$/.test(amountIn)) {
+                    throw new Error('amountIn must be a positive integer string')
+                  }
+                  if (amountIn.length > MAX_AMOUNT_IN_DIGITS) {
+                    throw new Error('amountIn is too large')
+                  }
+                  if (maxNumQuotes !== 1) {
+                    throw new Error('maxNumQuotes must be 1')
+                  }
+                  return M0_ORCHESTRATION_API_KEY
+                }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
         (rewrite_source_root / "src/hooks").mkdir(parents=True)
         (rewrite_source_root / "src/hooks/useRemoteSwap.ts").write_text(
             textwrap.dedent(
@@ -33843,7 +34117,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rewrite_transaction_flow_review.get("intent_policy_scaffold", {}).get("status")
             == "profile-quote-intent-indexed"
             and rewrite_transaction_flow_review.get("intent_policy_scaffold", {}).get("configured_direction_count", 0) >= 2
+            and rewrite_transaction_flow_review.get("quote_source_contract_review", {}).get("status")
+            == "quote-source-contract-indexed"
             and "remote-payload-to-wallet-signing" in transaction_flow_review_dataflow_ids
+            and "quote-source-contract-indexed" in transaction_flow_review_dataflow_ids
             and rewrite_transaction_matrix.get("summary", {}).get("rpc_method_policy_source") == "profile-fallback"
             and rewrite_transaction_hypothesis is not None
             and rewrite_transaction_hypothesis.get("status") == "ready-for-offline-review"
@@ -33860,6 +34137,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             == "profile-quote-intent-indexed"
             and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("configured_intent_direction_count", 0)
             >= 2
+            and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("quote_source_contract_status")
+            == "quote-source-contract-indexed"
             and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
             and TRANSACTION_FLOW_REVIEW_ARTIFACT in (rewrite_transaction_hypothesis.get("evidence_refs", []) or [])
             and rewrite_transaction_validation_item is not None
@@ -33872,6 +34151,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 0,
             )
             >= 1
+            and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("quote_source_contract_status")
+            == "quote-source-contract-indexed"
             and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
         )
         rate_limit_resource_review = rewrite_transaction_policy.get("rate_limit_resource_review", {})
@@ -38913,6 +39194,8 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
     summary = review.get("summary", {}) or {}
     intent = review.get("transaction_intent", {}) or {}
     scaffold = review.get("intent_policy_scaffold", {}) or {}
+    source_contract = review.get("quote_source_contract_review") if isinstance(review.get("quote_source_contract_review"), dict) else {}
+    source_contract_summary = source_contract.get("summary", {}) if isinstance(source_contract.get("summary"), dict) else {}
     print(f"Transaction flow review: {review['status']}")
     print(
         "Source refs: "
@@ -38934,6 +39217,13 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
         f"status={scaffold.get('status')}, "
         f"directions={scaffold.get('configured_direction_count', 0)}/{scaffold.get('direction_count', 0)}"
     )
+    if source_contract:
+        print(
+            "Source contract: "
+            f"status={source_contract.get('status')}, "
+            f"decisions={source_contract_summary.get('decisions', 0)}, "
+            f"missing_required={len(source_contract_summary.get('missing_required_decisions', []) or [])}"
+        )
     top_count = max(0, int(args.top))
     if top_count:
         print("Dataflows:")
@@ -39079,7 +39369,8 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         f"static_signals={transaction_flow.get('static_signal_count', 0)} "
                         f"dataflows={transaction_flow.get('dataflow_count', 0)} "
                         f"remote_signing_sinks={transaction_flow.get('remote_signing_sink_ref_count', 0)} "
-                        f"policy_scaffold={transaction_flow.get('intent_policy_scaffold_status', 'missing')}"
+                        f"policy_scaffold={transaction_flow.get('intent_policy_scaffold_status', 'missing')} "
+                        f"quote_contract={transaction_flow.get('quote_source_contract_status', 'missing')}"
                     )
                 resource_review = (
                     item.get("resource_abuse_review")

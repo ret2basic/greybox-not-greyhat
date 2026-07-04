@@ -312,7 +312,10 @@ directories, and distinguishes remote quote transaction payloads flowing toward
 wallet signing from locally constructed transaction signing helpers. The output
 `.greybox/transaction-flow-review.json` lists dataflow refs, required decoded
 intent comparisons, forbidden actions, and an intent-policy scaffold derived
-from profile `quote_intent` directions. The scaffold records which buy/sell
+from profile `quote_intent` directions. It also indexes source-backed quote
+intent contract evidence: client request shape, server request-key allowlists,
+mint/direction constraints, sender/recipient binding, amount bounds, quote-count
+bounds, and executable payload extraction. The scaffold records which buy/sell
 mint pairs and `allowedPrograms` are already known and which runtime values
 still need an approved quote corpus, wallet, and raw `amountIn`. It sends no
 requests, does not open a wallet, and never signs or submits transactions.
