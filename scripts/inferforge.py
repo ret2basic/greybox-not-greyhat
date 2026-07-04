@@ -2192,6 +2192,14 @@ def source_root_relative_or_repo(path: Path, source_root: Path) -> str:
 def route_segment_to_path_segment(segment: str) -> str | None:
     if not segment or segment.startswith("(") and segment.endswith(")"):
         return None
+    while segment.startswith("(..)"):
+        segment = segment[4:]
+    for marker in ("(...)", "(.)"):
+        if segment.startswith(marker):
+            segment = segment[len(marker):]
+            break
+    if not segment:
+        return None
     if segment.startswith("@"):
         return None
     if segment.startswith("[[...") and segment.endswith("]]"):
@@ -23137,6 +23145,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "export async function GET() { return Response.json({ ok: true }) }\n",
             encoding="utf-8",
         )
+        (rewrite_source_root / "src/app/(.)intercepted").mkdir(parents=True)
+        (rewrite_source_root / "src/app/(.)intercepted/route.ts").write_text(
+            "export async function GET() { return Response.json({ ok: true }) }\n",
+            encoding="utf-8",
+        )
         (rewrite_source_root / "src/app/actions.ts").write_text(
             textwrap.dedent(
                 """
@@ -23368,6 +23381,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             ),
             None,
         )
+        intercepted_app_cluster = next(
+            (
+                cluster
+                for cluster in rewrite_clusters.get("clusters", [])
+                if cluster.get("id") == "route-intercepted"
+            ),
+            None,
+        )
         server_action_entries = rewrite_inventory.get("server_actions", [])
         rewrite_cluster_candidates = (
             []
@@ -23503,6 +23524,20 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 match
                 for match in optional_nested_resolution.get("matches", [])
                 if match.get("cluster_id") == "route-api-optional-slug"
+            ),
+            None,
+        )
+        intercepted_resolution = resolve_endpoint_sources(
+            rewrite_source_root,
+            "GET",
+            "/intercepted",
+            rewrite_inventory,
+        )
+        intercepted_resolution_match = next(
+            (
+                match
+                for match in intercepted_resolution.get("matches", [])
+                if match.get("cluster_id") == "route-intercepted"
             ),
             None,
         )
@@ -23805,7 +23840,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         rewrite_server_action_report_lines = rewrite_source_resolver_report.get("server_action_lines", [])
         rewrite_discovery_passed = (
             rewrite_inventory.get("summary", {}).get("rewrite_count") == 1
-            and rewrite_inventory.get("summary", {}).get("app_router_route_count") == 3
+            and rewrite_inventory.get("summary", {}).get("app_router_route_count") == 4
             and rewrite_inventory.get("summary", {}).get("pages_router_api_route_count") == 1
             and rewrite_inventory.get("summary", {}).get("middleware_count") == 1
             and rewrite_inventory.get("summary", {}).get("server_action_file_count") == 1
@@ -23881,6 +23916,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and optional_nested_resolution_match is not None
             and str(optional_nested_resolution_match.get("source_ref", "")).endswith(
                 "src/app/api/optional/[[...slug]]/route.ts"
+            )
+            and intercepted_app_cluster is not None
+            and intercepted_app_cluster.get("path") == "/intercepted"
+            and intercepted_resolution_match is not None
+            and str(intercepted_resolution_match.get("source_ref", "")).endswith(
+                "src/app/(.)intercepted/route.ts"
             )
             and len(server_action_entries) == 1
             and {"updateWidget", "deleteWidget"}.issubset(set(server_action_entries[0].get("action_names", [])))
