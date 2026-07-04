@@ -96,6 +96,7 @@ BLACKBOX_ASSET_CANDIDATES_ARTIFACT = "blackbox-asset-candidates.json"
 BLACKBOX_ASSET_PROFILE_ARTIFACT = "blackbox-asset-profile.json"
 HOST_TAKEOVER_BASELINE_ARTIFACT = "host-takeover-baseline.json"
 RESOURCE_SNAPSHOT_ARTIFACT = "resource-snapshot.json"
+SCOPE_POLICY_ARTIFACT = "scope-policy.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -258,6 +259,7 @@ INDEX_ARTIFACT_ORDER = [
     "probe-results-summary.json",
     HOST_TAKEOVER_BASELINE_ARTIFACT,
     RESOURCE_SNAPSHOT_ARTIFACT,
+    SCOPE_POLICY_ARTIFACT,
     "response-delta-analysis.json",
     "warmup-results.json",
     "traffic-index.json",
@@ -6641,6 +6643,201 @@ def build_resource_snapshot(
             "tokens are redacted; no network requests or target probes are performed."
         ),
     }
+
+
+def normalize_scope_host(host: Any) -> str:
+    return str(host or "").lower().strip().strip(".")
+
+
+def scope_policy_seen_hosts(asset_candidates_doc: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    seen: dict[str, dict[str, Any]] = {}
+
+    def item_for(host: Any) -> dict[str, Any] | None:
+        normalized = normalize_scope_host(host)
+        if not normalized:
+            return None
+        return seen.setdefault(
+            normalized,
+            {
+                "host": normalized,
+                "sources": {},
+                "roles": {},
+                "schemes": {},
+                "triage_classes": {},
+                "sample_paths": [],
+            },
+        )
+
+    doc = asset_candidates_doc if isinstance(asset_candidates_doc, dict) else {}
+    for candidate in doc.get("candidates", []) or []:
+        if not isinstance(candidate, dict):
+            continue
+        item = item_for(candidate.get("host"))
+        if item is None:
+            continue
+        increment_count(item["sources"], "asset-candidate")
+        triage_class = (candidate.get("triage", {}) or {}).get("class") if isinstance(candidate.get("triage"), dict) else None
+        if triage_class:
+            increment_count(item["triage_classes"], str(triage_class))
+        path = str(candidate.get("path") or "")
+        if path and len(item["sample_paths"]) < 4 and path not in item["sample_paths"]:
+            item["sample_paths"].append(path)
+
+    external_scripts = doc.get("external_scripts", {}) if isinstance(doc.get("external_scripts"), dict) else {}
+    for host, count in (external_scripts.get("host_counts", {}) or {}).items():
+        item = item_for(host)
+        if item is None:
+            continue
+        item["sources"]["external-script"] = int(count or 0)
+    for sample in external_scripts.get("samples", []) or []:
+        if not isinstance(sample, dict):
+            continue
+        item = item_for(sample.get("host"))
+        if item is None:
+            continue
+        path = str(sample.get("path") or "")
+        if path and len(item["sample_paths"]) < 4 and path not in item["sample_paths"]:
+            item["sample_paths"].append(path)
+
+    config_hosts = doc.get("config_hosts", {}) if isinstance(doc.get("config_hosts"), dict) else {}
+    for host_item in config_hosts.get("hosts", []) or []:
+        if not isinstance(host_item, dict):
+            continue
+        item = item_for(host_item.get("host"))
+        if item is None:
+            continue
+        item["sources"]["runtime-config"] = int(host_item.get("count") or 0)
+        for role, count in (host_item.get("roles", {}) or {}).items():
+            item["roles"][str(role)] = int(count or 0)
+        for scheme, count in (host_item.get("schemes", {}) or {}).items():
+            item["schemes"][str(scheme)] = int(count or 0)
+        triage_class = (host_item.get("triage", {}) or {}).get("class") if isinstance(host_item.get("triage"), dict) else None
+        if triage_class:
+            increment_count(item["triage_classes"], str(triage_class))
+        for sample in host_item.get("samples", []) or []:
+            if not isinstance(sample, dict):
+                continue
+            path = str(sample.get("path") or "")
+            if path and len(item["sample_paths"]) < 4 and path not in item["sample_paths"]:
+                item["sample_paths"].append(path)
+    return seen
+
+
+def build_scope_policy(
+    *,
+    target: str,
+    allowed_hosts: set[str],
+    asset_candidates_doc: dict[str, Any] | None,
+    deny_unlisted_hosts: bool,
+    source_url: str | None = None,
+    source_label: str | None = None,
+) -> dict[str, Any]:
+    target_host = normalize_scope_host(urllib.parse.urlparse(target).netloc)
+    normalized_allowed = {normalize_scope_host(host) for host in allowed_hosts if normalize_scope_host(host)}
+    if target_host:
+        normalized_allowed.add(target_host)
+    seen_hosts = scope_policy_seen_hosts(asset_candidates_doc)
+    for host in normalized_allowed:
+        seen_hosts.setdefault(
+            host,
+            {
+                "host": host,
+                "sources": {"explicit-allowlist": 1},
+                "roles": {},
+                "schemes": {},
+                "triage_classes": {},
+                "sample_paths": [],
+            },
+        )
+
+    decisions = []
+    decision_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    for item in sorted(seen_hosts.values(), key=lambda row: row["host"]):
+        host = str(item["host"])
+        if host in normalized_allowed:
+            decision = "in-scope-explicit-host"
+            reason = "Host is present in the explicit scope host allowlist for this policy."
+            safe_next_step = "Use only the existing low-volume reviewed workflows for this host."
+        elif deny_unlisted_hosts:
+            decision = "out-of-scope-by-default"
+            reason = "Host is not present in the explicit scope host allowlist; deny-by-default is enabled."
+            safe_next_step = "Do not request this host from automation unless the bounty scope is updated and the policy is regenerated."
+        else:
+            decision = "needs-scope-review"
+            reason = "Host is not present in the explicit scope host allowlist and deny-by-default is disabled."
+            safe_next_step = "Confirm bounty scope before using this host as a target."
+        increment_count(decision_counts, decision)
+        for source, count in item.get("sources", {}).items():
+            source_counts[str(source)] = source_counts.get(str(source), 0) + int(count or 0)
+        decisions.append(
+            {
+                "host": host,
+                "decision": decision,
+                "reason": reason,
+                "safe_next_step": safe_next_step,
+                "sources": dict(sorted((item.get("sources") or {}).items())),
+                "roles": dict(sorted((item.get("roles") or {}).items())),
+                "schemes": dict(sorted((item.get("schemes") or {}).items())),
+                "triage_classes": dict(sorted((item.get("triage_classes") or {}).items())),
+                "sample_paths": item.get("sample_paths", [])[:4],
+            }
+        )
+
+    unresolved_hosts = [item["host"] for item in decisions if item.get("decision") == "needs-scope-review"]
+    return {
+        "generated_at": utc_now(),
+        "status": "needs-scope-review" if unresolved_hosts else "complete",
+        "target": target,
+        "source": {
+            "label": source_label or "explicit-scope-host-policy",
+            "url": source_url,
+        },
+        "policy": {
+            "allowed_hosts": sorted(normalized_allowed),
+            "deny_unlisted_hosts": bool(deny_unlisted_hosts),
+        },
+        "summary": {
+            "host_count": len(decisions),
+            "decision_counts": dict(sorted(decision_counts.items())),
+            "source_counts": dict(sorted(source_counts.items())),
+            "unresolved_host_count": len(unresolved_hosts),
+        },
+        "unresolved_hosts": unresolved_hosts,
+        "decisions": decisions,
+        "safety": (
+            "Scope policy is an allowlist/deny-by-default planning artifact. "
+            "It does not request hosts and does not prove vulnerability impact."
+        ),
+    }
+
+
+def scope_policy_decision_map(scope_policy: dict[str, Any] | None) -> dict[str, str]:
+    if not isinstance(scope_policy, dict):
+        return {}
+    return {
+        normalize_scope_host(item.get("host")): str(item.get("decision") or "")
+        for item in scope_policy.get("decisions", []) or []
+        if isinstance(item, dict) and normalize_scope_host(item.get("host"))
+    }
+
+
+def scope_policy_unresolved_hosts(scope_policy: dict[str, Any] | None, hosts: list[str]) -> list[str]:
+    decisions = scope_policy_decision_map(scope_policy)
+    unresolved = []
+    for host in sorted({normalize_scope_host(item) for item in hosts if normalize_scope_host(item)}):
+        decision = decisions.get(host)
+        if decision not in {"in-scope-explicit-host", "out-of-scope-by-default"}:
+            unresolved.append(host)
+    return unresolved
+
+
+def scope_policy_decision_counts_for_hosts(scope_policy: dict[str, Any] | None, hosts: list[str]) -> dict[str, int]:
+    decisions = scope_policy_decision_map(scope_policy)
+    counts: dict[str, int] = {}
+    for host in sorted({normalize_scope_host(item) for item in hosts if normalize_scope_host(item)}):
+        increment_count(counts, decisions.get(host) or "missing-policy-decision")
+    return dict(sorted(counts.items()))
 
 
 def contains_unredacted_secret_text(value: str) -> bool:
@@ -15686,32 +15883,69 @@ def build_verification_queue(
         if artifact_dir is not None
         else None
     )
+    scope_policy_doc = (
+        load_optional_json(artifact_dir / SCOPE_POLICY_ARTIFACT)
+        if artifact_dir is not None
+        else None
+    )
+    asset_profile_doc = (
+        load_optional_json(artifact_dir / BLACKBOX_ASSET_PROFILE_ARTIFACT)
+        if artifact_dir is not None
+        else None
+    )
     asset_candidates = (asset_candidates_doc or {}).get("candidates", []) or []
     external_scripts_doc = (asset_candidates_doc or {}).get("external_scripts", {}) if isinstance(asset_candidates_doc, dict) else {}
     if isinstance(external_scripts_doc, dict) and external_scripts_doc.get("review_required"):
-        add_item(
-            "REVIEW-blackbox-external-script-hosts",
-            "Review external script hosts before asset expansion",
-            "manual-review",
-            "medium",
-            (
-                f"{external_scripts_doc.get('total', 0)} external script URL(s) were referenced by the target page. "
-                "They were not fetched because they are outside the current target origin or allowed host list."
-            ),
-            evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT],
-            prerequisites=[
-                "Confirm whether each external script host is in bounty scope or approved as a static asset source before fetching it.",
-                "If approved, rerun blackbox-asset-map with explicit scope review and keep the same low max-assets/max-bytes limits.",
-                "Do not request out-of-scope static assets from automation.",
-            ],
-            safety="Scope review only. This queue item does not authorize fetching external script assets.",
-            extra={
-                "external_script_total": external_scripts_doc.get("total", 0),
-                "external_script_host_counts": external_scripts_doc.get("host_counts", {}),
-                "external_script_scope_status_counts": external_scripts_doc.get("scope_status_counts", {}),
-                "external_script_samples": external_scripts_doc.get("samples", [])[:8],
-            },
-        )
+        external_hosts = [str(host) for host in (external_scripts_doc.get("host_counts", {}) or {})]
+        external_unresolved = scope_policy_unresolved_hosts(scope_policy_doc, external_hosts)
+        if scope_policy_doc and not external_unresolved:
+            add_item(
+                "SCOPE-blackbox-external-script-hosts",
+                "Apply scope policy to external script hosts",
+                "ready",
+                "low",
+                (
+                    f"{external_scripts_doc.get('total', 0)} external script URL(s) were covered by scope-policy decisions. "
+                    "No external script hosts are authorized for automated fetching from this queue item."
+                ),
+                evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT, SCOPE_POLICY_ARTIFACT],
+                prerequisites=[
+                    "Keep unlisted hosts out of automated requests unless the explicit scope policy changes.",
+                    "Regenerate scope-policy.json if the bounty program adds or removes assets.",
+                ],
+                safety="Scope policy coverage only. Does not fetch external script assets.",
+                extra={
+                    "external_script_total": external_scripts_doc.get("total", 0),
+                    "external_script_host_counts": external_scripts_doc.get("host_counts", {}),
+                    "scope_policy_decision_counts": scope_policy_decision_counts_for_hosts(scope_policy_doc, external_hosts),
+                    "external_script_samples": external_scripts_doc.get("samples", [])[:8],
+                },
+            )
+        else:
+            add_item(
+                "REVIEW-blackbox-external-script-hosts",
+                "Review external script hosts before asset expansion",
+                "manual-review",
+                "medium",
+                (
+                    f"{external_scripts_doc.get('total', 0)} external script URL(s) were referenced by the target page. "
+                    "They were not fetched because they are outside the current target origin or allowed host list."
+                ),
+                evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT],
+                prerequisites=[
+                    "Confirm whether each external script host is in bounty scope or approved as a static asset source before fetching it.",
+                    "If approved, rerun blackbox-asset-map with explicit scope review and keep the same low max-assets/max-bytes limits.",
+                    "Do not request out-of-scope static assets from automation.",
+                ],
+                safety="Scope review only. This queue item does not authorize fetching external script assets.",
+                extra={
+                    "external_script_total": external_scripts_doc.get("total", 0),
+                    "external_script_host_counts": external_scripts_doc.get("host_counts", {}),
+                    "external_script_scope_status_counts": external_scripts_doc.get("scope_status_counts", {}),
+                    "external_script_scope_policy_unresolved_hosts": external_unresolved,
+                    "external_script_samples": external_scripts_doc.get("samples", [])[:8],
+                },
+            )
     config_hosts_doc = (asset_candidates_doc or {}).get("config_hosts", {}) if isinstance(asset_candidates_doc, dict) else {}
     config_summary = config_hosts_doc.get("summary", {}) if isinstance(config_hosts_doc, dict) else {}
     if isinstance(config_hosts_doc, dict) and config_summary.get("review_host_count", 0):
@@ -15729,42 +15963,82 @@ def build_verification_queue(
             str((item.get("triage", {}) or {}).get("priority")) == "high"
             for item in review_hosts
         ) else "medium"
-        add_item(
-            "REVIEW-blackbox-config-hosts",
-            "Review runtime configuration hosts",
-            "manual-review",
-            highest_config_priority,
-            (
-                f"{config_summary.get('review_host_count', 0)} runtime URL host(s) were referenced outside the explicit allowed host set. "
-                "They were recorded as leads only and were not requested by config-host mapping."
-            ),
-            evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT],
-            prerequisites=[
-                "Review whether each runtime host is in bounty scope before using it as a target.",
-                "Prioritize hosts tied to API, RPC, quote, prod, or testnet roles; ignore analytics/CDN-only hosts unless they carry an in-scope impact.",
-                "Treat impact mappings as hypotheses only; a runtime configuration reference is not a reportable finding by itself.",
-                "Report only after confirmed scope and a concrete PoC for a listed impact gate.",
-                "Do not probe sibling or external hosts until scope and impact are confirmed.",
-            ],
-            safety="Scope review only. Runtime config host mapping is passive and does not request referenced hosts.",
-            extra={
-                "config_host_summary": config_summary,
-                "prioritized_review_host_count": len(prioritized_review_hosts),
-                "review_hosts": [
-                    {
-                        "host": item.get("host"),
-                        "count": item.get("count"),
-                        "scope_status": item.get("scope_status"),
-                        "roles": item.get("roles"),
-                        "schemes": item.get("schemes"),
-                        "triage": item.get("triage"),
-                        "samples": item.get("samples", [])[:2],
-                    }
-                    for item in (prioritized_review_hosts or review_hosts)[:12]
+        config_review_host_names = [str(item.get("host") or "") for item in review_hosts]
+        config_unresolved = scope_policy_unresolved_hosts(scope_policy_doc, config_review_host_names)
+        config_extra_hosts = [
+            {
+                "host": item.get("host"),
+                "count": item.get("count"),
+                "scope_status": item.get("scope_status"),
+                "roles": item.get("roles"),
+                "schemes": item.get("schemes"),
+                "triage": item.get("triage"),
+                "samples": item.get("samples", [])[:2],
+            }
+            for item in (prioritized_review_hosts or review_hosts)[:12]
+        ]
+        if scope_policy_doc and not config_unresolved:
+            add_item(
+                "SCOPE-blackbox-config-hosts",
+                "Apply scope policy to runtime configuration hosts",
+                "ready",
+                "medium",
+                (
+                    f"{config_summary.get('review_host_count', 0)} runtime URL host(s) outside the explicit allowed host set "
+                    "were covered by scope-policy decisions and remain leads only."
+                ),
+                evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT, SCOPE_POLICY_ARTIFACT],
+                prerequisites=[
+                    "Do not probe out-of-scope-by-default hosts unless the explicit bounty scope changes.",
+                    "Treat impact mappings as hypotheses only; a runtime configuration reference is not reportable by itself.",
+                    "Regenerate scope-policy.json when program scope changes.",
                 ],
-            },
-        )
+                safety="Scope policy coverage only. Runtime config host mapping is passive and does not request referenced hosts.",
+                extra={
+                    "config_host_summary": config_summary,
+                    "prioritized_review_host_count": len(prioritized_review_hosts),
+                    "scope_policy_decision_counts": scope_policy_decision_counts_for_hosts(scope_policy_doc, config_review_host_names),
+                    "review_hosts": config_extra_hosts,
+                },
+            )
+        else:
+            add_item(
+                "REVIEW-blackbox-config-hosts",
+                "Review runtime configuration hosts",
+                "manual-review",
+                highest_config_priority,
+                (
+                    f"{config_summary.get('review_host_count', 0)} runtime URL host(s) were referenced outside the explicit allowed host set. "
+                    "They were recorded as leads only and were not requested by config-host mapping."
+                ),
+                evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT],
+                prerequisites=[
+                    "Review whether each runtime host is in bounty scope before using it as a target.",
+                    "Prioritize hosts tied to API, RPC, quote, prod, or testnet roles; ignore analytics/CDN-only hosts unless they carry an in-scope impact.",
+                    "Treat impact mappings as hypotheses only; a runtime configuration reference is not a reportable finding by itself.",
+                    "Report only after confirmed scope and a concrete PoC for a listed impact gate.",
+                    "Do not probe sibling or external hosts until scope and impact are confirmed.",
+                ],
+                safety="Scope review only. Runtime config host mapping is passive and does not request referenced hosts.",
+                extra={
+                    "config_host_summary": config_summary,
+                    "prioritized_review_host_count": len(prioritized_review_hosts),
+                    "config_scope_policy_unresolved_hosts": config_unresolved,
+                    "review_hosts": config_extra_hosts,
+                },
+            )
     if asset_candidates:
+        promoted_candidate_ids = {
+            str(candidate_id)
+            for cluster in (asset_profile_doc or {}).get("clusters", []) or []
+            if isinstance(cluster, dict)
+            for candidate_id in (cluster.get("discovery", {}) or {}).get("source_candidate_ids", []) or []
+        }
+        pending_asset_candidates = [
+            item
+            for item in asset_candidates
+            if isinstance(item, dict) and str(item.get("id") or "") not in promoted_candidate_ids
+        ] if promoted_candidate_ids else [item for item in asset_candidates if isinstance(item, dict)]
         candidate_preview = [
             {
                 "id": item.get("id"),
@@ -15776,41 +16050,91 @@ def build_verification_queue(
                 "triage_risk": (item.get("triage", {}) or {}).get("risk") if isinstance(item.get("triage"), dict) else None,
                 "source_count": len(item.get("sources", []) or []),
             }
-            for item in asset_candidates[:12]
+            for item in pending_asset_candidates[:12]
             if isinstance(item, dict)
         ]
         asset_summary = (asset_candidates_doc or {}).get("summary", {}) or {}
-        add_item(
-            "REVIEW-blackbox-asset-candidates",
-            "Review static asset endpoint candidates",
-            "manual-review",
-            "medium",
-            (
-                f"{len(asset_candidates)} endpoint or WebSocket candidate(s) were extracted from static assets. "
-                "They are leads only until scope, authentication context, and business-operation risk are reviewed."
-            ),
-            commands=[
-                cmd(
-                    "blackbox-asset-map --force "
-                    "--scope-host REPLACE_WITH_IN_SCOPE_HOST"
-                )
-            ],
-            evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT],
-            prerequisites=[
-                "Review each candidate in blackbox-asset-candidates.json before adding it to a black-box profile.",
-                "Do not probe account, order, trade, wallet, or state-changing paths without an explicit read-only reproduction plan.",
-                "Promote only concrete low-risk GET/HEAD/WebSocket handshake candidates that are in the bounty scope.",
-            ],
-            safety="Static asset lead review only. Candidate endpoints are not requested by blackbox-asset-map.",
-            extra={
-                "asset_candidate_count": len(asset_candidates),
-                "asset_candidate_triage": {
-                    "class_counts": asset_summary.get("triage_class_counts", {}),
-                    "risk_counts": asset_summary.get("triage_risk_counts", {}),
+        if promoted_candidate_ids and not pending_asset_candidates:
+            add_item(
+                "SCOPE-blackbox-asset-candidates",
+                "Account for promoted static asset endpoint candidates",
+                "ready",
+                "low",
+                f"All {len(asset_candidates)} static asset candidate(s) are represented by the generated asset profile.",
+                evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT, BLACKBOX_ASSET_PROFILE_ARTIFACT],
+                prerequisites=[
+                    "Regenerate blackbox-asset-profile.json after refreshing asset candidates.",
+                    "Keep API, WebSocket, sensitive, and mutation candidates out of the asset profile unless separately reviewed.",
+                ],
+                safety="Artifact accounting only. Does not send requests.",
+                extra={
+                    "asset_candidate_count": len(asset_candidates),
+                    "promoted_candidate_count": len(promoted_candidate_ids),
                 },
-                "asset_candidate_preview": candidate_preview,
-            },
-        )
+            )
+        elif promoted_candidate_ids and all(
+            ((item.get("triage", {}) or {}).get("class") == "websocket-handshake-review")
+            for item in pending_asset_candidates
+        ):
+            pending_hosts = [str(item.get("host") or "") for item in pending_asset_candidates]
+            add_item(
+                "REVIEW-blackbox-websocket-candidates",
+                "Review static asset WebSocket candidates",
+                "manual-review",
+                "medium",
+                (
+                    f"{len(pending_asset_candidates)} WebSocket handshake candidate(s) remain after "
+                    f"{len(promoted_candidate_ids)} low-risk page-route candidate(s) were promoted into the asset profile."
+                ),
+                evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT, BLACKBOX_ASSET_PROFILE_ARTIFACT, SCOPE_POLICY_ARTIFACT],
+                prerequisites=[
+                    "Confirm each WebSocket endpoint is in scope and handshake-only validation is acceptable.",
+                    "Do not send subscription messages, trading requests, wallet payloads, or high-volume connection tests from this queue item.",
+                    "Add a bounded WebSocket handshake profile only after semantics and scope are reviewed.",
+                ],
+                safety="Manual review only. Does not authorize WebSocket connections or messages.",
+                extra={
+                    "asset_candidate_count": len(asset_candidates),
+                    "promoted_candidate_count": len(promoted_candidate_ids),
+                    "pending_websocket_candidate_count": len(pending_asset_candidates),
+                    "scope_policy_decision_counts": scope_policy_decision_counts_for_hosts(scope_policy_doc, pending_hosts),
+                    "asset_candidate_preview": candidate_preview,
+                },
+            )
+        else:
+            add_item(
+                "REVIEW-blackbox-asset-candidates",
+                "Review static asset endpoint candidates",
+                "manual-review",
+                "medium",
+                (
+                    f"{len(pending_asset_candidates)} of {len(asset_candidates)} endpoint or WebSocket candidate(s) still need review. "
+                    "They are leads only until scope, authentication context, and business-operation risk are reviewed."
+                ),
+                commands=[
+                    cmd(
+                        "blackbox-asset-map --force "
+                        "--scope-host REPLACE_WITH_IN_SCOPE_HOST"
+                    )
+                ],
+                evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT],
+                prerequisites=[
+                    "Review each candidate in blackbox-asset-candidates.json before adding it to a black-box profile.",
+                    "Do not probe account, order, trade, wallet, or state-changing paths without an explicit read-only reproduction plan.",
+                    "Promote only concrete low-risk GET/HEAD/WebSocket handshake candidates that are in the bounty scope.",
+                ],
+                safety="Static asset lead review only. Candidate endpoints are not requested by blackbox-asset-map.",
+                extra={
+                    "asset_candidate_count": len(asset_candidates),
+                    "promoted_candidate_count": len(promoted_candidate_ids),
+                    "pending_asset_candidate_count": len(pending_asset_candidates),
+                    "asset_candidate_triage": {
+                        "class_counts": asset_summary.get("triage_class_counts", {}),
+                        "risk_counts": asset_summary.get("triage_risk_counts", {}),
+                    },
+                    "asset_candidate_preview": candidate_preview,
+                },
+            )
 
     takeover_doc = (
         load_optional_json(artifact_dir / HOST_TAKEOVER_BASELINE_ARTIFACT)
@@ -30846,6 +31170,54 @@ def run_resource_snapshot(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_scope_policy(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    asset_candidates_doc = load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT)
+    allowed_hosts = {normalize_scope_host(host) for host in (args.scope_host or []) if normalize_scope_host(host)}
+    config_hosts_doc = (asset_candidates_doc or {}).get("config_hosts", {}) if isinstance(asset_candidates_doc, dict) else {}
+    for host in config_hosts_doc.get("allowed_hosts", []) or []:
+        normalized = normalize_scope_host(host)
+        if normalized:
+            allowed_hosts.add(normalized)
+    policy = build_scope_policy(
+        target=target,
+        allowed_hosts=allowed_hosts,
+        asset_candidates_doc=asset_candidates_doc,
+        deny_unlisted_hosts=not args.allow_unlisted_review,
+        source_url=args.source_url,
+        source_label=args.source_label,
+    )
+    output_path = artifact_dir / SCOPE_POLICY_ARTIFACT
+    if not args.no_write:
+        write_json(output_path, policy)
+    print(f"Scope policy: {policy['status']}")
+    print(
+        "Hosts: "
+        f"{policy['summary']['host_count']} total, "
+        f"unresolved={policy['summary']['unresolved_host_count']}, "
+        f"decisions={json.dumps(policy['summary']['decision_counts'], sort_keys=True)}"
+    )
+    print(f"Allowed hosts: {', '.join(policy['policy']['allowed_hosts']) or '(none)'}")
+    if args.no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="scope-policy",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    output_path,
+                ],
+            )
+        )
+    return 1 if args.strict and policy["status"] != "complete" else 0
+
+
 def run_decode_transactions(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -32154,6 +32526,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print resource status only; do not write resource-snapshot.json or refresh manifests.",
     )
     resource_snapshot.set_defaults(func=run_resource_snapshot)
+
+    scope_policy = sub.add_parser(
+        "scope-policy",
+        help="Build an explicit host allowlist policy for passive black-box leads",
+    )
+    scope_policy.add_argument(
+        "--scope-host",
+        action="append",
+        help="Explicit in-scope host. Repeat as needed. Existing asset-map allowed_hosts are included automatically.",
+    )
+    scope_policy.add_argument(
+        "--allow-unlisted-review",
+        action="store_true",
+        help="Leave unlisted hosts as needs-scope-review instead of out-of-scope-by-default.",
+    )
+    scope_policy.add_argument(
+        "--source-url",
+        help="Program scope URL or local source used to justify the host allowlist.",
+    )
+    scope_policy.add_argument(
+        "--source-label",
+        default="explicit-scope-host-policy",
+        help="Short label for the scope source.",
+    )
+    scope_policy.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print scope policy summary only; do not write scope-policy.json or refresh manifests.",
+    )
+    scope_policy.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless every observed host has an allowlist or deny-by-default decision.",
+    )
+    scope_policy.set_defaults(func=run_scope_policy)
 
     decode = sub.add_parser(
         "decode-transactions",

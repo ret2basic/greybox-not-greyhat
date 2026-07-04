@@ -204,6 +204,24 @@ Proxy Intercept off by default, does not persist raw MCP history, and filters
 history by both target `Host` and the InferForge observation signal so old local
 traffic cannot crowd out the current target.
 
+When a bounty program has an explicit host list, turn that scope into a local
+policy artifact before reviewing runtime or external hosts:
+
+```bash
+python3 scripts/inferforge.py --target https://in-scope.example \
+  --artifact-dir .greybox/in-scope-example \
+  scope-policy \
+  --scope-host in-scope.example \
+  --source-url https://example.com/program-scope
+```
+
+`scope-policy` reads existing asset-candidate artifacts only. Listed hosts are
+marked `in-scope-explicit-host`; every observed but unlisted host is
+`out-of-scope-by-default` unless `--allow-unlisted-review` is set. Verification
+queues use this artifact to avoid turning passive runtime config or external
+script references into manual blockers when the explicit scope already excludes
+them.
+
 For takeover-oriented Web/App scope checks, keep the host list explicit:
 
 ```bash
