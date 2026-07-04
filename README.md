@@ -196,12 +196,12 @@ whitespace are profile-validation errors. Keep unresolved paths in
 `review_observation_candidates` until one reviewed concrete path is promoted.
 
 When a separate profile file omits target-specific fields such as `clusters`,
-`probe_targets`, `quote_intent`, `quote_request`, `quote_provider`,
-`environment_readiness`, `burp_observation_plan`, or
+`probe_targets`, `quote_intent`, `quote_request`, `quote_response`,
+`quote_provider`, `environment_readiness`, `burp_observation_plan`, or
 `websocket_observation`, InferForge uses neutral empty defaults and emits
 profile-validation warnings. It does not borrow `infrafi-web` clusters, probe
-paths, quote mint intent, quote request shape, or external readiness checks for
-another target. Quote collection and
+paths, quote mint intent, quote request/response shape, or external readiness
+checks for another target. Quote collection and
 direction-derived transaction policy checks read mint direction from the target
 profile:
 
@@ -268,6 +268,22 @@ field-specific probes can delete or mutate the correct target-specific field:
 }
 ```
 
+Quote response transaction extraction can also be profile-owned. Candidate
+paths are simple JSON paths supporting object fields plus array indexes or
+wildcards. InferForge tries these configured paths first, then keeps its generic
+recursive JSON and base64 scan as a fallback:
+
+```json
+{
+  "quote_response": {
+    "transaction_candidate_paths": [
+      "$[*].payloads[*].data.transaction",
+      "$.payloads[*].data.transaction"
+    ]
+  }
+}
+```
+
 Quote provider response diagnosis is profile-owned too. Use
 `quote_provider.diagnostics` to map target-specific local/upstream error shapes
 to stable classifications without hard-coding a provider globally:
@@ -328,10 +344,11 @@ declare its own provider variables or leave this empty:
 
 `discover-profile` copies `quote_intent` into the generated starter profile only
 when the seed profile passed with `--profile` explicitly declares complete
-`buy` and `sell` directions. It copies `quote_request` and `quote_provider`
-only from an explicit seed profile that declares them. Running discovery without
-an explicit profile does not copy the built-in regression target mint intent,
-request shape, or provider diagnostics into a new target.
+`buy` and `sell` directions. It copies `quote_request`, `quote_response`, and
+`quote_provider` only from an explicit seed profile that declares them. Running
+discovery without an explicit profile does not copy the built-in regression
+target mint intent, request/response shape, or provider diagnostics into a new
+target.
 
 Use the static routing self-test to guard this invariant:
 
@@ -439,6 +456,10 @@ dependency to decode account keys, signer/writable flags, recent blockhash, and
 compiled instruction metadata. It can also compare decoded payloads against an
 expected swap intent. It never signs or submits transactions. Extra payload
 files can be supplied as JSON, JSONL, or text:
+
+When the active profile declares `quote_response.transaction_candidate_paths`,
+those simple JSON paths are applied before the generic recursive/base64 scan so
+candidate summaries retain the provider-specific response location.
 
 ```bash
 python3 scripts/inferforge.py decode-transactions --input .greybox/transaction-payloads.jsonl

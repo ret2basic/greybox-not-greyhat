@@ -72,6 +72,10 @@ DEFAULT_QUOTE_REQUEST_POLICY_FIELDS = {
     "recipient": "recipient",
     "max_num_quotes": "maxNumQuotes",
 }
+DEFAULT_QUOTE_RESPONSE_CANDIDATE_PATHS = [
+    "$[*].payloads[*].data.transaction",
+    "$.payloads[*].data.transaction",
+]
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_BODY_SAMPLE_CHARS = 1200
 MAX_REQUEST_CONTEXTS_PER_ENDPOINT = 6
@@ -481,6 +485,9 @@ def default_target_profile() -> dict[str, Any]:
             "body_template": json_clone(DEFAULT_QUOTE_REQUEST_TEMPLATE),
             "policy_fields": json_clone(DEFAULT_QUOTE_REQUEST_POLICY_FIELDS),
         },
+        "quote_response": {
+            "transaction_candidate_paths": json_clone(DEFAULT_QUOTE_RESPONSE_CANDIDATE_PATHS),
+        },
         "quote_provider": {
             "name": "M0",
             "diagnostics": [
@@ -791,6 +798,7 @@ def neutral_target_profile_defaults(
         "probe_targets": {},
         "quote_intent": {},
         "quote_request": {},
+        "quote_response": {},
         "quote_provider": {},
         "environment_readiness": {"checks": []},
         "clusters": [],
@@ -835,6 +843,7 @@ def normalize_target_profile(profile: dict[str, Any], *, profile_path: Path | No
         "probe_targets",
         "quote_intent",
         "quote_request",
+        "quote_response",
         "quote_provider",
         "environment_readiness",
         "clusters",
@@ -1291,6 +1300,84 @@ def build_quote_request_body(
     return body
 
 
+def quote_response_config(profile: dict[str, Any] | None) -> dict[str, Any]:
+    configured = (profile or {}).get("quote_response")
+    if isinstance(configured, dict):
+        return json_clone(configured)
+    if uses_builtin_target_defaults(profile):
+        return json_clone(default_target_profile().get("quote_response", {}))
+    return {}
+
+
+def quote_response_candidate_paths(profile: dict[str, Any] | None) -> list[str]:
+    config = quote_response_config(profile)
+    raw_paths = (
+        config.get("transaction_candidate_paths")
+        or config.get("transactionCandidatePaths")
+        or config.get("candidate_paths")
+    )
+    return normalize_string_list(raw_paths)
+
+
+def parse_simple_json_path(path: str) -> list[tuple[str, str | int]] | None:
+    if not isinstance(path, str) or not path.startswith("$"):
+        return None
+    tokens: list[tuple[str, str | int]] = []
+    index = 1
+    while index < len(path):
+        char = path[index]
+        if char == ".":
+            index += 1
+            start = index
+            while index < len(path) and path[index] not in ".[":
+                index += 1
+            field = path[start:index]
+            if not field:
+                return None
+            tokens.append(("field", field))
+            continue
+        if char == "[":
+            end = path.find("]", index)
+            if end == -1:
+                return None
+            raw_index = path[index + 1:end].strip()
+            if raw_index in {"", "*"}:
+                tokens.append(("wildcard", "*"))
+            elif raw_index.isdigit():
+                tokens.append(("index", int(raw_index)))
+            else:
+                return None
+            index = end + 1
+            continue
+        return None
+    return tokens
+
+
+def select_simple_json_path_values(value: Any, path: str) -> list[tuple[str, Any]]:
+    tokens = parse_simple_json_path(path)
+    if tokens is None:
+        return []
+    selected: list[tuple[str, Any]] = [("$", value)]
+    for token_type, token_value in tokens:
+        next_selected: list[tuple[str, Any]] = []
+        for current_path, current_value in selected:
+            if token_type == "field":
+                if isinstance(current_value, dict) and token_value in current_value:
+                    next_selected.append((f"{current_path}.{token_value}", current_value[token_value]))
+                continue
+            if token_type == "index":
+                if isinstance(current_value, list) and int(token_value) < len(current_value):
+                    next_selected.append((f"{current_path}[{token_value}]", current_value[int(token_value)]))
+                continue
+            if token_type == "wildcard" and isinstance(current_value, list):
+                for item_index, item in enumerate(current_value):
+                    next_selected.append((f"{current_path}[{item_index}]", item))
+        selected = next_selected
+        if not selected:
+            break
+    return selected
+
+
 def quote_provider_config(profile: dict[str, Any] | None) -> dict[str, Any]:
     configured = (profile or {}).get("quote_provider")
     if isinstance(configured, dict):
@@ -1443,6 +1530,7 @@ def build_profile_validation_artifact(
             "probe_targets",
             "quote_intent",
             "quote_request",
+            "quote_response",
             "quote_provider",
             "source_peeks",
             "burp_observation_plan",
@@ -1598,6 +1686,45 @@ def build_profile_validation_artifact(
                         "message": (
                             f"`quote_request.policy_fields.{field}` points to `{path}`, "
                             "but that path is not present in `quote_request.body_template`."
+                        ),
+                    }
+                )
+
+    raw_quote_response = profile.get("quote_response")
+    if raw_quote_response not in (None, {}) and not isinstance(raw_quote_response, dict):
+        warnings.append(
+            {
+                "id": "quote-response:not-object",
+                "severity": "warning",
+                "message": "`quote_response` should be an object with optional transaction candidate extraction paths.",
+            }
+        )
+    if isinstance(raw_quote_response, dict):
+        raw_candidate_paths = (
+            raw_quote_response.get("transaction_candidate_paths")
+            or raw_quote_response.get("transactionCandidatePaths")
+            or raw_quote_response.get("candidate_paths")
+        )
+        if raw_candidate_paths is not None and not isinstance(raw_candidate_paths, (list, str)):
+            warnings.append(
+                {
+                    "id": "quote-response:transaction-candidate-paths-invalid",
+                    "severity": "warning",
+                    "message": (
+                        "`quote_response.transaction_candidate_paths` should be a string or an array "
+                        "of simple JSON paths."
+                    ),
+                }
+            )
+        for path in normalize_string_list(raw_candidate_paths):
+            if parse_simple_json_path(path) is None:
+                warnings.append(
+                    {
+                        "id": f"quote-response:transaction-candidate-path:{safe_probe_id(path)}:invalid",
+                        "severity": "warning",
+                        "message": (
+                            f"Quote response transaction candidate path `{path}` is not supported. "
+                            "Use simple paths like `$[*].payloads[*].data.transaction`."
                         ),
                     }
                 )
@@ -3690,6 +3817,27 @@ def quote_request_for_discovered_profile(
     return json_clone(configured)
 
 
+def quote_response_for_discovered_profile(
+    seed_profile: dict[str, Any] | None,
+    clusters: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    has_quote_cluster = any(
+        str(cluster.get("id") or "") == "quote"
+        or str(cluster.get("strategy_set") or "") == "quote-transaction-decoder"
+        for cluster in clusters
+    )
+    if not has_quote_cluster or not seed_profile or uses_builtin_target_defaults(seed_profile):
+        return None
+    if "quote_response" in set(seed_profile.get("_profile_defaulted_keys") or []):
+        return None
+    configured = seed_profile.get("quote_response")
+    if not isinstance(configured, dict) or not configured:
+        return None
+    if not quote_response_candidate_paths(seed_profile):
+        return None
+    return json_clone(configured)
+
+
 def build_discovered_burp_observation_plan(
     clusters: list[dict[str, Any]],
     probe_targets: dict[str, Any],
@@ -4100,6 +4248,9 @@ def build_discovered_profile(
     quote_request = quote_request_for_discovered_profile(seed_profile, clusters)
     if quote_request is not None:
         profile["quote_request"] = quote_request
+    quote_response = quote_response_for_discovered_profile(seed_profile, clusters)
+    if quote_response is not None:
+        profile["quote_response"] = quote_response
     quote_provider = quote_provider_for_discovered_profile(seed_profile, clusters)
     if quote_provider is not None:
         profile["quote_provider"] = quote_provider
@@ -18704,6 +18855,7 @@ def add_transaction_candidate(
     source: str,
     json_path: str,
     probe_id: str | None = None,
+    configured_json_path: str | None = None,
 ) -> None:
     normalized = "".join(value.strip().split())
     decoded = decode_base64_candidate(normalized)
@@ -18724,6 +18876,7 @@ def add_transaction_candidate(
             "base64_length": len(normalized),
             "base64_sha256": digest,
             "decoded_byte_length": len(decoded),
+            **({"configured_json_path": configured_json_path} if configured_json_path else {}),
         }
     )
 
@@ -18784,6 +18937,7 @@ def extract_transaction_candidates_from_text(
     probe_id: str | None,
     candidates: list[dict[str, Any]],
     seen: set[str],
+    candidate_paths: list[str] | None = None,
 ) -> None:
     if not text.strip():
         return
@@ -18794,6 +18948,19 @@ def extract_transaction_candidates_from_text(
         parsed = None
 
     if parsed is not None:
+        for candidate_path in candidate_paths or []:
+            for actual_path, candidate_value in select_simple_json_path_values(parsed, candidate_path):
+                if not isinstance(candidate_value, str):
+                    continue
+                add_transaction_candidate(
+                    candidates,
+                    seen,
+                    candidate_value,
+                    source=source,
+                    json_path=actual_path,
+                    probe_id=probe_id,
+                    configured_json_path=candidate_path,
+                )
         walk_transaction_json(
             parsed,
             source=source,
@@ -18820,6 +18987,7 @@ def extract_transaction_candidates_from_burp_items(
     target_netloc: str | None,
     source: str,
     quote_path: str = "/api/quote",
+    candidate_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -18840,6 +19008,7 @@ def extract_transaction_candidates_from_burp_items(
             probe_id=None,
             candidates=candidates,
             seen=seen,
+            candidate_paths=candidate_paths,
         )
 
     return {
@@ -18944,9 +19113,11 @@ def collect_transaction_candidates(
     artifact_dir: Path,
     results: list[dict[str, Any]],
     extra_inputs: list[Path] | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
+    candidate_paths = quote_response_candidate_paths(profile)
 
     for row in results:
         if row.get("category") != "quote" and row.get("path") != "/api/quote":
@@ -18958,6 +19129,7 @@ def collect_transaction_candidates(
             probe_id=row.get("probe_id"),
             candidates=candidates,
             seen=seen,
+            candidate_paths=candidate_paths,
         )
 
     sidecars = [
@@ -18982,6 +19154,7 @@ def collect_transaction_candidates(
                     probe_id=None,
                     candidates=candidates,
                     seen=seen,
+                    candidate_paths=candidate_paths,
                 )
         else:
             extract_transaction_candidates_from_text(
@@ -18990,6 +19163,7 @@ def collect_transaction_candidates(
                 probe_id=None,
                 candidates=candidates,
                 seen=seen,
+                candidate_paths=candidate_paths,
             )
 
     return candidates
@@ -19492,7 +19666,7 @@ def build_transaction_intent(
     intent_amount_in: str | None = None,
     intent_allowed_programs: list[str] | None = None,
 ) -> dict[str, Any]:
-    candidates = collect_transaction_candidates(artifact_dir, results, extra_inputs)
+    candidates = collect_transaction_candidates(artifact_dir, results, extra_inputs, profile)
     summaries = [
         {key: value for key, value in candidate.items() if key != "base64"}
         for candidate in candidates
@@ -21579,6 +21753,7 @@ def import_burp_history_inputs(
 ) -> dict[str, Any]:
     target_netloc = None if all_hosts else urllib.parse.urlparse(target).netloc
     quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
+    candidate_paths = quote_response_candidate_paths(profile)
     imported: list[dict[str, Any]] = []
     burp_transaction_candidate_docs: list[dict[str, Any]] = []
     input_summaries: list[dict[str, Any]] = []
@@ -21594,6 +21769,7 @@ def import_burp_history_inputs(
             target_netloc=target_netloc,
             source=source,
             quote_path=quote_path,
+            candidate_paths=candidate_paths,
         )
         imported.extend(observations)
         burp_transaction_candidate_docs.append(transaction_candidate_doc)
@@ -21808,6 +21984,9 @@ def build_profile_routing_selftest_profile() -> dict[str, Any]:
                 "max_num_quotes": "limit",
             },
         },
+        "quote_response": {
+            "transaction_candidate_paths": ["$.quotes[*].tx.raw"],
+        },
         "quote_provider": {
             "name": "SelfTestQuoteProvider",
             "diagnostics": [
@@ -21968,6 +22147,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         for probe in probes
         if probe.category == "quote" and probe.policy_field
     }
+    quote_response_candidates: list[dict[str, Any]] = []
+    quote_response_seen: set[str] = set()
+    quote_response_candidate_base64 = "A" * 80
+    extract_transaction_candidates_from_text(
+        json.dumps({"quotes": [{"tx": {"raw": quote_response_candidate_base64}}]}),
+        source="self-test-quote-response",
+        probe_id="quote_response_selftest",
+        candidates=quote_response_candidates,
+        seen=quote_response_seen,
+        candidate_paths=quote_response_candidate_paths(test_profile),
+    )
     missing_quote_intent_profile = json_clone(test_profile)
     missing_quote_intent_profile["quote_intent"] = {}
     missing_quote_intent_validation = build_profile_validation_artifact(
@@ -22016,6 +22206,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and invalid_source_mint_from.get("mint") == "not-a-mint"
         and quote_probe_policy_fields.get("quote_invalid_source_mint") == "swap.from.mint"
         and quote_probe_policy_fields.get("quote_max_num_quotes_high") == "limit"
+    )
+    quote_response_profile_passed = (
+        len(quote_response_candidates) == 1
+        and quote_response_candidates[0].get("json_path") == "$.quotes[0].tx.raw"
+        and quote_response_candidates[0].get("configured_json_path") == "$.quotes[*].tx.raw"
+        and quote_response_candidates[0].get("base64_sha256")
+        == hashlib.sha256(quote_response_candidate_base64.encode("utf-8")).hexdigest()
     )
     quote_intent_profile_passed = (
         quote_policy_sample.get("sourceMint") == "So11111111111111111111111111111111111111112"
@@ -22138,6 +22335,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         seeded_quote_request_from.get("mint") == "{sourceMint}"
         and seeded_quote_request_fields.get("source_mint") == "swap.from.mint"
         and "quote_request" not in discovered_quote_no_seed_profile
+    )
+    discovered_quote_response_passed = (
+        quote_response_candidate_paths(discovered_quote_seed_profile) == ["$.quotes[*].tx.raw"]
+        and "quote_response" not in discovered_quote_no_seed_profile
     )
     discovered_quote_provider_passed = (
         (discovered_quote_seed_profile.get("quote_provider") or {}).get("name") == "SelfTestQuoteProvider"
@@ -23576,9 +23777,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and target_lock_passed
         and quote_intent_profile_passed
         and quote_request_profile_passed
+        and quote_response_profile_passed
         and quote_provider_profile_passed
         and discovered_quote_intent_passed
         and discovered_quote_request_passed
+        and discovered_quote_response_passed
         and discovered_quote_provider_passed
         and discover_profile_seed_cli_passed
         and readiness_profile_passed
@@ -23636,6 +23839,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "quote_invalid_source_mint": quote_probe_json_bodies.get("quote_invalid_source_mint"),
             },
         },
+        "quote_response_profile_routing": {
+            "status": "passed" if quote_response_profile_passed else "failed",
+            "candidate_paths": quote_response_candidate_paths(test_profile),
+            "candidates": [
+                {key: value for key, value in candidate.items() if key != "base64"}
+                for candidate in quote_response_candidates
+            ],
+        },
         "quote_provider_profile_routing": {
             "status": "passed" if quote_provider_profile_passed else "failed",
             "provider": quote_provider_name(test_profile),
@@ -23650,6 +23861,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "status": "passed" if discovered_quote_request_passed else "failed",
             "seeded_quote_request": discovered_quote_seed_profile.get("quote_request"),
             "no_seed_has_quote_request": "quote_request" in discovered_quote_no_seed_profile,
+        },
+        "discovered_quote_response_seed_routing": {
+            "status": "passed" if discovered_quote_response_passed else "failed",
+            "seeded_quote_response": discovered_quote_seed_profile.get("quote_response"),
+            "no_seed_has_quote_response": "quote_response" in discovered_quote_no_seed_profile,
         },
         "discovered_quote_provider_seed_routing": {
             "status": "passed" if discovered_quote_provider_passed else "failed",

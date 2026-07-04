@@ -98,6 +98,12 @@
       "max_num_quotes": "maxNumQuotes"
     }
   },
+  "quote_response": {
+    "transaction_candidate_paths": [
+      "$[*].payloads[*].data.transaction",
+      "$.payloads[*].data.transaction"
+    ]
+  },
   "quote_provider": {
     "name": "M0",
     "diagnostics": [
