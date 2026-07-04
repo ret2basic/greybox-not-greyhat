@@ -34,7 +34,7 @@ import urllib.request
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -91,6 +91,7 @@ PROFILE_VALIDATION_ARTIFACT = "profile-validation.json"
 ROUTE_INVENTORY_ARTIFACT = "route-inventory.json"
 DISCOVERED_PROFILE_ARTIFACT = "discovered-profile.json"
 BLACKBOX_PROFILE_ARTIFACT = "blackbox-profile.json"
+BLACKBOX_ASSET_CANDIDATES_ARTIFACT = "blackbox-asset-candidates.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -154,6 +155,7 @@ DISCOVERY_ARTIFACTS = [
     "blackbox-profile-validation.json",
     "blackbox-profile-summary.json",
     DISCOVERY_COVERAGE_ARTIFACT,
+    BLACKBOX_ASSET_CANDIDATES_ARTIFACT,
 ]
 KNOWN_OPTIONAL_ARTIFACTS = [
     *DISCOVERY_ARTIFACTS,
@@ -4924,6 +4926,434 @@ def build_blackbox_profile_from_history(
         "safety": "Profile generation is read-only over normalized Burp history and does not send HTTP requests.",
     }
     return profile, summary
+
+
+BLACKBOX_ASSET_ENDPOINT_PREFIXES = (
+    "/api",
+    "/v1",
+    "/v2",
+    "/v3",
+    "/graphql",
+    "/ws",
+    "/socket",
+    "/websocket",
+    "/quote",
+    "/spot",
+    "/perp",
+    "/order",
+    "/orders",
+    "/account",
+    "/user",
+    "/trade",
+    "/markets",
+    "/market",
+)
+BLACKBOX_ASSET_ENDPOINT_TOKENS = (
+    "/api/",
+    "/quote",
+    "/order",
+    "/account",
+    "/trade",
+    "/position",
+    "/markets",
+    "/ticker",
+    "/depth",
+    "/kline",
+    "/ws",
+    "graphql",
+    "websocket",
+)
+
+
+def same_origin_url(url: str, origin: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    parsed_origin = urllib.parse.urlparse(origin)
+    return parsed.scheme in {"http", "https"} and parsed.netloc == parsed_origin.netloc
+
+
+def normalize_allowed_hosts(target: str, extra_hosts: list[str] | None = None) -> set[str]:
+    hosts = {urllib.parse.urlparse(target).netloc}
+    for item in extra_hosts or []:
+        parsed = urllib.parse.urlparse(item if "://" in item else f"https://{item}")
+        if parsed.netloc:
+            hosts.add(parsed.netloc)
+    return {host for host in hosts if host}
+
+
+def html_script_srcs(html_text: str, page_url: str, *, same_origin_only: bool = True) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    origin = origin_for(page_url)
+
+    def add_url(raw_src: str) -> None:
+        raw_src = html.unescape(raw_src.strip())
+        if not raw_src or raw_src.startswith(("data:", "blob:", "javascript:")):
+            return
+        url = urllib.parse.urljoin(page_url, raw_src)
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            return
+        if same_origin_only and not same_origin_url(url, origin):
+            return
+        if url in seen:
+            return
+        seen.add(url)
+        urls.append(url)
+
+    for match in re.finditer(r"<script\b[^>]*\bsrc\s*=\s*([\"'])(.*?)\1", html_text, flags=re.IGNORECASE | re.DOTALL):
+        add_url(match.group(2))
+    for tag_match in re.finditer(r"<link\b[^>]*>", html_text, flags=re.IGNORECASE | re.DOTALL):
+        tag = tag_match.group(0)
+        href_match = re.search(r"\bhref\s*=\s*([\"'])(.*?)\1", tag, flags=re.IGNORECASE | re.DOTALL)
+        if not href_match:
+            continue
+        rel_match = re.search(r"\brel\s*=\s*([\"'])(.*?)\1", tag, flags=re.IGNORECASE | re.DOTALL)
+        rel = rel_match.group(2).lower() if rel_match else ""
+        href = href_match.group(2).strip()
+        href_path = urllib.parse.urlparse(href).path.lower()
+        if "modulepreload" in rel or ("preload" in rel and href_path.endswith((".js", ".mjs"))) or href_path.endswith((".js", ".mjs")):
+            add_url(href)
+    for match in re.finditer(r"(?:\bimport\s*\(|\bfrom\s+)([\"'])(.*?\.(?:js|mjs)(?:\?[^\"']*)?)\1", html_text):
+        add_url(match.group(2))
+    return urls
+
+
+def strip_query_values(path: str) -> tuple[str, list[str]]:
+    parsed = urllib.parse.urlparse(path)
+    query_keys = sorted({key for key, _value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if key})
+    query = urllib.parse.urlencode([(key, "") for key in query_keys])
+    stripped = urllib.parse.urlunparse(("", "", parsed.path or "/", "", query, ""))
+    return stripped, query_keys
+
+
+def normalize_asset_candidate_url(raw_value: str, *, base_url: str, allowed_hosts: set[str]) -> dict[str, Any] | None:
+    value = html.unescape(str(raw_value or "").strip())
+    if not value or value.startswith(("data:", "blob:", "javascript:", "mailto:", "#")):
+        return None
+    if "${" in value:
+        value = re.sub(r"\$\{[^}]+\}", "{param}", value)
+    if not value.startswith(("/", "http://", "https://", "ws://", "wss://")):
+        if re.match(r"^(api|v[0-9]+|graphql|ws|socket|quote|spot|perp|order|account|trade|markets?)/", value):
+            value = "/" + value
+        else:
+            return None
+
+    absolute = urllib.parse.urljoin(base_url, value)
+    parsed = urllib.parse.urlparse(absolute)
+    if parsed.scheme not in {"http", "https", "ws", "wss"}:
+        return None
+    if parsed.netloc and parsed.netloc not in allowed_hosts:
+        return None
+    if is_static_asset_path(parsed.path or "/"):
+        return None
+
+    path, query_keys = strip_query_values(urllib.parse.urlunparse(("", "", parsed.path or "/", "", parsed.query, "")))
+    lower_path = (parsed.path or "/").lower()
+    lower_value = value.lower()
+    endpoint_like = (
+        lower_path.startswith(BLACKBOX_ASSET_ENDPOINT_PREFIXES)
+        or any(token in lower_path for token in BLACKBOX_ASSET_ENDPOINT_TOKENS)
+        or parsed.scheme in {"ws", "wss"}
+        or any(token in lower_value for token in ("api.", "quote.", "spot.", "perp."))
+    )
+    if not endpoint_like:
+        return None
+
+    return {
+        "scheme": parsed.scheme,
+        "host": parsed.netloc,
+        "path": path,
+        "path_without_query": urllib.parse.urlparse(path).path or "/",
+        "query_keys": query_keys,
+        "kind": "websocket-candidate" if parsed.scheme in {"ws", "wss"} or "ws" in lower_path or "socket" in lower_path else "http-candidate",
+        "raw_value_sha256": hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest(),
+    }
+
+
+def iter_javascript_string_literals(source: str) -> Iterator[tuple[str, int, int]]:
+    index = 0
+    while index < len(source):
+        quote = source[index]
+        if quote not in {"'", '"', "`"}:
+            index += 1
+            continue
+        start = index
+        index += 1
+        escaped = False
+        chars: list[str] = []
+        while index < len(source):
+            char = source[index]
+            if escaped:
+                chars.append("\\" + char)
+                escaped = False
+                index += 1
+                continue
+            if char == "\\":
+                escaped = True
+                index += 1
+                continue
+            if char == quote:
+                raw_fragment = "".join(chars)
+                yield decode_loose_json_string_fragment(raw_fragment), start, index + 1
+                index += 1
+                break
+            chars.append(char)
+            index += 1
+        else:
+            break
+
+
+def method_hint_near_literal(source: str, start: int, end: int) -> str | None:
+    prefix = source[max(0, start - 80) : start]
+    for method in ["DELETE", "PATCH", "POST", "PUT", "GET", "HEAD", "OPTIONS"]:
+        if re.search(rf"\b(?:axios|client|http|request)\s*\.\s*{method.lower()}\s*\([^()\n]*$", prefix):
+            return method
+    window = source[max(0, start - 180) : min(len(source), end + 180)]
+    for method in ["DELETE", "PATCH", "POST", "PUT", "GET", "HEAD", "OPTIONS"]:
+        if re.search(rf"\bmethod\s*[:=]\s*['\"]{method}['\"]", window, flags=re.IGNORECASE):
+            return method
+        if re.search(rf"\b(?:axios|client|http|request)\s*\.\s*{method.lower()}\s*\(", window):
+            return method
+    if "new WebSocket" in window or "WebSocket(" in window:
+        return "WS"
+    return None
+
+
+def add_asset_candidate(
+    candidates: dict[tuple[str, str, str], dict[str, Any]],
+    *,
+    candidate: dict[str, Any],
+    source_url: str,
+    source_kind: str,
+    source_sha256: str,
+    line: int | None,
+    method_hint: str | None,
+) -> None:
+    method = "WS" if candidate.get("kind") == "websocket-candidate" else (method_hint or "UNKNOWN")
+    key = (method, str(candidate.get("host") or ""), str(candidate.get("path") or "/"))
+    item = candidates.setdefault(
+        key,
+        {
+            "id": f"asset-{safe_probe_id(method)}-{safe_probe_id(candidate.get('host') or 'same-origin')}-{safe_probe_id(candidate.get('path') or 'root')}",
+            "method_hint": method,
+            "host": candidate.get("host"),
+            "path": candidate.get("path"),
+            "path_without_query": candidate.get("path_without_query"),
+            "query_keys": candidate.get("query_keys", []),
+            "kind": candidate.get("kind"),
+            "sources": [],
+            "risk": "review-required",
+            "review_note": "Static asset candidate only. Do not probe until scope, auth context, and business impact are reviewed.",
+        },
+    )
+    source_ref = {
+        "source_url": source_url,
+        "source_kind": source_kind,
+        "source_sha256": source_sha256,
+        "line": line,
+        "raw_value_sha256": candidate.get("raw_value_sha256"),
+    }
+    if source_ref not in item["sources"]:
+        item["sources"].append(source_ref)
+
+
+def extract_blackbox_asset_candidates_from_text(
+    source: str,
+    *,
+    source_url: str,
+    source_kind: str,
+    base_url: str,
+    allowed_hosts: set[str],
+    candidate_limit: int | None = None,
+) -> list[dict[str, Any]]:
+    source_sha256 = hashlib.sha256(source.encode("utf-8", errors="replace")).hexdigest()
+    candidates: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    def limit_reached() -> bool:
+        return candidate_limit is not None and len(candidates) >= candidate_limit
+
+    for value, start, end in iter_javascript_string_literals(source):
+        if limit_reached():
+            break
+        candidate = normalize_asset_candidate_url(value, base_url=base_url, allowed_hosts=allowed_hosts)
+        if candidate is None:
+            continue
+        line = source.count("\n", 0, start) + 1
+        add_asset_candidate(
+            candidates,
+            candidate=candidate,
+            source_url=source_url,
+            source_kind=source_kind,
+            source_sha256=source_sha256,
+            line=line,
+            method_hint=method_hint_near_literal(source, start, end),
+        )
+
+    url_pattern = re.compile(r"\b(?:https?|wss?)://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+")
+    for match in url_pattern.finditer(source):
+        if limit_reached():
+            break
+        candidate = normalize_asset_candidate_url(match.group(0), base_url=base_url, allowed_hosts=allowed_hosts)
+        if candidate is None:
+            continue
+        line = source.count("\n", 0, match.start()) + 1
+        add_asset_candidate(
+            candidates,
+            candidate=candidate,
+            source_url=source_url,
+            source_kind=source_kind,
+            source_sha256=source_sha256,
+            line=line,
+            method_hint=method_hint_near_literal(source, match.start(), match.end()),
+        )
+    return sorted(candidates.values(), key=lambda item: (item.get("host") or "", item.get("path") or "", item.get("method_hint") or ""))
+
+
+def http_get_url_text_limited(url: str, *, timeout: int, max_bytes: int, user_agent: str) -> dict[str, Any]:
+    started = time.monotonic()
+    request = urllib.request.Request(url, method="GET", headers={"User-Agent": user_agent})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read(max_bytes + 1)
+            headers = dict(response.headers.items())
+            status = response.status
+    except urllib.error.HTTPError as error:
+        body = error.read(max_bytes + 1)
+        headers = dict(error.headers.items())
+        status = error.code
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as error:
+        return {
+            "ok": False,
+            "url": url,
+            "status": None,
+            "duration_ms": round((time.monotonic() - started) * 1000),
+            "error": str(getattr(error, "reason", error)),
+            "text": "",
+            "bytes": 0,
+            "sha256": None,
+            "truncated": False,
+            "headers": {},
+        }
+    truncated = len(body) > max_bytes
+    if truncated:
+        body = body[:max_bytes]
+    return {
+        "ok": True,
+        "url": url,
+        "status": status,
+        "duration_ms": round((time.monotonic() - started) * 1000),
+        "error": None,
+        "text": body.decode("utf-8", errors="replace"),
+        "bytes": len(body),
+        "sha256": hashlib.sha256(body).hexdigest(),
+        "truncated": truncated,
+        "headers": headers,
+    }
+
+
+def merge_asset_candidates(candidate_lists: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for candidates in candidate_lists:
+        for candidate in candidates:
+            key = (
+                str(candidate.get("method_hint") or ""),
+                str(candidate.get("host") or ""),
+                str(candidate.get("path") or ""),
+            )
+            item = merged.setdefault(key, json_clone(candidate))
+            for source_ref in candidate.get("sources", []) or []:
+                if source_ref not in item["sources"]:
+                    item["sources"].append(source_ref)
+    return sorted(merged.values(), key=lambda item: (item.get("host") or "", item.get("path") or "", item.get("method_hint") or ""))
+
+
+def build_blackbox_asset_map(
+    *,
+    target: str,
+    page_url: str,
+    page_fetch: dict[str, Any] | None,
+    page_text: str,
+    assets: list[dict[str, Any]],
+    allowed_hosts: set[str],
+    max_assets: int,
+    candidate_limit: int | None = None,
+) -> dict[str, Any]:
+    script_urls = html_script_srcs(page_text, page_url, same_origin_only=True)
+    candidate_lists = [
+        extract_blackbox_asset_candidates_from_text(
+            page_text,
+            source_url=page_url,
+            source_kind="html",
+            base_url=page_url,
+            allowed_hosts=allowed_hosts,
+            candidate_limit=candidate_limit,
+        )
+    ]
+    asset_summaries = []
+    for asset in assets:
+        text = str(asset.get("text") or "")
+        current_count = sum(len(candidates) for candidates in candidate_lists)
+        remaining_limit = None if candidate_limit is None else max(0, candidate_limit - current_count)
+        if remaining_limit == 0:
+            text = ""
+        candidate_lists.append(
+            extract_blackbox_asset_candidates_from_text(
+                text,
+                source_url=str(asset.get("url") or ""),
+                source_kind="script",
+                base_url=str(asset.get("url") or page_url),
+                allowed_hosts=allowed_hosts,
+                candidate_limit=remaining_limit,
+            )
+        )
+        headers = asset.get("headers", {}) if isinstance(asset.get("headers"), dict) else {}
+        asset_summaries.append(
+            {
+                "url": asset.get("url"),
+                "status": asset.get("status"),
+                "bytes": asset.get("bytes"),
+                "sha256": asset.get("sha256"),
+                "truncated": asset.get("truncated"),
+                "content_type": headers.get("Content-Type") or headers.get("content-type"),
+                "duration_ms": asset.get("duration_ms"),
+                "error": redacted_error_summary(Exception(str(asset.get("error")))) if asset.get("error") else None,
+            }
+        )
+    candidates = merge_asset_candidates(candidate_lists)
+    page_headers = page_fetch.get("headers", {}) if isinstance(page_fetch, dict) and isinstance(page_fetch.get("headers"), dict) else {}
+    return {
+        "generated_at": utc_now(),
+        "status": "candidates-found" if candidates else "no-candidates",
+        "target": target,
+        "page": {
+            "url": page_url,
+            "status": None if page_fetch is None else page_fetch.get("status"),
+            "bytes": len(page_text.encode("utf-8", errors="replace")) if page_fetch is None else page_fetch.get("bytes"),
+            "sha256": hashlib.sha256(page_text.encode("utf-8", errors="replace")).hexdigest(),
+            "content_type": page_headers.get("Content-Type") or page_headers.get("content-type"),
+            "script_urls_seen": len(script_urls),
+            "script_urls_considered": min(len(script_urls), max_assets),
+        },
+        "allowed_hosts": sorted(allowed_hosts),
+        "assets": asset_summaries,
+        "summary": {
+            "assets_fetched": len(assets),
+            "candidates": len(candidates),
+            "http_candidates": sum(1 for item in candidates if item.get("kind") == "http-candidate"),
+            "websocket_candidates": sum(1 for item in candidates if item.get("kind") == "websocket-candidate"),
+            "post_hints": sum(1 for item in candidates if item.get("method_hint") == "POST"),
+            "review_required": len(candidates),
+            "candidate_limit": candidate_limit,
+            "candidate_limit_reached": candidate_limit is not None and len(candidates) >= candidate_limit,
+        },
+        "candidates": candidates,
+        "safety": [
+            "Low-volume static asset mapping only; candidate endpoints are not requested.",
+            "Only the target page and same-origin script assets are fetched by this command.",
+            "Raw HTML and JavaScript bodies are not persisted; artifacts store paths, query keys, hashes, and source URLs only.",
+            "Query values are stripped from candidate paths.",
+        ],
+    }
 
 
 def load_target_profile(profile_path: str | None) -> dict[str, Any]:
@@ -13942,6 +14372,53 @@ def build_verification_queue(
             safety="Do not report unless the finding gate passes and reproduction evidence is complete.",
         )
 
+    asset_candidates_doc = (
+        load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT)
+        if artifact_dir is not None
+        else None
+    )
+    asset_candidates = (asset_candidates_doc or {}).get("candidates", []) or []
+    if asset_candidates:
+        candidate_preview = [
+            {
+                "id": item.get("id"),
+                "method_hint": item.get("method_hint"),
+                "host": item.get("host"),
+                "path": item.get("path"),
+                "kind": item.get("kind"),
+                "source_count": len(item.get("sources", []) or []),
+            }
+            for item in asset_candidates[:12]
+            if isinstance(item, dict)
+        ]
+        add_item(
+            "REVIEW-blackbox-asset-candidates",
+            "Review static asset endpoint candidates",
+            "manual-review",
+            "medium",
+            (
+                f"{len(asset_candidates)} endpoint or WebSocket candidate(s) were extracted from static assets. "
+                "They are leads only until scope, authentication context, and business-operation risk are reviewed."
+            ),
+            commands=[
+                cmd(
+                    "blackbox-asset-map --force "
+                    "--scope-host REPLACE_WITH_IN_SCOPE_HOST"
+                )
+            ],
+            evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT],
+            prerequisites=[
+                "Review each candidate in blackbox-asset-candidates.json before adding it to a black-box profile.",
+                "Do not probe account, order, trade, wallet, or state-changing paths without an explicit read-only reproduction plan.",
+                "Promote only concrete low-risk GET/HEAD/WebSocket handshake candidates that are in the bounty scope.",
+            ],
+            safety="Static asset lead review only. Candidate endpoints are not requested by blackbox-asset-map.",
+            extra={
+                "asset_candidate_count": len(asset_candidates),
+                "asset_candidate_preview": candidate_preview,
+            },
+        )
+
     status_counts: dict[str, int] = {}
     for item in items:
         status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
@@ -15252,9 +15729,45 @@ def build_review_blockers_selftest() -> dict[str, Any]:
         root = Path(temp_dir)
         default_dir = root / "default"
         discovered_dir = root / "discovered"
+        asset_queue_dir = root / "asset-queue"
         manifest_only_dir = root / "manifest-only"
         write_json(default_dir / REVIEW_BLOCKERS_ARTIFACT, default_blockers)
         write_json(discovered_dir / REVIEW_BLOCKERS_ARTIFACT, discovered_blockers)
+        write_json(
+            asset_queue_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT,
+            {
+                "generated_at": utc_now(),
+                "status": "candidates-found",
+                "candidates": [
+                    {
+                        "id": "asset-post-blackbox-api-orders",
+                        "method_hint": "POST",
+                        "host": "blackbox.test",
+                        "path": "/api/orders?market=",
+                        "kind": "http-candidate",
+                        "sources": [{"source_url": "https://blackbox.test/assets/app.js"}],
+                    }
+                ],
+            },
+        )
+        asset_queue = build_verification_queue(
+            target,
+            {"clusters": profile["clusters"]},
+            None,
+            None,
+            None,
+            None,
+            {"status": "ready"},
+            artifact_dir=asset_queue_dir,
+            attack_strategy={"status": "ready-for-regression"},
+        )
+        asset_blockers = build_review_blockers(
+            target=target,
+            profile=profile,
+            artifact_dir=asset_queue_dir,
+            verification_queue=asset_queue,
+            environment_readiness={"status": "ready", "checks": []},
+        )
         write_json(
             manifest_only_dir / MANIFEST_NAME,
             {
@@ -15488,6 +16001,33 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             ),
             "expected": "top summaries start with the highest-priority human-review group",
             "actual": rollup_top_group_summaries,
+        },
+        {
+            "id": "asset-candidates-enter-review-queue",
+            "passed": (
+                asset_queue.get("status") == "needs-human-review"
+                and any(item.get("id") == "REVIEW-blackbox-asset-candidates" for item in asset_queue.get("items", []))
+                and asset_blockers.get("status") == "needs-human-review"
+                and any(
+                    blocker.get("id") == "QUEUE-REVIEW-blackbox-asset-candidates"
+                    and blocker.get("category") == "human-review"
+                    for blocker in asset_blockers.get("blockers", [])
+                )
+            ),
+            "expected": "blackbox asset candidates produce a manual-review verification queue item and review blocker",
+            "actual": {
+                "queue_status": asset_queue.get("status"),
+                "queue_items": [item.get("id") for item in asset_queue.get("items", [])],
+                "blocker_status": asset_blockers.get("status"),
+                "blockers": [
+                    {
+                        "id": blocker.get("id"),
+                        "category": blocker.get("category"),
+                        "status": blocker.get("status"),
+                    }
+                    for blocker in asset_blockers.get("blockers", [])
+                ],
+            },
         },
         {
             "id": "cli-no-write-skips-review-blocker-outputs",
@@ -24056,6 +24596,38 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             ],
         )
         blackbox_target_info_sample = blackbox_target_info_from_artifacts("http://blackbox.test", blackbox_info_path)
+    blackbox_asset_map_sample = build_blackbox_asset_map(
+        target="https://blackbox.test",
+        page_url="https://blackbox.test/",
+        page_fetch=None,
+        page_text=(
+            '<html><script src="/assets/app.js"></script>'
+            '<script src="https://cdn.blackbox.test/external.js"></script></html>'
+        ),
+        assets=[
+            {
+                "url": "https://blackbox.test/assets/app.js",
+                "status": 200,
+                "text": (
+                    'fetch("/api/orders?token=secret-value&market=ETH-USD", { method: "POST" });\n'
+                    'const socket = new WebSocket("wss://quote.blackbox.test/ws/v1/quotes?symbol=BTC-USD");\n'
+                    'const ignored = "/assets/logo.svg";\n'
+                    'axios.get("api/v1/markets");\n'
+                ),
+                "bytes": 240,
+                "sha256": "selftest-js",
+                "truncated": False,
+                "headers": {"Content-Type": "application/javascript"},
+                "duration_ms": 1,
+            }
+        ],
+        allowed_hosts={"blackbox.test", "quote.blackbox.test"},
+        max_assets=8,
+    )
+    blackbox_asset_candidates = {
+        (item.get("method_hint"), item.get("host"), item.get("path"))
+        for item in blackbox_asset_map_sample.get("candidates", [])
+    }
     blackbox_probe_ids_sample = [
         probe.id
         for probe in build_probe_plan(
@@ -24103,6 +24675,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_target_info_sample.get("health_status") == 404
         and blackbox_target_info_sample.get("health_path") is None
         and blackbox_target_info_sample.get("health_source") == "blackbox-burp-history"
+        and blackbox_asset_map_sample.get("status") == "candidates-found"
+        and ("POST", "blackbox.test", "/api/orders?market=&token=") in blackbox_asset_candidates
+        and ("WS", "quote.blackbox.test", "/ws/v1/quotes?symbol=") in blackbox_asset_candidates
+        and ("GET", "blackbox.test", "/api/v1/markets") in blackbox_asset_candidates
+        and all("/assets/logo.svg" != item.get("path") for item in blackbox_asset_map_sample.get("candidates", []))
         and all(check.get("status") == "not-applicable" for check in blackbox_source_context_checks)
         and any(probe_id.startswith("blackbox_") for probe_id in blackbox_probe_ids_sample)
         and "quote" not in stale_cluster_selection_sample.get("selected_cluster_ids", [])
@@ -28144,6 +28721,118 @@ def run_blackbox_profile(args: argparse.Namespace) -> int:
     return 0 if summary["status"] == "generated" and validation["status"] != "failed" else 1
 
 
+def run_blackbox_asset_map(args: argparse.Namespace) -> int:
+    _profile, artifact_dir, target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    parsed_target = urllib.parse.urlparse(target)
+    page_url = urllib.parse.urljoin(target.rstrip("/") + "/", str(args.path or "/").lstrip("/"))
+    allowed_hosts = normalize_allowed_hosts(target, args.scope_host)
+    timeout = int(args.timeout)
+    max_assets = int(args.max_assets)
+    max_bytes = int(args.max_bytes)
+    candidate_limit = int(args.candidate_limit)
+    user_agent = args.user_agent or "InferForge-Blackbox-Asset-Map/0.1"
+
+    if urllib.parse.urlparse(page_url).netloc != parsed_target.netloc:
+        print(f"Refusing to fetch a page outside the target host: {page_url}")
+        return 2
+
+    if args.input_html:
+        page_path = Path(args.input_html).resolve()
+        page_text = page_path.read_text(encoding="utf-8", errors="replace")
+        page_fetch = None
+        script_urls = []
+        fetched_assets: list[dict[str, Any]] = []
+    else:
+        try:
+            with TargetProbeLock(target, purpose="blackbox-asset-map"):
+                page_fetch = http_get_url_text_limited(
+                    page_url,
+                    timeout=timeout,
+                    max_bytes=max_bytes,
+                    user_agent=user_agent,
+                )
+                page_text = str(page_fetch.get("text") or "")
+                script_urls = html_script_srcs(page_text, page_url, same_origin_only=True)
+                fetched_assets = []
+                if not args.no_fetch_assets:
+                    for script_url in script_urls[:max_assets]:
+                        if not same_origin_url(script_url, origin_for(target)):
+                            continue
+                        fetched_assets.append(
+                            http_get_url_text_limited(
+                                script_url,
+                                timeout=timeout,
+                                max_bytes=max_bytes,
+                                user_agent=user_agent,
+                            )
+                        )
+        except RuntimeError as error:
+            lock_path = artifact_dir / "target-probe-lock.json"
+            write_json(
+                lock_path,
+                target_probe_lock_blocked_payload(
+                    target=target,
+                    error=error,
+                    safety="Only one active low-volume target mapping run may target the same service at a time.",
+                ),
+            )
+            print(f"Target probe lock blocked blackbox-asset-map: {error}")
+            print(f"Wrote {lock_path}")
+            return 2
+
+    asset_map = build_blackbox_asset_map(
+        target=target,
+        page_url=page_url,
+        page_fetch=page_fetch,
+        page_text=page_text,
+        assets=fetched_assets,
+        allowed_hosts=allowed_hosts,
+        max_assets=max_assets,
+        candidate_limit=candidate_limit,
+    )
+    asset_map["options"] = {
+        "path": args.path,
+        "max_assets": max_assets,
+        "max_bytes": max_bytes,
+        "candidate_limit": candidate_limit,
+        "timeout": timeout,
+        "no_fetch_assets": bool(args.no_fetch_assets),
+        "input_html": str(Path(args.input_html).resolve()) if args.input_html else None,
+    }
+    output_path = Path(args.output).resolve() if args.output else artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT
+    if output_path.exists() and not args.force:
+        print(f"Refusing to overwrite existing asset map without --force: {output_path}")
+        return 2
+    write_json(output_path, sanitize_artifact_samples(asset_map))
+    print(f"Black-box asset map: {asset_map['status']}")
+    print(
+        "Assets: "
+        f"scripts_seen={asset_map['page']['script_urls_seen']} "
+        f"fetched={asset_map['summary']['assets_fetched']} "
+        f"candidates={asset_map['summary']['candidates']} "
+        f"ws={asset_map['summary']['websocket_candidates']} "
+        f"post_hints={asset_map['summary']['post_hints']}"
+    )
+    for candidate in asset_map["candidates"][:10]:
+        print(
+            f"- {candidate.get('method_hint')} {candidate.get('host')}{candidate.get('path')} "
+            f"{candidate.get('kind')}"
+        )
+    if len(asset_map["candidates"]) > 10:
+        print(f"- ... +{len(asset_map['candidates']) - 10} more candidate(s)")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="blackbox-asset-map",
+            output_paths=[output_path],
+        )
+    )
+    return 0 if asset_map["status"] in {"candidates-found", "no-candidates"} else 1
+
+
 def run_adjudicate(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -28988,6 +29677,68 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow overwriting an explicit --output profile path",
     )
     blackbox_profile.set_defaults(func=run_blackbox_profile)
+
+    blackbox_asset_map = sub.add_parser(
+        "blackbox-asset-map",
+        help="Extract review-only endpoint and WebSocket candidates from a target page and same-origin script assets",
+    )
+    blackbox_asset_map.add_argument(
+        "--path",
+        default="/",
+        help="Target page path to fetch. Defaults to /.",
+    )
+    blackbox_asset_map.add_argument(
+        "--scope-host",
+        action="append",
+        help="Additional in-scope host whose absolute URLs may be recorded as candidates. Repeat as needed.",
+    )
+    blackbox_asset_map.add_argument(
+        "--max-assets",
+        type=positive_int,
+        default=4,
+        help="Maximum same-origin script assets to fetch from the page. Defaults to 4.",
+    )
+    blackbox_asset_map.add_argument(
+        "--max-bytes",
+        type=positive_int,
+        default=256 * 1024,
+        help="Maximum bytes to read from the page or each script asset. Defaults to 262144.",
+    )
+    blackbox_asset_map.add_argument(
+        "--candidate-limit",
+        type=positive_int,
+        default=80,
+        help="Maximum endpoint candidates to retain across the page and fetched assets. Defaults to 80.",
+    )
+    blackbox_asset_map.add_argument(
+        "--timeout",
+        type=positive_int,
+        default=12,
+        help="Timeout in seconds for each low-volume page or asset fetch. Defaults to 12.",
+    )
+    blackbox_asset_map.add_argument(
+        "--no-fetch-assets",
+        action="store_true",
+        help="Only parse the page HTML; do not fetch referenced script assets.",
+    )
+    blackbox_asset_map.add_argument(
+        "--input-html",
+        help="Parse a local HTML file instead of fetching the target page. Intended for offline self-checks.",
+    )
+    blackbox_asset_map.add_argument(
+        "--user-agent",
+        help="User-Agent for page and script asset fetches. Defaults to InferForge-Blackbox-Asset-Map/0.1.",
+    )
+    blackbox_asset_map.add_argument(
+        "--output",
+        help="Where to write candidates. Defaults to ARTIFACT_DIR/blackbox-asset-candidates.json.",
+    )
+    blackbox_asset_map.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwriting an existing output artifact.",
+    )
+    blackbox_asset_map.set_defaults(func=run_blackbox_asset_map)
 
     collect = sub.add_parser("collect", help="Normalize available Burp history observations into traffic artifacts")
     collect.add_argument(

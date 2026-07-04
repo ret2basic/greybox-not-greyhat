@@ -105,8 +105,33 @@ python3 scripts/inferforge.py --target https://in-scope.example \
 groups concrete observed paths into `blackbox-http-observed` clusters, strips
 query values from the profile while keeping query parameter names, and marks
 `assessment_mode: "blackbox"` so later artifacts do not try to read local
-source code. Review program scope, authentication context, and endpoint
-criticality before any active probes:
+source code.
+
+For black-box lead generation, map endpoint and WebSocket candidates from the
+target page and same-origin JavaScript assets:
+
+```bash
+python3 scripts/inferforge.py --target https://in-scope.example \
+  --artifact-dir .greybox/in-scope-example \
+  blackbox-asset-map \
+  --scope-host in-scope.example \
+  --force
+```
+
+`blackbox-asset-map` sends only low-volume `GET` requests for the selected page
+and same-origin script assets. It does not request the candidate endpoints and
+does not persist raw HTML or JavaScript. The output
+`blackbox-asset-candidates.json` stores path candidates, query parameter names,
+source URLs, and source hashes; query values are stripped. Candidate endpoints
+are added to verification/review blockers as leads, not as findings, until
+scope, authentication context, and business-operation risk are reviewed. The
+default resource caps are intentionally small: 4 same-origin script assets,
+256 KiB per fetched resource, and 80 retained candidates. Raise
+`--max-assets`, `--max-bytes`, or `--candidate-limit` only when the runner has
+enough memory and the target scope permits the extra page-asset requests.
+
+Review program scope, authentication context, and endpoint criticality before
+any active probes:
 
 ```bash
 python3 scripts/inferforge.py --profile profiles/in-scope-example-blackbox.json \
