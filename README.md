@@ -1066,6 +1066,7 @@ Key outputs:
 .greybox/probe-plan.json
 .greybox/probe-ranking.json
 .greybox/probe-results.jsonl
+.greybox/probe-results-summary.json
 .greybox/response-delta-analysis.json
 .greybox/orca-baseline.json
 .greybox/quote-collection.json

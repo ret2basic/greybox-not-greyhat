@@ -252,6 +252,7 @@ INDEX_ARTIFACT_ORDER = [
     "probe-plan.json",
     "probe-ranking.json",
     "probe-results.jsonl",
+    "probe-results-summary.json",
     "response-delta-analysis.json",
     "warmup-results.json",
     "traffic-index.json",
@@ -8630,6 +8631,83 @@ def sanitize_probe_result_for_artifact(row: dict[str, Any]) -> dict[str, Any]:
 
 def sanitize_probe_results_for_artifact(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [sanitize_probe_result_for_artifact(row) for row in rows]
+
+
+def compact_probe_result_summary_row(row: dict[str, Any]) -> dict[str, Any]:
+    error = row.get("error")
+    return {
+        "probe_id": row.get("probe_id"),
+        "phase": row.get("phase"),
+        "method": row.get("method"),
+        "path": row.get("path"),
+        "category": row.get("category"),
+        "risk": row.get("risk"),
+        "expectation": row.get("expectation"),
+        "expectation_result": row.get("expectation_result"),
+        "expected_statuses": row.get("expected_statuses", []),
+        "status": row.get("status"),
+        "expected": bool(row.get("expected")),
+        "interesting": bool(row.get("interesting")),
+        "duration_ms": row.get("duration_ms"),
+        "body_sha256": row.get("body_sha256"),
+        "body_length": row.get("body_length"),
+        "body_truncated": bool(row.get("body_truncated")),
+        "attempt_count": row.get("attempt_count", 1),
+        "error": redacted_error_summary(error) if error else None,
+    }
+
+
+def build_probe_results_summary(
+    results: list[dict[str, Any]],
+    warmup_results: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    status_counts: dict[str, int] = {}
+    method_counts: dict[str, int] = {}
+    category_counts: dict[str, int] = {}
+    risk_counts: dict[str, int] = {}
+    expectation_counts: dict[str, int] = {}
+    unexpected_probe_ids: list[str] = []
+    interesting_probe_ids: list[str] = []
+    transport_error_probe_ids: list[str] = []
+
+    for row in results:
+        status_key = "transport-error" if row.get("status") is None else str(row.get("status"))
+        increment_count(status_counts, status_key)
+        increment_count(method_counts, str(row.get("method") or "UNKNOWN"))
+        increment_count(category_counts, str(row.get("category") or "unknown"))
+        increment_count(risk_counts, str(row.get("risk") or "unknown"))
+        increment_count(expectation_counts, str(row.get("expectation_result") or row.get("expectation") or "unknown"))
+        probe_id = str(row.get("probe_id") or "")
+        if not row.get("expected") and probe_id:
+            unexpected_probe_ids.append(probe_id)
+        if row.get("interesting") and probe_id:
+            interesting_probe_ids.append(probe_id)
+        if row.get("status") is None and probe_id:
+            transport_error_probe_ids.append(probe_id)
+
+    warmup_rows = (warmup_results or {}).get("results", []) if isinstance(warmup_results, dict) else []
+    return {
+        "generated_at": utc_now(),
+        "status": "unexpected-results" if unexpected_probe_ids else "complete",
+        "summary": {
+            "probe_count": len(results),
+            "unexpected_count": len(unexpected_probe_ids),
+            "interesting_count": len(interesting_probe_ids),
+            "transport_error_count": len(transport_error_probe_ids),
+            "status_counts": dict(sorted(status_counts.items())),
+            "method_counts": dict(sorted(method_counts.items())),
+            "category_counts": dict(sorted(category_counts.items())),
+            "risk_counts": dict(sorted(risk_counts.items())),
+            "expectation_counts": dict(sorted(expectation_counts.items())),
+            "warmup_ready": (warmup_results or {}).get("ready") if isinstance(warmup_results, dict) else None,
+            "warmup_count": len(warmup_rows),
+        },
+        "unexpected_probe_ids": unexpected_probe_ids,
+        "interesting_probe_ids": interesting_probe_ids,
+        "transport_error_probe_ids": transport_error_probe_ids,
+        "results": [compact_probe_result_summary_row(row) for row in results],
+        "safety": "Compact probe rollup only. Response bodies and body samples are intentionally omitted.",
+    }
 
 
 def sanitize_artifact_samples(value: Any) -> Any:
@@ -23318,6 +23396,7 @@ def run_audit(args: argparse.Namespace) -> int:
         return 2
 
     append_jsonl(artifact_dir / "probe-results.jsonl", sanitize_probe_results_for_artifact(results))
+    write_json(artifact_dir / "probe-results-summary.json", build_probe_results_summary(results, warmup_results))
     response_delta_analysis = build_response_delta_analysis(clusters, results)
     write_json(artifact_dir / "response-delta-analysis.json", sanitize_artifact_samples(response_delta_analysis))
     traffic_index = build_traffic_index(results, burp_history)
