@@ -8143,7 +8143,121 @@ def endpoint_clusters_for_hypothesis_matrix(
     return clusters, "profile-fallback"
 
 
-def rewrite_review_item_for_cluster(cluster: dict[str, Any]) -> dict[str, Any] | None:
+def source_root_for_review_artifact(profile: dict[str, Any] | None, artifact_dir: Path) -> Path:
+    profile_doc = profile if isinstance(profile, dict) else {}
+    if not profile_doc:
+        profile_doc = load_optional_json(artifact_dir / TARGET_PROFILE_ARTIFACT) or {}
+    return resolve_repo_path(profile_doc.get("default_source_root") or DEFAULT_SOURCE_ROOT)
+
+
+def line_number_for_offset(source: str, offset: int) -> int:
+    return source.count("\n", 0, max(0, offset)) + 1
+
+
+CLIENT_HTTP_LITERAL_RE = re.compile(
+    r"\b(?P<receiver>[A-Za-z_$][\w$]*)\s*\.\s*"
+    r"(?P<method>get|head|post|put|patch|delete)\s*"
+    r"(?:<[^>\n]+>)?\s*\(\s*"
+    r"(?P<quote>['\"`])(?P<path>/[^'\"`?#\n)]*)",
+    re.IGNORECASE,
+)
+
+
+def collect_client_http_path_candidates(source_root: Path, *, limit: int = 200) -> list[dict[str, Any]]:
+    roots = [source_root / "src"] if (source_root / "src").exists() else [source_root]
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, int]] = set()
+    for root in roots:
+        for path in sorted(root.rglob("*")):
+            if len(candidates) >= limit:
+                return candidates
+            if not path.is_file() or path.suffix not in {".js", ".jsx", ".ts", ".tsx"}:
+                continue
+            if any(part in {"node_modules", ".next"} for part in path.parts):
+                continue
+            try:
+                source = read_text(path)
+            except (UnicodeDecodeError, OSError):
+                continue
+            for match in CLIENT_HTTP_LITERAL_RE.finditer(source):
+                method = str(match.group("method") or "").upper()
+                api_path = str(match.group("path") or "")
+                if not api_path or api_path.startswith("//"):
+                    continue
+                line = line_number_for_offset(source, match.start())
+                source_ref = f"{source_root_relative_or_repo(path, source_root)}:{line}"
+                key = (method, api_path, source_ref, line)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(
+                    {
+                        "method": method,
+                        "path": api_path,
+                        "receiver": match.group("receiver"),
+                        "source_ref": source_ref,
+                        "line": line,
+                    }
+                )
+                if len(candidates) >= limit:
+                    return candidates
+    candidates.sort(key=lambda item: (str(item.get("method")), str(item.get("path")), str(item.get("source_ref"))))
+    return candidates
+
+
+def rewrite_path_candidates_for_cluster(
+    cluster: dict[str, Any],
+    client_candidates: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    path = str(cluster.get("path") or "")
+    prefix = catchall_prefix_for_path(path)
+    if not prefix:
+        return {"read_only": [], "blocked": []}
+    read_only = []
+    blocked = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in client_candidates:
+        method = str(candidate.get("method") or "").upper()
+        api_path = str(candidate.get("path") or "")
+        if not api_path.startswith("/"):
+            continue
+        local_path = f"{prefix}{api_path.lstrip('/')}"
+        key = (method, local_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        row = {
+            "method": method,
+            "local_path": local_path,
+            "upstream_path": api_path,
+            "client_path": api_path,
+            "source_ref": candidate.get("source_ref"),
+            "receiver": candidate.get("receiver"),
+        }
+        if any(token in api_path for token in ["${", "{", "}"]):
+            row["status"] = "blocked-dynamic-template"
+            row["reason"] = "Dynamic client API path is not a concrete approved rewrite validation path."
+            blocked.append(row)
+        elif method in {"GET", "HEAD"}:
+            row["status"] = "reviewable-read-only"
+            row["approval_required"] = [
+                "Confirm this client path is in scope and known to be read-only.",
+                "Confirm requesting this path will not disclose personal data, secrets, account state, or privileged records unless that is the intended impact check.",
+                "Promote exactly one concrete local_path into a Burp observation plan before sending traffic.",
+            ]
+            read_only.append(row)
+        else:
+            row["status"] = "blocked-non-read-only"
+            row["reason"] = "Non-GET/HEAD client API path is not eligible for unattended rewrite validation."
+            blocked.append(row)
+    return {"read_only": read_only[:20], "blocked": blocked[:20]}
+
+
+def rewrite_review_item_for_cluster(
+    cluster: dict[str, Any],
+    *,
+    client_candidates: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
     discovery = cluster.get("discovery") if isinstance(cluster.get("discovery"), dict) else {}
     rewrites = discovery.get("rewrites", []) if isinstance(discovery.get("rewrites"), list) else []
     fixed_upstreams = [str(item) for item in discovery.get("fixed_upstreams", []) or [] if str(item).strip()]
@@ -8169,6 +8283,9 @@ def rewrite_review_item_for_cluster(cluster: dict[str, Any]) -> dict[str, Any] |
     status = "needs-approved-read-only-path" if rewrites and catch_all else "needs-offline-review"
     if not fixed_upstreams:
         status = "needs-source-review"
+    path_candidates = rewrite_path_candidates_for_cluster(cluster, client_candidates or [])
+    read_only_candidates = path_candidates["read_only"]
+    blocked_candidates = path_candidates["blocked"]
 
     risk_factors = []
     if fixed_upstreams:
@@ -8181,6 +8298,12 @@ def rewrite_review_item_for_cluster(cluster: dict[str, Any]) -> dict[str, Any] |
         risk_factors.append("unconditional-route")
     if review_candidates:
         risk_factors.append("review-observation-candidate")
+    if read_only_candidates:
+        risk_factors.append("client-read-only-path-candidate")
+    if any(candidate.get("status") == "blocked-non-read-only" for candidate in blocked_candidates):
+        risk_factors.append("client-non-read-only-path-blocked")
+    if any(candidate.get("status") == "blocked-dynamic-template" for candidate in blocked_candidates):
+        risk_factors.append("client-dynamic-path-blocked")
 
     return {
         "id": f"REWRITE-{safe_probe_id(cluster.get('id') or path or kind)}",
@@ -8197,6 +8320,8 @@ def rewrite_review_item_for_cluster(cluster: dict[str, Any]) -> dict[str, Any] |
         "risk_factors": risk_factors,
         "rewrites": rewrites,
         "review_observation_candidates": review_candidates,
+        "read_only_path_candidates": read_only_candidates,
+        "blocked_path_candidates": blocked_candidates,
         "source_refs": source_refs,
         "validation_questions": [
             "Does the local rewrite expose a fixed upstream path family that should not be reachable from unauthenticated users?",
@@ -8215,7 +8340,9 @@ def rewrite_review_item_for_cluster(cluster: dict[str, Any]) -> dict[str, Any] |
             "Escalate only with concrete in-scope impact evidence from an approved minimal path."
         ),
         "safe_next_step": (
-            "Choose exactly one known safe read-only concrete path, confirm scope, then add it through review-observation promotion."
+            "Review one client-derived read-only path candidate, confirm scope, then promote exactly one concrete local_path."
+            if read_only_candidates
+            else "Choose exactly one known safe read-only concrete path, confirm scope, then add it through review-observation promotion."
             if rewrites and catch_all
             else "Review source guards and identify whether a single safe read-only validation path exists."
         ),
@@ -8241,11 +8368,13 @@ def build_rewrite_review_run(
         profile=profile,
         artifact_dir=artifact_dir,
     )
+    source_root = source_root_for_review_artifact(profile, artifact_dir)
+    client_candidates = collect_client_http_path_candidates(source_root)
     items = [
         item
         for cluster in endpoint_clusters.get("clusters", []) or []
         if isinstance(cluster, dict)
-        for item in [rewrite_review_item_for_cluster(cluster)]
+        for item in [rewrite_review_item_for_cluster(cluster, client_candidates=client_candidates)]
         if item is not None
     ]
     items.sort(
@@ -8259,9 +8388,13 @@ def build_rewrite_review_run(
     status_counts: dict[str, int] = {}
     priority_counts: dict[str, int] = {}
     risk_counts: dict[str, int] = {}
+    read_only_candidate_count = 0
+    blocked_candidate_count = 0
     for item in items:
         increment_count(status_counts, str(item.get("status") or "unknown"))
         increment_count(priority_counts, str(item.get("priority") or "info"))
+        read_only_candidate_count += len(item.get("read_only_path_candidates", []) or [])
+        blocked_candidate_count += len(item.get("blocked_path_candidates", []) or [])
         for risk in item.get("risk_factors", []) or []:
             increment_count(risk_counts, str(risk))
 
@@ -8279,6 +8412,9 @@ def build_rewrite_review_run(
             "priority_counts": dict(sorted(priority_counts.items())),
             "risk_counts": dict(sorted(risk_counts.items())),
             "endpoint_clusters_source": endpoint_clusters_source,
+            "client_http_path_candidates": len(client_candidates),
+            "read_only_path_candidates": read_only_candidate_count,
+            "blocked_path_candidates": blocked_candidate_count,
         },
         "items": items,
         "artifact_refs": {
@@ -8347,9 +8483,13 @@ def build_rewrite_review_rollup(
     status_counts: dict[str, int] = {}
     priority_counts: dict[str, int] = {}
     risk_counts: dict[str, int] = {}
+    read_only_candidate_count = 0
+    blocked_candidate_count = 0
     for item in items:
         increment_count(status_counts, str(item.get("status") or "unknown"))
         increment_count(priority_counts, str(item.get("priority") or "info"))
+        read_only_candidate_count += len(item.get("read_only_path_candidates", []) or [])
+        blocked_candidate_count += len(item.get("blocked_path_candidates", []) or [])
         for risk in item.get("risk_factors", []) or []:
             increment_count(risk_counts, str(risk))
     if missing:
@@ -8372,6 +8512,8 @@ def build_rewrite_review_rollup(
             "status_counts": dict(sorted(status_counts.items())),
             "priority_counts": dict(sorted(priority_counts.items())),
             "risk_counts": dict(sorted(risk_counts.items())),
+            "read_only_path_candidates": read_only_candidate_count,
+            "blocked_path_candidates": blocked_candidate_count,
             "run_status_counts": dict(sorted(run_status_counts.items())),
         },
         "runs": runs,
@@ -29899,6 +30041,22 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             + "\n",
             encoding="utf-8",
         )
+        (rewrite_source_root / "src/store").mkdir(parents=True)
+        (rewrite_source_root / "src/store/client.ts").write_text(
+            textwrap.dedent(
+                """
+                export async function loadUser(http: { get: (path: string) => Promise<unknown> }) {
+                  return http.get('/users/42')
+                }
+
+                export async function createUser(http: { post: (path: string) => Promise<unknown> }) {
+                  return http.post('/users')
+                }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
         (rewrite_source_root / "src/pages/api").mkdir(parents=True)
         (rewrite_source_root / "src/pages/api/widgets.ts").write_text(
             textwrap.dedent(
@@ -30655,7 +30813,21 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rewrite_review_proxy_item.get("priority") == "high"
             and rewrite_review_proxy_item.get("catch_all") is True
             and "fixed-upstream" in rewrite_review_proxy_item.get("risk_factors", [])
+            and "client-read-only-path-candidate" in rewrite_review_proxy_item.get("risk_factors", [])
+            and "client-non-read-only-path-blocked" in rewrite_review_proxy_item.get("risk_factors", [])
             and "https://api.example.test" in rewrite_review_proxy_item.get("fixed_upstreams", [])
+            and any(
+                candidate.get("method") == "GET"
+                and candidate.get("local_path") == "/api/proxy/users/42"
+                and candidate.get("status") == "reviewable-read-only"
+                for candidate in rewrite_review_proxy_item.get("read_only_path_candidates", [])
+            )
+            and any(
+                candidate.get("method") == "POST"
+                and candidate.get("local_path") == "/api/proxy/users"
+                and candidate.get("status") == "blocked-non-read-only"
+                for candidate in rewrite_review_proxy_item.get("blocked_path_candidates", [])
+            )
             and "top-secret" not in rewrite_review_text_sample
             and "AbC1234567890Token" not in rewrite_review_text_sample
             and "route-api-proxy-path" in classify_endpoint("GET", "/api/proxy/users/42", rewrite_clusters)
@@ -35020,6 +35192,8 @@ def run_rewrite_review(args: argparse.Namespace) -> int:
     print(
         "Items: "
         f"{summary.get('items', 0)} total, "
+        f"read_only_candidates={summary.get('read_only_path_candidates', 0)}, "
+        f"blocked_candidates={summary.get('blocked_path_candidates', 0)}, "
         f"statuses={json.dumps(summary.get('status_counts', {}), sort_keys=True)} "
         f"risks={json.dumps(summary.get('risk_counts', {}), sort_keys=True)}"
     )
@@ -35036,6 +35210,20 @@ def run_rewrite_review(args: argparse.Namespace) -> int:
             if args.show_next:
                 print(f"  next={inline_summary_text(item.get('safe_next_step'), max_chars=220)}")
                 print(f"  gate={inline_summary_text(item.get('reportability_gate'), max_chars=220)}")
+                read_only_candidates = item.get("read_only_path_candidates", []) or []
+                blocked_candidates = item.get("blocked_path_candidates", []) or []
+                for candidate in read_only_candidates[:3]:
+                    print(
+                        "  candidate="
+                        f"{candidate.get('method')} {candidate.get('local_path')} "
+                        f"source={candidate.get('source_ref')}"
+                    )
+                for candidate in blocked_candidates[:3]:
+                    print(
+                        "  blocked_candidate="
+                        f"{candidate.get('method')} {candidate.get('local_path')} "
+                        f"reason={inline_summary_text(candidate.get('reason'), max_chars=120)}"
+                    )
 
     if no_write:
         print("No files written (--no-write).")

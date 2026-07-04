@@ -299,6 +299,11 @@ This command is local and read-only. It flags catch-all rewrites, fixed
 upstreams, unconditional routes, and review-only observation candidates, then
 lists the evidence required before a static rewrite/proxy hypothesis can become
 a reportable issue.
+For catch-all rewrites, it also scans local frontend client code for concrete
+HTTP `GET` / `HEAD` path literals and maps them to local rewrite paths as
+reviewable read-only candidates. Dynamic templates such as ``/users/${id}`` and
+non-read-only methods such as `POST` are listed as blocked candidates instead;
+they are never promoted into unattended validation traffic by this review step.
 
 Use `validation-plan` to turn the ranked hypotheses into explicit preconditions,
 allowed commands, required evidence, stop conditions, and forbidden actions:
