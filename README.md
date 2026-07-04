@@ -196,20 +196,48 @@ whitespace are profile-validation errors. Keep unresolved paths in
 `review_observation_candidates` until one reviewed concrete path is promoted.
 
 When a separate profile file omits target-specific fields such as `clusters`,
-`probe_targets`, `burp_observation_plan`, or `websocket_observation`, InferForge
-uses neutral empty defaults and emits profile-validation warnings. It does not
-borrow `infrafi-web` clusters or probe paths for another target. Use the static
-routing self-test to guard this invariant:
+`probe_targets`, `quote_intent`, `burp_observation_plan`, or
+`websocket_observation`, InferForge uses neutral empty defaults and emits
+profile-validation warnings. It does not borrow `infrafi-web` clusters, probe
+paths, or quote mint intent for another target. Quote collection and
+direction-derived transaction policy checks read mint direction from the target
+profile:
+
+```json
+{
+  "quote_intent": {
+    "chain": "Solana",
+    "maxNumQuotes": 1,
+    "directions": {
+      "buy": {
+        "sourceMint": "SOURCE_MINT_FOR_BUY",
+        "destinationMint": "DESTINATION_MINT_FOR_BUY"
+      },
+      "sell": {
+        "sourceMint": "SOURCE_MINT_FOR_SELL",
+        "destinationMint": "DESTINATION_MINT_FOR_SELL"
+      }
+    }
+  }
+}
+```
+
+`discover-profile` copies `quote_intent` into the generated starter profile only
+when the seed profile passed with `--profile` explicitly declares complete
+`buy` and `sell` directions. Running discovery without an explicit profile does
+not copy the built-in regression target mint intent into a new target.
+
+Use the static routing self-test to guard this invariant:
 
 ```bash
 python3 scripts/inferforge.py self-test-profile-routing
 ```
 
-The self-test builds a synthetic profile with non-`infrafi-web` paths, including
-a generic API route, generates probe/warmup/Burp observation plans, and fails if
-default regression-target paths leak into those plans. It writes
-`.greybox/profile-routing-selftest.json` and does not send HTTP requests or call
-Burp.
+The self-test builds a synthetic profile with non-`infrafi-web` paths and quote
+mints, including a generic API route, generates probe/warmup/Burp observation
+plans, and fails if default regression-target paths or quote mint intent leak
+into those plans. It writes `.greybox/profile-routing-selftest.json` and does
+not send HTTP requests or call Burp.
 
 Use the discovery coverage self-test to guard static surface classification:
 
@@ -334,14 +362,15 @@ Or through `.greybox/transaction-intent-policy.json`:
 }
 ```
 
-For `buy`, InferForge expects USDC as the source mint and USD.tel as the
-destination mint. For `sell`, the expected mints are reversed. The current
-checks verify that the decoded transaction has the expected wallet account, the
-wallet is a signer, both expected mints appear in static account keys when
-available, compiled instructions are present, and all compiled instruction
-program IDs are in `allowedPrograms` when that allowlist is configured. Address
-table lookups can require manual review because loaded accounts are not expanded
-from chain state.
+For `buy` and `sell`, InferForge derives expected source and destination mints
+from `quote_intent.directions` in the active target profile, unless an explicit
+transaction intent policy supplies `sourceMint` and `destinationMint`. The
+current checks verify that the decoded transaction has the expected wallet
+account, the wallet is a signer, both expected mints appear in static account
+keys when available, compiled instructions are present, and all compiled
+instruction program IDs are in `allowedPrograms` when that allowlist is
+configured. Address table lookups can require manual review because loaded
+accounts are not expanded from chain state.
 
 `collect-quote` is the safe quote-corpus helper. It requests `/api/quote`, saves
 a successful quote response to `.greybox/transaction-payloads.json`, writes

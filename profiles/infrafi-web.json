@@ -53,6 +53,20 @@
       "query_injection_path": "/api/orca/pools/not-an-address?url=https://evil.example"
     }
   },
+  "quote_intent": {
+    "chain": "Solana",
+    "maxNumQuotes": 1,
+    "directions": {
+      "buy": {
+        "sourceMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "destinationMint": "dawn7ZUF7h7anFuEsDdAU1Y3HYwikwqNMAENZsQJdNL"
+      },
+      "sell": {
+        "sourceMint": "dawn7ZUF7h7anFuEsDdAU1Y3HYwikwqNMAENZsQJdNL",
+        "destinationMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+      }
+    }
+  },
   "clusters": [
     {
       "id": "health",

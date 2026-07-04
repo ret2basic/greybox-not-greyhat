@@ -440,6 +440,20 @@ def default_target_profile() -> dict[str, Any]:
                 "query_injection_path": "/api/orca/pools/not-an-address?url=https://evil.example",
             },
         },
+        "quote_intent": {
+            "chain": "Solana",
+            "maxNumQuotes": 1,
+            "directions": {
+                "buy": {
+                    "sourceMint": USDC_MINT,
+                    "destinationMint": USDTEL_MINT,
+                },
+                "sell": {
+                    "sourceMint": USDTEL_MINT,
+                    "destinationMint": USDC_MINT,
+                },
+            },
+        },
         "clusters": [
             {
                 "id": "health",
@@ -693,6 +707,7 @@ def neutral_target_profile_defaults(
             "prefer_loopback_targets": True,
         },
         "probe_targets": {},
+        "quote_intent": {},
         "clusters": [],
         "source_peeks": [],
         "burp_observation_plan": [],
@@ -733,6 +748,7 @@ def normalize_target_profile(profile: dict[str, Any], *, profile_path: Path | No
         "strategy_sets",
         "safety",
         "probe_targets",
+        "quote_intent",
         "clusters",
         "source_peeks",
         "burp_observation_plan",
@@ -932,6 +948,50 @@ def orca_probe_paths(profile: dict[str, Any] | None) -> dict[str, str]:
     }
 
 
+def quote_intent_config(profile: dict[str, Any] | None) -> dict[str, Any]:
+    configured = (profile or {}).get("quote_intent")
+    if isinstance(configured, dict):
+        return json_clone(configured)
+    if uses_builtin_target_defaults(profile):
+        return json_clone(default_target_profile().get("quote_intent", {}))
+    return {}
+
+
+def quote_direction_config(profile: dict[str, Any] | None, direction: str) -> dict[str, Any]:
+    config = quote_intent_config(profile)
+    directions = config.get("directions")
+    if not isinstance(directions, dict):
+        return {}
+    direction_config = directions.get(direction)
+    return json_clone(direction_config) if isinstance(direction_config, dict) else {}
+
+
+def quote_direction_mints(profile: dict[str, Any] | None, direction: str) -> tuple[str, str] | None:
+    direction_config = quote_direction_config(profile, direction)
+    source_mint = direction_config.get("sourceMint") or direction_config.get("source_mint")
+    destination_mint = direction_config.get("destinationMint") or direction_config.get("destination_mint")
+    if isinstance(source_mint, str) and source_mint and isinstance(destination_mint, str) and destination_mint:
+        return source_mint, destination_mint
+    return None
+
+
+def quote_chain_for_direction(profile: dict[str, Any] | None, direction: str) -> str:
+    config = quote_intent_config(profile)
+    direction_config = quote_direction_config(profile, direction)
+    chain = (
+        direction_config.get("chain")
+        or direction_config.get("sourceChain")
+        or config.get("chain")
+        or "Solana"
+    )
+    return str(chain)
+
+
+def quote_max_num_quotes(profile: dict[str, Any] | None) -> int:
+    value = quote_intent_config(profile).get("maxNumQuotes", 1)
+    return value if isinstance(value, int) and value > 0 else 1
+
+
 def is_concrete_probe_path(path: str | None) -> bool:
     return bool(path and str(path).startswith("/") and "{" not in str(path) and "}" not in str(path))
 
@@ -1027,6 +1087,7 @@ def build_profile_validation_artifact(
         for key in sorted(set(defaulted_keys) & {
             "clusters",
             "probe_targets",
+            "quote_intent",
             "source_peeks",
             "burp_observation_plan",
             "websocket_observation",
@@ -1122,6 +1183,20 @@ def build_profile_validation_artifact(
                         ),
                     }
                 )
+            if cluster_id == "quote":
+                for direction in ["buy", "sell"]:
+                    if quote_direction_mints(profile, direction) is None:
+                        warnings.append(
+                            {
+                                "id": f"cluster:quote:missing-{direction}-quote-intent",
+                                "severity": "warning",
+                                "message": (
+                                    f"Cluster `quote` is active, but `quote_intent.directions.{direction}` "
+                                    "does not define sourceMint and destinationMint. collect-quote and "
+                                    "direction-derived transaction policy checks require explicit mints."
+                                ),
+                            }
+                        )
         if strategy_set == "nextjs-api-routes" and cluster_id != "health":
             generic_path = probe_target_path(profile, cluster_id, "path", str(cluster.get("path") or ""))
             if not is_concrete_probe_path(generic_path):
@@ -2951,6 +3026,27 @@ def build_probe_targets_from_clusters(clusters: list[dict[str, Any]]) -> dict[st
     return targets
 
 
+def quote_intent_for_discovered_profile(
+    seed_profile: dict[str, Any] | None,
+    clusters: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    has_quote_cluster = any(
+        str(cluster.get("id") or "") == "quote"
+        or str(cluster.get("strategy_set") or "") == "quote-transaction-decoder"
+        for cluster in clusters
+    )
+    if not has_quote_cluster or not seed_profile or uses_builtin_target_defaults(seed_profile):
+        return None
+    if "quote_intent" in set(seed_profile.get("_profile_defaulted_keys") or []):
+        return None
+    configured = seed_profile.get("quote_intent")
+    if not isinstance(configured, dict):
+        return None
+    if quote_direction_mints(seed_profile, "buy") is None or quote_direction_mints(seed_profile, "sell") is None:
+        return None
+    return json_clone(configured)
+
+
 def build_discovered_burp_observation_plan(
     clusters: list[dict[str, Any]],
     probe_targets: dict[str, Any],
@@ -3251,6 +3347,7 @@ def build_discovered_profile(
     display_name: str,
     target: str,
     source_root: Path,
+    seed_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     routes = route_inventory.get("routes", [])
     rewrites = route_inventory.get("rewrites", [])
@@ -3305,7 +3402,7 @@ def build_discovered_profile(
     if next_config_runtime.get("i18n_configured"):
         frameworks.append("Next.js i18n")
 
-    return {
+    profile = {
         "schema_version": 1,
         "name": name,
         "display_name": display_name,
@@ -3354,6 +3451,10 @@ def build_discovered_profile(
             ],
         },
     }
+    quote_intent = quote_intent_for_discovered_profile(seed_profile, clusters)
+    if quote_intent is not None:
+        profile["quote_intent"] = quote_intent
+    return profile
 
 
 def load_target_profile(profile_path: str | None) -> dict[str, Any]:
@@ -5107,6 +5208,12 @@ def build_probe_plan(
     alternate_wallet = "11111111111111111111111111111111"
     health_path = probe_target_path(profile, "health", "path", "/health")
     quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
+    quote_mints = expected_mints_for_direction("buy", profile) or (
+        "So11111111111111111111111111111111111111112",
+        "11111111111111111111111111111111",
+    )
+    quote_chain = quote_chain_for_direction(profile, "buy")
+    quote_max_quotes = quote_max_num_quotes(profile)
     rpc_paths = rpc_probe_paths(profile)
     rpc_path = rpc_paths["path"]
     rpc_root_path = rpc_paths["root_path"]
@@ -5118,11 +5225,11 @@ def build_probe_plan(
         amount_in: Any = "1000000",
         sender: Any = valid_wallet,
         recipient: Any = valid_wallet,
-        source_chain: Any = "Solana",
-        source_address: Any = USDC_MINT,
-        destination_chain: Any = "Solana",
-        destination_address: Any = USDTEL_MINT,
-        max_num_quotes: Any = 1,
+        source_chain: Any = quote_chain,
+        source_address: Any = quote_mints[0],
+        destination_chain: Any = quote_chain,
+        destination_address: Any = quote_mints[1],
+        max_num_quotes: Any = quote_max_quotes,
         include_route: bool = True,
         include_source: bool = True,
         include_destination: bool = True,
@@ -5168,7 +5275,7 @@ def build_probe_plan(
             probe_id,
             label,
             "POST",
-            "/api/quote",
+            quote_path,
             body,
             allowed_origin,
             "application/json",
@@ -5617,7 +5724,7 @@ def build_probe_plan(
             "quote_malformed_json",
             "Quote malformed JSON",
             "POST",
-            "/api/quote",
+            quote_path,
             "{bad json",
             allowed_origin,
             "application/json",
@@ -5630,7 +5737,7 @@ def build_probe_plan(
             "quote_text_plain_invalid_json",
             "Quote text/plain invalid JSON",
             "POST",
-            "/api/quote",
+            quote_path,
             "not-json",
             allowed_origin,
             "text/plain",
@@ -18405,7 +18512,12 @@ console.log(JSON.stringify({
         )
 
 
-def expected_mints_for_direction(direction: str) -> tuple[str, str] | None:
+def expected_mints_for_direction(direction: str, profile: dict[str, Any] | None = None) -> tuple[str, str] | None:
+    configured = quote_direction_mints(profile, direction)
+    if configured:
+        return configured
+    if profile is not None and not uses_builtin_target_defaults(profile):
+        return None
     if direction == "buy":
         return USDC_MINT, USDTEL_MINT
     if direction == "sell":
@@ -18423,7 +18535,7 @@ def normalize_string_list(value: Any) -> list[str]:
     return []
 
 
-def normalize_transaction_intent_policy(raw: dict[str, Any]) -> dict[str, Any]:
+def normalize_transaction_intent_policy(raw: dict[str, Any], profile: dict[str, Any] | None = None) -> dict[str, Any]:
     direction = raw.get("direction")
     wallet = raw.get("wallet") or raw.get("walletAddress") or raw.get("sender")
     amount_in = raw.get("amountIn") or raw.get("amount_in")
@@ -18438,7 +18550,7 @@ def normalize_transaction_intent_policy(raw: dict[str, Any]) -> dict[str, Any]:
     if isinstance(amount_in, str):
         amount_in = amount_in.strip()
 
-    expected = expected_mints_for_direction(direction) if isinstance(direction, str) else None
+    expected = expected_mints_for_direction(direction, profile) if isinstance(direction, str) else None
     if expected:
         source_mint = source_mint or expected[0]
         destination_mint = destination_mint or expected[1]
@@ -18476,6 +18588,7 @@ def normalize_transaction_intent_policy(raw: dict[str, Any]) -> dict[str, Any]:
 def load_transaction_intent_policy(
     artifact_dir: Path,
     *,
+    profile: dict[str, Any] | None = None,
     policy_path: Path | None = None,
     direction: str | None = None,
     wallet: str | None = None,
@@ -18518,7 +18631,7 @@ def load_transaction_intent_policy(
             "sources": [],
         }
 
-    policy = normalize_transaction_intent_policy(raw)
+    policy = normalize_transaction_intent_policy(raw, profile)
     policy["sources"] = sources
     return policy
 
@@ -18704,6 +18817,7 @@ def build_transaction_intent(
     results: list[dict[str, Any]],
     node: str,
     source_root: Path,
+    profile: dict[str, Any] | None = None,
     extra_inputs: list[Path] | None = None,
     policy_path: Path | None = None,
     intent_direction: str | None = None,
@@ -18730,6 +18844,7 @@ def build_transaction_intent(
     decoded_count = sum(1 for item in transactions if item.get("decoded"))
     policy = load_transaction_intent_policy(
         artifact_dir,
+        profile=profile,
         policy_path=policy_path,
         direction=intent_direction,
         wallet=intent_wallet,
@@ -18762,6 +18877,7 @@ def generate_synthetic_transaction_payload(
     node: str,
     source_root: Path,
     *,
+    profile: dict[str, Any] | None = None,
     direction: str,
     wallet: str,
 ) -> dict[str, Any]:
@@ -18777,9 +18893,13 @@ def generate_synthetic_transaction_payload(
             }
         node = "node"
 
-    expected = expected_mints_for_direction(direction)
+    expected = expected_mints_for_direction(direction, profile)
     if expected is None:
-        return {"ok": False, "error": redacted_error_summary("direction must be buy or sell")}
+        if direction not in {"buy", "sell"}:
+            message = "direction must be buy or sell"
+        else:
+            message = f"quote_intent.directions.{direction} must define sourceMint and destinationMint"
+        return {"ok": False, "error": redacted_error_summary(message)}
 
     if not source_root.is_dir():
         return {"ok": False, "error": redacted_error_summary(f"Source root not found: {source_root}")}
@@ -18847,6 +18967,7 @@ def build_transaction_decoder_selftest(
     source_root: Path,
     node: str,
     *,
+    profile: dict[str, Any] | None = None,
     direction: str,
     wallet: str,
     amount_in: str,
@@ -18854,6 +18975,7 @@ def build_transaction_decoder_selftest(
     payload = generate_synthetic_transaction_payload(
         node,
         source_root,
+        profile=profile,
         direction=direction,
         wallet=wallet,
     )
@@ -18885,7 +19007,8 @@ def build_transaction_decoder_selftest(
             "sourceMint": payload["sourceMint"],
             "destinationMint": payload["destinationMint"],
             "allowedPrograms": [payload["allowedProgram"]],
-        }
+        },
+        profile,
     )
     policy_checks = build_transaction_intent_checks(transactions, policy)
     decoded_count = sum(1 for item in transactions if item.get("decoded"))
@@ -20301,6 +20424,7 @@ def run_audit(args: argparse.Namespace) -> int:
         results,
         args.node,
         source_root,
+        profile=profile,
         policy_path=Path(args.intent_policy).resolve() if args.intent_policy else None,
         intent_direction=args.intent_direction,
         intent_wallet=args.intent_wallet,
@@ -20312,6 +20436,7 @@ def run_audit(args: argparse.Namespace) -> int:
         artifact_dir,
         source_root,
         args.node,
+        profile=profile,
         direction=args.intent_direction or "buy",
         wallet=args.intent_wallet or DEFAULT_TEST_WALLET,
         amount_in=args.intent_amount_in or "1000000",
@@ -20809,6 +20934,7 @@ def import_burp_history_inputs(
         load_jsonl(artifact_dir / "probe-results.jsonl"),
         node,
         source_root,
+        profile=profile,
     )
     write_json(artifact_dir / "transaction-intent.json", transaction_intent)
     summary = {
@@ -20945,6 +21071,20 @@ def build_profile_routing_selftest_profile() -> dict[str, Any]:
                 "query_injection_path": "/poolz/not-an-address?url=https://evil.example",
             },
         },
+        "quote_intent": {
+            "chain": "Solana",
+            "maxNumQuotes": 2,
+            "directions": {
+                "buy": {
+                    "sourceMint": "So11111111111111111111111111111111111111112",
+                    "destinationMint": "11111111111111111111111111111111",
+                },
+                "sell": {
+                    "sourceMint": "11111111111111111111111111111111",
+                    "destinationMint": "So11111111111111111111111111111111111111112",
+                },
+            },
+        },
         "clusters": [
             {
                 "id": "health",
@@ -21046,6 +21186,112 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
     warmups = build_warmup_probes(target, test_profile, cluster_ids)
     observation_plan = build_burp_observation_plan(target, test_profile)
     validation = build_profile_validation_artifact(test_profile, clusters, ROOT)
+    quote_body_sample = build_quote_collection_body(test_profile, "buy", DEFAULT_TEST_WALLET, "1000000")
+    quote_policy_sample = normalize_transaction_intent_policy(
+        {
+            "direction": "buy",
+            "wallet": DEFAULT_TEST_WALLET,
+            "amountIn": "1000000",
+        },
+        test_profile,
+    )
+    missing_quote_intent_profile = json_clone(test_profile)
+    missing_quote_intent_profile["quote_intent"] = {}
+    missing_quote_intent_validation = build_profile_validation_artifact(
+        missing_quote_intent_profile,
+        build_clusters(missing_quote_intent_profile, ROOT),
+        ROOT,
+    )
+    quote_intent_profile_passed = (
+        quote_body_sample["route"]["source"]["address"] == "So11111111111111111111111111111111111111112"
+        and quote_body_sample["route"]["destination"]["address"] == "11111111111111111111111111111111"
+        and quote_body_sample["maxNumQuotes"] == 2
+        and quote_policy_sample.get("sourceMint") == "So11111111111111111111111111111111111111112"
+        and quote_policy_sample.get("destinationMint") == "11111111111111111111111111111111"
+        and quote_policy_sample.get("sourceMint") != USDC_MINT
+        and quote_policy_sample.get("destinationMint") != USDTEL_MINT
+        and missing_quote_intent_validation.get("status") != "failed"
+        and {
+            "cluster:quote:missing-buy-quote-intent",
+            "cluster:quote:missing-sell-quote-intent",
+        }.issubset({str(item.get("id")) for item in missing_quote_intent_validation.get("warnings", [])})
+    )
+    quote_discovery_inventory = {
+        "generated_at": utc_now(),
+        "status": "discovered",
+        "summary": {
+            "route_count": 1,
+            "app_router_route_count": 1,
+            "pages_router_api_route_count": 0,
+            "rewrite_count": 0,
+            "custom_server_entrypoint_count": 0,
+            "middleware_count": 0,
+            "server_action_file_count": 0,
+            "server_action_export_count": 0,
+            "redirect_count": 0,
+            "header_route_count": 0,
+            "route_policy_count": 0,
+            "entrypoint_count": 1,
+            "surface_count": 1,
+            "api_route_count": 1,
+            "strategy_sets": ["quote-transaction-decoder"],
+            "next_config_runtime": {
+                "base_path": None,
+                "trailing_slash": None,
+                "i18n_configured": False,
+                "locale_count": 0,
+            },
+        },
+        "next_config": {},
+        "routes": [
+            {
+                "cluster_id": "quote",
+                "path": "/bridge/quote",
+                "source_path": "/bridge/quote",
+                "methods": ["POST"],
+                "file": "src/app/bridge/quote/route.ts",
+                "repo_file": "src/app/bridge/quote/route.ts",
+                "router": "app",
+                "dynamic_segments": [],
+                "fixed_upstreams": ["https://gateway.example.invalid"],
+                "strategy_set": "quote-transaction-decoder",
+                "kind": "orchestration-proxy",
+                "priority": "high",
+                "inference_reasons": ["self-test"],
+                "match": {"methods": ["POST"], "paths": ["/bridge/quote"]},
+                "next_config": {},
+            }
+        ],
+        "rewrites": [],
+        "custom_server_entrypoints": [],
+        "middleware": [],
+        "server_actions": [],
+        "redirects": [],
+        "headers": [],
+    }
+    discovered_quote_seed_profile = build_discovered_profile(
+        quote_discovery_inventory,
+        name="quote-seed-discovery-selftest",
+        display_name="Quote Seed Discovery Self-Test",
+        target="http://127.0.0.1:9995",
+        source_root=ROOT,
+        seed_profile=test_profile,
+    )
+    discovered_quote_no_seed_profile = build_discovered_profile(
+        quote_discovery_inventory,
+        name="quote-no-seed-discovery-selftest",
+        display_name="Quote No Seed Discovery Self-Test",
+        target="http://127.0.0.1:9995",
+        source_root=ROOT,
+    )
+    discovered_quote_intent_passed = (
+        (discovered_quote_seed_profile.get("quote_intent") or {}).get("maxNumQuotes") == 2
+        and quote_direction_mints(discovered_quote_seed_profile, "buy")
+        == ("So11111111111111111111111111111111111111112", "11111111111111111111111111111111")
+        and quote_direction_mints(discovered_quote_seed_profile, "sell")
+        == ("11111111111111111111111111111111", "So11111111111111111111111111111111111111112")
+        and "quote_intent" not in discovered_quote_no_seed_profile
+    )
     unsafe_observation_profile = json_clone(test_profile)
     unsafe_observation_profile["burp_observation_plan"] = [
         {
@@ -22325,6 +22571,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and configured_nextjs_runtime_passed
         and initial_artifacts_passed
         and target_lock_passed
+        and quote_intent_profile_passed
+        and discovered_quote_intent_passed
         and attack_strategy_status_passed
     )
 
@@ -22349,6 +22597,20 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "gate_status": None if generic_gate_item is None else generic_gate_item.get("gate_status"),
             "source_refs": [] if generic_suspicion is None else generic_suspicion.get("source_refs", []),
             "hardening_note_ids": [item.get("id") for item in generic_hardening_notes],
+        },
+        "quote_intent_profile_routing": {
+            "status": "passed" if quote_intent_profile_passed else "failed",
+            "quote_body": quote_body_sample,
+            "quote_policy": quote_policy_sample,
+            "missing_quote_intent_validation": {
+                "status": missing_quote_intent_validation.get("status"),
+                "warning_ids": [item.get("id") for item in missing_quote_intent_validation.get("warnings", [])],
+            },
+        },
+        "discovered_quote_intent_seed_routing": {
+            "status": "passed" if discovered_quote_intent_passed else "failed",
+            "seeded_quote_intent": discovered_quote_seed_profile.get("quote_intent"),
+            "no_seed_has_quote_intent": "quote_intent" in discovered_quote_no_seed_profile,
         },
         "response_delta_analysis": {
             "status": "passed" if response_delta_selftest_passed else "failed",
@@ -24435,6 +24697,7 @@ def run_discover_profile(args: argparse.Namespace) -> int:
         display_name=display_name,
         target=target,
         source_root=source_root,
+        seed_profile=base_profile,
     )
     output_path = Path(args.output).resolve() if args.output else artifact_dir / DISCOVERED_PROFILE_ARTIFACT
     explicit_output = bool(args.output)
@@ -24711,7 +24974,8 @@ def run_decode_transactions(args: argparse.Namespace) -> int:
         results,
         args.node,
         source_root,
-        extra_inputs,
+        profile=profile,
+        extra_inputs=extra_inputs,
         policy_path=Path(args.intent_policy).resolve() if args.intent_policy else None,
         intent_direction=args.intent_direction,
         intent_wallet=args.intent_wallet,
@@ -24749,6 +25013,7 @@ def run_transaction_decoder_selftest(args: argparse.Namespace) -> int:
         artifact_dir,
         source_root,
         args.node,
+        profile=profile,
         direction=args.direction,
         wallet=args.wallet,
         amount_in=args.amount_in,
@@ -24773,20 +25038,28 @@ def run_transaction_decoder_selftest(args: argparse.Namespace) -> int:
     return 0 if result["status"] == "passed" else 1
 
 
-def build_quote_collection_body(direction: str, wallet: str, amount_in: str) -> dict[str, Any]:
-    expected = expected_mints_for_direction(direction)
+def build_quote_collection_body(
+    profile: dict[str, Any] | None,
+    direction: str,
+    wallet: str,
+    amount_in: str,
+) -> dict[str, Any]:
+    expected = expected_mints_for_direction(direction, profile)
     if expected is None:
-        raise ValueError("direction must be buy or sell")
+        if direction not in {"buy", "sell"}:
+            raise ValueError("direction must be buy or sell")
+        raise ValueError(f"quote_intent.directions.{direction} must define sourceMint and destinationMint")
     source_mint, destination_mint = expected
+    chain = quote_chain_for_direction(profile, direction)
     return {
         "route": {
-            "source": {"chain": "Solana", "address": source_mint},
-            "destination": {"chain": "Solana", "address": destination_mint},
+            "source": {"chain": chain, "address": source_mint},
+            "destination": {"chain": chain, "address": destination_mint},
         },
         "amountIn": amount_in,
         "sender": wallet,
         "recipient": wallet,
-        "maxNumQuotes": 1,
+        "maxNumQuotes": quote_max_num_quotes(profile),
     }
 
 
@@ -24849,13 +25122,48 @@ def run_collect_quote(args: argparse.Namespace) -> int:
     write_target_profile_artifact(artifact_dir, profile, target, source_root)
     ensure_burp_transaction_candidates_artifact(artifact_dir)
 
-    body = build_quote_collection_body(args.direction, args.wallet, args.amount_in)
     quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
     output_path = Path(args.output).resolve() if args.output else artifact_dir / "transaction-payloads.json"
+    try:
+        body = build_quote_collection_body(profile, args.direction, args.wallet, args.amount_in)
+    except ValueError as error:
+        quote_collection_path = artifact_dir / "quote-collection.json"
+        quote_collection = {
+            "generated_at": utc_now(),
+            "profile": profile_summary(profile),
+            "target": target,
+            "path": quote_path,
+            "status": "failed",
+            "safety": "Quote collection was not sent because profile quote intent is incomplete. No wallet signing or transaction submission is performed.",
+            "error": redacted_error_summary(error),
+            "diagnosis": {
+                "classification": "quote-intent-profile-incomplete",
+                "summary": "The target profile does not define enough quote mint intent to build a safe quote request.",
+                "next_step": "Add quote_intent.directions.<direction>.sourceMint and destinationMint to the target profile, or provide an explicit transaction intent policy.",
+            },
+        }
+        write_json(quote_collection_path, quote_collection)
+        print(f"Quote collection profile error: {error}")
+        print(f"Wrote {quote_collection_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="collect-quote",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    artifact_dir / "burp-transaction-candidates.json",
+                    quote_collection_path,
+                ],
+            )
+        )
+        return 2
     policy = {
         "direction": args.direction,
         "wallet": args.wallet,
         "amountIn": args.amount_in,
+        "sourceMint": body["route"]["source"]["address"],
+        "destinationMint": body["route"]["destination"]["address"],
     }
     if args.intent_allowed_program:
         policy["allowedPrograms"] = args.intent_allowed_program
@@ -24941,6 +25249,7 @@ def run_collect_quote(args: argparse.Namespace) -> int:
         load_jsonl(artifact_dir / "probe-results.jsonl"),
         args.node,
         source_root,
+        profile=profile,
         extra_inputs=extra_inputs,
         intent_direction=args.direction,
         intent_wallet=args.wallet,
@@ -24974,6 +25283,7 @@ def run_collect_quote(args: argparse.Namespace) -> int:
         artifact_dir,
         source_root,
         args.node,
+        profile=profile,
         direction=args.direction,
         wallet=args.wallet,
         amount_in=args.amount_in,
@@ -25075,7 +25385,7 @@ def run_collect_orca_baseline(args: argparse.Namespace) -> int:
     transaction_intent = (
         json.loads(read_text(transaction_intent_path))
         if transaction_intent_path.exists()
-        else build_transaction_intent(artifact_dir, results, args.node, source_root)
+        else build_transaction_intent(artifact_dir, results, args.node, source_root, profile=profile)
     )
     rpc_policy_path = artifact_dir / "rpc-method-policy.json"
     rpc_method_policy = (
