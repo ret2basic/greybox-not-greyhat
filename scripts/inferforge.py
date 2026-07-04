@@ -126,6 +126,7 @@ ITERATION_DECISION_ARTIFACT = "iteration-decision.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT = "deployment-resource-review.json"
 TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
+TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -212,6 +213,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     REWRITE_REVIEW_ARTIFACT,
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
+    TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
     "artifact-health.json",
     "regression-suite.json",
     "orca-baseline.json",
@@ -302,6 +304,7 @@ INDEX_ARTIFACT_ORDER = [
     WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT,
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
+    TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
     "response-delta-analysis.json",
     "warmup-results.json",
     "traffic-index.json",
@@ -7844,6 +7847,7 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
     ],
     "finding-identification": [
         "response-deltas --no-write",
+        "transaction-corpus-checklist --no-write --show-commands",
         "transaction-flow-review --no-write --top 8",
         "hypothesis-matrix --no-write --show-next",
     ],
@@ -7851,6 +7855,7 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
         "methodology-review --no-write --limit 8",
         "evidence-gaps --no-write",
         "validation-plan --no-write --limit 8 --show-commands",
+        "transaction-corpus-checklist --no-write --show-commands",
         "deployment-review --no-write --top 8",
         "transaction-flow-review --no-write --top 8",
     ],
@@ -8382,7 +8387,7 @@ def methodology_next_command_for_hypothesis(
     impact = str(item.get("impact") or "")
     hypothesis_type = str(item.get("type") or item.get("hypothesis_type") or "")
     if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
-        subcommand = "transaction-flow-review --no-write --top 8"
+        subcommand = "transaction-corpus-checklist --no-write --show-commands"
     elif impact in {"credentialed-upstream-cost-abuse", "resource-exhaustion"} or hypothesis_type in {
         "credential-proxy-review",
         "resource-abuse-review",
@@ -10626,6 +10631,7 @@ def validation_allowed_commands(
         allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
     if hypothesis.get("type") == "transaction-flow-review" or hypothesis.get("impact") == "transaction-integrity":
         allowed_now_commands.insert(3, command("transaction-flow-review --no-write --top 8"))
+        allowed_now_commands.insert(3, command("transaction-corpus-checklist --no-write --show-commands"))
     if hypothesis.get("type") == "credential-proxy-review" or hypothesis.get("impact") == "credentialed-upstream-cost-abuse":
         allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
         allowed_now_commands.insert(3, command("transaction-flow-review --no-write --top 8"))
@@ -17870,6 +17876,246 @@ def build_transaction_flow_review(
         "safety": (
             "Offline bounded local source review only. It sends no requests, invokes no wallet, submits no transaction, "
             "and does not run Burp Scanner, Intruder, or fuzzing."
+        ),
+    }
+
+
+def transaction_corpus_policy_templates(profile: dict[str, Any] | None, artifact_dir: Path) -> list[dict[str, Any]]:
+    scaffold = build_transaction_intent_policy_scaffold(profile)
+    payload_sidecar = repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl")
+    templates = []
+    for row in scaffold.get("directions", []) or []:
+        if not isinstance(row, dict):
+            continue
+        direction = str(row.get("direction") or "")
+        if not direction:
+            continue
+        allowed_programs = normalize_string_list(row.get("allowedPrograms"))
+        decode_parts = [
+            "decode-transactions",
+            "--input",
+            payload_sidecar,
+            "--intent-direction",
+            direction,
+            "--intent-wallet",
+            PLACEHOLDER_REAL_WALLET,
+            "--intent-amount-in",
+            "REPLACE_WITH_RAW_AMOUNT",
+        ]
+        for program_id in allowed_programs:
+            decode_parts.extend(["--intent-allowed-program", program_id])
+        templates.append(
+            {
+                "direction": direction,
+                "status": "ready" if row.get("valid_profile_mints") else "needs-profile-mints",
+                "sourceMint": row.get("sourceMint"),
+                "destinationMint": row.get("destinationMint"),
+                "allowedPrograms": allowed_programs,
+                "missing_runtime_fields": row.get("missing_runtime_fields", []),
+                "intent_policy_sidecar_template": row.get("sidecar_template", {}),
+                "decode_command": validation_command_for_artifact_dir(
+                    artifact_dir,
+                    " ".join(shlex.quote(str(part)) for part in decode_parts),
+                    profile=profile,
+                ),
+            }
+        )
+    return templates
+
+
+def transaction_corpus_capture_gate(resource_snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    preflight = validation_resource_preflight_summary(resource_snapshot)
+    status = str(preflight.get("status") or "not-run")
+    budget = preflight.get("resource_budget") if isinstance(preflight.get("resource_budget"), dict) else {}
+    if status == "healthy" and str(budget.get("active_target_traffic") or "").startswith("allowed"):
+        capture_status = "ready-after-final-resource-check"
+    elif status == "not-run":
+        capture_status = "unchecked"
+    else:
+        capture_status = "blocked-resource"
+    return {
+        "status": capture_status,
+        "resource_preflight": preflight,
+        "required_before_capture": [
+            "resource-snapshot --strict must be healthy immediately before opening the target or Burp browser.",
+            "3100 target traffic, Burp browser automation, Scanner, Intruder, crawling, and active probes stay blocked while resource budget is degraded or critical.",
+            "Capture at most one approved quote response for the intended direction and amount; do not approve wallet signing prompts.",
+        ],
+    }
+
+
+def build_transaction_corpus_checklist(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    quote_collection: dict[str, Any] | None = None,
+    transaction_intent: dict[str, Any] | None = None,
+    burp_transaction_candidates: dict[str, Any] | None = None,
+    current_resource_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    quote_collection = quote_collection if isinstance(quote_collection, dict) else {}
+    transaction_intent = transaction_intent if isinstance(transaction_intent, dict) else {}
+    burp_transaction_candidates = (
+        burp_transaction_candidates if isinstance(burp_transaction_candidates, dict) else {}
+    )
+    policy_templates = transaction_corpus_policy_templates(profile, artifact_dir)
+    ready_policy_templates = [row for row in policy_templates if row.get("status") == "ready"]
+    candidate_paths = quote_response_candidate_paths(profile)
+    quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
+    capture_gate = transaction_corpus_capture_gate(current_resource_snapshot)
+
+    candidates_seen = int(transaction_intent.get("candidates_seen") or 0)
+    decoded_transactions = int(transaction_intent.get("decoded_transactions") or 0)
+    policy_checks = (
+        transaction_intent.get("intent_policy_checks")
+        if isinstance(transaction_intent.get("intent_policy_checks"), dict)
+        else {}
+    )
+    policy_status = str(policy_checks.get("status") or "not-configured")
+    burp_candidate_count = int(burp_transaction_candidates.get("candidate_count") or 0)
+    quote_success = bool(quote_collection.get("success"))
+    quote_diagnosis = quote_collection.get("diagnosis") if isinstance(quote_collection.get("diagnosis"), dict) else {}
+
+    if decoded_transactions > 0 and policy_status == "failed":
+        status = "decoded-intent-mismatch-review"
+    elif decoded_transactions > 0 and policy_status in {"passed", "review-required"}:
+        status = "decoded-corpus-ready-for-review"
+    elif decoded_transactions > 0:
+        status = "decoded-corpus-needs-policy"
+    elif candidates_seen > 0 or burp_candidate_count > 0 or quote_success:
+        status = "ready-to-decode"
+    elif capture_gate.get("status") == "blocked-resource":
+        status = "blocked-resource-needs-corpus"
+    else:
+        status = "needs-approved-quote-corpus"
+
+    payload_sidecars = [
+        repo_relative_or_absolute(artifact_dir / "transaction-payloads.json"),
+        repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl"),
+        repo_relative_or_absolute(artifact_dir / "transaction-payloads.txt"),
+        repo_relative_or_absolute(artifact_dir / "burp-transaction-candidates.json"),
+    ]
+    sidecar_example = {
+        "direction": "buy",
+        "wallet": PLACEHOLDER_REAL_WALLET,
+        "amountIn": "REPLACE_WITH_RAW_AMOUNT",
+        "response": {
+            "payloads": [
+                {
+                    "data": {
+                        "transaction": "REPLACE_WITH_BASE64_VERSIONED_TRANSACTION",
+                    }
+                }
+            ]
+        },
+    }
+    capture_steps = [
+        {
+            "id": "resource-preflight",
+            "status": capture_gate.get("status"),
+            "action": "Run resource-snapshot --strict and proceed only if it is healthy.",
+        },
+        {
+            "id": "single-approved-quote",
+            "status": "pending",
+            "action": (
+                f"Use the in-scope flow that sends POST {quote_path}; capture one approved quote response for one "
+                "direction, wallet, and amount before any wallet signing approval."
+            ),
+        },
+        {
+            "id": "payload-sidecar",
+            "status": "pending",
+            "action": (
+                "Save only the quote response body or extracted transaction payload to transaction-payloads.jsonl, "
+                "transaction-payloads.json, transaction-payloads.txt, or burp-transaction-candidates.json."
+            ),
+        },
+        {
+            "id": "decode-intent",
+            "status": "pending",
+            "action": "Run the matching decode-transactions command and review signer, account, mint, amount, and program checks.",
+        },
+    ]
+    acceptance_checks = [
+        {
+            "id": "policy-template-ready",
+            "status": "passed" if ready_policy_templates else "waiting",
+            "evidence": f"{len(ready_policy_templates)}/{len(policy_templates)} direction templates ready",
+        },
+        {
+            "id": "transaction-candidate-present",
+            "status": "passed" if candidates_seen > 0 or burp_candidate_count > 0 else "waiting",
+            "evidence": {
+                "transaction_intent_candidates": candidates_seen,
+                "burp_transaction_candidates": burp_candidate_count,
+                "quote_collection_success": quote_success,
+            },
+        },
+        {
+            "id": "decoded-transaction-present",
+            "status": "passed" if decoded_transactions > 0 else "waiting",
+            "evidence": decoded_transactions,
+        },
+        {
+            "id": "intent-policy-checks",
+            "status": policy_status,
+            "evidence": policy_checks.get("summary") or transaction_intent.get("warnings", [])[:3],
+        },
+    ]
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "quote_endpoint": {
+            "path": quote_path,
+            "transaction_candidate_paths": candidate_paths,
+        },
+        "resource_capture_gate": capture_gate,
+        "summary": {
+            "policy_templates": len(policy_templates),
+            "ready_policy_templates": len(ready_policy_templates),
+            "quote_collection_status": quote_collection.get("status") or "missing",
+            "quote_collection_classification": quote_diagnosis.get("classification") or "missing",
+            "quote_collection_success": quote_success,
+            "burp_transaction_candidates": burp_candidate_count,
+            "transaction_intent_candidates": candidates_seen,
+            "decoded_transactions": decoded_transactions,
+            "intent_policy_status": policy_status,
+        },
+        "policy_templates": policy_templates,
+        "capture_steps": capture_steps,
+        "payload_sidecars": payload_sidecars,
+        "sidecar_jsonl_example": sidecar_example,
+        "acceptance_checks": acceptance_checks,
+        "decode_commands": [row.get("decode_command") for row in policy_templates if row.get("decode_command")],
+        "reportability_gate": (
+            "A corpus only advances the transaction-integrity thread when decode-transactions shows a concrete signer, "
+            "account, mint, amount, or program mismatch, or another user-funds impact. Do not sign or submit transactions."
+        ),
+        "forbidden": [
+            "Do not approve wallet signing prompts.",
+            "Do not submit transactions.",
+            "Do not trade or mutate funds.",
+            "Do not collect more than the minimum approved quote corpus needed for decoding.",
+            "Do not run active capture while resource_capture_gate.status is blocked-resource.",
+        ],
+        "next_step": (
+            "Run decode-transactions with the matching policy template."
+            if status == "ready-to-decode"
+            else "Wait for a healthy resource gate, then capture one approved quote response and save it to a sidecar."
+            if status == "blocked-resource-needs-corpus"
+            else "Review decoded intent checks and only escalate concrete mismatches."
+            if status.startswith("decoded-")
+            else "Prepare one approved quote response sidecar and matching intent policy values."
+        ),
+        "safety": (
+            "Offline checklist only. It reads local artifacts and /proc resource state, sends no requests, reads no raw Burp "
+            "history, invokes no wallet, and submits no transaction."
         ),
     }
 
@@ -28014,6 +28260,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("rewrite-review", "run_rewrite_review"),
         refresh_expectation("deployment-review", "run_deployment_review"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
+        refresh_expectation("transaction-corpus-checklist", "run_transaction_corpus_checklist"),
         refresh_expectation("validation-plan", "run_validation_plan"),
         refresh_expectation("iteration-decision", "run_iteration_decision"),
         refresh_expectation("collect", "run_collect"),
@@ -28255,6 +28502,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         evidence_gaps_output_dir = root / "evidence-gaps-output"
         report_output_dir = root / "report-output"
         methodology_review_output_dir = root / "methodology-review-output"
+        transaction_corpus_checklist_output_dir = root / "transaction-corpus-checklist-output"
         promote_output_dir = root / "promote-output"
         invalid_promote_output_dir = root / "invalid-promote-output"
         import_history_output_dir = root / "import-history-output"
@@ -28419,6 +28667,23 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--show-commands",
                 ]
             )
+            transaction_corpus_checklist_return_code, transaction_corpus_checklist_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(transaction_corpus_checklist_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "transaction-corpus-checklist",
+                    "--no-write",
+                    "--show-commands",
+                    "--show-steps",
+                    "--skip-current-resource-check",
+                ]
+            )
             promote_return_code, promote_stdout = run_cli(
                 [
                     "--profile",
@@ -28547,6 +28812,16 @@ def build_no_write_selftest() -> dict[str, Any]:
             ).exists(),
             "methodology_review_json": (methodology_review_output_dir / METHODOLOGY_REVIEW_ARTIFACT).exists(),
             "methodology_review_manifest": (methodology_review_output_dir / MANIFEST_NAME).exists(),
+            "transaction_corpus_checklist_dir": transaction_corpus_checklist_output_dir.exists(),
+            "transaction_corpus_checklist_target_profile_json": (
+                transaction_corpus_checklist_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "transaction_corpus_checklist_json": (
+                transaction_corpus_checklist_output_dir / TRANSACTION_CORPUS_CHECKLIST_ARTIFACT
+            ).exists(),
+            "transaction_corpus_checklist_manifest": (
+                transaction_corpus_checklist_output_dir / MANIFEST_NAME
+            ).exists(),
             "promote_dir": promote_output_dir.exists(),
             "promote_reviewed_profile": (promote_output_dir / "reviewed-profile.json").exists(),
             "promote_validation": (promote_output_dir / "reviewed-profile-validation.json").exists(),
@@ -28579,6 +28854,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     evidence_gaps_stdout_text = "\n".join(evidence_gaps_stdout)
     report_stdout_text = "\n".join(report_stdout)
     methodology_review_stdout_text = "\n".join(methodology_review_stdout)
+    transaction_corpus_checklist_stdout_text = "\n".join(transaction_corpus_checklist_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
     invalid_promote_stdout_text = "\n".join(invalid_promote_stdout)
     import_history_limit_stdout_text = "\n".join(import_history_limit_stdout)
@@ -29140,6 +29416,31 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": methodology_review_return_code,
                 "stdout": methodology_review_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "transaction-corpus-checklist-no-write-skips-artifacts",
+            "passed": (
+                transaction_corpus_checklist_return_code == 0
+                and "Transaction corpus checklist:" in transaction_corpus_checklist_stdout_text
+                and "Capture gate:" in transaction_corpus_checklist_stdout_text
+                and "No files written (--no-write)." in transaction_corpus_checklist_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "transaction_corpus_checklist_dir",
+                        "transaction_corpus_checklist_target_profile_json",
+                        "transaction_corpus_checklist_json",
+                        "transaction_corpus_checklist_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in transaction_corpus_checklist_stdout)
+            ),
+            "expected": "transaction-corpus-checklist --no-write prints corpus guidance without writing artifacts or manifests",
+            "actual": {
+                "return_code": transaction_corpus_checklist_return_code,
+                "stdout": transaction_corpus_checklist_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -41804,6 +42105,94 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    current_resource_snapshot = None
+    if not getattr(args, "skip_current_resource_check", False):
+        current_resource_snapshot = build_default_resource_snapshot(max_processes=8)
+    checklist = build_transaction_corpus_checklist(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        quote_collection=load_optional_json(artifact_dir / "quote-collection.json"),
+        transaction_intent=load_optional_json(artifact_dir / "transaction-intent.json"),
+        burp_transaction_candidates=load_optional_json(artifact_dir / "burp-transaction-candidates.json"),
+        current_resource_snapshot=current_resource_snapshot,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / TRANSACTION_CORPUS_CHECKLIST_ARTIFACT
+    )
+    if not no_write:
+        write_json(output_path, checklist)
+
+    summary = checklist.get("summary", {}) or {}
+    gate = checklist.get("resource_capture_gate", {}) if isinstance(checklist.get("resource_capture_gate"), dict) else {}
+    preflight = gate.get("resource_preflight", {}) if isinstance(gate.get("resource_preflight"), dict) else {}
+    budget = preflight.get("resource_budget", {}) if isinstance(preflight.get("resource_budget"), dict) else {}
+    print(f"Transaction corpus checklist: {checklist['status']}")
+    print(
+        "Corpus: "
+        f"quote={summary.get('quote_collection_status')} "
+        f"classification={summary.get('quote_collection_classification')} "
+        f"burp_candidates={summary.get('burp_transaction_candidates', 0)} "
+        f"candidates={summary.get('transaction_intent_candidates', 0)} "
+        f"decoded={summary.get('decoded_transactions', 0)} "
+        f"policy={summary.get('intent_policy_status')}"
+    )
+    print(
+        "Capture gate: "
+        f"status={gate.get('status')} "
+        f"resource={preflight.get('status') or 'not-run'} "
+        f"budget={budget.get('mode') or 'unknown'}"
+    )
+    print(
+        "Policy templates: "
+        f"ready={summary.get('ready_policy_templates', 0)}/{summary.get('policy_templates', 0)}"
+    )
+    for row in (checklist.get("policy_templates", []) or [])[: max(0, int(args.top))]:
+        print(
+            f"- {row.get('status')} direction={row.get('direction')} "
+            f"source={row.get('sourceMint') or '-'} destination={row.get('destinationMint') or '-'} "
+            f"allowed_programs={len(row.get('allowedPrograms', []) or [])}"
+        )
+        if args.show_commands and row.get("decode_command"):
+            print(f"  decode={inline_summary_text(row.get('decode_command'), max_chars=420)}")
+    if args.show_steps:
+        print("Capture steps:")
+        for step in checklist.get("capture_steps", []) or []:
+            print(
+                f"- {step.get('status')} {step.get('id')}: "
+                f"{inline_summary_text(step.get('action'), max_chars=260)}"
+            )
+    print(f"Next: {inline_summary_text(checklist.get('next_step'), max_chars=260)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="transaction-corpus-checklist",
+                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+            )
+        )
+    if args.strict and checklist["status"] not in {
+        "ready-to-decode",
+        "decoded-corpus-ready-for-review",
+        "decoded-intent-mismatch-review",
+    }:
+        return 1
+    return 0
+
+
 def run_validation_plan(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -44060,6 +44449,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless a remote transaction signing flow needs intent-corpus review.",
     )
     transaction_flow_review.set_defaults(func=run_transaction_flow_review)
+
+    transaction_corpus_checklist = sub.add_parser(
+        "transaction-corpus-checklist",
+        help="Plan the minimal approved quote transaction corpus needed for offline decoding",
+    )
+    transaction_corpus_checklist.add_argument(
+        "--output",
+        help=(
+            f"Where to write {TRANSACTION_CORPUS_CHECKLIST_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{TRANSACTION_CORPUS_CHECKLIST_ARTIFACT}."
+        ),
+    )
+    transaction_corpus_checklist.add_argument(
+        "--top",
+        type=positive_int,
+        default=4,
+        help="Number of policy templates to print.",
+    )
+    transaction_corpus_checklist.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print decode-transactions commands for each policy template.",
+    )
+    transaction_corpus_checklist.add_argument(
+        "--show-steps",
+        action="store_true",
+        help="Print the capture checklist steps.",
+    )
+    transaction_corpus_checklist.add_argument(
+        "--skip-current-resource-check",
+        action="store_true",
+        help="Use only existing artifacts instead of checking current /proc memory and watched ports.",
+    )
+    transaction_corpus_checklist.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print transaction corpus checklist only; do not write {TRANSACTION_CORPUS_CHECKLIST_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    transaction_corpus_checklist.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless a payload corpus is ready to decode or already decoded.",
+    )
+    transaction_corpus_checklist.set_defaults(func=run_transaction_corpus_checklist)
 
     validation_plan = sub.add_parser(
         "validation-plan",

@@ -862,6 +862,7 @@ python3 scripts/inferforge.py regression-suite --include-external --ws-resource-
 python3 scripts/inferforge.py adjudicate
 python3 scripts/inferforge.py audit --no-ws
 python3 scripts/inferforge.py audit --ws-resource-probes
+python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-commands
 python3 scripts/inferforge.py decode-transactions
 python3 scripts/inferforge.py self-test-transactions
 python3 scripts/inferforge.py self-test-profile-routing
@@ -891,6 +892,18 @@ approved:
 When the active profile declares `quote_response.transaction_candidate_paths`,
 those simple JSON paths are applied before the generic recursive/base64 scan so
 candidate summaries retain the provider-specific response location.
+
+`transaction-corpus-checklist` is the offline bridge between source-flow review
+and decoding. It reads the current quote collection, Burp transaction candidate,
+transaction intent, profile, and resource snapshot artifacts, then prints the
+minimal approved quote-response corpus needed for `decode-transactions`. It does
+not send requests, read raw Burp history, sign wallets, or submit transactions.
+When the resource gate is degraded or critical, it keeps capture steps marked as
+blocked and only prints sidecar formats plus decode commands:
+
+```bash
+python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-commands --show-steps
+```
 
 ```bash
 python3 scripts/inferforge.py decode-transactions --input .greybox/transaction-payloads.jsonl
