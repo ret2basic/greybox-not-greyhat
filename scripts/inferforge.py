@@ -49,6 +49,29 @@ DEFAULT_TEST_WALLET = "EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR"
 PLACEHOLDER_REAL_WALLET = "REPLACE_WITH_REAL_WALLET"
 PLACEHOLDER_APPROVED_POOL_ADDRESS = "REPLACE_WITH_APPROVED_POOL_ADDRESS"
 PLACEHOLDER_APPROVED_CONCRETE_PATH = "REPLACE_WITH_APPROVED_CONCRETE_LOCAL_PATH"
+DEFAULT_QUOTE_REQUEST_TEMPLATE = {
+    "route": {
+        "source": {"chain": "{sourceChain}", "address": "{sourceMint}"},
+        "destination": {"chain": "{destinationChain}", "address": "{destinationMint}"},
+    },
+    "amountIn": "{amountIn}",
+    "sender": "{wallet}",
+    "recipient": "{recipient}",
+    "maxNumQuotes": "{maxNumQuotes}",
+}
+DEFAULT_QUOTE_REQUEST_POLICY_FIELDS = {
+    "route": "route",
+    "source": "route.source",
+    "destination": "route.destination",
+    "source_chain": "route.source.chain",
+    "destination_chain": "route.destination.chain",
+    "source_mint": "route.source.address",
+    "destination_mint": "route.destination.address",
+    "amount": "amountIn",
+    "sender": "sender",
+    "recipient": "recipient",
+    "max_num_quotes": "maxNumQuotes",
+}
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_BODY_SAMPLE_CHARS = 1200
 MAX_REQUEST_CONTEXTS_PER_ENDPOINT = 6
@@ -454,6 +477,10 @@ def default_target_profile() -> dict[str, Any]:
                 },
             },
         },
+        "quote_request": {
+            "body_template": json_clone(DEFAULT_QUOTE_REQUEST_TEMPLATE),
+            "policy_fields": json_clone(DEFAULT_QUOTE_REQUEST_POLICY_FIELDS),
+        },
         "quote_provider": {
             "name": "M0",
             "diagnostics": [
@@ -763,6 +790,7 @@ def neutral_target_profile_defaults(
         },
         "probe_targets": {},
         "quote_intent": {},
+        "quote_request": {},
         "quote_provider": {},
         "environment_readiness": {"checks": []},
         "clusters": [],
@@ -806,6 +834,7 @@ def normalize_target_profile(profile: dict[str, Any], *, profile_path: Path | No
         "safety",
         "probe_targets",
         "quote_intent",
+        "quote_request",
         "quote_provider",
         "environment_readiness",
         "clusters",
@@ -1064,6 +1093,204 @@ def quote_allowed_programs(profile: dict[str, Any] | None, direction: str | None
     return []
 
 
+def default_quote_request_config() -> dict[str, Any]:
+    return {
+        "body_template": json_clone(DEFAULT_QUOTE_REQUEST_TEMPLATE),
+        "policy_fields": json_clone(DEFAULT_QUOTE_REQUEST_POLICY_FIELDS),
+        "extra_fields_path": "",
+    }
+
+
+def quote_request_config(profile: dict[str, Any] | None) -> dict[str, Any]:
+    configured = (profile or {}).get("quote_request")
+    config = default_quote_request_config()
+    if not isinstance(configured, dict):
+        return config
+    for key, value in configured.items():
+        if key == "policy_fields" and isinstance(value, dict):
+            fields = json_clone(DEFAULT_QUOTE_REQUEST_POLICY_FIELDS)
+            fields.update(
+                {
+                    str(field): str(path)
+                    for field, path in value.items()
+                    if isinstance(path, str)
+                }
+            )
+            config["policy_fields"] = fields
+            continue
+        config[str(key)] = json_clone(value)
+    return config
+
+
+def quote_request_policy_fields(profile: dict[str, Any] | None) -> dict[str, str]:
+    fields = quote_request_config(profile).get("policy_fields")
+    if not isinstance(fields, dict):
+        return json_clone(DEFAULT_QUOTE_REQUEST_POLICY_FIELDS)
+    normalized = {
+        str(field): str(path)
+        for field, path in fields.items()
+        if isinstance(field, str) and isinstance(path, str) and path.strip()
+    }
+    defaults = json_clone(DEFAULT_QUOTE_REQUEST_POLICY_FIELDS)
+    defaults.update(normalized)
+    return defaults
+
+
+def quote_request_path_parts(path: str | None) -> list[str]:
+    if not isinstance(path, str) or not path.strip():
+        return []
+    return [part for part in path.strip().split(".") if part]
+
+
+def quote_request_get_path(data: Any, path: str | None) -> Any:
+    current = data
+    for part in quote_request_path_parts(path):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def quote_request_set_path(data: dict[str, Any], path: str | None, value: Any) -> bool:
+    parts = quote_request_path_parts(path)
+    if not parts:
+        return False
+    current: Any = data
+    for part in parts[:-1]:
+        if not isinstance(current, dict) or part not in current:
+            return False
+        current = current[part]
+    if not isinstance(current, dict) or parts[-1] not in current:
+        return False
+    current[parts[-1]] = value
+    return True
+
+
+def quote_request_delete_path(data: dict[str, Any], path: str | None) -> bool:
+    parts = quote_request_path_parts(path)
+    if not parts:
+        return False
+    current: Any = data
+    for part in parts[:-1]:
+        if not isinstance(current, dict) or part not in current:
+            return False
+        current = current[part]
+    if not isinstance(current, dict) or parts[-1] not in current:
+        return False
+    del current[parts[-1]]
+    return True
+
+
+def render_quote_request_template(template: Any, replacements: dict[str, Any]) -> Any:
+    if isinstance(template, str):
+        return replacements.get(template, template)
+    if isinstance(template, list):
+        return [render_quote_request_template(item, replacements) for item in template]
+    if isinstance(template, dict):
+        return {
+            str(key): render_quote_request_template(value, replacements)
+            for key, value in template.items()
+        }
+    return json_clone(template)
+
+
+def collect_quote_request_placeholders(value: Any) -> set[str]:
+    placeholders: set[str] = set()
+    if isinstance(value, str) and re.fullmatch(r"\{[A-Za-z][A-Za-z0-9_]*\}", value):
+        placeholders.add(value)
+    elif isinstance(value, list):
+        for item in value:
+            placeholders.update(collect_quote_request_placeholders(item))
+    elif isinstance(value, dict):
+        for item in value.values():
+            placeholders.update(collect_quote_request_placeholders(item))
+    return placeholders
+
+
+def merge_quote_request_extra_fields(body: dict[str, Any], profile: dict[str, Any] | None, extra: dict[str, Any]) -> None:
+    config = quote_request_config(profile)
+    extra_path = config.get("extra_fields_path") or config.get("unknown_fields_path") or ""
+    target = quote_request_get_path(body, str(extra_path)) if extra_path else body
+    if isinstance(target, dict):
+        target.update(json_clone(extra))
+    else:
+        body.update(json_clone(extra))
+
+
+def fallback_quote_mints_for_direction(direction: str) -> tuple[str, str]:
+    if direction == "sell":
+        return "11111111111111111111111111111111", "So11111111111111111111111111111111111111112"
+    return "So11111111111111111111111111111111111111112", "11111111111111111111111111111111"
+
+
+def build_quote_request_body(
+    profile: dict[str, Any] | None,
+    direction: str,
+    wallet: Any,
+    amount_in: Any,
+    *,
+    recipient: Any | None = None,
+    source_chain: Any | None = None,
+    destination_chain: Any | None = None,
+    source_mint: Any | None = None,
+    destination_mint: Any | None = None,
+    max_num_quotes: Any | None = None,
+    omit_fields: set[str] | None = None,
+    set_fields: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
+    require_intent: bool = True,
+) -> dict[str, Any]:
+    expected = expected_mints_for_direction(direction, profile)
+    if expected is None:
+        if require_intent:
+            if direction not in {"buy", "sell"}:
+                raise ValueError("direction must be buy or sell")
+            raise ValueError(f"quote_intent.directions.{direction} must define sourceMint and destinationMint")
+        expected = fallback_quote_mints_for_direction(direction)
+
+    resolved_source_mint = source_mint if source_mint is not None else expected[0]
+    resolved_destination_mint = destination_mint if destination_mint is not None else expected[1]
+    chain = quote_chain_for_direction(profile, direction)
+    resolved_source_chain = source_chain if source_chain is not None else chain
+    resolved_destination_chain = destination_chain if destination_chain is not None else chain
+    resolved_recipient = wallet if recipient is None else recipient
+    resolved_max_num_quotes = quote_max_num_quotes(profile) if max_num_quotes is None else max_num_quotes
+    replacements = {
+        "{direction}": direction,
+        "{chain}": chain,
+        "{sourceChain}": resolved_source_chain,
+        "{destinationChain}": resolved_destination_chain,
+        "{sourceMint}": resolved_source_mint,
+        "{destinationMint}": resolved_destination_mint,
+        "{sourceAddress}": resolved_source_mint,
+        "{destinationAddress}": resolved_destination_mint,
+        "{amountIn}": amount_in,
+        "{amount}": amount_in,
+        "{wallet}": wallet,
+        "{sender}": wallet,
+        "{recipient}": resolved_recipient,
+        "{maxNumQuotes}": resolved_max_num_quotes,
+        "{maxQuotes}": resolved_max_num_quotes,
+    }
+    config = quote_request_config(profile)
+    template = config.get("body_template")
+    if not isinstance(template, dict):
+        template = DEFAULT_QUOTE_REQUEST_TEMPLATE
+    body = render_quote_request_template(template, replacements)
+    if not isinstance(body, dict):
+        body = json_clone(DEFAULT_QUOTE_REQUEST_TEMPLATE)
+        body = render_quote_request_template(body, replacements)
+
+    fields = quote_request_policy_fields(profile)
+    for field in omit_fields or set():
+        quote_request_delete_path(body, fields.get(field))
+    for field, value in (set_fields or {}).items():
+        quote_request_set_path(body, fields.get(field), value)
+    if extra:
+        merge_quote_request_extra_fields(body, profile, extra)
+    return body
+
+
 def quote_provider_config(profile: dict[str, Any] | None) -> dict[str, Any]:
     configured = (profile or {}).get("quote_provider")
     if isinstance(configured, dict):
@@ -1215,6 +1442,7 @@ def build_profile_validation_artifact(
             "environment_readiness",
             "probe_targets",
             "quote_intent",
+            "quote_request",
             "quote_provider",
             "source_peeks",
             "burp_observation_plan",
@@ -1281,6 +1509,98 @@ def build_profile_validation_artifact(
                     "message": f"Environment readiness target health check `{check_id}` is missing `field`.",
                 }
             )
+
+    quote_cluster_active = any(
+        str(cluster.get("id") or "") == "quote"
+        and strategy_set_enabled(profile, strategy_set_for_cluster(cluster))
+        for cluster in profile.get("clusters", []) or []
+        if isinstance(cluster, dict)
+    )
+    raw_quote_request = profile.get("quote_request")
+    quote_request = quote_request_config(profile)
+    if raw_quote_request not in (None, {}) and not isinstance(raw_quote_request, dict):
+        warnings.append(
+            {
+                "id": "quote-request:not-object",
+                "severity": "warning",
+                "message": "`quote_request` should be an object with `body_template` and `policy_fields` fields.",
+            }
+        )
+    if isinstance(raw_quote_request, dict):
+        if "body_template" in raw_quote_request and not isinstance(raw_quote_request.get("body_template"), dict):
+            warnings.append(
+                {
+                    "id": "quote-request:body-template-not-object",
+                    "severity": "warning",
+                    "message": "`quote_request.body_template` should be a JSON object.",
+                }
+            )
+        if "policy_fields" in raw_quote_request and not isinstance(raw_quote_request.get("policy_fields"), dict):
+            warnings.append(
+                {
+                    "id": "quote-request:policy-fields-not-object",
+                    "severity": "warning",
+                    "message": "`quote_request.policy_fields` should map semantic field names to dot paths.",
+                }
+            )
+        if (
+            quote_cluster_active
+            and "body_template" in raw_quote_request
+            and raw_quote_request.get("body_template") != DEFAULT_QUOTE_REQUEST_TEMPLATE
+            and "policy_fields" not in raw_quote_request
+        ):
+            warnings.append(
+                {
+                    "id": "quote-request:custom-template-missing-policy-fields",
+                    "severity": "warning",
+                    "message": (
+                        "`quote_request.body_template` customizes the quote request shape, but "
+                        "`quote_request.policy_fields` is missing. Field-specific quote probes may "
+                        "not mutate the intended request fields."
+                    ),
+                }
+            )
+        if isinstance(raw_quote_request.get("policy_fields"), dict):
+            for field, path in raw_quote_request.get("policy_fields", {}).items():
+                if not isinstance(path, str) or not path.strip():
+                    warnings.append(
+                        {
+                            "id": f"quote-request:policy-field-{field}:invalid-path",
+                            "severity": "warning",
+                            "message": f"`quote_request.policy_fields.{field}` should be a non-empty dot path.",
+                        }
+                    )
+    quote_template = quote_request.get("body_template")
+    if not isinstance(quote_template, dict):
+        quote_template = DEFAULT_QUOTE_REQUEST_TEMPLATE
+    if quote_cluster_active:
+        placeholders = collect_quote_request_placeholders(quote_template)
+        for placeholder in ["{sourceMint}", "{destinationMint}", "{amountIn}", "{wallet}"]:
+            if placeholder not in placeholders:
+                warnings.append(
+                    {
+                        "id": f"quote-request:missing-placeholder-{placeholder.strip('{}')}",
+                        "severity": "warning",
+                        "message": (
+                            f"`quote_request.body_template` does not contain `{placeholder}`. "
+                            "Quote collection may not reflect the configured direction or wallet."
+                        ),
+                    }
+                )
+        effective_policy_fields = quote_request_policy_fields(profile)
+        for field in ["source_mint", "destination_mint", "amount", "sender"]:
+            path = effective_policy_fields.get(field)
+            if quote_request_get_path(quote_template, path) is None:
+                warnings.append(
+                    {
+                        "id": f"quote-request:policy-field-{field}:path-not-in-template",
+                        "severity": "warning",
+                        "message": (
+                            f"`quote_request.policy_fields.{field}` points to `{path}`, "
+                            "but that path is not present in `quote_request.body_template`."
+                        ),
+                    }
+                )
 
     raw_quote_provider = profile.get("quote_provider")
     quote_provider = quote_provider_config(profile)
@@ -3349,6 +3669,27 @@ def quote_provider_for_discovered_profile(
     return json_clone(configured)
 
 
+def quote_request_for_discovered_profile(
+    seed_profile: dict[str, Any] | None,
+    clusters: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    has_quote_cluster = any(
+        str(cluster.get("id") or "") == "quote"
+        or str(cluster.get("strategy_set") or "") == "quote-transaction-decoder"
+        for cluster in clusters
+    )
+    if not has_quote_cluster or not seed_profile or uses_builtin_target_defaults(seed_profile):
+        return None
+    if "quote_request" in set(seed_profile.get("_profile_defaulted_keys") or []):
+        return None
+    configured = seed_profile.get("quote_request")
+    if not isinstance(configured, dict) or not configured:
+        return None
+    if not isinstance(configured.get("body_template"), dict):
+        return None
+    return json_clone(configured)
+
+
 def build_discovered_burp_observation_plan(
     clusters: list[dict[str, Any]],
     probe_targets: dict[str, Any],
@@ -3756,6 +4097,9 @@ def build_discovered_profile(
     quote_intent = quote_intent_for_discovered_profile(seed_profile, clusters)
     if quote_intent is not None:
         profile["quote_intent"] = quote_intent
+    quote_request = quote_request_for_discovered_profile(seed_profile, clusters)
+    if quote_request is not None:
+        profile["quote_request"] = quote_request
     quote_provider = quote_provider_for_discovered_profile(seed_profile, clusters)
     if quote_provider is not None:
         profile["quote_provider"] = quote_provider
@@ -5513,12 +5857,7 @@ def build_probe_plan(
     alternate_wallet = "11111111111111111111111111111111"
     health_path = probe_target_path(profile, "health", "path", "/health")
     quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
-    quote_mints = expected_mints_for_direction("buy", profile) or (
-        "So11111111111111111111111111111111111111112",
-        "11111111111111111111111111111111",
-    )
-    quote_chain = quote_chain_for_direction(profile, "buy")
-    quote_max_quotes = quote_max_num_quotes(profile)
+    quote_fields = quote_request_policy_fields(profile)
     rpc_paths = rpc_probe_paths(profile)
     rpc_path = rpc_paths["path"]
     rpc_root_path = rpc_paths["root_path"]
@@ -5530,11 +5869,11 @@ def build_probe_plan(
         amount_in: Any = "1000000",
         sender: Any = valid_wallet,
         recipient: Any = valid_wallet,
-        source_chain: Any = quote_chain,
-        source_address: Any = quote_mints[0],
-        destination_chain: Any = quote_chain,
-        destination_address: Any = quote_mints[1],
-        max_num_quotes: Any = quote_max_quotes,
+        source_chain: Any | None = None,
+        source_address: Any | None = None,
+        destination_chain: Any | None = None,
+        destination_address: Any | None = None,
+        max_num_quotes: Any | None = None,
         include_route: bool = True,
         include_source: bool = True,
         include_destination: bool = True,
@@ -5542,30 +5881,45 @@ def build_probe_plan(
         include_sender: bool = True,
         include_recipient: bool = True,
         include_max_num_quotes: bool = True,
+        route_value: Any | None = None,
         extra: dict[str, Any] | None = None,
     ) -> str:
-        body: dict[str, Any] = {}
-        if include_route:
-            route: dict[str, Any] = {}
-            if include_source:
-                route["source"] = {"chain": source_chain, "address": source_address}
-            if include_destination:
-                route["destination"] = {
-                    "chain": destination_chain,
-                    "address": destination_address,
-                }
-            body["route"] = route
-        if include_amount:
-            body["amountIn"] = amount_in
-        if include_sender:
-            body["sender"] = sender
-        if include_recipient:
-            body["recipient"] = recipient
-        if include_max_num_quotes:
-            body["maxNumQuotes"] = max_num_quotes
-        if extra:
-            body.update(extra)
+        omit_fields: set[str] = set()
+        if not include_route:
+            omit_fields.add("route")
+        if not include_source:
+            omit_fields.add("source")
+        if not include_destination:
+            omit_fields.add("destination")
+        if not include_amount:
+            omit_fields.add("amount")
+        if not include_sender:
+            omit_fields.add("sender")
+        if not include_recipient:
+            omit_fields.add("recipient")
+        if not include_max_num_quotes:
+            omit_fields.add("max_num_quotes")
+        set_fields = {"route": route_value} if route_value is not None else {}
+        body = build_quote_request_body(
+            profile,
+            "buy",
+            sender,
+            amount_in,
+            recipient=recipient,
+            source_chain=source_chain,
+            destination_chain=destination_chain,
+            source_mint=source_address,
+            destination_mint=destination_address,
+            max_num_quotes=max_num_quotes,
+            omit_fields=omit_fields,
+            set_fields=set_fields,
+            extra=extra,
+            require_intent=False,
+        )
         return json.dumps(body)
+
+    def quote_field(field: str, fallback: str) -> str:
+        return quote_fields.get(field) or fallback
 
     def quote_probe(
         probe_id: str,
@@ -5999,31 +6353,31 @@ def build_probe_plan(
             "quote_missing_route",
             "Quote missing route",
             quote_body(include_route=False),
-            policy_field="route",
+            policy_field=quote_field("route", "route"),
         ),
         quote_probe(
             "quote_missing_source",
             "Quote missing source route",
             quote_body(include_source=False),
-            policy_field="route.source",
+            policy_field=quote_field("source", "route.source"),
         ),
         quote_probe(
             "quote_missing_destination",
             "Quote missing destination route",
             quote_body(include_destination=False),
-            policy_field="route.destination",
+            policy_field=quote_field("destination", "route.destination"),
         ),
         quote_probe(
             "quote_missing_amount",
             "Quote missing amountIn",
             quote_body(include_amount=False),
-            policy_field="amountIn",
+            policy_field=quote_field("amount", "amountIn"),
         ),
         quote_probe(
             "quote_missing_sender",
             "Quote missing sender",
             quote_body(include_sender=False),
-            policy_field="sender",
+            policy_field=quote_field("sender", "sender"),
         ),
         Probe(
             "quote_malformed_json",
@@ -6055,27 +6409,19 @@ def build_probe_plan(
             "quote_wrong_amount_type",
             "Quote wrong amountIn type",
             quote_body(amount_in=1),
-            policy_field="amountIn",
+            policy_field=quote_field("amount", "amountIn"),
         ),
         quote_probe(
             "quote_wrong_sender_type",
             "Quote wrong sender type",
             quote_body(sender=1),
-            policy_field="sender",
+            policy_field=quote_field("sender", "sender"),
         ),
         quote_probe(
             "quote_route_wrong_type",
             "Quote wrong route type",
-            json.dumps(
-                {
-                    "route": "not-an-object",
-                    "amountIn": "1000000",
-                    "sender": valid_wallet,
-                    "recipient": valid_wallet,
-                    "maxNumQuotes": 1,
-                }
-            ),
-            policy_field="route",
+            quote_body(route_value="not-an-object"),
+            policy_field=quote_field("route", "route"),
         ),
         Probe(
             "orca_invalid_address",
@@ -6189,7 +6535,7 @@ def build_probe_plan(
                     "Quote invalid source chain",
                     quote_body(source_chain="Ethereum"),
                     external=True,
-                    policy_field="route.source.chain",
+                    policy_field=quote_field("source_chain", "route.source.chain"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6197,7 +6543,7 @@ def build_probe_plan(
                     "Quote invalid destination chain",
                     quote_body(destination_chain="Ethereum"),
                     external=True,
-                    policy_field="route.destination.chain",
+                    policy_field=quote_field("destination_chain", "route.destination.chain"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6205,7 +6551,7 @@ def build_probe_plan(
                     "Quote invalid source mint",
                     quote_body(source_address="not-a-mint"),
                     external=True,
-                    policy_field="route.source.address",
+                    policy_field=quote_field("source_mint", "route.source.address"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6213,7 +6559,7 @@ def build_probe_plan(
                     "Quote invalid destination mint",
                     quote_body(destination_address="not-a-mint"),
                     external=True,
-                    policy_field="route.destination.address",
+                    policy_field=quote_field("destination_mint", "route.destination.address"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6221,7 +6567,7 @@ def build_probe_plan(
                     "Quote source mint wrong type",
                     quote_body(source_address=123),
                     external=True,
-                    policy_field="route.source.address",
+                    policy_field=quote_field("source_mint", "route.source.address"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6229,7 +6575,7 @@ def build_probe_plan(
                     "Quote destination mint wrong type",
                     quote_body(destination_address=123),
                     external=True,
-                    policy_field="route.destination.address",
+                    policy_field=quote_field("destination_mint", "route.destination.address"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6237,7 +6583,7 @@ def build_probe_plan(
                     "Quote sender invalid public key",
                     quote_body(sender="not-a-wallet"),
                     external=True,
-                    policy_field="sender",
+                    policy_field=quote_field("sender", "sender"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6245,7 +6591,7 @@ def build_probe_plan(
                     "Quote recipient invalid public key",
                     quote_body(recipient="not-a-wallet"),
                     external=True,
-                    policy_field="recipient",
+                    policy_field=quote_field("recipient", "recipient"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6253,7 +6599,7 @@ def build_probe_plan(
                     "Quote missing recipient",
                     quote_body(include_recipient=False),
                     external=True,
-                    policy_field="recipient",
+                    policy_field=quote_field("recipient", "recipient"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6261,7 +6607,7 @@ def build_probe_plan(
                     "Quote sender recipient mismatch",
                     quote_body(recipient=alternate_wallet),
                     external=True,
-                    policy_field="recipient",
+                    policy_field=quote_field("recipient", "recipient"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6269,7 +6615,7 @@ def build_probe_plan(
                     "Quote amountIn zero",
                     quote_body(amount_in="0"),
                     external=True,
-                    policy_field="amountIn",
+                    policy_field=quote_field("amount", "amountIn"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6277,7 +6623,7 @@ def build_probe_plan(
                     "Quote amountIn negative",
                     quote_body(amount_in="-1"),
                     external=True,
-                    policy_field="amountIn",
+                    policy_field=quote_field("amount", "amountIn"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6285,7 +6631,7 @@ def build_probe_plan(
                     "Quote amountIn decimal",
                     quote_body(amount_in="1.5"),
                     external=True,
-                    policy_field="amountIn",
+                    policy_field=quote_field("amount", "amountIn"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6293,7 +6639,7 @@ def build_probe_plan(
                     "Quote amountIn scientific notation",
                     quote_body(amount_in="1e9"),
                     external=True,
-                    policy_field="amountIn",
+                    policy_field=quote_field("amount", "amountIn"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6301,7 +6647,7 @@ def build_probe_plan(
                     "Quote amountIn huge integer",
                     quote_body(amount_in="9" * 80),
                     external=True,
-                    policy_field="amountIn",
+                    policy_field=quote_field("amount", "amountIn"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6309,7 +6655,7 @@ def build_probe_plan(
                     "Quote amountIn non-numeric",
                     quote_body(amount_in="not-a-number"),
                     external=True,
-                    policy_field="amountIn",
+                    policy_field=quote_field("amount", "amountIn"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6317,7 +6663,7 @@ def build_probe_plan(
                     "Quote maxNumQuotes wrong type",
                     quote_body(max_num_quotes="1"),
                     external=True,
-                    policy_field="maxNumQuotes",
+                    policy_field=quote_field("max_num_quotes", "maxNumQuotes"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6325,7 +6671,7 @@ def build_probe_plan(
                     "Quote maxNumQuotes zero",
                     quote_body(max_num_quotes=0),
                     external=True,
-                    policy_field="maxNumQuotes",
+                    policy_field=quote_field("max_num_quotes", "maxNumQuotes"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -6333,7 +6679,7 @@ def build_probe_plan(
                     "Quote maxNumQuotes high",
                     quote_body(max_num_quotes=999),
                     external=True,
-                    policy_field="maxNumQuotes",
+                    policy_field=quote_field("max_num_quotes", "maxNumQuotes"),
                     risk=external_quote_risk,
                 ),
                 quote_probe(
@@ -21437,6 +21783,31 @@ def build_profile_routing_selftest_profile() -> dict[str, Any]:
                 },
             },
         },
+        "quote_request": {
+            "body_template": {
+                "swap": {
+                    "from": {"network": "{sourceChain}", "mint": "{sourceMint}"},
+                    "to": {"network": "{destinationChain}", "mint": "{destinationMint}"},
+                },
+                "amount": "{amountIn}",
+                "wallet": "{wallet}",
+                "receiver": "{recipient}",
+                "limit": "{maxNumQuotes}",
+            },
+            "policy_fields": {
+                "route": "swap",
+                "source": "swap.from",
+                "destination": "swap.to",
+                "source_chain": "swap.from.network",
+                "destination_chain": "swap.to.network",
+                "source_mint": "swap.from.mint",
+                "destination_mint": "swap.to.mint",
+                "amount": "amount",
+                "sender": "wallet",
+                "recipient": "receiver",
+                "max_num_quotes": "limit",
+            },
+        },
         "quote_provider": {
             "name": "SelfTestQuoteProvider",
             "diagnostics": [
@@ -21577,6 +21948,26 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         None,
         test_profile,
     )
+    quote_probe_json_bodies: dict[str, dict[str, Any]] = {}
+    for probe in probes:
+        if probe.category != "quote" or not probe.body:
+            continue
+        try:
+            parsed_body = json.loads(probe.body)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed_body, dict):
+            quote_probe_json_bodies[probe.id] = parsed_body
+    quote_probe_default_key_leaks = sorted(
+        probe_id
+        for probe_id, parsed_body in quote_probe_json_bodies.items()
+        if any(key in parsed_body for key in ["route", "amountIn", "maxNumQuotes"])
+    )
+    quote_probe_policy_fields = {
+        probe.id: probe.policy_field
+        for probe in probes
+        if probe.category == "quote" and probe.policy_field
+    }
     missing_quote_intent_profile = json_clone(test_profile)
     missing_quote_intent_profile["quote_intent"] = {}
     missing_quote_intent_validation = build_profile_validation_artifact(
@@ -21603,11 +21994,31 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         direction="buy",
         wallet=DEFAULT_TEST_WALLET,
     )
+    quote_body_swap = quote_body_sample.get("swap") if isinstance(quote_body_sample.get("swap"), dict) else {}
+    quote_body_swap_from = quote_body_swap.get("from") if isinstance(quote_body_swap.get("from"), dict) else {}
+    quote_body_swap_to = quote_body_swap.get("to") if isinstance(quote_body_swap.get("to"), dict) else {}
+    invalid_source_mint_probe = quote_probe_json_bodies.get("quote_invalid_source_mint", {})
+    invalid_source_mint_swap = (
+        invalid_source_mint_probe.get("swap") if isinstance(invalid_source_mint_probe.get("swap"), dict) else {}
+    )
+    invalid_source_mint_from = (
+        invalid_source_mint_swap.get("from") if isinstance(invalid_source_mint_swap.get("from"), dict) else {}
+    )
+    quote_request_profile_passed = (
+        quote_body_swap_from.get("mint") == "So11111111111111111111111111111111111111112"
+        and quote_body_swap_to.get("mint") == "11111111111111111111111111111111"
+        and quote_body_sample.get("limit") == 2
+        and "route" not in quote_body_sample
+        and "amountIn" not in quote_body_sample
+        and not quote_probe_default_key_leaks
+        and quote_probe_json_bodies.get("quote_wrong_amount_type", {}).get("amount") == 1
+        and quote_probe_json_bodies.get("quote_route_wrong_type", {}).get("swap") == "not-an-object"
+        and invalid_source_mint_from.get("mint") == "not-a-mint"
+        and quote_probe_policy_fields.get("quote_invalid_source_mint") == "swap.from.mint"
+        and quote_probe_policy_fields.get("quote_max_num_quotes_high") == "limit"
+    )
     quote_intent_profile_passed = (
-        quote_body_sample["route"]["source"]["address"] == "So11111111111111111111111111111111111111112"
-        and quote_body_sample["route"]["destination"]["address"] == "11111111111111111111111111111111"
-        and quote_body_sample["maxNumQuotes"] == 2
-        and quote_policy_sample.get("sourceMint") == "So11111111111111111111111111111111111111112"
+        quote_policy_sample.get("sourceMint") == "So11111111111111111111111111111111111111112"
         and quote_policy_sample.get("destinationMint") == "11111111111111111111111111111111"
         and quote_policy_sample.get("allowedPrograms") == ["11111111111111111111111111111111"]
         and quote_policy_override_sample.get("allowedPrograms")
@@ -21709,6 +22120,24 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and quote_direction_mints(discovered_quote_seed_profile, "sell")
         == ("11111111111111111111111111111111", "So11111111111111111111111111111111111111112")
         and "quote_intent" not in discovered_quote_no_seed_profile
+    )
+    seeded_quote_request = discovered_quote_seed_profile.get("quote_request") or {}
+    seeded_quote_request_template = seeded_quote_request.get("body_template") or {}
+    seeded_quote_request_swap = (
+        seeded_quote_request_template.get("swap")
+        if isinstance(seeded_quote_request_template.get("swap"), dict)
+        else {}
+    )
+    seeded_quote_request_from = (
+        seeded_quote_request_swap.get("from")
+        if isinstance(seeded_quote_request_swap.get("from"), dict)
+        else {}
+    )
+    seeded_quote_request_fields = seeded_quote_request.get("policy_fields") or {}
+    discovered_quote_request_passed = (
+        seeded_quote_request_from.get("mint") == "{sourceMint}"
+        and seeded_quote_request_fields.get("source_mint") == "swap.from.mint"
+        and "quote_request" not in discovered_quote_no_seed_profile
     )
     discovered_quote_provider_passed = (
         (discovered_quote_seed_profile.get("quote_provider") or {}).get("name") == "SelfTestQuoteProvider"
@@ -23146,8 +23575,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and initial_artifacts_passed
         and target_lock_passed
         and quote_intent_profile_passed
+        and quote_request_profile_passed
         and quote_provider_profile_passed
         and discovered_quote_intent_passed
+        and discovered_quote_request_passed
         and discovered_quote_provider_passed
         and discover_profile_seed_cli_passed
         and readiness_profile_passed
@@ -23194,6 +23625,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "missing_quote_body_error": missing_quote_body_error,
             "missing_quote_payload_error": missing_quote_payload.get("error"),
         },
+        "quote_request_profile_routing": {
+            "status": "passed" if quote_request_profile_passed else "failed",
+            "quote_body": quote_body_sample,
+            "probe_default_key_leaks": quote_probe_default_key_leaks,
+            "probe_policy_fields": quote_probe_policy_fields,
+            "probe_samples": {
+                "quote_wrong_amount_type": quote_probe_json_bodies.get("quote_wrong_amount_type"),
+                "quote_route_wrong_type": quote_probe_json_bodies.get("quote_route_wrong_type"),
+                "quote_invalid_source_mint": quote_probe_json_bodies.get("quote_invalid_source_mint"),
+            },
+        },
         "quote_provider_profile_routing": {
             "status": "passed" if quote_provider_profile_passed else "failed",
             "provider": quote_provider_name(test_profile),
@@ -23203,6 +23645,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "status": "passed" if discovered_quote_intent_passed else "failed",
             "seeded_quote_intent": discovered_quote_seed_profile.get("quote_intent"),
             "no_seed_has_quote_intent": "quote_intent" in discovered_quote_no_seed_profile,
+        },
+        "discovered_quote_request_seed_routing": {
+            "status": "passed" if discovered_quote_request_passed else "failed",
+            "seeded_quote_request": discovered_quote_seed_profile.get("quote_request"),
+            "no_seed_has_quote_request": "quote_request" in discovered_quote_no_seed_profile,
         },
         "discovered_quote_provider_seed_routing": {
             "status": "passed" if discovered_quote_provider_passed else "failed",
@@ -25678,23 +26125,14 @@ def build_quote_collection_body(
     wallet: str,
     amount_in: str,
 ) -> dict[str, Any]:
-    expected = expected_mints_for_direction(direction, profile)
-    if expected is None:
-        if direction not in {"buy", "sell"}:
-            raise ValueError("direction must be buy or sell")
-        raise ValueError(f"quote_intent.directions.{direction} must define sourceMint and destinationMint")
-    source_mint, destination_mint = expected
-    chain = quote_chain_for_direction(profile, direction)
-    return {
-        "route": {
-            "source": {"chain": chain, "address": source_mint},
-            "destination": {"chain": chain, "address": destination_mint},
-        },
-        "amountIn": amount_in,
-        "sender": wallet,
-        "recipient": wallet,
-        "maxNumQuotes": quote_max_num_quotes(profile),
-    }
+    return build_quote_request_body(
+        profile,
+        direction,
+        wallet,
+        amount_in,
+        recipient=wallet,
+        require_intent=True,
+    )
 
 
 def quote_provider_diagnostic_matches(diagnostic: dict[str, Any], status: Any, body_sample: str) -> bool:
@@ -25851,12 +26289,16 @@ def run_collect_quote(args: argparse.Namespace) -> int:
             )
         )
         return 2
+    expected_mints = expected_mints_for_direction(args.direction, profile)
+    if expected_mints is None:
+        raise RuntimeError("quote collection body was built without direction mints")
+    source_mint, destination_mint = expected_mints
     policy = {
         "direction": args.direction,
         "wallet": args.wallet,
         "amountIn": args.amount_in,
-        "sourceMint": body["route"]["source"]["address"],
-        "destinationMint": body["route"]["destination"]["address"],
+        "sourceMint": source_mint,
+        "destinationMint": destination_mint,
     }
     if args.intent_allowed_program:
         policy["allowedPrograms"] = args.intent_allowed_program
@@ -25924,8 +26366,8 @@ def run_collect_quote(args: argparse.Namespace) -> int:
             "direction": args.direction,
             "amountIn": args.amount_in,
             "wallet": args.wallet,
-            "sourceMint": body["route"]["source"]["address"],
-            "destinationMint": body["route"]["destination"]["address"],
+            "sourceMint": source_mint,
+            "destinationMint": destination_mint,
         },
         "response": {
             "status": response["status"],

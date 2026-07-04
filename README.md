@@ -196,11 +196,12 @@ whitespace are profile-validation errors. Keep unresolved paths in
 `review_observation_candidates` until one reviewed concrete path is promoted.
 
 When a separate profile file omits target-specific fields such as `clusters`,
-`probe_targets`, `quote_intent`, `quote_provider`, `environment_readiness`,
-`burp_observation_plan`, or `websocket_observation`, InferForge uses neutral
-empty defaults and emits profile-validation warnings. It does not borrow
-`infrafi-web` clusters, probe paths, quote mint intent, or external readiness
-checks for another target. Quote collection and
+`probe_targets`, `quote_intent`, `quote_request`, `quote_provider`,
+`environment_readiness`, `burp_observation_plan`, or
+`websocket_observation`, InferForge uses neutral empty defaults and emits
+profile-validation warnings. It does not borrow `infrafi-web` clusters, probe
+paths, quote mint intent, quote request shape, or external readiness checks for
+another target. Quote collection and
 direction-derived transaction policy checks read mint direction from the target
 profile:
 
@@ -221,6 +222,47 @@ profile:
         "sourceMint": "SOURCE_MINT_FOR_SELL",
         "destinationMint": "DESTINATION_MINT_FOR_SELL"
       }
+    }
+  }
+}
+```
+
+Quote request construction is profile-owned too. `body_template` is a JSON
+object whose exact placeholder strings are replaced structurally, preserving the
+replacement value type. `policy_fields` maps semantic fields to dot paths so
+field-specific probes can delete or mutate the correct target-specific field:
+
+```json
+{
+  "quote_request": {
+    "body_template": {
+      "swap": {
+        "from": {
+          "network": "{sourceChain}",
+          "mint": "{sourceMint}"
+        },
+        "to": {
+          "network": "{destinationChain}",
+          "mint": "{destinationMint}"
+        }
+      },
+      "amount": "{amountIn}",
+      "wallet": "{wallet}",
+      "receiver": "{recipient}",
+      "limit": "{maxNumQuotes}"
+    },
+    "policy_fields": {
+      "route": "swap",
+      "source": "swap.from",
+      "destination": "swap.to",
+      "source_chain": "swap.from.network",
+      "destination_chain": "swap.to.network",
+      "source_mint": "swap.from.mint",
+      "destination_mint": "swap.to.mint",
+      "amount": "amount",
+      "sender": "wallet",
+      "recipient": "receiver",
+      "max_num_quotes": "limit"
     }
   }
 }
@@ -286,10 +328,10 @@ declare its own provider variables or leave this empty:
 
 `discover-profile` copies `quote_intent` into the generated starter profile only
 when the seed profile passed with `--profile` explicitly declares complete
-`buy` and `sell` directions. It copies `quote_provider` only from an explicit
-seed profile that declares it. Running discovery without an explicit profile does
-not copy the built-in regression target mint intent or provider diagnostics into
-a new target.
+`buy` and `sell` directions. It copies `quote_request` and `quote_provider`
+only from an explicit seed profile that declares them. Running discovery without
+an explicit profile does not copy the built-in regression target mint intent,
+request shape, or provider diagnostics into a new target.
 
 Use the static routing self-test to guard this invariant:
 

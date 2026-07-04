@@ -67,6 +67,37 @@
       }
     }
   },
+  "quote_request": {
+    "body_template": {
+      "route": {
+        "source": {
+          "chain": "{sourceChain}",
+          "address": "{sourceMint}"
+        },
+        "destination": {
+          "chain": "{destinationChain}",
+          "address": "{destinationMint}"
+        }
+      },
+      "amountIn": "{amountIn}",
+      "sender": "{wallet}",
+      "recipient": "{recipient}",
+      "maxNumQuotes": "{maxNumQuotes}"
+    },
+    "policy_fields": {
+      "route": "route",
+      "source": "route.source",
+      "destination": "route.destination",
+      "source_chain": "route.source.chain",
+      "destination_chain": "route.destination.chain",
+      "source_mint": "route.source.address",
+      "destination_mint": "route.destination.address",
+      "amount": "amountIn",
+      "sender": "sender",
+      "recipient": "recipient",
+      "max_num_quotes": "maxNumQuotes"
+    }
+  },
   "quote_provider": {
     "name": "M0",
     "diagnostics": [
