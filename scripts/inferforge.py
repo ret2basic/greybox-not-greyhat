@@ -2266,7 +2266,7 @@ def nextjs_pages_api_path(api_file: Path, source_root: Path) -> str | None:
     return None
 
 
-def source_without_js_comments_and_strings(source: str) -> str:
+def source_without_js_comments_and_strings(source: str, *, strip_strings: bool = True) -> str:
     output: list[str] = []
     index = 0
     state = "code"
@@ -2312,6 +2312,16 @@ def source_without_js_comments_and_strings(source: str) -> str:
             index += 1
             continue
         if state == "string":
+            if not strip_strings:
+                output.append(char)
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    state = "code"
+                index += 1
+                continue
             if escaped:
                 output.append("\n" if char == "\n" else " ")
                 escaped = False
@@ -2326,6 +2336,10 @@ def source_without_js_comments_and_strings(source: str) -> str:
             index += 1
             continue
     return "".join(output)
+
+
+def source_without_js_comments(source: str) -> str:
+    return source_without_js_comments_and_strings(source, strip_strings=False)
 
 
 def extract_export_list_route_methods(source: str) -> set[str]:
@@ -2352,13 +2366,14 @@ def extract_route_methods(source: str) -> list[str]:
 
 def extract_pages_api_methods(source: str) -> list[str]:
     methods = set(extract_route_methods(source))
+    scan_source = source_without_js_comments(source)
     methods.update(
         re.findall(
             r"\b(?:req|request)\.method\s*(?:={2,3}|!={1,2})\s*['\"]([A-Z]+)['\"]",
-            source,
+            scan_source,
         )
     )
-    methods.update(re.findall(r"\bcase\s+['\"]([A-Z]+)['\"]\s*:", source))
+    methods.update(re.findall(r"\bcase\s+['\"]([A-Z]+)['\"]\s*:", scan_source))
     return sorted(method for method in methods if method in HTTP_METHODS)
 
 
@@ -23240,6 +23255,27 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and route_method_export_list_samples.get("string_exports_ignored") == []
         and route_method_export_list_samples.get("type_export_ignored") == []
     )
+    pages_api_method_samples = {
+        "req_method_real": extract_pages_api_methods(
+            "export default function handler(req, res) {\n"
+            "  if (req.method === 'GET') return res.status(200).end()\n"
+            "}\n"
+        ),
+        "switch_real": extract_pages_api_methods(
+            "export default function handler(req, res) {\n"
+            "  switch (req.method) { case 'POST': return res.status(200).end() }\n"
+            "}\n"
+        ),
+        "commented_req_method_ignored": extract_pages_api_methods(
+            "// if (req.method === 'DELETE') return res.status(200).end()\n"
+            "/* case 'PATCH': return res.status(200).end() */\n"
+        ),
+    }
+    pages_api_method_samples_passed = (
+        pages_api_method_samples.get("req_method_real") == ["GET"]
+        and pages_api_method_samples.get("switch_real") == ["POST"]
+        and pages_api_method_samples.get("commented_req_method_ignored") == []
+    )
     any_method_match_reasons = entrypoint_match_reasons(
         {
             "path": "/any-method",
@@ -24862,6 +24898,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and ws_resource_open_item_passed
         and unsafe_observation_validation_passed
         and route_method_export_list_passed
+        and pages_api_method_samples_passed
         and any_method_match_reason_passed
         and rewrite_discovery_passed
         and profile_custom_ws_discovery_passed
@@ -24911,6 +24948,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         "route_method_export_list": {
             "status": "passed" if route_method_export_list_passed else "failed",
             "samples": route_method_export_list_samples,
+        },
+        "pages_api_method_detection": {
+            "status": "passed" if pages_api_method_samples_passed else "failed",
+            "samples": pages_api_method_samples,
         },
         "any_method_match_reasons": {
             "status": "passed" if any_method_match_reason_passed else "failed",
