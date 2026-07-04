@@ -208,6 +208,9 @@ profile:
   "quote_intent": {
     "chain": "Solana",
     "maxNumQuotes": 1,
+    "allowedPrograms": [
+      "EXPECTED_SOLANA_PROGRAM_ID"
+    ],
     "directions": {
       "buy": {
         "sourceMint": "SOURCE_MINT_FOR_BUY",
@@ -364,19 +367,22 @@ Or through `.greybox/transaction-intent-policy.json`:
 
 For `buy` and `sell`, InferForge derives expected source and destination mints
 from `quote_intent.directions` in the active target profile, unless an explicit
-transaction intent policy supplies `sourceMint` and `destinationMint`. The
-current checks verify that the decoded transaction has the expected wallet
-account, the wallet is a signer, both expected mints appear in static account
-keys when available, compiled instructions are present, and all compiled
-instruction program IDs are in `allowedPrograms` when that allowlist is
-configured. Address table lookups can require manual review because loaded
-accounts are not expanded from chain state.
+transaction intent policy supplies `sourceMint` and `destinationMint`.
+`allowedPrograms` can also live in `quote_intent` or in a specific direction,
+and explicit CLI or policy-file allowlists take precedence. The current checks
+verify that the decoded transaction has the expected wallet account, the wallet
+is a signer, both expected mints appear in static account keys when available,
+compiled instructions are present, and all compiled instruction program IDs are
+in `allowedPrograms` when that allowlist is configured. Address table lookups
+can require manual review because loaded accounts are not expanded from chain
+state.
 
-`collect-quote` is the safe quote-corpus helper. It requests `/api/quote`, saves
-a successful quote response to `.greybox/transaction-payloads.json`, writes
-`.greybox/quote-collection.json`, refreshes `.greybox/transaction-intent.json`,
-updates the related evidence/readiness artifacts, and refreshes the managed
-artifact manifest. It does not sign transactions or submit them to Solana.
+`collect-quote` is the safe quote-corpus helper. It requests the active
+profile's quote path, saves a successful quote response to
+`.greybox/transaction-payloads.json`, writes `.greybox/quote-collection.json`,
+refreshes `.greybox/transaction-intent.json`, updates the related
+evidence/readiness artifacts, and refreshes the managed artifact manifest. It
+does not sign transactions or submit them to Solana.
 Non-200 responses are recorded as collection metadata without being treated as
 transaction payloads. The collection artifact includes
 `diagnosis.classification`, for example `m0-config-missing-or-placeholder` when

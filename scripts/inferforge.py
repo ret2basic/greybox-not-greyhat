@@ -992,6 +992,19 @@ def quote_max_num_quotes(profile: dict[str, Any] | None) -> int:
     return value if isinstance(value, int) and value > 0 else 1
 
 
+def quote_allowed_programs(profile: dict[str, Any] | None, direction: str | None = None) -> list[str]:
+    config = quote_intent_config(profile)
+    scopes: list[dict[str, Any]] = []
+    if direction:
+        scopes.append(quote_direction_config(profile, direction))
+    scopes.append(config)
+    for scope in scopes:
+        for key in ["allowedPrograms", "allowed_programs"]:
+            if key in scope:
+                return normalize_string_list(scope.get(key))
+    return []
+
+
 def is_concrete_probe_path(path: str | None) -> bool:
     return bool(path and str(path).startswith("/") and "{" not in str(path) and "}" not in str(path))
 
@@ -1197,6 +1210,28 @@ def build_profile_validation_artifact(
                                 ),
                             }
                         )
+                quote_config = quote_intent_config(profile)
+                allowed_program_scopes = [("quote_intent", quote_config)]
+                for direction in ["buy", "sell"]:
+                    allowed_program_scopes.append(
+                        (
+                            f"quote_intent.directions.{direction}",
+                            quote_direction_config(profile, direction),
+                        )
+                    )
+                for scope_name, scope_config in allowed_program_scopes:
+                    for key in ["allowedPrograms", "allowed_programs"]:
+                        if key in scope_config and not normalize_string_list(scope_config.get(key)):
+                            warnings.append(
+                                {
+                                    "id": f"cluster:quote:invalid-{scope_name.replace('.', '-')}-allowed-programs",
+                                    "severity": "warning",
+                                    "message": (
+                                        f"`{scope_name}.{key}` is declared but does not contain any program IDs. "
+                                        "Use a non-empty string or array when configuring transaction program allowlists."
+                                    ),
+                                }
+                            )
         if strategy_set == "nextjs-api-routes" and cluster_id != "health":
             generic_path = probe_target_path(profile, cluster_id, "path", str(cluster.get("path") or ""))
             if not is_concrete_probe_path(generic_path):
@@ -18541,7 +18576,9 @@ def normalize_transaction_intent_policy(raw: dict[str, Any], profile: dict[str, 
     amount_in = raw.get("amountIn") or raw.get("amount_in")
     source_mint = raw.get("sourceMint") or raw.get("source_mint")
     destination_mint = raw.get("destinationMint") or raw.get("destination_mint")
-    allowed_programs = normalize_string_list(raw.get("allowedPrograms") or raw.get("allowed_programs"))
+    explicit_allowed_programs = "allowedPrograms" in raw or "allowed_programs" in raw
+    allowed_programs_raw = raw.get("allowedPrograms") if "allowedPrograms" in raw else raw.get("allowed_programs")
+    allowed_programs = normalize_string_list(allowed_programs_raw)
 
     if isinstance(direction, str):
         direction = direction.strip().lower()
@@ -18554,6 +18591,8 @@ def normalize_transaction_intent_policy(raw: dict[str, Any], profile: dict[str, 
     if expected:
         source_mint = source_mint or expected[0]
         destination_mint = destination_mint or expected[1]
+    if not explicit_allowed_programs and isinstance(direction, str):
+        allowed_programs = quote_allowed_programs(profile, direction)
 
     policy = {
         "direction": direction,
@@ -18574,7 +18613,7 @@ def normalize_transaction_intent_policy(raw: dict[str, Any], profile: dict[str, 
         issues.append("sourceMint must be provided or derivable from direction")
     if not isinstance(destination_mint, str) or not destination_mint:
         issues.append("destinationMint must be provided or derivable from direction")
-    if raw.get("allowedPrograms") is not None and not allowed_programs:
+    if explicit_allowed_programs and not allowed_programs:
         issues.append("allowedPrograms must be a non-empty string or array when provided")
 
     return {
@@ -21074,6 +21113,7 @@ def build_profile_routing_selftest_profile() -> dict[str, Any]:
         "quote_intent": {
             "chain": "Solana",
             "maxNumQuotes": 2,
+            "allowedPrograms": ["11111111111111111111111111111111"],
             "directions": {
                 "buy": {
                     "sourceMint": "So11111111111111111111111111111111111111112",
@@ -21195,11 +21235,27 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         },
         test_profile,
     )
+    quote_policy_override_sample = normalize_transaction_intent_policy(
+        {
+            "direction": "buy",
+            "wallet": DEFAULT_TEST_WALLET,
+            "amountIn": "1000000",
+            "allowedPrograms": ["MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"],
+        },
+        test_profile,
+    )
     missing_quote_intent_profile = json_clone(test_profile)
     missing_quote_intent_profile["quote_intent"] = {}
     missing_quote_intent_validation = build_profile_validation_artifact(
         missing_quote_intent_profile,
         build_clusters(missing_quote_intent_profile, ROOT),
+        ROOT,
+    )
+    invalid_quote_allowed_programs_profile = json_clone(test_profile)
+    invalid_quote_allowed_programs_profile["quote_intent"]["allowedPrograms"] = []
+    invalid_quote_allowed_programs_validation = build_profile_validation_artifact(
+        invalid_quote_allowed_programs_profile,
+        build_clusters(invalid_quote_allowed_programs_profile, ROOT),
         ROOT,
     )
     missing_quote_body_error = None
@@ -21220,6 +21276,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and quote_body_sample["maxNumQuotes"] == 2
         and quote_policy_sample.get("sourceMint") == "So11111111111111111111111111111111111111112"
         and quote_policy_sample.get("destinationMint") == "11111111111111111111111111111111"
+        and quote_policy_sample.get("allowedPrograms") == ["11111111111111111111111111111111"]
+        and quote_policy_override_sample.get("allowedPrograms")
+        == ["MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"]
         and quote_policy_sample.get("sourceMint") != USDC_MINT
         and quote_policy_sample.get("destinationMint") != USDTEL_MINT
         and missing_quote_intent_validation.get("status") != "failed"
@@ -21227,6 +21286,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "cluster:quote:missing-buy-quote-intent",
             "cluster:quote:missing-sell-quote-intent",
         }.issubset({str(item.get("id")) for item in missing_quote_intent_validation.get("warnings", [])})
+        and "cluster:quote:invalid-quote_intent-allowed-programs"
+        in {str(item.get("id")) for item in invalid_quote_allowed_programs_validation.get("warnings", [])}
         and (missing_quote_body_error or {}).get("message_redacted") is True
         and missing_quote_payload.get("ok") is False
         and ((missing_quote_payload.get("error") or {}).get("message_redacted") is True)
@@ -21301,6 +21362,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
     )
     discovered_quote_intent_passed = (
         (discovered_quote_seed_profile.get("quote_intent") or {}).get("maxNumQuotes") == 2
+        and (discovered_quote_seed_profile.get("quote_intent") or {}).get("allowedPrograms")
+        == ["11111111111111111111111111111111"]
         and quote_direction_mints(discovered_quote_seed_profile, "buy")
         == ("So11111111111111111111111111111111111111112", "11111111111111111111111111111111")
         and quote_direction_mints(discovered_quote_seed_profile, "sell")
@@ -22617,9 +22680,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "status": "passed" if quote_intent_profile_passed else "failed",
             "quote_body": quote_body_sample,
             "quote_policy": quote_policy_sample,
+            "quote_policy_override": quote_policy_override_sample,
             "missing_quote_intent_validation": {
                 "status": missing_quote_intent_validation.get("status"),
                 "warning_ids": [item.get("id") for item in missing_quote_intent_validation.get("warnings", [])],
+            },
+            "invalid_allowed_programs_validation": {
+                "status": invalid_quote_allowed_programs_validation.get("status"),
+                "warning_ids": [
+                    item.get("id") for item in invalid_quote_allowed_programs_validation.get("warnings", [])
+                ],
             },
             "missing_quote_body_error": missing_quote_body_error,
             "missing_quote_payload_error": missing_quote_payload.get("error"),
@@ -25184,6 +25254,10 @@ def run_collect_quote(args: argparse.Namespace) -> int:
     }
     if args.intent_allowed_program:
         policy["allowedPrograms"] = args.intent_allowed_program
+    else:
+        profile_allowed_programs = quote_allowed_programs(profile, args.direction)
+        if profile_allowed_programs:
+            policy["allowedPrograms"] = profile_allowed_programs
     write_json(artifact_dir / "transaction-intent-policy.json", policy)
 
     try:
@@ -26093,7 +26167,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     collect_quote = sub.add_parser(
         "collect-quote",
-        help="Safely request /api/quote and save returned transaction payloads without signing or submitting",
+        help="Safely request the profile quote path and save returned transaction payloads without signing or submitting",
     )
     collect_quote.add_argument("--direction", choices=["buy", "sell"], required=True, help="Swap direction to quote")
     collect_quote.add_argument("--wallet", required=True, help="Solana wallet/sender for the quote request")
