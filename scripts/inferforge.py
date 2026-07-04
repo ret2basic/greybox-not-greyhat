@@ -987,7 +987,7 @@ def probe_target_path(
     return render_path_template(fallback, replacements)
 
 
-def rpc_probe_paths(profile: dict[str, Any] | None) -> dict[str, str]:
+def rpc_probe_paths(profile: dict[str, Any] | None) -> dict[str, Any]:
     config = explicit_probe_target_config(profile, "solana-rpc-http")
     cluster = str(config.get("cluster") or "devnet")
     unknown_cluster = str(config.get("unknown_cluster") or "localnet")
@@ -1002,7 +1002,9 @@ def rpc_probe_paths(profile: dict[str, Any] | None) -> dict[str, str]:
         str(path)
         for path in (declared_cluster_by_id(profile, "solana-rpc-http") or {}).get("match", {}).get("paths", [])
     ]
-    root = str(config.get("root_path") or (root_candidates[0] if root_candidates else "/api/rpc"))
+    root = str(config.get("root_path") or root_candidates[0]) if config.get("root_path") or root_candidates else None
+    if root is None and uses_builtin_target_defaults(profile):
+        root = "/api/rpc"
     unknown = (
         render_path_template(str(config["unknown_cluster_path"]), {"cluster": unknown_cluster})
         if config.get("unknown_cluster_path")
@@ -3882,11 +3884,12 @@ def build_probe_targets_from_clusters(clusters: list[dict[str, Any]]) -> dict[st
             unknown_path = render_path_template(path, {dynamic_match.group(1): "localnet"}) if dynamic_match else path
             targets["solana-rpc-http"] = {
                 "path": concrete_path,
-                "root_path": root_paths[0] if root_paths else "/api/rpc",
                 "unknown_cluster_path": unknown_path,
                 "cluster": cluster_value,
                 "unknown_cluster": "localnet",
             }
+            if root_paths:
+                targets["solana-rpc-http"]["root_path"] = root_paths[0]
             targets.setdefault("solana-rpc-ws", {"path": concrete_path})
         elif cluster_id == "solana-rpc-ws":
             targets["solana-rpc-ws"] = {"path": render_path_template(path, {"cluster": "devnet"})}
@@ -6165,7 +6168,7 @@ def build_probe_plan(
     quote_fields = quote_request_policy_fields(profile)
     rpc_paths = rpc_probe_paths(profile)
     rpc_path = rpc_paths["path"]
-    rpc_root_path = rpc_paths["root_path"]
+    rpc_root_path = rpc_paths.get("root_path")
     rpc_unknown_cluster_path = rpc_paths["unknown_cluster_path"]
     orca_paths = orca_probe_paths(profile)
 
@@ -6998,11 +7001,13 @@ def build_probe_plan(
             ]
         )
 
+    if not rpc_root_path:
+        probes = [probe for probe in probes if not probe.id.startswith("rpc_root_")]
+
     path_rewrites = {
         "/health": health_path,
         "/api/quote": quote_path,
         "/api/rpc/solana/devnet": rpc_path,
-        "/api/rpc": rpc_root_path,
         "/api/rpc/solana/localnet": rpc_unknown_cluster_path,
         "/api/orca/pools/not-an-address": orca_paths["invalid_address_path"],
         "/api/orca/pools/0OIlnotbase58": orca_paths["invalid_base58_path"],
@@ -7012,6 +7017,8 @@ def build_probe_plan(
         "/api/orca/pools/not-an-address/extra": orca_paths["extra_segment_path"],
         "/api/orca/pools/not-an-address?url=https://evil.example": orca_paths["query_injection_path"],
     }
+    if rpc_root_path:
+        path_rewrites["/api/rpc"] = str(rpc_root_path)
     probes = [replace(probe, path=path_rewrites.get(probe.path, probe.path)) for probe in probes]
 
     filtered = [
@@ -22485,6 +22492,26 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and "SELFTEST_PROVIDER_TOKEN" in str(quote_provider_diagnosis_sample.get("next_step") or "")
         and no_provider_fallback_diagnosis_sample.get("classification") == "quote-collection-no-payload"
     )
+    no_root_rpc_profile = json_clone(test_profile)
+    no_root_rpc_profile["probe_targets"]["solana-rpc-http"].pop("root_path", None)
+    for cluster in no_root_rpc_profile.get("clusters", []):
+        if cluster.get("id") == "solana-rpc-http":
+            (cluster.get("match") or {}).pop("paths", None)
+    no_root_rpc_paths = rpc_probe_paths(no_root_rpc_profile)
+    no_root_rpc_probes = build_probe_plan(
+        target,
+        include_external=False,
+        selected_clusters={"solana-rpc-http"},
+        profile=no_root_rpc_profile,
+    )
+    no_root_rpc_probe_ids = {probe.id for probe in no_root_rpc_probes}
+    no_root_rpc_probe_paths = {probe.path for probe in no_root_rpc_probes}
+    no_root_rpc_passed = (
+        no_root_rpc_paths.get("root_path") is None
+        and not any(probe_id.startswith("rpc_root_") for probe_id in no_root_rpc_probe_ids)
+        and "/api/rpc" not in no_root_rpc_probe_paths
+        and "/chain/solana/devnet" in no_root_rpc_probe_paths
+    )
     quote_discovery_inventory = {
         "generated_at": utc_now(),
         "status": "discovered",
@@ -24244,6 +24271,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and quote_request_profile_passed
         and quote_response_profile_passed
         and quote_provider_profile_passed
+        and no_root_rpc_passed
         and discovered_quote_intent_passed
         and discovered_quote_request_passed
         and discovered_quote_response_passed
@@ -24334,6 +24362,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "provider": quote_provider_name(test_profile),
             "diagnosis": quote_provider_diagnosis_sample,
             "no_provider_fallback_diagnosis": no_provider_fallback_diagnosis_sample,
+        },
+        "no_root_rpc_profile_routing": {
+            "status": "passed" if no_root_rpc_passed else "failed",
+            "rpc_paths": no_root_rpc_paths,
+            "probe_ids": sorted(no_root_rpc_probe_ids),
+            "probe_paths": sorted(no_root_rpc_probe_paths),
         },
         "discovered_quote_intent_seed_routing": {
             "status": "passed" if discovered_quote_intent_passed else "failed",
