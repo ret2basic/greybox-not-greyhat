@@ -81,7 +81,13 @@ MAX_RESPONSE_BYTES = 256 * 1024
 MAX_BODY_SAMPLE_CHARS = 1200
 DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_BURP_HISTORY_INPUT_BYTES = 4 * 1024 * 1024
-DEFAULT_BURP_SYNC_COUNT = 50
+DEFAULT_BURP_SYNC_COUNT = 20
+DEFAULT_RESOURCE_WARNING_BURP_SYNC_COUNT = 10
+DEFAULT_RESOURCE_CRITICAL_BURP_SYNC_COUNT = 3
+DEFAULT_RESOURCE_DEGRADED_OFFLINE_COMMAND_LIMIT = 4
+DEFAULT_RESOURCE_CRITICAL_OFFLINE_COMMAND_LIMIT = 2
+DEFAULT_RESOURCE_CRITICAL_AVAILABLE_MIB = 1024
+DEFAULT_RESOURCE_CRITICAL_SWAP_USED_PCT = 75.0
 DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES = 512 * 1024
 DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES = 256 * 1024
 DEFAULT_TRANSACTION_FLOW_REVIEW_MAX_FILE_BYTES = 512 * 1024
@@ -6606,6 +6612,69 @@ def kib_to_mib(value: int | None) -> float | None:
     return round(value / 1024, 1)
 
 
+def numeric_resource_value(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_resource_budget(status: str, warnings: list[str], memory: dict[str, Any]) -> dict[str, Any]:
+    mem_available_mib = numeric_resource_value(memory.get("mem_available_mib"))
+    swap_used_pct = numeric_resource_value(memory.get("swap_used_pct"))
+    severe_memory_pressure = bool(
+        status != "healthy"
+        and (
+            (mem_available_mib is not None and mem_available_mib < DEFAULT_RESOURCE_CRITICAL_AVAILABLE_MIB)
+            or (swap_used_pct is not None and swap_used_pct >= DEFAULT_RESOURCE_CRITICAL_SWAP_USED_PCT)
+        )
+    )
+    if status == "healthy":
+        mode = "normal"
+        offline_limit = 8
+        burp_count_limit = DEFAULT_BURP_SYNC_COUNT
+        active_target_traffic = "allowed-after-resource-check"
+        browser_automation = "allowed-after-resource-check"
+        recommendations = [
+            "Run resource-snapshot --strict immediately before active target traffic.",
+            "Keep Burp history reads bounded and avoid raw history persistence unless explicitly debugging.",
+        ]
+    elif severe_memory_pressure:
+        mode = "critical"
+        offline_limit = DEFAULT_RESOURCE_CRITICAL_OFFLINE_COMMAND_LIMIT
+        burp_count_limit = DEFAULT_RESOURCE_CRITICAL_BURP_SYNC_COUNT
+        active_target_traffic = "blocked"
+        browser_automation = "blocked"
+        recommendations = [
+            "Do not start the target server, browser automation, Burp Scanner, Intruder, broad crawling, or active probes.",
+            "Run only short offline planning, artifact-health, and source-review commands until swap pressure clears.",
+            "If Burp history must be read after explicit approval, use the capped effective count recorded in burp-sync artifacts.",
+        ]
+    else:
+        mode = "degraded"
+        offline_limit = DEFAULT_RESOURCE_DEGRADED_OFFLINE_COMMAND_LIMIT
+        burp_count_limit = DEFAULT_RESOURCE_WARNING_BURP_SYNC_COUNT
+        active_target_traffic = "blocked"
+        browser_automation = "blocked"
+        recommendations = [
+            "Prefer no-write offline review commands and avoid starting new long-running local services.",
+            "Run active target traffic only after resource-snapshot --strict is healthy.",
+            "If a resource warning is explicitly accepted, keep Burp history and probe limits at the resource-budget caps.",
+        ]
+
+    return {
+        "mode": mode,
+        "warnings": warnings,
+        "offline_command_preview_limit": offline_limit,
+        "burp_history_count_limit": burp_count_limit,
+        "active_target_traffic": active_target_traffic,
+        "browser_automation": browser_automation,
+        "allow_raw_burp_history": False,
+        "allow_scanner_or_intruder": False,
+        "recommendations": recommendations,
+    }
+
+
 def read_proc_meminfo() -> dict[str, int]:
     meminfo_path = Path("/proc/meminfo")
     meminfo: dict[str, int] = {}
@@ -6730,6 +6799,23 @@ def build_resource_snapshot(
     if swap_used is not None and swap_used > warn_swap_used_mib * 1024:
         warnings.append("swap-usage-above-threshold")
 
+    memory = {
+        "mem_total_mib": kib_to_mib(mem_total),
+        "mem_available_mib": kib_to_mib(mem_available),
+        "mem_available_pct": (
+            round((mem_available / mem_total) * 100, 1)
+            if mem_total and mem_available is not None
+            else None
+        ),
+        "swap_total_mib": kib_to_mib(swap_total),
+        "swap_used_mib": kib_to_mib(swap_used),
+        "swap_used_pct": (
+            round((swap_used / swap_total) * 100, 1)
+            if swap_total and swap_used is not None
+            else None
+        ),
+    }
+    status = "warning" if warnings else "healthy"
     listening_ports = set(listening_tcp_ports())
     watched_ports = {
         str(port): {"listening": port in listening_ports}
@@ -6737,28 +6823,16 @@ def build_resource_snapshot(
     }
     return {
         "generated_at": utc_now(),
-        "status": "warning" if warnings else "healthy",
+        "status": status,
         "warnings": warnings,
         "thresholds": {
             "warn_available_mib": warn_available_mib,
             "warn_swap_used_mib": warn_swap_used_mib,
+            "critical_available_mib": DEFAULT_RESOURCE_CRITICAL_AVAILABLE_MIB,
+            "critical_swap_used_pct": DEFAULT_RESOURCE_CRITICAL_SWAP_USED_PCT,
         },
-        "memory": {
-            "mem_total_mib": kib_to_mib(mem_total),
-            "mem_available_mib": kib_to_mib(mem_available),
-            "mem_available_pct": (
-                round((mem_available / mem_total) * 100, 1)
-                if mem_total and mem_available is not None
-                else None
-            ),
-            "swap_total_mib": kib_to_mib(swap_total),
-            "swap_used_mib": kib_to_mib(swap_used),
-            "swap_used_pct": (
-                round((swap_used / swap_total) * 100, 1)
-                if swap_total and swap_used is not None
-                else None
-            ),
-        },
+        "memory": memory,
+        "resource_budget": build_resource_budget(status, warnings, memory),
         "watched_ports": watched_ports,
         "top_rss_processes": top_rss_processes(max_processes),
         "safety": (
@@ -6808,6 +6882,49 @@ def resource_gate_blocked_artifact(
             "No active target probes, Burp history reads, scanner actions, fuzzing, wallet signing, or transaction submission were run.",
             "The command stopped before long-running or memory-sensitive work because the local memory/swap gate is warning.",
         ],
+    }
+
+
+def resource_budget_for_snapshot(resource_snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(resource_snapshot, dict) or not resource_snapshot:
+        return {}
+    budget = resource_snapshot.get("resource_budget")
+    if isinstance(budget, dict) and budget:
+        return budget
+    status = artifact_summary_status(resource_snapshot)
+    if status not in {"healthy", "warning"}:
+        return {}
+    return build_resource_budget(
+        status,
+        [str(item) for item in resource_snapshot.get("warnings", []) or []],
+        resource_snapshot.get("memory", {}) if isinstance(resource_snapshot.get("memory"), dict) else {},
+    )
+
+
+def effective_burp_history_count(
+    requested_count: int,
+    resource_snapshot: dict[str, Any] | None,
+) -> tuple[int, dict[str, Any] | None]:
+    requested = max(1, int(requested_count))
+    resource_status = artifact_summary_status(resource_snapshot)
+    if resource_status == "healthy":
+        return requested, None
+    budget = resource_budget_for_snapshot(resource_snapshot)
+    raw_limit = budget.get("burp_history_count_limit") if budget else None
+    try:
+        limit = max(1, int(raw_limit))
+    except (TypeError, ValueError):
+        limit = DEFAULT_RESOURCE_WARNING_BURP_SYNC_COUNT
+    effective = min(requested, limit)
+    if effective == requested:
+        return effective, None
+    return effective, {
+        "reason": "resource-budget-cap",
+        "resource_status": resource_status,
+        "budget_mode": budget.get("mode") if budget else resource_status,
+        "requested_count": requested,
+        "effective_count": effective,
+        "limit": limit,
     }
 
 
@@ -10035,6 +10152,7 @@ def validation_resource_preflight_summary(snapshot: dict[str, Any] | None) -> di
         "status": artifact_summary_status(snapshot),
         "warnings": snapshot.get("warnings", []) or [],
         "memory": snapshot.get("memory", {}) or {},
+        "resource_budget": snapshot.get("resource_budget", {}) or {},
         "watched_ports": snapshot.get("watched_ports", {}) or {},
     }
 
@@ -10549,6 +10667,29 @@ def build_iteration_decision_from_plan(
     blocked = commands["blocked"]
     resource_preflight = validation_resource_preflight_summary(current_resource_snapshot)
     resource_status = str(resource_preflight.get("status") or "not-run")
+    resource_budget = (
+        resource_preflight.get("resource_budget")
+        if isinstance(resource_preflight.get("resource_budget"), dict)
+        else {}
+    )
+    if not resource_budget and resource_status in {"healthy", "warning"}:
+        resource_budget = build_resource_budget(
+            resource_status,
+            [str(item) for item in resource_preflight.get("warnings", []) or []],
+            resource_preflight.get("memory", {}) if isinstance(resource_preflight.get("memory"), dict) else {},
+        )
+        resource_preflight["resource_budget"] = resource_budget
+    resource_budget_mode = str(
+        resource_budget.get("mode")
+        or ("unchecked" if resource_status == "not-run" else resource_status)
+    )
+    offline_preview_limit = limit
+    raw_offline_preview_limit = resource_budget.get("offline_command_preview_limit")
+    try:
+        offline_preview_limit = min(limit, max(1, int(raw_offline_preview_limit)))
+    except (TypeError, ValueError):
+        if resource_status not in {"healthy", "not-run"}:
+            offline_preview_limit = min(limit, DEFAULT_RESOURCE_DEGRADED_OFFLINE_COMMAND_LIMIT)
     artifact_health_status = artifact_summary_status(artifact_health)
     artifact_repair = artifact_health_repair_commands(
         artifact_health,
@@ -10562,36 +10703,51 @@ def build_iteration_decision_from_plan(
 
     actions: list[dict[str, Any]] = []
     if offline:
+        offline_reason = "Read-only planning commands can run under current resource pressure."
+        if resource_status not in {"healthy", "not-run"}:
+            offline_reason = (
+                f"Resource budget mode is {resource_budget_mode}; run only capped no-write offline planning commands."
+            )
         actions.append(
             iteration_action(
                 action_id="offline-planning",
                 status="ready",
                 kind="offline",
-                reason="Read-only planning commands can run under current resource pressure.",
+                reason=offline_reason,
                 commands=offline,
-                limit=limit,
+                limit=offline_preview_limit,
             )
         )
     if artifact_health_blocks_active and artifact_repair:
+        repair_reason = "Artifact health is not clean; run offline artifact refresh commands before active validation."
+        if resource_status not in {"healthy", "not-run"}:
+            repair_reason = (
+                f"Artifact health is not clean and resource budget mode is {resource_budget_mode}; "
+                "run only capped offline repair commands."
+            )
         actions.append(
             iteration_action(
                 action_id="artifact-repair",
                 status="ready",
                 kind="artifact-repair",
-                reason="Artifact health is not clean; run offline artifact refresh commands before active validation.",
+                reason=repair_reason,
                 commands=artifact_repair,
-                limit=limit,
+                limit=offline_preview_limit,
             )
         )
     if active_after_gate:
         active_status = "ready-after-resource-gate"
         active_reason = "Active commands are constrained and still require the resource-check command immediately before execution."
-        if artifact_health_blocks_active:
+        if resource_blocks_active:
+            active_status = "blocked-resource"
+            active_reason = (
+                f"Current resource preflight is {resource_budget_mode}; do not run active validation commands."
+            )
+            if artifact_health_blocks_active:
+                active_reason += " Artifact health also blocks active validation."
+        elif artifact_health_blocks_active:
             active_status = "blocked-artifact-health"
             active_reason = "Artifact health is not clean; refresh required artifacts before active validation commands."
-        elif resource_blocks_active:
-            active_status = "blocked-resource"
-            active_reason = "Current resource preflight is not healthy; do not run active validation commands."
         actions.append(
             iteration_action(
                 action_id="active-validation",
@@ -10599,7 +10755,7 @@ def build_iteration_decision_from_plan(
                 kind="active-validation",
                 reason=active_reason,
                 commands=active_after_gate,
-                limit=limit,
+                limit=offline_preview_limit if active_status.startswith("blocked") else limit,
             )
         )
     if resource_checks:
@@ -10651,6 +10807,9 @@ def build_iteration_decision_from_plan(
             "validation_plan": validation_plan.get("status"),
             "artifact_health": artifact_health_status,
             "current_resource_snapshot": resource_status,
+            "resource_budget_mode": resource_budget_mode,
+            "offline_command_preview_limit": offline_preview_limit,
+            "burp_history_count_limit": resource_budget.get("burp_history_count_limit"),
             "validation_items": len(validation_plan.get("items", []) or []),
             "artifact_repair_commands": len(artifact_repair),
             "offline_commands": len(offline),
@@ -27935,6 +28094,7 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
         import_failure: bool = False,
         allow_resource_warning: bool = True,
         resource_snapshot_override: dict[str, Any] | None = None,
+        count: int = 1,
     ) -> dict[str, Any]:
         case_dir = root / case_id
         profile_path = root / f"{case_id}-profile.json"
@@ -27955,7 +28115,7 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
             "--mcp-url",
             "http://127.0.0.1:9876",
             "--count",
-            "1",
+            str(count),
             "--replace",
         ]
         if allow_resource_warning:
@@ -27991,12 +28151,13 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
         http_history = sync_doc.get("http_history", {}) if isinstance(sync_doc.get("http_history"), dict) else {}
         return {
             "case_id": case_id,
-            "return_code": return_code,
-            "stdout": stdout.splitlines(),
-            "sync": sync_doc,
-            "sync_exists": sync_path.exists(),
-            "raw_output": http_history.get("raw_output"),
-            "raw_persisted": http_history.get("raw_persisted"),
+                "return_code": return_code,
+                "stdout": stdout.splitlines(),
+                "sync": sync_doc,
+                "sync_exists": sync_path.exists(),
+                "http_history": http_history,
+                "raw_output": http_history.get("raw_output"),
+                "raw_persisted": http_history.get("raw_persisted"),
             "raw_file_exists": default_raw_path.exists(),
             "raw_bytes": http_history.get("bytes"),
             "raw_sha256": http_history.get("sha256"),
@@ -28012,7 +28173,7 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
             "generated_at": utc_now(),
             "status": "warning",
             "warnings": ["swap-usage-above-threshold"],
-            "memory": {"mem_available_mib": 1500, "swap_used_mib": 3500},
+            "memory": {"mem_available_mib": 1500, "swap_used_mib": 3500, "swap_used_pct": 82.0},
             "watched_ports": {"3100": {"listening": False}, "2455": {"listening": True}},
             "top_rss_processes": [],
         }
@@ -28047,6 +28208,14 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
                 "history-success",
                 make_profile("/health"),
                 mcp_client_cls=SuccessfulHistoryMcpSseClient,
+            ),
+            "resource_warning_capped_history": run_case(
+                root,
+                "resource-warning-capped-history",
+                make_profile("/health"),
+                mcp_client_cls=SuccessfulHistoryMcpSseClient,
+                resource_snapshot_override=warning_resource_snapshot,
+                count=50,
             ),
         }
 
@@ -28128,6 +28297,26 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
             ),
             "expected": "burp-sync blocks MCP history reads by default when the current resource snapshot is warning",
             "actual": cases["resource_gate"],
+        },
+        {
+            "id": "burp-sync-resource-warning-caps-history-count",
+            "passed": (
+                cases["resource_warning_capped_history"]["return_code"] == 0
+                and cases["resource_warning_capped_history"]["sync"].get("status") == "synced"
+                and cases["resource_warning_capped_history"]["http_history"].get("requested_count") == 50
+                and cases["resource_warning_capped_history"]["http_history"].get("count")
+                == DEFAULT_RESOURCE_CRITICAL_BURP_SYNC_COUNT
+                and cases["resource_warning_capped_history"]["http_history"].get("count_cap", {}).get("reason")
+                == "resource-budget-cap"
+                and cases["resource_warning_capped_history"]["http_history"].get("count_cap", {}).get("budget_mode")
+                == "critical"
+                and cases["resource_warning_capped_history"]["raw_file_exists"] is False
+                and not cases["resource_warning_capped_history"]["security_issues"]
+                and not cases["resource_warning_capped_history"]["leaked_files"]
+                and not cases["resource_warning_capped_history"]["stdout_leaked"]
+            ),
+            "expected": "burp-sync caps MCP history reads under an explicitly allowed critical resource warning",
+            "actual": cases["resource_warning_capped_history"],
         },
         {
             "id": "profile-validation-failure-redacts-error",
@@ -36018,6 +36207,11 @@ def run_burp_sync(args: argparse.Namespace) -> int:
         )
         return 2
 
+    resource_budget = resource_budget_for_snapshot(resource_snapshot)
+    if resource_budget and not resource_snapshot.get("resource_budget"):
+        resource_snapshot["resource_budget"] = resource_budget
+    history_count, history_count_cap = effective_burp_history_count(args.count, resource_snapshot)
+
     observe_result = None
     if args.observe:
         observe_result = run_burp_observe(args)
@@ -36118,7 +36312,9 @@ def run_burp_sync(args: argparse.Namespace) -> int:
             "requested_tool": "get_proxy_http_history_regex",
             "fallback_tool": "get_proxy_http_history",
             "tool": "get_proxy_http_history_regex",
-            "count": args.count,
+            "requested_count": args.count,
+            "count": history_count,
+            "count_cap": history_count_cap,
             "offset": args.offset,
             "fallback_used": False,
             "fallback_reason": None,
@@ -36202,9 +36398,9 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                 client,
                 sync_artifact,
                 primary_tool="get_proxy_http_history_regex",
-                primary_arguments={"count": args.count, "offset": args.offset, "regex": history_regex},
+                primary_arguments={"count": history_count, "offset": args.offset, "regex": history_regex},
                 fallback_tool="get_proxy_http_history",
-                fallback_arguments={"count": args.count, "offset": args.offset},
+                fallback_arguments={"count": history_count, "offset": args.offset},
                 available_tools=available_mcp_tools,
             )
             raw_text = str(http_read["raw_text"])
@@ -36229,9 +36425,9 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                     client,
                     sync_artifact,
                     primary_tool="get_proxy_websocket_history_regex",
-                    primary_arguments={"count": args.count, "offset": args.offset, "regex": history_regex},
+                    primary_arguments={"count": history_count, "offset": args.offset, "regex": history_regex},
                     fallback_tool="get_proxy_websocket_history",
-                    fallback_arguments={"count": args.count, "offset": args.offset},
+                    fallback_arguments={"count": history_count, "offset": args.offset},
                     available_tools=available_mcp_tools,
                 )
                 ws_raw_text = str(ws_read["raw_text"])
@@ -36243,7 +36439,9 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                     "requested_tool": "get_proxy_websocket_history_regex",
                     "fallback_tool": "get_proxy_websocket_history",
                     "tool": ws_read["tool"],
-                    "count": args.count,
+                    "requested_count": args.count,
+                    "count": history_count,
+                    "count_cap": history_count_cap,
                     "offset": args.offset,
                     "fallback_used": ws_read["fallback_used"],
                     "fallback_reason": ws_read["fallback_reason"],
@@ -36323,6 +36521,13 @@ def run_burp_sync(args: argparse.Namespace) -> int:
     write_json(sync_path, sync_artifact)
 
     print(f"Burp MCP sync: synced via {args.mcp_url}")
+    if history_count_cap:
+        print(
+            "Burp history count capped by resource budget: "
+            f"requested={history_count_cap['requested_count']} "
+            f"effective={history_count_cap['effective_count']} "
+            f"mode={history_count_cap.get('budget_mode')}"
+        )
     if persist_http_raw_history:
         print(f"Raw HTTP history: {raw_path}")
     else:
@@ -38879,6 +39084,7 @@ def run_resource_snapshot(args: argparse.Namespace) -> int:
     if not no_write:
         write_json(output_path, snapshot)
     memory = snapshot.get("memory", {})
+    budget = snapshot.get("resource_budget", {}) or {}
     print(f"Resource snapshot: {snapshot['status']}")
     print(
         "Memory: "
@@ -38889,6 +39095,14 @@ def run_resource_snapshot(args: argparse.Namespace) -> int:
     )
     warnings = snapshot.get("warnings", []) or []
     print(f"Warnings: {', '.join(warnings) if warnings else 'none'}")
+    if budget:
+        print(
+            "Resource budget: "
+            f"mode={budget.get('mode')} "
+            f"offline_preview_limit={budget.get('offline_command_preview_limit')} "
+            f"burp_history_count_limit={budget.get('burp_history_count_limit')} "
+            f"active_target_traffic={budget.get('active_target_traffic')}"
+        )
     port_text = ", ".join(
         f"{port}={'listening' if status.get('listening') else 'closed'}"
         for port, status in snapshot.get("watched_ports", {}).items()
@@ -39784,10 +39998,12 @@ def run_validation_plan(args: argparse.Namespace) -> int:
     )
     if resource_preflight and resource_preflight.get("status") != "not-run":
         warnings = resource_preflight.get("warnings", []) or []
+        budget = resource_preflight.get("resource_budget", {}) or {}
         print(
             "Current resource gate: "
             f"{resource_preflight.get('status')} "
-            f"warnings={','.join(warnings) if warnings else 'none'}"
+            f"warnings={','.join(warnings) if warnings else 'none'} "
+            f"budget={budget.get('mode') or 'unknown'}"
         )
     if command_safety:
         print(f"Command safety: {format_command_safety_summary(command_safety)}")
@@ -39977,19 +40193,23 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
         "Inputs: "
         f"validation_plan={summary.get('validation_plan')} "
         f"artifact_health={summary.get('artifact_health')} "
-        f"resource={summary.get('current_resource_snapshot')}"
+        f"resource={summary.get('current_resource_snapshot')} "
+        f"budget={summary.get('resource_budget_mode')}"
     )
     if resource_preflight and resource_preflight.get("status") != "not-run":
         warnings = resource_preflight.get("warnings", []) or []
+        budget = resource_preflight.get("resource_budget", {}) or {}
         print(
             "Current resource gate: "
             f"{resource_preflight.get('status')} "
-            f"warnings={','.join(warnings) if warnings else 'none'}"
+            f"warnings={','.join(warnings) if warnings else 'none'} "
+            f"budget={budget.get('mode') or summary.get('resource_budget_mode') or 'unknown'}"
         )
     print(
         "Commands: "
         f"artifact_repair={summary.get('artifact_repair_commands', 0)} "
         f"offline={summary.get('offline_commands', 0)} "
+        f"offline_preview_limit={summary.get('offline_command_preview_limit', 0)} "
         f"resource_checks={summary.get('resource_check_commands', 0)} "
         f"active_after_gate={summary.get('active_after_resource_gate_commands', 0)} "
         f"artifact_blocked_active={summary.get('artifact_health_blocked_active_commands', 0)} "
@@ -41492,7 +41712,7 @@ def build_parser() -> argparse.ArgumentParser:
     resource_snapshot.add_argument(
         "--max-processes",
         type=positive_int,
-        default=12,
+        default=8,
         help="Number of top RSS processes to include.",
     )
     resource_snapshot.add_argument(
@@ -41504,8 +41724,8 @@ def build_parser() -> argparse.ArgumentParser:
     resource_snapshot.add_argument(
         "--warn-available-mib",
         type=positive_int,
-        default=1024,
-        help="Warn when MemAvailable is below this many MiB.",
+        default=DEFAULT_RESOURCE_WARN_AVAILABLE_MIB,
+        help=f"Warn when MemAvailable is below this many MiB. Defaults to {DEFAULT_RESOURCE_WARN_AVAILABLE_MIB}.",
     )
     resource_snapshot.add_argument(
         "--warn-swap-used-mib",
