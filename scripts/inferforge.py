@@ -16065,7 +16065,7 @@ def build_verification_queue(
                     cmd(f"decode-transactions --input {transaction_payload_path}"),
                 ]
             )
-        commands.append(cmd("audit --include-external --ws-resource-probes"))
+        commands.append(cmd(audit_policy["subcommand"]))
         add_item(
             "RESOLVE-attack-strategy-external-evidence",
             "Resolve attack strategy external evidence",
@@ -16132,14 +16132,14 @@ def build_verification_queue(
             commands = [
                 cmd(f"collect-quote --direction buy --wallet {PLACEHOLDER_REAL_WALLET} --amount-in 1000000"),
                 cmd(f"decode-transactions --input {transaction_payload_path}"),
-                cmd("audit --include-external --ws-resource-probes"),
+                cmd(audit_policy["subcommand"]),
             ]
             status = "blocked-external"
         elif gap_id == "GAP-orca-real-address-cache-baseline":
             prerequisites = [str(gap.get("safe_next_step"))]
             commands = [
                 cmd(f"collect-orca-baseline --address {PLACEHOLDER_APPROVED_POOL_ADDRESS}"),
-                cmd("audit --include-external --ws-resource-probes"),
+                cmd(audit_policy["subcommand"]),
             ]
             status = "manual-review"
         else:
