@@ -22046,8 +22046,7 @@ def build_artifact_manifest(
                 if path.name in status_source_names:
                     status_sources[path.name] = json_status_snapshot(data)
         elif path.suffix == ".jsonl":
-            lines = path.read_text(encoding="utf-8").splitlines()
-            row["line_count"] = sum(1 for line in lines if line.strip())
+            row["line_count"] = count_jsonl_rows(path)
         artifact_rows.append(row)
 
     names = {row["name"] for row in artifact_rows}
@@ -22264,23 +22263,24 @@ def parse_artifact_json(path: Path) -> tuple[dict[str, Any] | None, dict[str, An
 def parse_artifact_jsonl(path: Path) -> tuple[int, list[dict[str, Any]]]:
     rows = 0
     errors = []
-    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        rows += 1
-        try:
-            json.loads(line)
-        except Exception as error:
-            errors.append(
-                {
-                    "file": path.name,
-                    "line": lineno,
-                    "kind": "jsonl",
-                    "error": str(error),
-                }
-            )
-            if len(errors) >= 10:
-                break
+    with path.open("r", encoding="utf-8") as handle:
+        for lineno, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            rows += 1
+            try:
+                json.loads(line)
+            except Exception as error:
+                errors.append(
+                    {
+                        "file": path.name,
+                        "line": lineno,
+                        "kind": "jsonl",
+                        "error": str(error),
+                    }
+                )
+                if len(errors) >= 10:
+                    break
     return rows, errors
 
 
@@ -34819,6 +34819,11 @@ def run_artifact_health(args: argparse.Namespace) -> int:
             f"source_peek_requests={statuses.get('source_peek_requests')} "
             f"burp_observation={statuses.get('burp_observation_coverage')}"
         )
+        missing_required = item.get("missing_required", []) or []
+        for missing_name in missing_required[:8]:
+            print(f"  missing: {missing_name}")
+        if len(missing_required) > 8:
+            print(f"  missing: {len(missing_required) - 8} more required artifact(s); inspect artifact-health.json")
         stale_inputs = item.get("stale_inputs", []) or []
         for stale_issue in stale_inputs[:3]:
             print(f"  stale: {format_artifact_health_stale_issue(stale_issue)}")
