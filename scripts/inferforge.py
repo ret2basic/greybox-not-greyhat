@@ -2266,6 +2266,68 @@ def nextjs_pages_api_path(api_file: Path, source_root: Path) -> str | None:
     return None
 
 
+def source_without_js_comments_and_strings(source: str) -> str:
+    output: list[str] = []
+    index = 0
+    state = "code"
+    quote = ""
+    escaped = False
+    while index < len(source):
+        char = source[index]
+        next_char = source[index + 1] if index + 1 < len(source) else ""
+        if state == "code":
+            if char == "/" and next_char == "/":
+                output.extend([" ", " "])
+                index += 2
+                state = "line-comment"
+                continue
+            if char == "/" and next_char == "*":
+                output.extend([" ", " "])
+                index += 2
+                state = "block-comment"
+                continue
+            if char in {"'", '"', "`"}:
+                output.append(char)
+                quote = char
+                escaped = False
+                state = "string"
+                index += 1
+                continue
+            output.append(char)
+            index += 1
+            continue
+        if state == "line-comment":
+            output.append("\n" if char == "\n" else " ")
+            if char == "\n":
+                state = "code"
+            index += 1
+            continue
+        if state == "block-comment":
+            if char == "*" and next_char == "/":
+                output.extend([" ", " "])
+                index += 2
+                state = "code"
+                continue
+            output.append("\n" if char == "\n" else " ")
+            index += 1
+            continue
+        if state == "string":
+            if escaped:
+                output.append("\n" if char == "\n" else " ")
+                escaped = False
+            elif char == "\\":
+                output.append(" ")
+                escaped = True
+            elif char == quote:
+                output.append(char)
+                state = "code"
+            else:
+                output.append("\n" if char == "\n" else " ")
+            index += 1
+            continue
+    return "".join(output)
+
+
 def extract_export_list_route_methods(source: str) -> set[str]:
     methods: set[str] = set()
     for match in re.finditer(r"\bexport\s+(?!type\b)\{([^}]+)\}(?:\s+from\b[^;]*)?", source, re.S):
@@ -2281,9 +2343,10 @@ def extract_export_list_route_methods(source: str) -> set[str]:
 
 
 def extract_route_methods(source: str) -> list[str]:
-    methods = set(re.findall(r"export\s+(?:async\s+)?function\s+([A-Z]+)\b", source))
-    methods.update(re.findall(r"export\s+const\s+([A-Z]+)\b(?:\s*:[^\n=]+)?\s*=", source))
-    methods.update(extract_export_list_route_methods(source))
+    scan_source = source_without_js_comments_and_strings(source)
+    methods = set(re.findall(r"export\s+(?:async\s+)?function\s+([A-Z]+)\b", scan_source))
+    methods.update(re.findall(r"export\s+const\s+([A-Z]+)\b(?:\s*:[^\n=]+)?\s*=", scan_source))
+    methods.update(extract_export_list_route_methods(scan_source))
     return sorted(method for method in methods if method in HTTP_METHODS)
 
 
@@ -23159,6 +23222,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "type RouteHandler = () => Response\n"
             "export const PUT: RouteHandler = () => Response.json({ ok: true })\n"
         ),
+        "commented_exports_ignored": extract_route_methods(
+            "// export async function DELETE() { return Response.json({ ok: true }) }\n"
+            "/* export const PATCH = () => Response.json({ ok: true }) */\n"
+        ),
+        "string_exports_ignored": extract_route_methods(
+            "const fixture = \"export async function DELETE() { return Response.json({ ok: true }) }\"\n"
+        ),
         "type_export_ignored": extract_route_methods("export type { GET } from './types'\n"),
     }
     route_method_export_list_passed = (
@@ -23166,6 +23236,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and route_method_export_list_samples.get("direct_reexport") == ["GET"]
         and route_method_export_list_samples.get("renamed_reexport") == ["PATCH"]
         and route_method_export_list_samples.get("typed_const_export") == ["PUT"]
+        and route_method_export_list_samples.get("commented_exports_ignored") == []
+        and route_method_export_list_samples.get("string_exports_ignored") == []
         and route_method_export_list_samples.get("type_export_ignored") == []
     )
     any_method_match_reasons = entrypoint_match_reasons(
