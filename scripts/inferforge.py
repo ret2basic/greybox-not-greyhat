@@ -23447,6 +23447,16 @@ def format_command_ref_label(ref: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def format_iteration_action_command_label(action: dict[str, Any], ref: dict[str, Any]) -> str:
+    label = format_command_ref_label(ref)
+    action_status = str(action.get("status") or "")
+    if not action_status.startswith("blocked"):
+        return label
+    if label.startswith("[") and "]" in label:
+        return f"[{action_status}]{label[label.index(']') + 1:]}"
+    return f"[{action_status}] {label}".strip()
+
+
 def review_blocker_group_command_refs(group: dict[str, Any]) -> list[dict[str, Any]]:
     commands = review_blocker_group_command_templates(group)
     item_status = review_blocker_command_status(str(group.get("status") or ""))
@@ -28167,6 +28177,10 @@ def build_no_write_selftest() -> dict[str, Any]:
     ready_followup_preview_lines = verification_queue_followup_preview_lines(
         {"id": "READY-commandless", "status": "ready", "reason": "No preview expected."}
     )
+    blocked_iteration_command_label = format_iteration_action_command_label(
+        {"status": "blocked-resource"},
+        {"classification": "ready"},
+    )
     regression_health_summary_line = regression_suite_artifact_health_summary_line(
         {
             "status": "needs-human-review",
@@ -28650,6 +28664,12 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "parse_errors": harness_followup_parse_errors,
             },
+        },
+        {
+            "id": "iteration-action-command-label-prefers-blocked-action-status",
+            "passed": blocked_iteration_command_label == "[blocked-resource]",
+            "expected": "blocked iteration actions print the action blocker status instead of a misleading ready command label",
+            "actual": blocked_iteration_command_label,
         },
         {
             "id": "regression-suite-final-summary-lines-surface-health-gates",
@@ -41485,7 +41505,10 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
             )
             if args.show_commands:
                 for ref in (action.get("commands", []) or [])[:3]:
-                    print(f"    - {format_command_ref_label(ref)} {inline_summary_text(ref.get('command'), max_chars=420)}")
+                    print(
+                        f"    - {format_iteration_action_command_label(action, ref)} "
+                        f"{inline_summary_text(ref.get('command'), max_chars=420)}"
+                    )
 
     if no_write:
         print("No files written (--no-write).")
