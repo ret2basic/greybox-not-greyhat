@@ -8580,6 +8580,12 @@ def hypotheses_from_credential_proxy_review(
             continue
         file_name = str(row.get("file") or "")
         path = app_route_path_from_source_file(file_name)
+        control_context = (
+            row.get("route_bound_control_context")
+            if isinstance(row.get("route_bound_control_context"), dict)
+            else {}
+        )
+        control_summary = control_context.get("summary", {}) if isinstance(control_context.get("summary"), dict) else {}
         source_refs = [
             f"{ref.get('file')}:{ref.get('line')}"
             for ref in [
@@ -8629,6 +8635,11 @@ def hypotheses_from_credential_proxy_review(
                     "external_upstream_ref_count": len(row.get("external_upstream_refs", []) or []),
                     "auth_guard_ref_count": len(row.get("auth_guard_refs", []) or []),
                     "rate_limit_guard_ref_count": len(row.get("rate_limit_guard_refs", []) or []),
+                    "route_bound_control_status": control_context.get("status"),
+                    "route_bound_auth_guard_ref_count": control_summary.get("route_bound_auth_guard_refs", 0),
+                    "route_bound_rate_limit_guard_ref_count": control_summary.get("route_bound_rate_limit_guard_refs", 0),
+                    "unbound_auth_guard_ref_count": control_summary.get("unbound_auth_guard_refs", 0),
+                    "unbound_rate_limit_guard_ref_count": control_summary.get("unbound_rate_limit_guard_refs", 0),
                     "required_evidence": review.get("required_evidence", []),
                     "review_question": row.get("review_question"),
                 },
@@ -16399,7 +16410,143 @@ def build_quote_source_contract_review(
     }
 
 
-def build_server_credential_proxy_review(refs_by_group: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+def refs_for_file_name(refs: list[dict[str, Any]], file_name: str) -> list[dict[str, Any]]:
+    return [ref for ref in refs if str(ref.get("file") or "") == file_name]
+
+
+def source_ref_parent_dir(file_name: str) -> str:
+    normalized = file_name.replace("\\", "/").strip("/")
+    return normalized.rsplit("/", 1)[0] if "/" in normalized else ""
+
+
+def credential_proxy_route_bound_control_context(
+    *,
+    source_root: Path,
+    file_name: str,
+    auth_refs: list[dict[str, Any]],
+    rate_refs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    route_path = app_route_path_from_source_file(file_name)
+    route_dir = source_ref_parent_dir(file_name)
+    same_file_auth_refs = refs_for_file_name(auth_refs, file_name)
+    same_file_rate_refs = refs_for_file_name(rate_refs, file_name)
+    same_dir_auth_refs = [
+        ref
+        for ref in auth_refs
+        if str(ref.get("file") or "") != file_name
+        and source_ref_parent_dir(str(ref.get("file") or "")) == route_dir
+    ]
+    same_dir_rate_refs = [
+        ref
+        for ref in rate_refs
+        if str(ref.get("file") or "") != file_name
+        and source_ref_parent_dir(str(ref.get("file") or "")) == route_dir
+    ]
+
+    middleware_context = []
+    middleware_files_for_route: set[str] = set()
+    if route_path:
+        middleware_entries = discover_nextjs_middleware(source_root)
+        middleware_context = middleware_context_for_endpoint(
+            source_root,
+            middleware_entries,
+            "GET",
+            route_path,
+        )
+        middleware_files_for_route = {
+            str(item.get("source_ref") or "").replace("\\", "/")
+            for item in middleware_context
+            if item.get("source_ref")
+        }
+        middleware_files_for_route.update(
+            str(item.get("source_ref") or "").replace("\\", "/").split(str(source_root.name) + "/", 1)[-1]
+            for item in middleware_context
+            if item.get("source_ref")
+        )
+        middleware_files_for_route.update(
+            str(item.get("file") or "").replace("\\", "/")
+            for entry in middleware_entries
+            for item in middleware_context
+            if item.get("id") == entry.get("id")
+        )
+
+    def ref_in_middleware(ref: dict[str, Any]) -> bool:
+        ref_file = str(ref.get("file") or "").replace("\\", "/")
+        return ref_file in middleware_files_for_route or any(
+            source_file.endswith("/" + ref_file) for source_file in middleware_files_for_route
+        )
+
+    middleware_auth_refs = [ref for ref in auth_refs if ref_in_middleware(ref)]
+    middleware_rate_refs = [ref for ref in rate_refs if ref_in_middleware(ref)]
+    bound_auth_refs = ordered_unique_ref_dicts([*same_file_auth_refs, *same_dir_auth_refs, *middleware_auth_refs])
+    bound_rate_refs = ordered_unique_ref_dicts([*same_file_rate_refs, *same_dir_rate_refs, *middleware_rate_refs])
+    bound_files = {
+        str(ref.get("file") or "")
+        for ref in [*bound_auth_refs, *bound_rate_refs]
+        if ref.get("file")
+    }
+    unbound_auth_refs = [
+        ref
+        for ref in auth_refs
+        if str(ref.get("file") or "") not in bound_files and str(ref.get("file") or "") != file_name
+    ]
+    unbound_rate_refs = [
+        ref
+        for ref in rate_refs
+        if str(ref.get("file") or "") not in bound_files and str(ref.get("file") or "") != file_name
+    ]
+    status = "route-bound-controls-indexed" if bound_auth_refs or bound_rate_refs else "no-route-bound-controls"
+    return {
+        "status": status,
+        "route_path": route_path,
+        "route_directory": route_dir,
+        "same_file_auth_guard_refs": same_file_auth_refs[:8],
+        "same_file_rate_limit_guard_refs": same_file_rate_refs[:8],
+        "route_directory_auth_guard_refs": same_dir_auth_refs[:8],
+        "route_directory_rate_limit_guard_refs": same_dir_rate_refs[:8],
+        "middleware_context": middleware_context[:4],
+        "middleware_auth_guard_refs": middleware_auth_refs[:8],
+        "middleware_rate_limit_guard_refs": middleware_rate_refs[:8],
+        "route_bound_auth_guard_refs": bound_auth_refs[:12],
+        "route_bound_rate_limit_guard_refs": bound_rate_refs[:12],
+        "unbound_auth_guard_refs": unbound_auth_refs[:8],
+        "unbound_rate_limit_guard_refs": unbound_rate_refs[:8],
+        "summary": {
+            "same_file_auth_guard_refs": len(same_file_auth_refs),
+            "same_file_rate_limit_guard_refs": len(same_file_rate_refs),
+            "route_directory_auth_guard_refs": len(same_dir_auth_refs),
+            "route_directory_rate_limit_guard_refs": len(same_dir_rate_refs),
+            "middleware_auth_guard_refs": len(middleware_auth_refs),
+            "middleware_rate_limit_guard_refs": len(middleware_rate_refs),
+            "route_bound_auth_guard_refs": len(bound_auth_refs),
+            "route_bound_rate_limit_guard_refs": len(bound_rate_refs),
+            "unbound_auth_guard_refs": len(unbound_auth_refs),
+            "unbound_rate_limit_guard_refs": len(unbound_rate_refs),
+        },
+        "review_note": (
+            "Only same-file controls, same-route-directory helper controls, and middleware/proxy controls "
+            "whose matcher covers this route are treated as route-bound evidence."
+        ),
+    }
+
+
+def ordered_unique_ref_dicts(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, Any, str]] = set()
+    unique: list[dict[str, Any]] = []
+    for ref in refs:
+        key = (str(ref.get("file") or ""), ref.get("line"), str(ref.get("token") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(ref)
+    return unique
+
+
+def build_server_credential_proxy_review(
+    refs_by_group: dict[str, list[dict[str, Any]]],
+    *,
+    source_root: Path,
+) -> dict[str, Any]:
     credential_refs = refs_by_group.get("server_credential_sources", []) or []
     upstream_refs = refs_by_group.get("server_external_upstreams", []) or []
     auth_refs = refs_by_group.get("server_auth_guards", []) or []
@@ -16408,19 +16555,29 @@ def build_server_credential_proxy_review(refs_by_group: dict[str, list[dict[str,
 
     candidate_files = sorted(transaction_flow_files_for_refs([*credential_refs, *upstream_refs]))
 
-    def refs_for_file(refs: list[dict[str, Any]], file_name: str) -> list[dict[str, Any]]:
-        return [ref for ref in refs if str(ref.get("file") or "") == file_name]
-
     files = []
     file_status_counts: dict[str, int] = {}
+    route_bound_auth_ref_count = 0
+    route_bound_rate_ref_count = 0
+    needs_review_route_bound_auth_ref_count = 0
+    needs_review_route_bound_rate_ref_count = 0
     for file_name in candidate_files:
-        file_credential_refs = refs_for_file(credential_refs, file_name)
-        file_upstream_refs = refs_for_file(upstream_refs, file_name)
-        file_auth_refs = refs_for_file(auth_refs, file_name)
-        file_rate_refs = refs_for_file(rate_refs, file_name)
-        file_validation_refs = refs_for_file(validation_refs, file_name)
+        file_credential_refs = refs_for_file_name(credential_refs, file_name)
+        file_upstream_refs = refs_for_file_name(upstream_refs, file_name)
+        file_validation_refs = refs_for_file_name(validation_refs, file_name)
+        control_context = credential_proxy_route_bound_control_context(
+            source_root=source_root,
+            file_name=file_name,
+            auth_refs=auth_refs,
+            rate_refs=rate_refs,
+        )
+        context_summary = control_context.get("summary", {}) or {}
+        route_bound_auth_refs = control_context.get("route_bound_auth_guard_refs", []) or []
+        route_bound_rate_refs = control_context.get("route_bound_rate_limit_guard_refs", []) or []
+        route_bound_auth_ref_count += int(context_summary.get("route_bound_auth_guard_refs", 0) or 0)
+        route_bound_rate_ref_count += int(context_summary.get("route_bound_rate_limit_guard_refs", 0) or 0)
         if file_credential_refs and file_upstream_refs:
-            if file_auth_refs or file_rate_refs:
+            if route_bound_auth_refs or route_bound_rate_refs:
                 status = "credential-proxy-controls-indexed"
             else:
                 status = "needs-cost-abuse-review"
@@ -16428,6 +16585,9 @@ def build_server_credential_proxy_review(refs_by_group: dict[str, list[dict[str,
             status = "partial-credential-proxy-context"
         else:
             status = "no-credential-proxy-evidence"
+        if status == "needs-cost-abuse-review":
+            needs_review_route_bound_auth_ref_count += int(context_summary.get("route_bound_auth_guard_refs", 0) or 0)
+            needs_review_route_bound_rate_ref_count += int(context_summary.get("route_bound_rate_limit_guard_refs", 0) or 0)
         increment_count(file_status_counts, status)
         files.append(
             {
@@ -16435,8 +16595,9 @@ def build_server_credential_proxy_review(refs_by_group: dict[str, list[dict[str,
                 "status": status,
                 "credential_refs": file_credential_refs[:8],
                 "external_upstream_refs": file_upstream_refs[:8],
-                "auth_guard_refs": file_auth_refs[:8],
-                "rate_limit_guard_refs": file_rate_refs[:8],
+                "auth_guard_refs": route_bound_auth_refs[:8],
+                "rate_limit_guard_refs": route_bound_rate_refs[:8],
+                "route_bound_control_context": control_context,
                 "request_validation_refs": file_validation_refs[:8],
                 "review_question": (
                     "Can unauthenticated users consume a server-side credentialed upstream, quota, or billed provider "
@@ -16468,6 +16629,10 @@ def build_server_credential_proxy_review(refs_by_group: dict[str, list[dict[str,
             "external_upstream_refs": len(upstream_refs),
             "auth_guard_refs": len(auth_refs),
             "rate_limit_guard_refs": len(rate_refs),
+            "route_bound_auth_guard_refs": route_bound_auth_ref_count,
+            "route_bound_rate_limit_guard_refs": route_bound_rate_ref_count,
+            "needs_review_route_bound_auth_guard_refs": needs_review_route_bound_auth_ref_count,
+            "needs_review_route_bound_rate_limit_guard_refs": needs_review_route_bound_rate_ref_count,
             "file_status_counts": dict(sorted(file_status_counts.items())),
         },
         "files": files,
@@ -16587,7 +16752,7 @@ def build_transaction_flow_review(
 
     policy_scaffold = build_transaction_intent_policy_scaffold(profile)
     quote_contract_review = build_quote_source_contract_review(refs_by_group, policy_scaffold)
-    credential_proxy_review = build_server_credential_proxy_review(refs_by_group)
+    credential_proxy_review = build_server_credential_proxy_review(refs_by_group, source_root=source_root)
     if quote_contract_review.get("status") == "quote-source-contract-indexed":
         contract_refs = []
         for decision in quote_contract_review.get("decisions", []) or []:
@@ -16616,7 +16781,7 @@ def build_transaction_flow_review(
             "server-credential-proxy-cost-review",
             "needs-cost-abuse-review",
             "medium",
-            "A route can call a credentialed external upstream from server-side code without same-file auth or rate-limit evidence.",
+            "A route can call a credentialed external upstream from server-side code without route-bound auth or rate-limit evidence.",
             [ref for ref in credential_refs if isinstance(ref, dict)][:12],
             "Can unauthenticated requests consume provider quota, billing, or availability through this server-side credential proxy?",
         )
@@ -34780,6 +34945,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             == 0
             and rewrite_credential_proxy_validation_item.get("credential_proxy_review", {}).get("auth_guard_ref_count")
             == 0
+            and rewrite_credential_proxy_validation_item.get("credential_proxy_review", {}).get("route_bound_control_status")
+            == "no-route-bound-controls"
+            and rewrite_credential_proxy_validation_item.get("credential_proxy_review", {}).get(
+                "route_bound_rate_limit_guard_ref_count"
+            )
+            == 0
+            and rewrite_credential_proxy_validation_item.get("credential_proxy_review", {}).get(
+                "route_bound_auth_guard_ref_count"
+            )
+            == 0
         )
         rate_limit_resource_review = rewrite_transaction_policy.get("rate_limit_resource_review", {})
         rate_limit_signal_ids = {
@@ -39887,7 +40062,9 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
             f"status={credential_proxy.get('status')}, "
             f"files_needing_review={credential_proxy_summary.get('files_needing_cost_review', 0)}, "
             f"credential_refs={credential_proxy_summary.get('credential_refs', 0)}, "
-            f"upstream_refs={credential_proxy_summary.get('external_upstream_refs', 0)}"
+            f"upstream_refs={credential_proxy_summary.get('external_upstream_refs', 0)}, "
+            f"needs_review_route_bound_auth={credential_proxy_summary.get('needs_review_route_bound_auth_guard_refs', 0)}, "
+            f"needs_review_route_bound_rate={credential_proxy_summary.get('needs_review_route_bound_rate_limit_guard_refs', 0)}"
         )
     top_count = max(0, int(args.top))
     if top_count:
@@ -40064,7 +40241,10 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         f"credential_refs={credential_review.get('credential_ref_count', 0)} "
                         f"upstream_refs={credential_review.get('external_upstream_ref_count', 0)} "
                         f"auth_refs={credential_review.get('auth_guard_ref_count', 0)} "
-                        f"rate_refs={credential_review.get('rate_limit_guard_ref_count', 0)}"
+                        f"rate_refs={credential_review.get('rate_limit_guard_ref_count', 0)} "
+                        f"route_bound={credential_review.get('route_bound_control_status') or 'unknown'} "
+                        f"unbound_auth={credential_review.get('unbound_auth_guard_ref_count', 0)} "
+                        f"unbound_rate={credential_review.get('unbound_rate_limit_guard_ref_count', 0)}"
                     )
                 rewrite_review = item.get("rewrite_review") if isinstance(item.get("rewrite_review"), dict) else {}
                 source_guard = (
