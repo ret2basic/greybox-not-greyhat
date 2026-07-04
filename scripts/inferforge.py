@@ -8168,6 +8168,11 @@ def hypothesis_from_rpc_method_policy(
     remote_refs = [
         item for item in rpc_method_policy.get("remote_transaction_material_refs", []) or [] if isinstance(item, dict)
     ]
+    static_intent_review = (
+        review.get("static_intent_review")
+        if isinstance(review.get("static_intent_review"), dict)
+        else {}
+    )
     source_refs = [
         f"{item.get('file')}:{item.get('line')}"
         for item in [*frontend_refs[:5], *remote_refs[:5]]
@@ -8211,6 +8216,8 @@ def hypothesis_from_rpc_method_policy(
                 "remote_transaction_material_ref_count",
                 len(remote_refs),
             ),
+            "static_signal_count": static_intent_review.get("signal_count", 0),
+            "static_intent_review": static_intent_review,
             "frontend_transaction_dependency_refs": frontend_refs[:5],
             "remote_transaction_material_refs": remote_refs[:5],
             "required_evidence": review.get("required_evidence", []),
@@ -14143,9 +14150,15 @@ def parse_typescript_string_set(source: str, const_name: str) -> list[str]:
     return re.findall(r"['\"]([^'\"]+)['\"]", match.group(1))
 
 
-def source_references(source_root: Path, patterns: list[str]) -> list[dict[str, Any]]:
-    refs = []
+def grouped_source_references(
+    source_root: Path,
+    pattern_groups: dict[str, list[str]],
+) -> dict[str, list[dict[str, Any]]]:
+    refs_by_group: dict[str, list[dict[str, Any]]] = {key: [] for key in pattern_groups}
     extensions = {".js", ".jsx", ".ts", ".tsx"}
+    source_dir = source_root / "src"
+    if not source_dir.exists():
+        return refs_by_group
     for path in sorted((source_root / "src").rglob("*")):
         if path.suffix not in extensions or not path.is_file():
             continue
@@ -14154,22 +14167,99 @@ def source_references(source_root: Path, patterns: list[str]) -> list[dict[str, 
         except UnicodeDecodeError:
             continue
         for index, line in enumerate(lines, start=1):
-            if any(pattern in line for pattern in patterns):
-                refs.append(
-                    {
-                        "file": source_root_relative_or_repo(path, source_root),
-                        "line": index,
-                        "sample": line.strip()[:180],
-                    }
-                )
-    return refs
+            for group, patterns in pattern_groups.items():
+                if any(pattern in line for pattern in patterns):
+                    refs_by_group[group].append(
+                        {
+                            "file": source_root_relative_or_repo(path, source_root),
+                            "line": index,
+                            "sample": line.strip()[:180],
+                        }
+                    )
+    return refs_by_group
+
+
+def source_references(source_root: Path, patterns: list[str]) -> list[dict[str, Any]]:
+    return grouped_source_references(source_root, {"matches": patterns}).get("matches", [])
+
+
+def build_transaction_flow_static_review(
+    *,
+    frontend_transaction_refs: list[dict[str, Any]],
+    remote_transaction_material_refs: list[dict[str, Any]],
+    preview_wallet_refs: list[dict[str, Any]],
+    execution_wallet_refs: list[dict[str, Any]],
+    recent_blockhash_refs: list[dict[str, Any]],
+    quote_amount_refs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    signals = []
+
+    def add_signal(signal_id: str, summary: str, refs: list[dict[str, Any]], review_question: str) -> None:
+        signals.append(
+            {
+                "id": signal_id,
+                "summary": summary,
+                "ref_count": len(refs),
+                "refs": refs[:6],
+                "review_question": review_question,
+            }
+        )
+
+    if frontend_transaction_refs and remote_transaction_material_refs:
+        add_signal(
+            "remote-payload-to-wallet-signing",
+            "Remote transaction material is deserialized before a wallet signing call.",
+            [*remote_transaction_material_refs[:3], *frontend_transaction_refs[:3]],
+            "Do decoded signer, writable account, mint, amount, and program IDs match the user's intended swap?",
+        )
+    if preview_wallet_refs and execution_wallet_refs:
+        add_signal(
+            "preview-wallet-execution-wallet-review",
+            "Quote preview and execution paths can use different wallet inputs.",
+            [*preview_wallet_refs[:3], *execution_wallet_refs[:3]],
+            "Does a preview quote ever get reused for execution, or does execution fetch a fresh quote for the connected wallet?",
+        )
+    if remote_transaction_material_refs and recent_blockhash_refs:
+        add_signal(
+            "client-recent-blockhash-rewrite",
+            "Client code refreshes recentBlockhash on a remotely supplied transaction before signing.",
+            recent_blockhash_refs,
+            "After blockhash replacement, do all decoded accounts, signers, and program IDs still match approved intent?",
+        )
+    if remote_transaction_material_refs and quote_amount_refs:
+        add_signal(
+            "quote-amount-intent-review",
+            "Quote amount fields are displayed or reused near remote transaction payload handling.",
+            quote_amount_refs,
+            "Do decoded token account changes agree with requested amountIn and displayed amountOut?",
+        )
+
+    return {
+        "status": "needs-decoded-intent-review" if signals else "no-static-intent-signals",
+        "signal_count": len(signals),
+        "signals": signals,
+        "required_comparisons": [
+            "Compare the executing wallet with decoded signer accounts.",
+            "Compare requested source/destination mints with decoded static account keys and loaded account review notes.",
+            "Compare requested amountIn and displayed amountOut with decoded token movement when available.",
+            "Review all compiled instruction program IDs against the profile allowedPrograms list.",
+        ],
+        "safety": "Static intent signals only. They define decode-transactions review questions and are not reportable findings by themselves.",
+    }
 
 
 def build_remote_transaction_signing_review(
     *,
     frontend_transaction_refs: list[dict[str, Any]],
     remote_transaction_material_refs: list[dict[str, Any]],
+    static_intent_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    static_review = static_intent_review or {
+        "status": "not-run",
+        "signal_count": 0,
+        "signals": [],
+        "required_comparisons": [],
+    }
     if frontend_transaction_refs and remote_transaction_material_refs:
         status = "needs-transaction-intent-corpus"
         priority = "high"
@@ -14189,22 +14279,31 @@ def build_remote_transaction_signing_review(
         status = "no-static-remote-signing-pattern"
         priority = "info"
         next_step = "No static remote-transaction signing pattern was found in the scanned source tree."
+    required_evidence = [
+        "One approved quote response or transaction payload corpus collected without wallet signing.",
+        "decode-transactions output tied to expected wallet, sender, recipient, amount, mints, and allowed programs.",
+        "A finding-gate decision showing concrete transaction-integrity impact rather than source pattern presence.",
+    ]
+    if static_review.get("signal_count"):
+        required_evidence.extend(
+            [
+                "Decoded transaction signer accounts compared against the executing wallet, not only a quote-preview wallet.",
+                "Decoded program IDs, account keys, and token movement reviewed after any client-side recentBlockhash refresh.",
+            ]
+        )
     return {
         "status": status,
         "priority": priority,
         "frontend_signing_ref_count": len(frontend_transaction_refs),
         "remote_transaction_material_ref_count": len(remote_transaction_material_refs),
+        "static_intent_review": static_review,
         "reportability_gate": (
             "Static remote-transaction signing flow evidence is not reportable by itself. "
             "Escalate only with decoded transaction intent mismatch, unsafe signer/account/mint/program behavior, "
             "or another concrete user-funds impact, without signing or submitting transactions."
         ),
         "next_step": next_step,
-        "required_evidence": [
-            "One approved quote response or transaction payload corpus collected without wallet signing.",
-            "decode-transactions output tied to expected wallet, sender, recipient, amount, mints, and allowed programs.",
-            "A finding-gate decision showing concrete transaction-integrity impact rather than source pattern presence.",
-        ],
+        "required_evidence": required_evidence,
         "safety": (
             "Offline source review only. Do not sign wallets, submit transactions, trade, or treat this static pattern "
             "as a vulnerability finding without decoded intent evidence."
@@ -14417,22 +14516,41 @@ def build_rpc_method_policy(
     env_configured_methods = os.environ.get("SOLANA_RPC_PROXY_ALLOWED_METHODS")
     env_allow_transaction_methods = os.environ.get("SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS")
     explicit_gate_present = "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS" in rpc_source
-    frontend_transaction_refs = source_references(
+    source_ref_groups = grouped_source_references(
         source_root,
-        ["walletProvider.sendTransaction", "sendRawTransaction", "sendTransaction("],
+        {
+            "frontend_transaction_refs": ["walletProvider.sendTransaction", "sendRawTransaction", "sendTransaction("],
+            "remote_transaction_material_refs": [
+                "VersionedTransaction.deserialize",
+                "deserializeTransaction(",
+                "transactionBase64s",
+                "payload.data.transaction",
+            ],
+            "proxy_connection_refs": ["/api/rpc/solana/", "getSolanaRpcProxyUrl", "getSolanaRpcProxyEndpoint"],
+            "preview_wallet_refs": [
+                "NEXT_PUBLIC_M0_QUOTE_PREVIEW_WALLET",
+                "previewWallet",
+                "fetchQuote(rawAmount, direction, previewWallet",
+            ],
+            "execution_wallet_refs": [
+                "fetchQuote(requestedRawAmount, direction, solanaAddress",
+                "sender: walletAddress",
+                "recipient: walletAddress",
+            ],
+            "recent_blockhash_refs": ["getLatestBlockhash", "recentBlockhash"],
+            "quote_amount_refs": ["quote.amountIn", "quote.amountOut", "requestedRawAmount"],
+        },
     )
-    remote_transaction_material_refs = source_references(
-        source_root,
-        [
-            "VersionedTransaction.deserialize",
-            "deserializeTransaction(",
-            "transactionBase64s",
-            "payload.data.transaction",
-        ],
-    )
-    proxy_connection_refs = source_references(
-        source_root,
-        ["/api/rpc/solana/", "getSolanaRpcProxyUrl", "getSolanaRpcProxyEndpoint"],
+    frontend_transaction_refs = source_ref_groups["frontend_transaction_refs"]
+    remote_transaction_material_refs = source_ref_groups["remote_transaction_material_refs"]
+    proxy_connection_refs = source_ref_groups["proxy_connection_refs"]
+    static_intent_review = build_transaction_flow_static_review(
+        frontend_transaction_refs=frontend_transaction_refs,
+        remote_transaction_material_refs=remote_transaction_material_refs,
+        preview_wallet_refs=source_ref_groups["preview_wallet_refs"],
+        execution_wallet_refs=source_ref_groups["execution_wallet_refs"],
+        recent_blockhash_refs=source_ref_groups["recent_blockhash_refs"],
+        quote_amount_refs=source_ref_groups["quote_amount_refs"],
     )
 
     if default_high_impact:
@@ -14464,6 +14582,7 @@ def build_rpc_method_policy(
         "remote_transaction_signing_review": build_remote_transaction_signing_review(
             frontend_transaction_refs=frontend_transaction_refs,
             remote_transaction_material_refs=remote_transaction_material_refs,
+            static_intent_review=static_intent_review,
         ),
         "proxy_connection_refs": proxy_connection_refs,
         "transaction_probe_results": transaction_probe_results,
@@ -30568,9 +30687,29 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 """
                 import { extractRemoteTransactions } from '@/lib/remote-tx'
 
-                export async function executeRemoteSwap(walletProvider, connection, payloads) {
-                  const txs = await extractRemoteTransactions(payloads)
+                const M0_QUOTE_PREVIEW_WALLET = process.env.NEXT_PUBLIC_M0_QUOTE_PREVIEW_WALLET
+
+                async function fetchQuote(rawAmount, direction, walletAddress) {
+                  return {
+                    amountIn: rawAmount,
+                    amountOut: '1',
+                    sender: walletAddress,
+                    recipient: walletAddress,
+                    payloads: [],
+                  }
+                }
+
+                export async function previewRemoteSwap(rawAmount, direction) {
+                  const previewWallet = M0_QUOTE_PREVIEW_WALLET
+                  return fetchQuote(rawAmount, direction, previewWallet)
+                }
+
+                export async function executeRemoteSwap(walletProvider, connection, solanaAddress, requestedRawAmount, direction) {
+                  const executableQuote = await fetchQuote(requestedRawAmount, direction, solanaAddress)
+                  const txs = await extractRemoteTransactions(executableQuote.payloads)
                   for (const tx of txs) {
+                    const { blockhash } = await connection.getLatestBlockhash('confirmed')
+                    tx.message.recentBlockhash = blockhash
                     await walletProvider.sendTransaction(tx, connection)
                   }
                 }
@@ -31322,22 +31461,38 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rewrite_burp_rows.get("route-api-proxy-path", {}).get("review_candidate_count") == 1
             and rewrite_gap_id in rewrite_burp_rows.get("route-api-proxy-path", {}).get("evidence_gaps", [])
         )
+        transaction_static_review = (
+            rewrite_transaction_policy.get("remote_transaction_signing_review", {}).get("static_intent_review", {})
+        )
+        transaction_static_signal_ids = {
+            signal.get("id")
+            for signal in transaction_static_review.get("signals", [])
+            if isinstance(signal, dict)
+        }
         transaction_flow_hypothesis_passed = (
             rewrite_transaction_policy.get("remote_transaction_signing_review", {}).get("status")
             == "needs-transaction-intent-corpus"
             and rewrite_transaction_policy.get("remote_transaction_signing_review", {}).get("priority") == "high"
             and len(rewrite_transaction_policy.get("frontend_transaction_dependency_refs", []) or []) >= 1
             and len(rewrite_transaction_policy.get("remote_transaction_material_refs", []) or []) >= 1
+            and transaction_static_review.get("status") == "needs-decoded-intent-review"
+            and {
+                "remote-payload-to-wallet-signing",
+                "preview-wallet-execution-wallet-review",
+                "client-recent-blockhash-rewrite",
+            }.issubset(transaction_static_signal_ids)
             and rewrite_transaction_matrix.get("summary", {}).get("rpc_method_policy_source") == "profile-fallback"
             and rewrite_transaction_hypothesis is not None
             and rewrite_transaction_hypothesis.get("status") == "ready-for-offline-review"
             and rewrite_transaction_hypothesis.get("impact") == "transaction-integrity"
             and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("status")
             == "needs-transaction-intent-corpus"
+            and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
             and rewrite_transaction_validation_item is not None
             and rewrite_transaction_validation_item.get("status") == "ready-offline"
             and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("status")
             == "needs-transaction-intent-corpus"
+            and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
         )
         rewrite_server_action_report_lines = rewrite_source_resolver_report.get("server_action_lines", [])
         rewrite_discovery_passed = (
@@ -35934,7 +36089,8 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         "  transaction_flow_review="
                         f"{transaction_flow.get('status')} "
                         f"frontend_refs={transaction_flow.get('frontend_signing_ref_count', 0)} "
-                        f"remote_tx_refs={transaction_flow.get('remote_transaction_material_ref_count', 0)}"
+                        f"remote_tx_refs={transaction_flow.get('remote_transaction_material_ref_count', 0)} "
+                        f"static_signals={transaction_flow.get('static_signal_count', 0)}"
                     )
                 rewrite_review = item.get("rewrite_review") if isinstance(item.get("rewrite_review"), dict) else {}
                 read_only_candidates = rewrite_review.get("read_only_path_candidates", []) or []

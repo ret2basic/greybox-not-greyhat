@@ -292,6 +292,11 @@ transaction material flowing toward wallet signing calls, the matrix adds a
 `transaction-flow-review` hypothesis. This is offline-only: the next step is to
 collect an approved transaction corpus and run `decode-transactions`, not to
 sign or submit a wallet transaction.
+The RPC/source policy also records static transaction-intent signals such as
+preview-wallet versus execution-wallet paths, remote payload deserialization,
+and client-side recent-blockhash refreshes. These signals only define what the
+decoded corpus must be compared against; they are not vulnerability findings on
+their own.
 
 Use `rewrite-review` for the dedicated fixed-upstream rewrite/proxy review:
 
