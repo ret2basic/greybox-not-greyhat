@@ -9110,6 +9110,42 @@ def build_rewrite_review_rollup(
     }
 
 
+def transaction_flow_review_for_hypothesis_matrix(
+    *,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    rpc_method_policy: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str]:
+    artifact = load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT)
+    if isinstance(artifact, dict) and isinstance(artifact.get("quote_source_contract_review"), dict):
+        return artifact, "artifact"
+
+    profile_doc = profile if isinstance(profile, dict) else {}
+    if not profile_doc:
+        profile_doc = load_optional_json(artifact_dir / TARGET_PROFILE_ARTIFACT) or {}
+
+    stale_source = "stale-artifact-schema" if artifact else "missing"
+    if not profile_doc:
+        return artifact or {}, stale_source
+    if is_blackbox_profile_like(profile_doc):
+        return artifact or {}, f"{stale_source}-blackbox"
+
+    source_root = resolve_repo_path(profile_doc.get("default_source_root") or DEFAULT_SOURCE_ROOT)
+    if not source_root.exists():
+        return artifact or {}, "source-unavailable" if not artifact else "stale-artifact-source-unavailable"
+
+    transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {}
+    return (
+        build_transaction_flow_review(
+            source_root,
+            profile_doc,
+            transaction_intent=transaction_intent,
+            rpc_method_policy=rpc_method_policy or {},
+        ),
+        "profile-fallback" if not artifact else "profile-fallback-stale-artifact-schema",
+    )
+
+
 def build_hypothesis_matrix_run(
     *,
     target: str,
@@ -9127,7 +9163,11 @@ def build_hypothesis_matrix_run(
         profile=profile,
         artifact_dir=artifact_dir,
     )
-    transaction_flow_review = load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT) or {}
+    transaction_flow_review, transaction_flow_review_source = transaction_flow_review_for_hypothesis_matrix(
+        profile=profile,
+        artifact_dir=artifact_dir,
+        rpc_method_policy=rpc_method_policy,
+    )
     asset_candidates = load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT) or {}
     harness_loop = build_harness_loop_run(target=target, profile=profile, artifact_dir=artifact_dir)
 
@@ -9265,6 +9305,7 @@ def build_hypothesis_matrix_run(
             "resource_snapshot": artifact_summary_status(resource_snapshot),
             "endpoint_clusters_source": endpoint_clusters_source,
             "rpc_method_policy_source": rpc_method_policy_source,
+            "transaction_flow_review_source": transaction_flow_review_source,
         },
         "hypotheses": deduped,
         "artifact_refs": {
@@ -33486,6 +33527,28 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             profile=rewrite_normalized,
             artifact_dir=rewrite_transaction_matrix_dir,
         )
+        rewrite_transaction_stale_matrix_dir = Path(temp_dir) / "transaction-flow-stale-artifacts"
+        rewrite_transaction_stale_matrix_dir.mkdir()
+        write_json(
+            rewrite_transaction_stale_matrix_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT,
+            {
+                "status": "needs-transaction-intent-corpus",
+                "summary": {"remote_signing_sink_refs": 1},
+            },
+        )
+        rewrite_transaction_stale_matrix = build_hypothesis_matrix_run(
+            target="http://127.0.0.1:9998",
+            profile=rewrite_normalized,
+            artifact_dir=rewrite_transaction_stale_matrix_dir,
+        )
+        rewrite_transaction_stale_hypothesis = next(
+            (
+                item
+                for item in rewrite_transaction_stale_matrix.get("hypotheses", [])
+                if item.get("type") == "transaction-flow-review"
+            ),
+            None,
+        )
         rewrite_transaction_hypothesis = next(
             (
                 item
@@ -34122,6 +34185,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and "remote-payload-to-wallet-signing" in transaction_flow_review_dataflow_ids
             and "quote-source-contract-indexed" in transaction_flow_review_dataflow_ids
             and rewrite_transaction_matrix.get("summary", {}).get("rpc_method_policy_source") == "profile-fallback"
+            and rewrite_transaction_matrix.get("summary", {}).get("transaction_flow_review_source") == "artifact"
+            and rewrite_transaction_stale_matrix.get("summary", {}).get("transaction_flow_review_source")
+            == "profile-fallback-stale-artifact-schema"
+            and rewrite_transaction_stale_hypothesis is not None
+            and rewrite_transaction_stale_hypothesis.get("transaction_flow_review", {}).get("quote_source_contract_status")
+            == "quote-source-contract-indexed"
             and rewrite_transaction_hypothesis is not None
             and rewrite_transaction_hypothesis.get("status") == "ready-for-offline-review"
             and rewrite_transaction_hypothesis.get("impact") == "transaction-integrity"

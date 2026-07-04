@@ -295,6 +295,9 @@ transaction material flowing toward wallet signing calls, the matrix adds a
 `transaction-flow-review` hypothesis. This is offline-only: the next step is to
 collect an approved transaction corpus and run `decode-transactions`, not to
 sign or submit a wallet transaction.
+If the transaction-flow artifact is missing or from an older schema, matrix and
+validation-plan generation rebuild a bounded in-memory source review instead of
+propagating stale `quote_contract=missing` context.
 The RPC/source policy also records static transaction-intent signals such as
 preview-wallet versus execution-wallet paths, remote payload deserialization,
 and client-side recent-blockhash refreshes. These signals only define what the
