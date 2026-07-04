@@ -770,6 +770,8 @@ python3 scripts/inferforge.py gate
 python3 scripts/inferforge.py coverage
 python3 scripts/inferforge.py burp-observation-coverage
 python3 scripts/inferforge.py response-deltas
+python3 scripts/inferforge.py source-peek
+python3 scripts/inferforge.py source-peek --no-write
 python3 scripts/inferforge.py source-peek-requests
 python3 scripts/inferforge.py attack-strategy
 python3 scripts/inferforge.py attack-strategy --no-write
@@ -1009,6 +1011,14 @@ source-only Server Action discovery. This artifact does not send traffic or read
 more than the existing source resolver context; it records the question,
 black-box evidence refs, source refs, and answer artifact for review.
 
+`source-peek` writes `.greybox/source-peek-results.json` from bounded local
+source snippets. It consumes `source-peek-requests.json` when present, resolves
+declared source refs and line refs with a per-file byte cap, keeps unresolved
+refs explicit, and records when manual deployment/operator evidence is still
+required. `source-peek --no-write` previews the same answer summary without
+writing target-profile artifacts, source-peek results, traffic indexes, or
+manifests.
+
 `attack-strategy.json` is the machine-readable strategy contract for the run. It
 records the active methodology, specific strategy coverage for each endpoint
 cluster, next-development-action status counts, and a top-level status such as
@@ -1130,7 +1140,8 @@ generates this manifest as its final write so the manifest covers the rendered
 report and index page. Standalone local refresh commands that rewrite existing
 top-level artifacts, such as `profile`, `plan`, `collect`, `burp-observe`,
 `burp-sync`, `import-burp-history`, `coverage`, `burp-observation-coverage`,
-`discovery-coverage`, `response-deltas`, `source-peek-requests`,
+`discovery-coverage`, `response-deltas`, `source-peek`,
+`source-peek-requests`,
 `evidence-chain`, `evidence-appendix`, `verification-queue`, `review-blockers`,
 `gate`, `adjudicate`, `artifact-health`, `review-candidates`,
 `promote-observation-candidate`, `discover-profile`, `capabilities`,

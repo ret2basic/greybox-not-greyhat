@@ -82,6 +82,7 @@ MAX_BODY_SAMPLE_CHARS = 1200
 DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_BURP_HISTORY_INPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_BURP_SYNC_COUNT = 50
+DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES = 512 * 1024
 MAX_REQUEST_CONTEXTS_PER_ENDPOINT = 6
 REDACTED_VALUE = "[redacted]"
 GENERIC_HTTP_ROUTE_STRATEGY_SETS = {"nextjs-api-routes", "blackbox-http-observed"}
@@ -9880,6 +9881,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     "response-delta-analysis.json": "response-deltas",
     "traffic-index.json": "evidence-gaps",
     "source-peek-requests.json": "source-peek-requests",
+    "source-peek-results.json": "source-peek",
     "burp-observation-coverage.json": "evidence-gaps",
     "blackbox-coverage.json": "evidence-gaps",
     "evidence-gaps.json": "evidence-gaps",
@@ -9911,6 +9913,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "plan",
     "response-deltas",
     "source-peek-requests",
+    "source-peek",
     "evidence-gaps",
     "evidence-chain",
     "evidence-appendix",
@@ -14422,6 +14425,220 @@ def build_source_peeks(
     }
 
 
+def split_source_ref_line(ref: str) -> tuple[str, int | None]:
+    raw = str(ref).strip()
+    path_part, sep, line_part = raw.rpartition(":")
+    if sep and line_part.isdigit() and path_part:
+        return path_part, int(line_part)
+    return raw, None
+
+
+def source_ref_excerpt(
+    source_root: Path,
+    ref: str,
+    *,
+    context_lines: int,
+    max_file_bytes: int,
+) -> dict[str, Any]:
+    path_ref, requested_line = split_source_ref_line(ref)
+    path = source_ref_to_path(source_root, path_ref)
+    display_file = source_ref_for_artifact(source_root, path_ref)
+    result: dict[str, Any] = {
+        "source_ref": ref,
+        "file": display_file,
+        "requested_line": requested_line,
+        "status": "unresolved",
+        "excerpt": [],
+    }
+    if not path.exists() or not path.is_file():
+        result["status"] = "missing"
+        return result
+
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        result["status"] = "stat-error"
+        result["error"] = redacted_error_summary(error)
+        return result
+    result["byte_size"] = size
+    if size > max_file_bytes:
+        result["status"] = "too-large"
+        result["max_file_bytes"] = max_file_bytes
+        return result
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as error:
+        result["status"] = "read-error"
+        result["error"] = redacted_error_summary(error)
+        return result
+
+    result["line_count"] = len(lines)
+    if requested_line is not None and not (1 <= requested_line <= len(lines)):
+        result["status"] = "line-out-of-range"
+        return result
+
+    if requested_line is None:
+        non_empty_index = next((index for index, line in enumerate(lines, start=1) if line.strip()), 1)
+        requested_line = non_empty_index
+        result["requested_line"] = requested_line
+
+    context = max(0, context_lines)
+    start_line = max(1, requested_line - context)
+    end_line = min(len(lines), requested_line + context)
+    result["status"] = "resolved"
+    result["excerpt"] = [
+        {
+            "line": line_number,
+            "text": redact_text(lines[line_number - 1].strip(), max_chars=240),
+        }
+        for line_number in range(start_line, end_line + 1)
+    ]
+    return result
+
+
+def source_peek_answer_status(refs: list[dict[str, Any]]) -> str:
+    if not refs:
+        return "needs-source-resolution"
+    resolved = sum(1 for ref in refs if ref.get("status") == "resolved")
+    if resolved == len(refs):
+        return "answered"
+    if resolved:
+        return "partially-answered"
+    return "needs-source-resolution"
+
+
+def positive_int_or_default(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def build_source_peek_results(
+    source_root: Path,
+    profile: dict[str, Any] | None,
+    source_peek_requests: dict[str, Any] | None,
+    observed_endpoints: list[dict[str, Any]] | None,
+    *,
+    context_lines: int = 2,
+    max_refs_per_request: int = 12,
+    max_file_bytes: int = DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES,
+) -> dict[str, Any]:
+    base = build_source_peeks(source_root, profile, observed_endpoints)
+    if base.get("status") == "not-applicable":
+        base["request_answers"] = []
+        return base
+
+    requests = (source_peek_requests or {}).get("requests", []) or []
+    answers: list[dict[str, Any]] = []
+    derived_source_peeks = list(base.get("source_peeks", []) or [])
+    status_counts: dict[str, int] = {}
+    unresolved_refs = 0
+
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        line_ref_values = []
+        if isinstance(request.get("line_refs"), dict):
+            line_ref_values = [value for value in request.get("line_refs", {}).values() if value]
+        refs = compact_source_refs([*line_ref_values, *(request.get("source_refs", []) or [])])
+        declared_limit = positive_int_or_default(request.get("max_files"), max_refs_per_request)
+        ref_limit = max(1, min(max(declared_limit, len(line_ref_values)), max_refs_per_request))
+        selected_refs = refs[:ref_limit]
+        resolved_refs = [
+            source_ref_excerpt(
+                source_root,
+                ref,
+                context_lines=context_lines,
+                max_file_bytes=max_file_bytes,
+            )
+            for ref in selected_refs
+        ]
+        answer_status = source_peek_answer_status(resolved_refs)
+        status_counts[answer_status] = status_counts.get(answer_status, 0) + 1
+        unresolved_refs += sum(1 for ref in resolved_refs if ref.get("status") != "resolved")
+        relevant_lines = {
+            f"ref_{index + 1}": (
+                f"{ref.get('file')}:{ref.get('requested_line')}"
+                if ref.get("status") == "resolved" and ref.get("requested_line")
+                else f"{ref.get('file')}:{ref.get('status')}"
+            )
+            for index, ref in enumerate(resolved_refs)
+        }
+        files = ordered_unique_strings(ref.get("file") for ref in resolved_refs if ref.get("file"))
+        if files or request.get("cluster_ids"):
+            derived_source_peeks.append(
+                {
+                    "endpoint": request.get("entrypoint"),
+                    "cluster_ids": request.get("cluster_ids", []) or [],
+                    "files": files,
+                    "relevant_lines": relevant_lines,
+                    "conclusion": (
+                        "Source refs were resolved for the source-peek request; deployment/operator evidence may still be required."
+                        if answer_status in {"answered", "partially-answered"}
+                        else "Source refs could not be resolved automatically."
+                    ),
+                    "request_id": request.get("id"),
+                    "trigger": request.get("trigger"),
+                }
+            )
+        answers.append(
+            {
+                "id": request.get("id"),
+                "trigger": request.get("trigger"),
+                "status": answer_status,
+                "request_status": request.get("status"),
+                "entrypoint": request.get("entrypoint"),
+                "cluster_ids": request.get("cluster_ids", []) or [],
+                "reason": request.get("reason"),
+                "questions": request.get("questions", []) or [],
+                "source_refs_requested": len(refs),
+                "source_refs_inspected": len(resolved_refs),
+                "source_refs_resolved": sum(1 for ref in resolved_refs if ref.get("status") == "resolved"),
+                "source_refs": resolved_refs,
+                "remaining_manual_review": (
+                    "Manual/deployment evidence is still required."
+                    if request.get("status") == "manual-review"
+                    else None
+                ),
+                "safety": request.get("safety")
+                or "Offline source context only; no request, mutation, wallet signing, or transaction submission was performed.",
+            }
+        )
+
+    if not answers:
+        status = "no-source-peek-requests"
+    elif status_counts.get("needs-source-resolution"):
+        status = "needs-source-resolution"
+    elif status_counts.get("partially-answered"):
+        status = "partially-answered"
+    elif any(answer.get("request_status") == "manual-review" for answer in answers):
+        status = "answered-with-manual-review"
+    else:
+        status = "answered"
+
+    base.update(
+        {
+            "generated_at": utc_now(),
+            "status": status,
+            "source_peeks": derived_source_peeks,
+            "request_answers": answers,
+            "summary": {
+                "requests": len(answers),
+                "status_counts": status_counts,
+                "unresolved_refs": unresolved_refs,
+                "context_lines": max(0, context_lines),
+                "max_refs_per_request": max_refs_per_request,
+                "max_file_bytes": max_file_bytes,
+            },
+            "safety": "Offline source-peek refresh only. It reads bounded local source snippets and sends no requests.",
+        }
+    )
+    return base
+
+
 def parse_typescript_string_set(source: str, const_name: str) -> list[str]:
     match = re.search(rf"const\s+{re.escape(const_name)}\s*=\s*new Set\(\[(.*?)\]\)", source, re.S)
     if not match:
@@ -16277,6 +16494,8 @@ def configured_source_peek_requests(
     requests = []
     for item in (source_peeks or {}).get("source_peeks", []) or []:
         if not isinstance(item, dict):
+            continue
+        if item.get("request_id"):
             continue
         cluster_ids = sorted(source_peek_item_cluster_ids(item, clusters))
         if cluster_ids and observed_cluster_ids and not (set(cluster_ids) & observed_cluster_ids):
@@ -19619,6 +19838,7 @@ def build_verification_queue(
             cmd("attack-strategy"),
             cmd("response-deltas"),
             cmd("source-peek-requests"),
+            cmd("source-peek"),
             cmd("evidence-chain"),
             cmd("evidence-appendix"),
             cmd("report"),
@@ -19627,6 +19847,7 @@ def build_verification_queue(
             "attack-strategy.json",
             "response-delta-analysis.json",
             "source-peek-requests.json",
+            "source-peek-results.json",
             "evidence-chain.json",
             "evidence-appendix.json",
             "report.md",
@@ -24653,6 +24874,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("discovery-coverage", "run_discovery_coverage"),
         refresh_expectation("evidence-gaps", "run_evidence_gaps"),
         refresh_expectation("response-deltas", "run_response_deltas"),
+        refresh_expectation("source-peek", "run_source_peek"),
         refresh_expectation("source-peek-requests", "run_source_peek_requests"),
         refresh_expectation("evidence-chain", "run_evidence_chain"),
         refresh_expectation("evidence-appendix", "run_evidence_appendix"),
@@ -24875,6 +25097,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         readiness_output_dir = root / "readiness-output"
         attack_strategy_output_dir = root / "attack-strategy-output"
         verification_queue_output_dir = root / "verification-queue-output"
+        source_peek_output_dir = root / "source-peek-output"
         source_peek_requests_output_dir = root / "source-peek-requests-output"
         promote_output_dir = root / "promote-output"
         invalid_promote_output_dir = root / "invalid-promote-output"
@@ -24966,6 +25189,20 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--source-root",
                     str(root),
                     "verification-queue",
+                    "--no-write",
+                ]
+            )
+            source_peek_return_code, source_peek_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(source_peek_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "source-peek",
                     "--no-write",
                 ]
             )
@@ -25071,6 +25308,12 @@ def build_no_write_selftest() -> dict[str, Any]:
                 verification_queue_output_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT
             ).exists(),
             "verification_queue_manifest": (verification_queue_output_dir / MANIFEST_NAME).exists(),
+            "source_peek_dir": source_peek_output_dir.exists(),
+            "source_peek_target_profile_json": (source_peek_output_dir / TARGET_PROFILE_ARTIFACT).exists(),
+            "source_peek_results_json": (source_peek_output_dir / "source-peek-results.json").exists(),
+            "source_peek_requests_json": (source_peek_output_dir / "source-peek-requests.json").exists(),
+            "source_peek_traffic_index": (source_peek_output_dir / "traffic-index.json").exists(),
+            "source_peek_manifest": (source_peek_output_dir / MANIFEST_NAME).exists(),
             "source_peek_requests_dir": source_peek_requests_output_dir.exists(),
             "source_peek_requests_target_profile_json": (
                 source_peek_requests_output_dir / TARGET_PROFILE_ARTIFACT
@@ -25105,6 +25348,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     readiness_stdout_text = "\n".join(readiness_stdout)
     attack_strategy_stdout_text = "\n".join(attack_strategy_stdout)
     verification_queue_stdout_text = "\n".join(verification_queue_stdout)
+    source_peek_stdout_text = "\n".join(source_peek_stdout)
     source_peek_requests_stdout_text = "\n".join(source_peek_requests_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
     invalid_promote_stdout_text = "\n".join(invalid_promote_stdout)
@@ -25468,6 +25712,33 @@ def build_no_write_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "source-peek-no-write-skips-artifacts",
+            "passed": (
+                source_peek_return_code == 0
+                and "Source peek: no-source-peek-requests" in source_peek_stdout
+                and "Answers: 0 requests" in source_peek_stdout_text
+                and "No files written (--no-write)." in source_peek_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "source_peek_dir",
+                        "source_peek_target_profile_json",
+                        "source_peek_results_json",
+                        "source_peek_requests_json",
+                        "source_peek_traffic_index",
+                        "source_peek_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in source_peek_stdout)
+            ),
+            "expected": "source-peek --no-write prints source answer summary without writing artifacts or manifests",
+            "actual": {
+                "return_code": source_peek_return_code,
+                "stdout": source_peek_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
             "id": "source-peek-requests-no-write-skips-artifacts",
             "passed": (
                 source_peek_requests_return_code == 0
@@ -25792,6 +26063,10 @@ def build_no_write_selftest() -> dict[str, Any]:
             "attack_strategy": {
                 "return_code": attack_strategy_return_code,
                 "stdout": attack_strategy_stdout,
+            },
+            "source_peek": {
+                "return_code": source_peek_return_code,
+                "stdout": source_peek_stdout,
             },
             "source_peek_requests": {
                 "return_code": source_peek_requests_return_code,
@@ -34600,6 +34875,90 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
     return 0 if evidence_chain["status"] in {"covered", "covered-with-external-blocker"} else 1
 
 
+def run_source_peek(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    clusters_path = artifact_dir / "endpoint-clusters.json"
+    clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
+    traffic_index = load_optional_json(artifact_dir / "traffic-index.json")
+    output_paths: list[Path] = []
+    if traffic_index is None:
+        traffic_index = build_traffic_index(
+            load_jsonl(artifact_dir / "probe-results.jsonl"),
+            load_jsonl(artifact_dir / "burp-history-observations.jsonl"),
+        )
+        traffic_index_path = artifact_dir / "traffic-index.json"
+        if not no_write:
+            write_json(traffic_index_path, sanitize_artifact_samples(traffic_index))
+            output_paths.append(traffic_index_path)
+
+    source_peek_requests_path = artifact_dir / "source-peek-requests.json"
+    source_peek_requests = load_optional_json(source_peek_requests_path)
+    if source_peek_requests is None:
+        source_peek_requests = build_source_peek_requests(
+            clusters,
+            traffic_index,
+            load_optional_json(artifact_dir / "source-peek-results.json"),
+            (load_optional_json(artifact_dir / "suspicions.json") or {}).get("suspicions", []),
+            load_optional_json(artifact_dir / "evidence-gaps.json"),
+        )
+        if not no_write:
+            write_json(source_peek_requests_path, source_peek_requests)
+            output_paths.append(source_peek_requests_path)
+
+    source_peek_results = build_source_peek_results(
+        source_root,
+        profile,
+        source_peek_requests,
+        (traffic_index or {}).get("endpoints", []),
+        context_lines=max(0, int(args.context_lines)),
+        max_refs_per_request=max(1, int(args.max_refs_per_request)),
+        max_file_bytes=max(1, int(args.max_file_bytes)),
+    )
+    output_path = artifact_dir / "source-peek-results.json"
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(source_peek_results))
+        output_paths.append(output_path)
+
+    summary = source_peek_results.get("summary", {}) or {}
+    print(f"Source peek: {source_peek_results.get('status', 'unknown')}")
+    print(
+        "Answers: "
+        f"{summary.get('requests', 0)} requests, "
+        f"status_counts={json.dumps(summary.get('status_counts', {}), sort_keys=True)}, "
+        f"unresolved_refs={summary.get('unresolved_refs', 0)}"
+    )
+    for answer in (source_peek_results.get("request_answers", []) or [])[: max(0, int(args.top))]:
+        print(
+            f"- {answer.get('id')} {answer.get('status')} "
+            f"resolved={answer.get('source_refs_resolved')}/{answer.get('source_refs_inspected')} "
+            f"refs={answer.get('source_refs_requested')} "
+            f"clusters={','.join(answer.get('cluster_ids', []) or []) or '-'}"
+        )
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="source-peek",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    *output_paths,
+                ],
+            )
+        )
+    if args.strict and source_peek_results.get("status") in {"needs-source-resolution", "partially-answered"}:
+        return 1
+    return 0
+
+
 def run_source_peek_requests(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -38326,6 +38685,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recompute machine-readable evidence chain from current artifacts",
     )
     evidence_chain.set_defaults(func=run_evidence_chain)
+
+    source_peek = sub.add_parser(
+        "source-peek",
+        help="Answer source-peek requests from bounded local source snippets",
+    )
+    source_peek.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of answered requests to print in the CLI summary.",
+    )
+    source_peek.add_argument(
+        "--context-lines",
+        type=int,
+        default=2,
+        help="Context lines around each referenced source line. Defaults to 2.",
+    )
+    source_peek.add_argument(
+        "--max-refs-per-request",
+        type=positive_int,
+        default=12,
+        help="Maximum source refs to resolve per source-peek request.",
+    )
+    source_peek.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES,
+        help=f"Maximum local source file bytes to read. Defaults to {DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES}.",
+    )
+    source_peek.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print source-peek answer summary only; do not write artifacts or refresh manifests.",
+    )
+    source_peek.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero when source refs cannot be resolved.",
+    )
+    source_peek.set_defaults(func=run_source_peek)
 
     source_peek_requests = sub.add_parser(
         "source-peek-requests",
