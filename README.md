@@ -125,6 +125,9 @@ does not persist raw HTML or JavaScript. The output
 source URLs, and source hashes; query values are stripped. Candidate endpoints
 are added to verification/review blockers as leads, not as findings, until
 scope, authentication context, and business-operation risk are reviewed.
+If the page references script assets on other hosts, the tool records their
+hosts, counts, hashes, and stripped paths as scope-review leads without fetching
+those external scripts.
 
 Each candidate is triaged before it reaches the review queue:
 

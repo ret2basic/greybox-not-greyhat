@@ -5044,6 +5044,54 @@ def html_script_srcs(html_text: str, page_url: str, *, same_origin_only: bool = 
     return urls
 
 
+def script_url_review_ref(url: str, *, allowed_hosts: set[str]) -> dict[str, Any]:
+    parsed = urllib.parse.urlparse(url)
+    query_keys = sorted(
+        {key for key, _value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if key}
+    )
+    stripped_query = urllib.parse.urlencode([(key, "") for key in query_keys])
+    path = urllib.parse.urlunparse(("", "", parsed.path or "/", "", stripped_query, ""))
+    return {
+        "host": parsed.netloc,
+        "path": path,
+        "query_keys": query_keys,
+        "url_sha256": hashlib.sha256(url.encode("utf-8")).hexdigest(),
+        "scope_status": "allowed-host" if parsed.netloc in allowed_hosts else "external-host-review",
+    }
+
+
+def external_script_review_summary(
+    script_urls: list[str],
+    *,
+    page_url: str,
+    allowed_hosts: set[str],
+    sample_limit: int = 8,
+) -> dict[str, Any]:
+    page_host = urllib.parse.urlparse(page_url).netloc
+    external_urls = [
+        url
+        for url in script_urls
+        if urllib.parse.urlparse(url).netloc and urllib.parse.urlparse(url).netloc != page_host
+    ]
+    host_counts: dict[str, int] = {}
+    scope_status_counts: dict[str, int] = {}
+    for url in external_urls:
+        ref = script_url_review_ref(url, allowed_hosts=allowed_hosts)
+        increment_count(host_counts, str(ref["host"]))
+        increment_count(scope_status_counts, str(ref["scope_status"]))
+    return {
+        "total": len(external_urls),
+        "host_counts": dict(sorted(host_counts.items())),
+        "scope_status_counts": dict(sorted(scope_status_counts.items())),
+        "review_required": any(host not in allowed_hosts for host in host_counts),
+        "samples": [
+            script_url_review_ref(url, allowed_hosts=allowed_hosts)
+            for url in external_urls[:sample_limit]
+        ],
+        "safety": "External script URLs are recorded for scope review only; blackbox-asset-map does not fetch them.",
+    }
+
+
 def strip_query_values(path: str) -> tuple[str, list[str]]:
     parsed = urllib.parse.urlparse(path)
     query_keys = sorted({key for key, _value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if key})
@@ -5374,7 +5422,13 @@ def build_blackbox_asset_map(
     max_assets: int,
     candidate_limit: int | None = None,
 ) -> dict[str, Any]:
+    all_script_urls = html_script_srcs(page_text, page_url, same_origin_only=False)
     script_urls = html_script_srcs(page_text, page_url, same_origin_only=True)
+    external_scripts = external_script_review_summary(
+        all_script_urls,
+        page_url=page_url,
+        allowed_hosts=allowed_hosts,
+    )
     candidate_lists = [
         extract_blackbox_asset_candidates_from_text(
             page_text,
@@ -5433,11 +5487,14 @@ def build_blackbox_asset_map(
             "bytes": len(page_text.encode("utf-8", errors="replace")) if page_fetch is None else page_fetch.get("bytes"),
             "sha256": hashlib.sha256(page_text.encode("utf-8", errors="replace")).hexdigest(),
             "content_type": page_headers.get("Content-Type") or page_headers.get("content-type"),
-            "script_urls_seen": len(script_urls),
+            "script_urls_seen": len(all_script_urls),
+            "same_origin_script_urls_seen": len(script_urls),
+            "external_script_urls_seen": external_scripts["total"],
             "script_urls_considered": min(len(script_urls), max_assets),
         },
         "allowed_hosts": sorted(allowed_hosts),
         "assets": asset_summaries,
+        "external_scripts": external_scripts,
         "summary": {
             "assets_fetched": len(assets),
             "candidates": len(candidates),
@@ -5445,6 +5502,9 @@ def build_blackbox_asset_map(
             "websocket_candidates": sum(1 for item in candidates if item.get("kind") == "websocket-candidate"),
             "post_hints": sum(1 for item in candidates if item.get("method_hint") == "POST"),
             "review_required": len(candidates),
+            "external_script_urls_seen": external_scripts["total"],
+            "external_script_hosts": len(external_scripts["host_counts"]),
+            "external_script_review_required": bool(external_scripts["review_required"]),
             "candidate_limit": candidate_limit,
             "candidate_limit_reached": candidate_limit is not None and len(candidates) >= candidate_limit,
             "triage_class_counts": triage_class_counts,
@@ -14817,6 +14877,31 @@ def build_verification_queue(
         else None
     )
     asset_candidates = (asset_candidates_doc or {}).get("candidates", []) or []
+    external_scripts_doc = (asset_candidates_doc or {}).get("external_scripts", {}) if isinstance(asset_candidates_doc, dict) else {}
+    if isinstance(external_scripts_doc, dict) and external_scripts_doc.get("review_required"):
+        add_item(
+            "REVIEW-blackbox-external-script-hosts",
+            "Review external script hosts before asset expansion",
+            "manual-review",
+            "medium",
+            (
+                f"{external_scripts_doc.get('total', 0)} external script URL(s) were referenced by the target page. "
+                "They were not fetched because they are outside the current target origin or allowed host list."
+            ),
+            evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT],
+            prerequisites=[
+                "Confirm whether each external script host is in bounty scope or approved as a static asset source before fetching it.",
+                "If approved, rerun blackbox-asset-map with explicit scope review and keep the same low max-assets/max-bytes limits.",
+                "Do not request out-of-scope static assets from automation.",
+            ],
+            safety="Scope review only. This queue item does not authorize fetching external script assets.",
+            extra={
+                "external_script_total": external_scripts_doc.get("total", 0),
+                "external_script_host_counts": external_scripts_doc.get("host_counts", {}),
+                "external_script_scope_status_counts": external_scripts_doc.get("scope_status_counts", {}),
+                "external_script_samples": external_scripts_doc.get("samples", [])[:8],
+            },
+        )
     if asset_candidates:
         candidate_preview = [
             {
@@ -25165,6 +25250,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_target_info_sample.get("health_path") is None
         and blackbox_target_info_sample.get("health_source") == "blackbox-burp-history"
         and blackbox_asset_map_sample.get("status") == "candidates-found"
+        and blackbox_asset_map_sample.get("page", {}).get("script_urls_seen") == 2
+        and blackbox_asset_map_sample.get("page", {}).get("same_origin_script_urls_seen") == 1
+        and blackbox_asset_map_sample.get("page", {}).get("external_script_urls_seen") == 1
+        and blackbox_asset_map_sample.get("summary", {}).get("external_script_review_required") is True
+        and blackbox_asset_map_sample.get("external_scripts", {}).get("host_counts", {}).get("cdn.blackbox.test") == 1
         and ("UNKNOWN", "blackbox.test", "/trade/BTCUSD?debug=&from=") in blackbox_asset_candidates
         and ("UNKNOWN", "blackbox.test", "/de-DE/trade/BTCUSD?lang=") in blackbox_asset_candidates
         and ("POST", "blackbox.test", "/api/orders?market=&token=") in blackbox_asset_candidates
@@ -29396,6 +29486,7 @@ def run_blackbox_asset_map(args: argparse.Namespace) -> int:
     print(
         "Assets: "
         f"scripts_seen={asset_map['page']['script_urls_seen']} "
+        f"external_scripts={asset_map['page'].get('external_script_urls_seen', 0)} "
         f"fetched={asset_map['summary']['assets_fetched']} "
         f"candidates={asset_map['summary']['candidates']} "
         f"ws={asset_map['summary']['websocket_candidates']} "
