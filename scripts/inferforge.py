@@ -6549,6 +6549,21 @@ def write_target_profile_artifact(
     write_json(artifact_dir / TARGET_PROFILE_ARTIFACT, doc)
     write_json(artifact_dir / STRATEGY_REGISTRY_ARTIFACT, build_strategy_registry_artifact(profile, clusters))
     write_json(artifact_dir / PROFILE_VALIDATION_ARTIFACT, build_profile_validation_artifact(profile, clusters, source_root))
+    write_json(
+        artifact_dir / "config.json",
+        {
+            "generated_at": utc_now(),
+            "tool": "InferForge local",
+            "profile": profile_summary(profile),
+            "target_profile": TARGET_PROFILE_ARTIFACT,
+            "strategy_registry": STRATEGY_REGISTRY_ARTIFACT,
+            "enabled_strategy_sets": sorted(enabled_strategy_set_ids(profile)),
+            "target": target,
+            "source_root": str(source_root),
+            "artifact_dir": str(artifact_dir),
+            "safety": "Run context metadata only. No requests are sent when this artifact is written.",
+        },
+    )
     return doc
 
 
@@ -6557,6 +6572,7 @@ def target_profile_artifact_paths(artifact_dir: Path) -> list[Path]:
         artifact_dir / TARGET_PROFILE_ARTIFACT,
         artifact_dir / STRATEGY_REGISTRY_ARTIFACT,
         artifact_dir / PROFILE_VALIDATION_ARTIFACT,
+        artifact_dir / "config.json",
     ]
 
 
@@ -9866,6 +9882,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     "burp-observation-coverage.json": "evidence-gaps",
     "blackbox-coverage.json": "evidence-gaps",
     "evidence-gaps.json": "evidence-gaps",
+    "rpc-method-policy.json": "evidence-gaps",
     "evidence-chain.json": "evidence-chain",
     "evidence-appendix.json": "evidence-appendix",
     "verification-queue.json": "verification-queue",
@@ -34245,6 +34262,8 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
         results,
         profile=profile,
     )
+    rpc_method_policy_path = artifact_dir / "rpc-method-policy.json"
+    write_json(rpc_method_policy_path, sanitize_artifact_samples(rpc_method_policy))
     orca_baseline = load_optional_json(artifact_dir / "orca-baseline.json")
     quote_collection = load_optional_json(artifact_dir / "quote-collection.json")
     evidence_gaps = build_evidence_gaps(
@@ -34307,6 +34326,7 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
             output_paths=[
                 *target_profile_artifact_paths(artifact_dir),
                 traffic_index_path,
+                rpc_method_policy_path,
                 evidence_gaps_path,
                 burp_observation_coverage_path,
                 blackbox_coverage_path,
@@ -35401,6 +35421,7 @@ def run_profile(args: argparse.Namespace) -> int:
     print(f"Wrote {artifact_dir / TARGET_PROFILE_ARTIFACT}")
     print(f"Wrote {artifact_dir / STRATEGY_REGISTRY_ARTIFACT}")
     print(f"Wrote {artifact_dir / PROFILE_VALIDATION_ARTIFACT}")
+    print(f"Wrote {artifact_dir / 'config.json'}")
     print(f"Wrote {artifact_dir / 'endpoint-clusters.json'}")
     print_refreshed_manifests(
         refresh_current_artifact_manifest(
@@ -35408,9 +35429,7 @@ def run_profile(args: argparse.Namespace) -> int:
             target=target,
             command="profile",
             output_paths=[
-                artifact_dir / TARGET_PROFILE_ARTIFACT,
-                artifact_dir / STRATEGY_REGISTRY_ARTIFACT,
-                artifact_dir / PROFILE_VALIDATION_ARTIFACT,
+                *target_profile_artifact_paths(artifact_dir),
                 artifact_dir / "endpoint-clusters.json",
             ],
         )
