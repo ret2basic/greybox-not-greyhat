@@ -23447,14 +23447,28 @@ def format_command_ref_label(ref: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def replace_command_ref_label_status(label: str, status: str) -> str:
+    if label.startswith("[") and "]" in label:
+        return f"[{status}]{label[label.index(']') + 1:]}"
+    return f"[{status}] {label}".strip()
+
+
 def format_iteration_action_command_label(action: dict[str, Any], ref: dict[str, Any]) -> str:
     label = format_command_ref_label(ref)
     action_status = str(action.get("status") or "")
     if not action_status.startswith("blocked"):
         return label
-    if label.startswith("[") and "]" in label:
-        return f"[{action_status}]{label[label.index(']') + 1:]}"
-    return f"[{action_status}] {label}".strip()
+    return replace_command_ref_label_status(label, action_status)
+
+
+def format_validation_plan_command_label(item: dict[str, Any], bucket: str, ref: dict[str, Any]) -> str:
+    label = format_command_ref_label(ref)
+    if bucket != "allowed_after_resource_gate":
+        return label
+    item_status = str(item.get("status") or "")
+    if item_status.startswith("blocked"):
+        return replace_command_ref_label_status(label, item_status)
+    return replace_command_ref_label_status(label, "after-resource-gate")
 
 
 def review_blocker_group_command_refs(group: dict[str, Any]) -> list[dict[str, Any]]:
@@ -28181,6 +28195,16 @@ def build_no_write_selftest() -> dict[str, Any]:
         {"status": "blocked-resource"},
         {"classification": "ready"},
     )
+    after_gate_command_label = format_validation_plan_command_label(
+        {"status": "ready-offline"},
+        "allowed_after_resource_gate",
+        {"classification": "ready"},
+    )
+    blocked_after_gate_command_label = format_validation_plan_command_label(
+        {"status": "blocked-resource"},
+        "allowed_after_resource_gate",
+        {"classification": "ready"},
+    )
     regression_health_summary_line = regression_suite_artifact_health_summary_line(
         {
             "status": "needs-human-review",
@@ -28670,6 +28694,18 @@ def build_no_write_selftest() -> dict[str, Any]:
             "passed": blocked_iteration_command_label == "[blocked-resource]",
             "expected": "blocked iteration actions print the action blocker status instead of a misleading ready command label",
             "actual": blocked_iteration_command_label,
+        },
+        {
+            "id": "validation-plan-after-gate-command-labels-are-not-misleading-ready",
+            "passed": (
+                after_gate_command_label == "[after-resource-gate]"
+                and blocked_after_gate_command_label == "[blocked-resource]"
+            ),
+            "expected": "validation-plan after-gate commands print after-gate or blocked status instead of a misleading ready label",
+            "actual": {
+                "after_gate": after_gate_command_label,
+                "blocked_after_gate": blocked_after_gate_command_label,
+            },
         },
         {
             "id": "regression-suite-final-summary-lines-surface-health-gates",
@@ -41384,7 +41420,10 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                 if after:
                     print("  allowed_after_resource_gate:")
                     for ref in after[:5]:
-                        print(f"    - {format_command_ref_label(ref)} {inline_summary_text(ref.get('command'), max_chars=420)}")
+                        print(
+                            f"    - {format_validation_plan_command_label(item, 'allowed_after_resource_gate', ref)} "
+                            f"{inline_summary_text(ref.get('command'), max_chars=420)}"
+                        )
                 if blocked:
                     print("  blocked_commands:")
                     for ref in blocked[:5]:
