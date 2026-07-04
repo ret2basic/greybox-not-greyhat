@@ -7720,6 +7720,7 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
         "hypothesis-matrix --no-write --show-next",
     ],
     "issue-validation": [
+        "evidence-gaps --no-write",
         "validation-plan --no-write --limit 8 --show-commands",
         "deployment-review --no-write --top 8",
         "transaction-flow-review --no-write --top 8",
@@ -27788,6 +27789,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         verification_queue_output_dir = root / "verification-queue-output"
         source_peek_output_dir = root / "source-peek-output"
         source_peek_requests_output_dir = root / "source-peek-requests-output"
+        evidence_gaps_output_dir = root / "evidence-gaps-output"
         promote_output_dir = root / "promote-output"
         invalid_promote_output_dir = root / "invalid-promote-output"
         import_history_output_dir = root / "import-history-output"
@@ -27909,6 +27911,20 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--no-write",
                 ]
             )
+            evidence_gaps_return_code, evidence_gaps_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(evidence_gaps_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "evidence-gaps",
+                    "--no-write",
+                ]
+            )
             promote_return_code, promote_stdout = run_cli(
                 [
                     "--profile",
@@ -28010,6 +28026,22 @@ def build_no_write_selftest() -> dict[str, Any]:
             "source_peek_requests_json": (source_peek_requests_output_dir / "source-peek-requests.json").exists(),
             "source_peek_requests_traffic_index": (source_peek_requests_output_dir / "traffic-index.json").exists(),
             "source_peek_requests_manifest": (source_peek_requests_output_dir / MANIFEST_NAME).exists(),
+            "evidence_gaps_dir": evidence_gaps_output_dir.exists(),
+            "evidence_gaps_target_profile_json": (evidence_gaps_output_dir / TARGET_PROFILE_ARTIFACT).exists(),
+            "evidence_gaps_traffic_index": (evidence_gaps_output_dir / "traffic-index.json").exists(),
+            "evidence_gaps_rpc_method_policy": (evidence_gaps_output_dir / "rpc-method-policy.json").exists(),
+            "evidence_gaps_deployment_review": (
+                evidence_gaps_output_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT
+            ).exists(),
+            "evidence_gaps_json": (evidence_gaps_output_dir / "evidence-gaps.json").exists(),
+            "evidence_gaps_burp_coverage": (
+                evidence_gaps_output_dir / "burp-observation-coverage.json"
+            ).exists(),
+            "evidence_gaps_blackbox_coverage": (evidence_gaps_output_dir / "blackbox-coverage.json").exists(),
+            "evidence_gaps_source_peek_requests": (
+                evidence_gaps_output_dir / "source-peek-requests.json"
+            ).exists(),
+            "evidence_gaps_manifest": (evidence_gaps_output_dir / MANIFEST_NAME).exists(),
             "promote_dir": promote_output_dir.exists(),
             "promote_reviewed_profile": (promote_output_dir / "reviewed-profile.json").exists(),
             "promote_validation": (promote_output_dir / "reviewed-profile-validation.json").exists(),
@@ -28039,6 +28071,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     verification_queue_stdout_text = "\n".join(verification_queue_stdout)
     source_peek_stdout_text = "\n".join(source_peek_stdout)
     source_peek_requests_stdout_text = "\n".join(source_peek_requests_stdout)
+    evidence_gaps_stdout_text = "\n".join(evidence_gaps_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
     invalid_promote_stdout_text = "\n".join(invalid_promote_stdout)
     import_history_limit_stdout_text = "\n".join(import_history_limit_stdout)
@@ -28480,6 +28513,38 @@ def build_no_write_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "evidence-gaps-no-write-skips-artifacts",
+            "passed": (
+                evidence_gaps_return_code == 0
+                and "Evidence gaps:" in evidence_gaps_stdout_text
+                and "Burp observation coverage:" in evidence_gaps_stdout_text
+                and "Blackbox coverage:" in evidence_gaps_stdout_text
+                and "No files written (--no-write)." in evidence_gaps_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "evidence_gaps_dir",
+                        "evidence_gaps_target_profile_json",
+                        "evidence_gaps_traffic_index",
+                        "evidence_gaps_rpc_method_policy",
+                        "evidence_gaps_deployment_review",
+                        "evidence_gaps_json",
+                        "evidence_gaps_burp_coverage",
+                        "evidence_gaps_blackbox_coverage",
+                        "evidence_gaps_source_peek_requests",
+                        "evidence_gaps_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in evidence_gaps_stdout)
+            ),
+            "expected": "evidence-gaps --no-write prints evidence coverage without writing artifacts or manifests",
+            "actual": {
+                "return_code": evidence_gaps_return_code,
+                "stdout": evidence_gaps_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
             "id": "regression-suite-final-summary-lines-surface-health-gates",
             "passed": (
                 regression_health_summary_line.startswith("Artifact health gate:")
@@ -28760,6 +28825,10 @@ def build_no_write_selftest() -> dict[str, Any]:
             "source_peek_requests": {
                 "return_code": source_peek_requests_return_code,
                 "stdout": source_peek_requests_stdout,
+            },
+            "evidence_gaps": {
+                "return_code": evidence_gaps_return_code,
+                "stdout": evidence_gaps_stdout,
             },
             "outputs_exist": output_paths,
         },
@@ -37864,15 +37933,18 @@ def run_response_deltas(args: argparse.Namespace) -> int:
 
 def run_evidence_gaps(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     clusters_path = artifact_dir / "endpoint-clusters.json"
     clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
     results = load_jsonl(artifact_dir / "probe-results.jsonl")
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
     traffic_index = build_traffic_index(results, burp_history)
     traffic_index_path = artifact_dir / "traffic-index.json"
-    write_json(traffic_index_path, sanitize_artifact_samples(traffic_index))
+    if not no_write:
+        write_json(traffic_index_path, sanitize_artifact_samples(traffic_index))
     source_peeks = load_optional_json(artifact_dir / "source-peek-results.json")
     transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {"candidates_seen": 0}
     rpc_method_policy = load_optional_json(artifact_dir / "rpc-method-policy.json") or build_rpc_method_policy(
@@ -37881,13 +37953,15 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
         profile=profile,
     )
     rpc_method_policy_path = artifact_dir / "rpc-method-policy.json"
-    write_json(rpc_method_policy_path, sanitize_artifact_samples(rpc_method_policy))
+    if not no_write:
+        write_json(rpc_method_policy_path, sanitize_artifact_samples(rpc_method_policy))
     deployment_review = load_optional_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT) or build_deployment_resource_review(
         source_root,
         profile,
     )
     deployment_review_path = artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT
-    write_json(deployment_review_path, sanitize_artifact_samples(deployment_review))
+    if not no_write:
+        write_json(deployment_review_path, sanitize_artifact_samples(deployment_review))
     orca_baseline = load_optional_json(artifact_dir / "orca-baseline.json")
     quote_collection = load_optional_json(artifact_dir / "quote-collection.json")
     evidence_gaps = build_evidence_gaps(
@@ -37903,7 +37977,8 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
         deployment_review=deployment_review,
     )
     evidence_gaps_path = artifact_dir / "evidence-gaps.json"
-    write_json(evidence_gaps_path, evidence_gaps)
+    if not no_write:
+        write_json(evidence_gaps_path, evidence_gaps)
     burp_observation_coverage = build_burp_observation_coverage(
         target,
         profile,
@@ -37913,7 +37988,8 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
         evidence_gaps,
     )
     burp_observation_coverage_path = artifact_dir / "burp-observation-coverage.json"
-    write_json(burp_observation_coverage_path, burp_observation_coverage)
+    if not no_write:
+        write_json(burp_observation_coverage_path, burp_observation_coverage)
     environment_readiness = load_optional_json(artifact_dir / "environment-readiness.json")
     transaction_decoder_selftest = load_optional_json(artifact_dir / "transaction-decoder-selftest.json")
     blackbox_coverage = build_blackbox_coverage(
@@ -37928,7 +38004,8 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
         profile=profile,
     )
     blackbox_coverage_path = artifact_dir / "blackbox-coverage.json"
-    write_json(blackbox_coverage_path, sanitize_artifact_samples(blackbox_coverage))
+    if not no_write:
+        write_json(blackbox_coverage_path, sanitize_artifact_samples(blackbox_coverage))
     suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
     source_peek_requests = build_source_peek_requests(
         clusters,
@@ -37938,28 +38015,32 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
         evidence_gaps,
     )
     source_peek_requests_path = artifact_dir / "source-peek-requests.json"
-    write_json(source_peek_requests_path, source_peek_requests)
+    if not no_write:
+        write_json(source_peek_requests_path, source_peek_requests)
     print(f"Evidence gaps: {len(evidence_gaps.get('gaps', []) or [])}")
     print(f"Burp observation coverage: {burp_observation_coverage['status']}")
     print(f"Blackbox coverage: {blackbox_coverage['status']}")
-    print(f"Wrote {evidence_gaps_path}")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="evidence-gaps",
-            output_paths=[
-                *target_profile_artifact_paths(artifact_dir),
-                traffic_index_path,
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {evidence_gaps_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="evidence-gaps",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    traffic_index_path,
                     rpc_method_policy_path,
                     deployment_review_path,
                     evidence_gaps_path,
-                burp_observation_coverage_path,
-                blackbox_coverage_path,
-                source_peek_requests_path,
-            ],
+                    burp_observation_coverage_path,
+                    blackbox_coverage_path,
+                    source_peek_requests_path,
+                ],
+            )
         )
-    )
     return 1 if args.strict and evidence_gaps.get("gaps") else 0
 
 
@@ -42421,6 +42502,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict",
         action="store_true",
         help="Return non-zero if any evidence gaps remain.",
+    )
+    evidence_gaps.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print evidence-gap summary only; do not write evidence-gaps or dependent coverage artifacts.",
     )
     evidence_gaps.set_defaults(func=run_evidence_gaps)
 
