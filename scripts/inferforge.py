@@ -8418,6 +8418,110 @@ def hypothesis_from_rpc_method_policy(
     }
 
 
+def app_route_path_from_source_file(file_name: str) -> str | None:
+    normalized = file_name.replace("\\", "/")
+    route_suffixes = ["/route.ts", "/route.tsx", "/route.js", "/route.jsx"]
+    suffix = next((item for item in route_suffixes if normalized.endswith(item)), None)
+    if suffix and normalized.startswith("src/app/"):
+        route_part = normalized[len("src/app") : -len(suffix)]
+    elif normalized.startswith("src/pages/api/") and Path(normalized).suffix in TRANSACTION_FLOW_SOURCE_SUFFIXES:
+        route_part = "/api/" + normalized[len("src/pages/api/") :].rsplit(".", 1)[0]
+    else:
+        return None
+
+    segments = []
+    for segment in route_part.strip("/").split("/"):
+        if not segment or (segment.startswith("(") and segment.endswith(")")):
+            continue
+        if segment.startswith("[[...") and segment.endswith("]]"):
+            segments.append(f"{{{segment[5:-2]}*}}")
+        elif segment.startswith("[...") and segment.endswith("]"):
+            segments.append(f"{{{segment[4:-1]}*}}")
+        elif segment.startswith("[") and segment.endswith("]"):
+            segments.append(f"{{{segment[1:-1]}}}")
+        else:
+            segments.append(segment)
+    return "/" + "/".join(segments) if segments else "/"
+
+
+def hypotheses_from_credential_proxy_review(
+    transaction_flow_review: dict[str, Any] | None,
+    *,
+    target_host: str,
+) -> list[dict[str, Any]]:
+    flow_artifact = transaction_flow_review if isinstance(transaction_flow_review, dict) else {}
+    review = (
+        flow_artifact.get("server_credential_proxy_review")
+        if isinstance(flow_artifact.get("server_credential_proxy_review"), dict)
+        else {}
+    )
+    if review.get("status") != "needs-cost-abuse-review":
+        return []
+    hypotheses = []
+    for row in review.get("files", []) or []:
+        if not isinstance(row, dict) or row.get("status") != "needs-cost-abuse-review":
+            continue
+        file_name = str(row.get("file") or "")
+        path = app_route_path_from_source_file(file_name)
+        source_refs = [
+            f"{ref.get('file')}:{ref.get('line')}"
+            for ref in [
+                *(row.get("credential_refs", []) or [])[:4],
+                *(row.get("external_upstream_refs", []) or [])[:4],
+                *(row.get("request_validation_refs", []) or [])[:4],
+            ]
+            if isinstance(ref, dict) and ref.get("file") and ref.get("line")
+        ]
+        hypotheses.append(
+            {
+                "id": f"HYP-credential-proxy-{safe_hypothesis_id(file_name)}",
+                "type": "credential-proxy-review",
+                "status": hypothesis_status_for_followup(
+                    scope_decision="in-scope-explicit-host",
+                    resource_gated=False,
+                    offline_only=True,
+                ),
+                "priority": hypothesis_priority_from_values(review.get("priority"), "medium"),
+                "host": target_host,
+                "path": path,
+                "cluster_id": None,
+                "scope_decision": "in-scope-explicit-host",
+                "impact": "credentialed-upstream-cost-abuse",
+                "impact_hypothesis": (
+                    "Can unauthenticated requests consume a server-side credentialed upstream provider, quota, "
+                    "billing allocation, or availability budget?"
+                ),
+                "reportability_gate": review.get("reportability_gate")
+                or "Static credential proxy evidence is not reportable without concrete cost, quota, or availability impact.",
+                "next_step": review.get("next_step")
+                or "Review provider quota/billing evidence before any active validation.",
+                "evidence_refs": compact_source_refs(
+                    [
+                        TRANSACTION_FLOW_REVIEW_ARTIFACT,
+                        file_name,
+                        *source_refs,
+                    ]
+                ),
+                "credential_proxy_review": {
+                    "status": row.get("status"),
+                    "artifact_status": review.get("status"),
+                    "priority": review.get("priority"),
+                    "file": file_name,
+                    "path": path,
+                    "credential_ref_count": len(row.get("credential_refs", []) or []),
+                    "external_upstream_ref_count": len(row.get("external_upstream_refs", []) or []),
+                    "auth_guard_ref_count": len(row.get("auth_guard_refs", []) or []),
+                    "rate_limit_guard_ref_count": len(row.get("rate_limit_guard_refs", []) or []),
+                    "required_evidence": review.get("required_evidence", []),
+                    "review_question": row.get("review_question"),
+                },
+                "safety": review.get("safety")
+                or "Offline credential proxy review only. Do not run high-volume traffic or expose secret values.",
+            }
+        )
+    return hypotheses
+
+
 def hypothesis_from_rpc_rate_limit_resource_policy(
     rpc_method_policy: dict[str, Any],
     *,
@@ -9221,6 +9325,11 @@ def build_hypothesis_matrix_run(
     )
     if rpc_hypothesis:
         add_hypothesis(hypotheses, rpc_hypothesis)
+    for credential_hypothesis in hypotheses_from_credential_proxy_review(
+        transaction_flow_review,
+        target_host=target_host,
+    ):
+        add_hypothesis(hypotheses, credential_hypothesis)
     rpc_resource_hypothesis = hypothesis_from_rpc_rate_limit_resource_policy(
         rpc_method_policy,
         target_host=target_host,
@@ -9567,6 +9676,8 @@ def validation_question_for_hypothesis(hypothesis: dict[str, Any]) -> str:
         return "Can the RPC proxy expose disallowed methods, bypass origin or rate limits, or disclose upstream-sensitive details?"
     if impact == "resource-exhaustion":
         return "Can resource-control fallback behavior create availability impact under the real deployment proxy trust model?"
+    if impact == "credentialed-upstream-cost-abuse":
+        return "Can unauthenticated requests consume a server-side credentialed upstream provider, quota, billing allocation, or availability budget?"
     if impact == "fixed-upstream-proxy-confusion":
         return "Can fixed upstream routing be confused into SSRF, path traversal, or sensitive upstream data exposure?"
     if impact == "browser-route-exposure":
@@ -9627,6 +9738,25 @@ def required_evidence_for_hypothesis(hypothesis: dict[str, Any]) -> list[str]:
                 *review_evidence,
                 "Deployment evidence that the fallback is reachable in production and not only a local/dev safeguard.",
                 "Concrete availability impact evidence that does not use flooding, rate-limit stress, or DoS testing.",
+                *common,
+            ]
+        )
+    if impact == "credentialed-upstream-cost-abuse":
+        credential_review = (
+            hypothesis.get("credential_proxy_review")
+            if isinstance(hypothesis.get("credential_proxy_review"), dict)
+            else {}
+        )
+        review_evidence = [
+            str(item)
+            for item in credential_review.get("required_evidence", []) or []
+            if str(item).strip()
+        ]
+        return ordered_unique_strings(
+            [
+                *review_evidence,
+                "Provider or operator evidence that upstream quota, billing, or account availability can be materially affected.",
+                "Evidence that validation can be limited to one approved request and does not require flooding, brute force, or stress traffic.",
                 *common,
             ]
         )
@@ -9746,6 +9876,9 @@ def validation_allowed_commands(
     if hypothesis.get("type") == "resource-abuse-review" or hypothesis.get("impact") == "resource-exhaustion":
         allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
     if hypothesis.get("type") == "transaction-flow-review" or hypothesis.get("impact") == "transaction-integrity":
+        allowed_now_commands.insert(3, command("transaction-flow-review --no-write --top 8"))
+    if hypothesis.get("type") == "credential-proxy-review" or hypothesis.get("impact") == "credentialed-upstream-cost-abuse":
+        allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
         allowed_now_commands.insert(3, command("transaction-flow-review --no-write --top 8"))
     allowed_after_gate_commands = [
         command("resource-snapshot --max-processes 8 --watch-port 3100 --watch-port 2455 --no-write --strict")
@@ -9879,6 +10012,7 @@ def validation_item_from_hypothesis(
         "rewrite_review": rewrite_review_context,
         "transaction_flow_review": hypothesis.get("transaction_flow_review"),
         "resource_abuse_review": hypothesis.get("resource_abuse_review"),
+        "credential_proxy_review": hypothesis.get("credential_proxy_review"),
         "command_safety": command_summary,
         "blocked_command_safety": blocked_command_summary,
         "required_evidence": required_evidence_for_hypothesis(hypothesis),
@@ -33734,6 +33868,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             ),
             None,
         )
+        rewrite_credential_proxy_hypothesis = next(
+            (
+                item
+                for item in rewrite_transaction_matrix.get("hypotheses", [])
+                if item.get("type") == "credential-proxy-review"
+            ),
+            None,
+        )
         rewrite_resource_hypothesis = next(
             (
                 item
@@ -33753,6 +33895,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 item
                 for item in rewrite_transaction_validation_plan.get("items", [])
                 if item.get("hypothesis_type") == "transaction-flow-review"
+            ),
+            None,
+        )
+        rewrite_credential_proxy_validation_item = next(
+            (
+                item
+                for item in rewrite_transaction_validation_plan.get("items", [])
+                if item.get("hypothesis_type") == "credential-proxy-review"
             ),
             None,
         )
@@ -34399,6 +34549,20 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 0,
             )
             >= 1
+            and rewrite_credential_proxy_hypothesis is not None
+            and rewrite_credential_proxy_hypothesis.get("status") == "ready-for-offline-review"
+            and rewrite_credential_proxy_hypothesis.get("priority") == "medium"
+            and rewrite_credential_proxy_hypothesis.get("impact") == "credentialed-upstream-cost-abuse"
+            and rewrite_credential_proxy_hypothesis.get("credential_proxy_review", {}).get("file")
+            == "src/lib/quote-contract-selftest.ts"
+            and rewrite_credential_proxy_hypothesis.get("credential_proxy_review", {}).get("status")
+            == "needs-cost-abuse-review"
+            and rewrite_credential_proxy_hypothesis.get("credential_proxy_review", {}).get("credential_ref_count", 0) >= 1
+            and rewrite_credential_proxy_hypothesis.get("credential_proxy_review", {}).get(
+                "external_upstream_ref_count",
+                0,
+            )
+            >= 1
             and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
             and TRANSACTION_FLOW_REVIEW_ARTIFACT in (rewrite_transaction_hypothesis.get("evidence_refs", []) or [])
             and rewrite_transaction_validation_item is not None
@@ -34418,6 +34582,15 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             )
             == "needs-cost-abuse-review"
             and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
+            and rewrite_credential_proxy_validation_item is not None
+            and rewrite_credential_proxy_validation_item.get("status") == "ready-offline"
+            and rewrite_credential_proxy_validation_item.get("impact") == "credentialed-upstream-cost-abuse"
+            and rewrite_credential_proxy_validation_item.get("credential_proxy_review", {}).get("status")
+            == "needs-cost-abuse-review"
+            and rewrite_credential_proxy_validation_item.get("credential_proxy_review", {}).get("rate_limit_guard_ref_count")
+            == 0
+            and rewrite_credential_proxy_validation_item.get("credential_proxy_review", {}).get("auth_guard_ref_count")
+            == 0
         )
         rate_limit_resource_review = rewrite_transaction_policy.get("rate_limit_resource_review", {})
         rate_limit_signal_ids = {
@@ -39661,6 +39834,21 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         "  resource_abuse_review="
                         f"{resource_review.get('status')} "
                         f"static_signals={resource_review.get('signal_count', 0)}"
+                    )
+                credential_review = (
+                    item.get("credential_proxy_review")
+                    if isinstance(item.get("credential_proxy_review"), dict)
+                    else {}
+                )
+                if credential_review:
+                    print(
+                        "  credential_proxy_review="
+                        f"{credential_review.get('status')} "
+                        f"file={credential_review.get('file') or '-'} "
+                        f"credential_refs={credential_review.get('credential_ref_count', 0)} "
+                        f"upstream_refs={credential_review.get('external_upstream_ref_count', 0)} "
+                        f"auth_refs={credential_review.get('auth_guard_ref_count', 0)} "
+                        f"rate_refs={credential_review.get('rate_limit_guard_ref_count', 0)}"
                     )
                 rewrite_review = item.get("rewrite_review") if isinstance(item.get("rewrite_review"), dict) else {}
                 source_guard = (

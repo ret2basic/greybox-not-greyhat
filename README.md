@@ -298,6 +298,11 @@ sign or submit a wallet transaction.
 If the transaction-flow artifact is missing or from an older schema, matrix and
 validation-plan generation rebuild a bounded in-memory source review instead of
 propagating stale `quote_contract=missing` context.
+When that review finds a server-side credentialed upstream without same-file
+auth or rate-limit evidence, the matrix also emits a separate
+`credential-proxy-review` hypothesis. This remains offline-only and requires
+provider quota, billing, availability, or account-abuse evidence before any
+finding claim.
 The RPC/source policy also records static transaction-intent signals such as
 preview-wallet versus execution-wallet paths, remote payload deserialization,
 and client-side recent-blockhash refreshes. These signals only define what the
