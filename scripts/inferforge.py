@@ -8638,17 +8638,49 @@ def validation_item_from_hypothesis(
     }
 
 
+def validation_resource_preflight_summary(snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(snapshot, dict) or not snapshot:
+        return {"status": "not-run"}
+    return {
+        "status": artifact_summary_status(snapshot),
+        "warnings": snapshot.get("warnings", []) or [],
+        "memory": snapshot.get("memory", {}) or {},
+        "watched_ports": snapshot.get("watched_ports", {}) or {},
+    }
+
+
+def apply_current_resource_gate_to_hypothesis(
+    hypothesis: dict[str, Any],
+    current_resource_snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(current_resource_snapshot, dict) or not current_resource_snapshot:
+        return hypothesis
+    if not matrix_resource_gated(current_resource_snapshot):
+        return hypothesis
+    if hypothesis.get("status") != "ready-for-low-risk-validation":
+        return hypothesis
+    gated = json_clone(hypothesis)
+    gated["status"] = "resource-gated"
+    gated["resource_gate_source"] = "current-resource-snapshot"
+    gated["resource_gate_warnings"] = (current_resource_snapshot or {}).get("warnings", []) or []
+    gated["next_step"] = (
+        "Current resource preflight is not healthy; rerun validation-plan after resource-snapshot --strict passes."
+    )
+    return gated
+
+
 def build_validation_plan_run(
     *,
     target: str,
     profile: dict[str, Any] | None,
     artifact_dir: Path,
     limit: int,
+    current_resource_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     matrix = build_hypothesis_matrix_run(target=target, profile=profile, artifact_dir=artifact_dir)
     verification_queue = load_optional_json(artifact_dir / "verification-queue.json") or {}
     hypotheses = [
-        item
+        apply_current_resource_gate_to_hypothesis(item, current_resource_snapshot)
         for item in matrix.get("hypotheses", []) or []
         if isinstance(item, dict)
         and str(item.get("status") or "") not in {"parked-terminal-lead"}
@@ -8705,6 +8737,7 @@ def build_validation_plan_run(
             "command_safety": command_summary,
             "blocked_command_safety": blocked_command_summary,
             "hypothesis_matrix": matrix.get("status"),
+            "current_resource_snapshot": artifact_summary_status(current_resource_snapshot),
         },
         "items": items,
         "artifact_refs": {
@@ -8712,6 +8745,7 @@ def build_validation_plan_run(
             "verification_queue": "verification-queue.json",
             "resource_snapshot": RESOURCE_SNAPSHOT_ARTIFACT,
         },
+        "resource_preflight": validation_resource_preflight_summary(current_resource_snapshot),
         "safety": (
             "Read-only validation plan. It prepares gated validation steps from local artifacts only; "
             "it does not execute commands, send requests, invoke Burp, sign wallets, or submit transactions."
@@ -8726,6 +8760,7 @@ def build_validation_plan_rollup(
     artifact_dir: Path,
     check_dirs: list[Path],
     limit: int,
+    current_resource_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     runs = []
     items: list[dict[str, Any]] = []
@@ -8744,6 +8779,7 @@ def build_validation_plan_rollup(
             profile=None,
             artifact_dir=check_dir,
             limit=per_run_limit,
+            current_resource_snapshot=current_resource_snapshot,
         )
         run_status = str(doc.get("status") or "unknown")
         increment_count(run_status_counts, run_status)
@@ -8820,6 +8856,7 @@ def build_validation_plan_rollup(
             "run_status_counts": dict(sorted(run_status_counts.items())),
             "command_safety": command_summary,
             "blocked_command_safety": blocked_command_summary,
+            "current_resource_snapshot": artifact_summary_status(current_resource_snapshot),
         },
         "runs": runs,
         "items": items,
@@ -8828,6 +8865,7 @@ def build_validation_plan_rollup(
             "hypothesis_matrix": HYPOTHESIS_MATRIX_ARTIFACT,
             "verification_queue": "verification-queue.json",
         },
+        "resource_preflight": validation_resource_preflight_summary(current_resource_snapshot),
         "safety": (
             "Read-only validation plan rollup. It reads child artifacts only and does not execute commands, "
             "send requests, invoke Burp, sign wallets, submit transactions, or fetch external hosts."
@@ -34263,6 +34301,15 @@ def run_validation_plan(args: argparse.Namespace) -> int:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         write_target_profile_artifact(artifact_dir, profile, target, source_root)
 
+    current_resource_snapshot = None
+    if not getattr(args, "skip_current_resource_check", False):
+        current_resource_snapshot = build_resource_snapshot(
+            max_processes=8,
+            watch_ports=[3100, 2455],
+            warn_available_mib=2048,
+            warn_swap_used_mib=1024,
+        )
+
     check_dirs: list[Path] = []
     for item in args.check_dir or []:
         check_dirs.append(resolve_repo_path(item))
@@ -34285,6 +34332,7 @@ def run_validation_plan(args: argparse.Namespace) -> int:
             artifact_dir=artifact_dir,
             check_dirs=deduped_dirs,
             limit=max(1, int(args.limit)),
+            current_resource_snapshot=current_resource_snapshot,
         )
     else:
         plan = build_validation_plan_run(
@@ -34292,6 +34340,7 @@ def run_validation_plan(args: argparse.Namespace) -> int:
             profile=profile,
             artifact_dir=artifact_dir,
             limit=max(1, int(args.limit)),
+            current_resource_snapshot=current_resource_snapshot,
         )
 
     output_path = resolve_repo_path(args.output) if args.output else artifact_dir / VALIDATION_PLAN_ARTIFACT
@@ -34317,6 +34366,7 @@ def run_validation_plan(args: argparse.Namespace) -> int:
     summary = plan.get("summary", {}) or {}
     command_safety = summary.get("command_safety", {}) or {}
     blocked_command_safety = summary.get("blocked_command_safety", {}) or {}
+    resource_preflight = plan.get("resource_preflight", {}) or {}
     print(f"Validation plan: {plan['status']}")
     if plan.get("mode") == "rollup":
         print(
@@ -34329,6 +34379,13 @@ def run_validation_plan(args: argparse.Namespace) -> int:
         f"{summary.get('items', 0)} total, "
         f"status_counts={json.dumps(summary.get('status_counts', {}), sort_keys=True)}"
     )
+    if resource_preflight and resource_preflight.get("status") != "not-run":
+        warnings = resource_preflight.get("warnings", []) or []
+        print(
+            "Current resource gate: "
+            f"{resource_preflight.get('status')} "
+            f"warnings={','.join(warnings) if warnings else 'none'}"
+        )
     if command_safety:
         print(f"Command safety: {format_command_safety_summary(command_safety)}")
     if blocked_command_safety and blocked_command_safety.get("commands"):
@@ -35919,6 +35976,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-commands",
         action="store_true",
         help="Print allowed command previews and command-safety labels.",
+    )
+    validation_plan.add_argument(
+        "--skip-current-resource-check",
+        action="store_true",
+        help="Use only artifact resource snapshots instead of checking current /proc memory and watched ports.",
     )
     validation_plan.add_argument(
         "--no-write",

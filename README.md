@@ -295,6 +295,10 @@ python3 scripts/inferforge.py --artifact-dir .greybox/target-set \
 The plan is still read-only. It does not run the commands it prints; it exists
 so unattended work can stop at scope, resource, command-safety, and
 reportability gates before any validation traffic is sent.
+By default it also takes a current local `/proc` resource snapshot and forces
+active validation items back behind the resource gate when memory or swap is
+unhealthy. Use `--skip-current-resource-check` only for deterministic offline
+artifact comparisons.
 
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:
