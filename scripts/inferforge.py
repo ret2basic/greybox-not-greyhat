@@ -24875,6 +24875,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         readiness_output_dir = root / "readiness-output"
         attack_strategy_output_dir = root / "attack-strategy-output"
         verification_queue_output_dir = root / "verification-queue-output"
+        source_peek_requests_output_dir = root / "source-peek-requests-output"
         promote_output_dir = root / "promote-output"
         invalid_promote_output_dir = root / "invalid-promote-output"
         import_history_output_dir = root / "import-history-output"
@@ -24968,6 +24969,20 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--no-write",
                 ]
             )
+            source_peek_requests_return_code, source_peek_requests_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(source_peek_requests_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "source-peek-requests",
+                    "--no-write",
+                ]
+            )
             promote_return_code, promote_stdout = run_cli(
                 [
                     "--profile",
@@ -25056,6 +25071,13 @@ def build_no_write_selftest() -> dict[str, Any]:
                 verification_queue_output_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT
             ).exists(),
             "verification_queue_manifest": (verification_queue_output_dir / MANIFEST_NAME).exists(),
+            "source_peek_requests_dir": source_peek_requests_output_dir.exists(),
+            "source_peek_requests_target_profile_json": (
+                source_peek_requests_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "source_peek_requests_json": (source_peek_requests_output_dir / "source-peek-requests.json").exists(),
+            "source_peek_requests_traffic_index": (source_peek_requests_output_dir / "traffic-index.json").exists(),
+            "source_peek_requests_manifest": (source_peek_requests_output_dir / MANIFEST_NAME).exists(),
             "promote_dir": promote_output_dir.exists(),
             "promote_reviewed_profile": (promote_output_dir / "reviewed-profile.json").exists(),
             "promote_validation": (promote_output_dir / "reviewed-profile-validation.json").exists(),
@@ -25083,6 +25105,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     readiness_stdout_text = "\n".join(readiness_stdout)
     attack_strategy_stdout_text = "\n".join(attack_strategy_stdout)
     verification_queue_stdout_text = "\n".join(verification_queue_stdout)
+    source_peek_requests_stdout_text = "\n".join(source_peek_requests_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
     invalid_promote_stdout_text = "\n".join(invalid_promote_stdout)
     import_history_limit_stdout_text = "\n".join(import_history_limit_stdout)
@@ -25445,6 +25468,32 @@ def build_no_write_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "source-peek-requests-no-write-skips-artifacts",
+            "passed": (
+                source_peek_requests_return_code == 0
+                and "Source-peek requests: no-source-peek-requests" in source_peek_requests_stdout
+                and "Requests: 0 total" in source_peek_requests_stdout_text
+                and "No files written (--no-write)." in source_peek_requests_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "source_peek_requests_dir",
+                        "source_peek_requests_target_profile_json",
+                        "source_peek_requests_json",
+                        "source_peek_requests_traffic_index",
+                        "source_peek_requests_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in source_peek_requests_stdout)
+            ),
+            "expected": "source-peek-requests --no-write prints source-review request summary without writing artifacts or manifests",
+            "actual": {
+                "return_code": source_peek_requests_return_code,
+                "stdout": source_peek_requests_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
             "id": "import-burp-history-max-input-bytes-blocks-large-raw-input",
             "passed": (
                 import_history_limit_return_code == 2
@@ -25743,6 +25792,10 @@ def build_no_write_selftest() -> dict[str, Any]:
             "attack_strategy": {
                 "return_code": attack_strategy_return_code,
                 "stdout": attack_strategy_stdout,
+            },
+            "source_peek_requests": {
+                "return_code": source_peek_requests_return_code,
+                "stdout": source_peek_requests_stdout,
             },
             "outputs_exist": output_paths,
         },
@@ -34549,8 +34602,10 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
 
 def run_source_peek_requests(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     clusters_path = artifact_dir / "endpoint-clusters.json"
     clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
     traffic_index = load_optional_json(artifact_dir / "traffic-index.json")
@@ -34561,8 +34616,9 @@ def run_source_peek_requests(args: argparse.Namespace) -> int:
             load_jsonl(artifact_dir / "burp-history-observations.jsonl"),
         )
         traffic_index_path = artifact_dir / "traffic-index.json"
-        write_json(traffic_index_path, sanitize_artifact_samples(traffic_index))
-        output_paths.append(traffic_index_path)
+        if not no_write:
+            write_json(traffic_index_path, sanitize_artifact_samples(traffic_index))
+            output_paths.append(traffic_index_path)
     source_peeks = load_optional_json(artifact_dir / "source-peek-results.json")
     suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
     source_peek_requests = build_source_peek_requests(
@@ -34573,23 +34629,33 @@ def run_source_peek_requests(args: argparse.Namespace) -> int:
         load_optional_json(artifact_dir / "evidence-gaps.json"),
     )
     output_path = artifact_dir / "source-peek-requests.json"
-    write_json(output_path, source_peek_requests)
-    output_paths.append(output_path)
+    if not no_write:
+        write_json(output_path, source_peek_requests)
+        output_paths.append(output_path)
     print(f"Source-peek requests: {source_peek_requests['status']}")
     print(
         "Requests: "
         f"{source_peek_requests['summary']['requests']} total, "
         f"triggers={json.dumps(source_peek_requests['summary']['trigger_counts'], sort_keys=True)}"
     )
-    print(f"Wrote {output_path}")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="source-peek-requests",
-            output_paths=output_paths,
+    for item in (source_peek_requests.get("requests", []) or [])[: max(0, int(args.top))]:
+        print(
+            f"- {item.get('id')} {item.get('trigger')} {item.get('status')} "
+            f"clusters={','.join(item.get('cluster_ids', []) or []) or '-'} "
+            f"entrypoint={inline_summary_text(item.get('entrypoint'), max_chars=120)}"
         )
-    )
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="source-peek-requests",
+                output_paths=output_paths,
+            )
+        )
     return 0
 
 
@@ -38264,6 +38330,17 @@ def build_parser() -> argparse.ArgumentParser:
     source_peek_requests = sub.add_parser(
         "source-peek-requests",
         help="Recompute source-peek request rationale from current artifacts",
+    )
+    source_peek_requests.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of requests to print in the CLI summary.",
+    )
+    source_peek_requests.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print source-peek request summary only; do not write artifacts or refresh manifests.",
     )
     source_peek_requests.set_defaults(func=run_source_peek_requests)
 
