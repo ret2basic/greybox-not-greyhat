@@ -6736,7 +6736,49 @@ def parse_proc_status(pid: int) -> dict[str, Any] | None:
     preview = proc_cmdline_preview(pid)
     if preview:
         parsed["command_preview"] = preview
+    cgroup_context = parse_proc_cgroup_context(pid)
+    if cgroup_context:
+        parsed["cgroup_context"] = cgroup_context
     return parsed
+
+
+def parse_proc_cgroup_context(pid: int) -> dict[str, Any] | None:
+    try:
+        lines = (Path("/proc") / str(pid) / "cgroup").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    paths: list[str] = []
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        path = parts[2].strip()
+        if path:
+            paths.append(path)
+    if not paths:
+        return None
+
+    context: dict[str, Any] = {"path_preview": paths[0][:180]}
+    joined = " ".join(paths)
+    docker_match = re.search(r"(?:docker[-/])([0-9a-f]{12,64})(?:\.scope)?", joined)
+    if docker_match:
+        container_id = docker_match.group(1)
+        context.update(
+            {
+                "scope": "container",
+                "runtime": "docker",
+                "container_id": container_id,
+                "container_id_short": container_id[:12],
+                "label": f"docker:{container_id[:12]}",
+            }
+        )
+    elif "user.slice" in joined or "session-" in joined:
+        context.update({"scope": "user-session", "label": "user-session"})
+    elif "system.slice" in joined:
+        context.update({"scope": "system-service", "label": "system-service"})
+    else:
+        context.update({"scope": "unknown", "label": "cgroup"})
+    return context
 
 
 def top_rss_processes(limit: int) -> list[dict[str, Any]]:
@@ -6764,6 +6806,7 @@ def resource_release_candidates(processes: list[dict[str, Any]]) -> list[dict[st
             continue
         name = str(process.get("name") or "")
         command = str(process.get("command_preview") or "")
+        cgroup_context = process.get("cgroup_context") if isinstance(process.get("cgroup_context"), dict) else {}
         lowered = f"{name} {command}".lower()
         if "codex" in lowered or ".vscode-server" in lowered:
             continue
@@ -6776,6 +6819,8 @@ def resource_release_candidates(processes: list[dict[str, Any]]) -> list[dict[st
         elif "--port 3100" in lowered or "--port 2455" in lowered or "next dev" in lowered:
             candidate_type = "local-service"
             recommendation = "Review whether this local service is still needed before continuing memory-sensitive work."
+            if cgroup_context.get("scope") == "container":
+                recommendation = "Identify the owning container or compose stack before stopping this memory-sensitive local service."
         else:
             continue
         candidates.append(
@@ -6784,6 +6829,7 @@ def resource_release_candidates(processes: list[dict[str, Any]]) -> list[dict[st
                 "name": name,
                 "rss_mib": process.get("rss_mib"),
                 "type": candidate_type,
+                "process_context": cgroup_context,
                 "recommendation": recommendation,
                 "safe_action": "Prefer graceful application shutdown; do not kill unknown user/session processes automatically.",
             }
@@ -34367,6 +34413,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     "name": "python",
                     "rss_mib": 640.0,
                     "command_preview": "python -m app.cli --host 0.0.0.0 --port 2455",
+                    "cgroup_context": {
+                        "scope": "container",
+                        "runtime": "docker",
+                        "container_id_short": "8c59a6d0c9ef",
+                        "label": "docker:8c59a6d0c9ef",
+                    },
                 },
                 {
                     "pid": 104,
@@ -34382,6 +34434,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         resource_release_candidates_passed = (
             resource_release_candidate_types == {"burp-gui", "browser", "local-service"}
             and {item.get("pid") for item in resource_release_candidate_sample} == {101, 102, 103}
+            and any(
+                item.get("pid") == 103
+                and (item.get("process_context") or {}).get("label") == "docker:8c59a6d0c9ef"
+                and "container" in str(item.get("recommendation") or "")
+                for item in resource_release_candidate_sample
+            )
         )
     blackbox_asset_profile_paths = {
         cluster.get("path")
@@ -40348,18 +40406,24 @@ def run_resource_snapshot(args: argparse.Namespace) -> int:
     )
     print(f"Watched ports: {port_text if port_text else 'none'}")
     for process in snapshot.get("top_rss_processes", [])[: min(5, args.max_processes)]:
+        process_context = process.get("cgroup_context") if isinstance(process.get("cgroup_context"), dict) else {}
+        context_label = process_context.get("label") or "host"
         print(
             "RSS: "
             f"pid={process.get('pid')} "
             f"rss={process.get('rss_mib')}MiB "
-            f"name={process.get('name')}"
+            f"name={process.get('name')} "
+            f"context={context_label}"
         )
     for candidate in snapshot.get("release_candidates", [])[:3]:
+        process_context = candidate.get("process_context") if isinstance(candidate.get("process_context"), dict) else {}
+        context_label = process_context.get("label") or "host"
         print(
             "Release candidate: "
             f"pid={candidate.get('pid')} "
             f"type={candidate.get('type')} "
             f"rss={candidate.get('rss_mib')}MiB "
+            f"context={context_label} "
             f"action={candidate.get('recommendation')}"
         )
     if no_write:
