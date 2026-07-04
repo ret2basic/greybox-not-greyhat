@@ -80,6 +80,7 @@ DEFAULT_QUOTE_RESPONSE_CANDIDATE_PATHS = [
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_BODY_SAMPLE_CHARS = 1200
 DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES = 4 * 1024 * 1024
+DEFAULT_BURP_HISTORY_INPUT_BYTES = 4 * 1024 * 1024
 MAX_REQUEST_CONTEXTS_PER_ENDPOINT = 6
 REDACTED_VALUE = "[redacted]"
 GENERIC_HTTP_ROUTE_STRATEGY_SETS = {"nextjs-api-routes", "blackbox-http-observed"}
@@ -431,6 +432,32 @@ def count_jsonl_rows(path: Path) -> int:
                 continue
             rows += 1
     return rows
+
+
+def input_size_limit_message(label: str, size: int, max_input_bytes: int, limit_name: str) -> str:
+    return f"{label} is {size} bytes, which exceeds {limit_name}={max_input_bytes}"
+
+
+def read_text_file_limited(path: Path, *, max_input_bytes: int, limit_name: str) -> str:
+    size = path.stat().st_size
+    if size > max_input_bytes:
+        raise ValueError(input_size_limit_message(str(path), size, max_input_bytes, limit_name))
+    return path.read_text(encoding="utf-8")
+
+
+def read_stdin_limited(*, max_input_bytes: int, limit_name: str) -> str:
+    binary_stdin = getattr(sys.stdin, "buffer", None)
+    if binary_stdin is not None:
+        data = binary_stdin.read(max_input_bytes + 1)
+        if len(data) > max_input_bytes:
+            raise ValueError(input_size_limit_message("stdin", len(data), max_input_bytes, limit_name))
+        return data.decode("utf-8")
+
+    text = sys.stdin.read(max_input_bytes + 1)
+    size = len(text.encode("utf-8"))
+    if size > max_input_bytes:
+        raise ValueError(input_size_limit_message("stdin", size, max_input_bytes, limit_name))
+    return text
 
 
 def load_optional_json(path: Path) -> dict[str, Any] | None:
@@ -24441,6 +24468,14 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("blackbox-asset-profile", "run_blackbox_asset_profile"),
         refresh_expectation("blackbox-asset-map", "run_blackbox_asset_map"),
         refresh_expectation("host-takeover-baseline", "run_host_takeover_baseline"),
+        refresh_expectation("scope-policy", "run_scope_policy"),
+        refresh_expectation("websocket-candidate-review", "run_websocket_candidate_review", min_refreshes=2, min_prints=2),
+        refresh_expectation("lead-portfolio", "run_lead_portfolio"),
+        refresh_expectation("harness-loop", "run_harness_loop"),
+        refresh_expectation("hypothesis-matrix", "run_hypothesis_matrix"),
+        refresh_expectation("rewrite-review", "run_rewrite_review"),
+        refresh_expectation("validation-plan", "run_validation_plan"),
+        refresh_expectation("iteration-decision", "run_iteration_decision"),
         refresh_expectation("collect", "run_collect"),
         refresh_expectation("burp-observe", "run_burp_observe", min_refreshes=3, min_prints=3),
         refresh_expectation("burp-sync", "run_burp_sync", min_refreshes=4, min_prints=4),
@@ -24450,6 +24485,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("coverage", "run_coverage"),
         refresh_expectation("burp-observation-coverage", "run_burp_observation_coverage"),
         refresh_expectation("discovery-coverage", "run_discovery_coverage"),
+        refresh_expectation("evidence-gaps", "run_evidence_gaps"),
         refresh_expectation("response-deltas", "run_response_deltas"),
         refresh_expectation("source-peek-requests", "run_source_peek_requests"),
         refresh_expectation("evidence-chain", "run_evidence_chain"),
@@ -24459,6 +24495,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("adjudicate", "run_adjudicate"),
         refresh_expectation("capabilities", "run_capabilities"),
         refresh_expectation("readiness", "run_readiness"),
+        refresh_expectation("resource-snapshot", "run_resource_snapshot"),
         refresh_expectation("decode-transactions", "run_decode_transactions"),
         refresh_expectation("self-test-profile-routing", "run_profile_routing_selftest"),
         refresh_expectation("self-test-discovery-coverage", "run_discovery_coverage_selftest"),
@@ -24674,6 +24711,9 @@ def build_no_write_selftest() -> dict[str, Any]:
         verification_queue_output_dir = root / "verification-queue-output"
         promote_output_dir = root / "promote-output"
         invalid_promote_output_dir = root / "invalid-promote-output"
+        import_history_output_dir = root / "import-history-output"
+        oversized_history_path = root / "oversized-burp-history.txt"
+        oversized_history_path.write_text("x" * 64, encoding="utf-8")
 
         original_build_capabilities = globals()["build_capabilities"]
         try:
@@ -24798,6 +24838,23 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--no-write",
                 ]
             )
+            import_history_limit_return_code, import_history_limit_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(import_history_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "import-burp-history",
+                    "--input",
+                    str(oversized_history_path),
+                    "--max-input-bytes",
+                    "32",
+                ]
+            )
         finally:
             globals()["build_capabilities"] = original_build_capabilities
 
@@ -24843,6 +24900,15 @@ def build_no_write_selftest() -> dict[str, Any]:
             "invalid_promote_validation": (invalid_promote_output_dir / "reviewed-profile-validation.json").exists(),
             "invalid_promote_artifact": (invalid_promote_output_dir / "reviewed-observation-promotion.json").exists(),
             "invalid_promote_manifest": (invalid_promote_output_dir / MANIFEST_NAME).exists(),
+            "import_history_dir": import_history_output_dir.exists(),
+            "import_history_target_profile_json": (import_history_output_dir / TARGET_PROFILE_ARTIFACT).exists(),
+            "import_history_jsonl": (import_history_output_dir / "burp-history-observations.jsonl").exists(),
+            "import_history_transaction_candidates": (
+                import_history_output_dir / "burp-transaction-candidates.json"
+            ).exists(),
+            "import_history_traffic_index": (import_history_output_dir / "traffic-index.json").exists(),
+            "import_history_collection_summary": (import_history_output_dir / "collection-summary.json").exists(),
+            "import_history_manifest": (import_history_output_dir / MANIFEST_NAME).exists(),
         }
 
     review_candidates_stdout_text = "\n".join(review_candidates_stdout)
@@ -24853,6 +24919,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     verification_queue_stdout_text = "\n".join(verification_queue_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
     invalid_promote_stdout_text = "\n".join(invalid_promote_stdout)
+    import_history_limit_stdout_text = "\n".join(import_history_limit_stdout)
     attack_strategy_overflow_no_write = format_attack_strategy_waiting_action_overflow(
         5,
         3,
@@ -25209,6 +25276,32 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "manual_preview": manual_followup_preview_lines,
                 "ready_preview": ready_followup_preview_lines,
+            },
+        },
+        {
+            "id": "import-burp-history-max-input-bytes-blocks-large-raw-input",
+            "passed": (
+                import_history_limit_return_code == 2
+                and "Burp history import blocked: ValueError" in import_history_limit_stdout
+                and "Limit: max_burp_history_input_bytes=32" in import_history_limit_stdout
+                and output_paths["import_history_target_profile_json"]
+                and output_paths["import_history_manifest"]
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "import_history_jsonl",
+                        "import_history_transaction_candidates",
+                        "import_history_traffic_index",
+                        "import_history_collection_summary",
+                    ]
+                )
+            ),
+            "expected": "import-burp-history refuses oversized raw input before writing normalized history artifacts",
+            "actual": {
+                "return_code": import_history_limit_return_code,
+                "stdout": import_history_limit_stdout,
+                "stdout_text": import_history_limit_stdout_text,
+                "outputs_exist": output_paths,
             },
         },
         {
@@ -29191,15 +29284,51 @@ def run_import_burp_history(args: argparse.Namespace) -> int:
     write_target_profile_artifact(artifact_dir, profile, target, source_root)
 
     inputs: list[tuple[str, str]] = []
-    for item in args.input or []:
-        if item == "-":
-            inputs.append(("stdin", sys.stdin.read()))
-            continue
-        path = Path(item).resolve()
-        inputs.append((str(path), read_text(path)))
+    max_input_bytes = int(args.max_input_bytes)
+    limit_name = "max_burp_history_input_bytes"
+    try:
+        for item in args.input or []:
+            if item == "-":
+                inputs.append(
+                    (
+                        "stdin",
+                        read_stdin_limited(max_input_bytes=max_input_bytes, limit_name=limit_name),
+                    )
+                )
+                continue
+            path = Path(item).resolve()
+            inputs.append(
+                (
+                    str(path),
+                    read_text_file_limited(path, max_input_bytes=max_input_bytes, limit_name=limit_name),
+                )
+            )
 
-    if not inputs and not sys.stdin.isatty():
-        inputs.append(("stdin", sys.stdin.read()))
+        if not inputs and not sys.stdin.isatty():
+            inputs.append(
+                (
+                    "stdin",
+                    read_stdin_limited(max_input_bytes=max_input_bytes, limit_name=limit_name),
+                )
+            )
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        error_summary = redacted_error_summary(error)
+        print(f"Burp history import blocked: {type(error).__name__}")
+        print(f"Limit: {limit_name}={max_input_bytes}")
+        print(
+            "Error: "
+            f"{error_summary['type']} "
+            f"sha256={error_summary['message_sha256']}"
+        )
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="import-burp-history",
+                output_paths=target_profile_artifact_paths(artifact_dir),
+            )
+        )
+        return 2
 
     if not inputs:
         print("No Burp MCP history input provided; pass --input PATH or pipe raw MCP output on stdin")
@@ -37614,6 +37743,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--input",
         action="append",
         help="Raw Burp MCP history text/JSON file. Use '-' to read stdin.",
+    )
+    import_history.add_argument(
+        "--max-input-bytes",
+        type=positive_int,
+        default=DEFAULT_BURP_HISTORY_INPUT_BYTES,
+        help=(
+            "Maximum raw Burp MCP history bytes to import from each input. "
+            f"Defaults to {DEFAULT_BURP_HISTORY_INPUT_BYTES}."
+        ),
     )
     import_history.add_argument(
         "--replace",

@@ -1221,7 +1221,10 @@ already been saved. For normal runs, prefer `burp-sync`.
 `get_proxy_http_history` / `get_proxy_http_history_regex`. It understands MCP
 text wrapper JSON, a JSON array of history items, JSONL, and Burp's blank-line
 separated JSON object output. By default it filters to the current `--target`
-host and writes normalized observations to:
+host. Each raw input is capped at 4 MiB by default so a large saved Burp export
+does not create a memory spike on small VPS hosts; raise `--max-input-bytes`
+only after reviewing the file and available memory. Successful imports write
+normalized observations to:
 
 ```text
 .greybox/burp-history-observations.jsonl
@@ -1244,6 +1247,7 @@ Pipe raw MCP output directly when convenient:
 
 ```bash
 python3 scripts/inferforge.py import-burp-history --replace --input -
+python3 scripts/inferforge.py import-burp-history --input .greybox/burp-mcp-history.txt --max-input-bytes 1048576
 ```
 
 If you intentionally persist raw MCP history for offline debugging, keep it out
