@@ -454,6 +454,35 @@ def default_target_profile() -> dict[str, Any]:
                 },
             },
         },
+        "quote_provider": {
+            "name": "M0",
+            "diagnostics": [
+                {
+                    "id": "m0-config-missing-or-placeholder",
+                    "classification": "m0-config-missing-or-placeholder",
+                    "statuses": [500],
+                    "body_contains": ["Quote service is not configured"],
+                    "summary": "The target rejected quote collection before upstream forwarding because the M0 key is missing or still set to a template placeholder.",
+                    "next_step": "Configure a real M0_ORCHESTRATION_API_KEY, restart the target server, and rerun collect-quote.",
+                },
+                {
+                    "id": "m0-upstream-auth-or-policy-rejected",
+                    "classification": "m0-upstream-auth-or-policy-rejected",
+                    "statuses": [401, 403],
+                    "body_contains": ["M0 orchestration quote failed"],
+                    "summary": "The target reached M0, but upstream rejected the quote request after local validation.",
+                    "next_step": "Verify the M0 key, account permissions, route, wallet, and amount, then rerun collect-quote.",
+                },
+                {
+                    "id": "m0-response-shape-unexpected",
+                    "classification": "m0-response-shape-unexpected",
+                    "statuses": [502],
+                    "body_contains": ["Invalid response shape"],
+                    "summary": "M0 returned a successful HTTP response, but the target did not recognize the quote response shape.",
+                    "next_step": "Capture the response shape in a controlled environment and update transaction extraction only after reviewing it.",
+                },
+            ],
+        },
         "environment_readiness": {
             "checks": [
                 {
@@ -734,6 +763,7 @@ def neutral_target_profile_defaults(
         },
         "probe_targets": {},
         "quote_intent": {},
+        "quote_provider": {},
         "environment_readiness": {"checks": []},
         "clusters": [],
         "source_peeks": [],
@@ -776,6 +806,7 @@ def normalize_target_profile(profile: dict[str, Any], *, profile_path: Path | No
         "safety",
         "probe_targets",
         "quote_intent",
+        "quote_provider",
         "environment_readiness",
         "clusters",
         "source_peeks",
@@ -1033,6 +1064,40 @@ def quote_allowed_programs(profile: dict[str, Any] | None, direction: str | None
     return []
 
 
+def quote_provider_config(profile: dict[str, Any] | None) -> dict[str, Any]:
+    configured = (profile or {}).get("quote_provider")
+    if isinstance(configured, dict):
+        return json_clone(configured)
+    if uses_builtin_target_defaults(profile):
+        return json_clone(default_target_profile().get("quote_provider", {}))
+    return {}
+
+
+def quote_provider_name(profile: dict[str, Any] | None) -> str:
+    name = quote_provider_config(profile).get("name")
+    return str(name).strip() if isinstance(name, str) and name.strip() else "quote provider"
+
+
+def quote_provider_diagnostics(profile: dict[str, Any] | None) -> list[dict[str, Any]]:
+    diagnostics = quote_provider_config(profile).get("diagnostics")
+    if not isinstance(diagnostics, list):
+        return []
+    return [json_clone(item) for item in diagnostics if isinstance(item, dict)]
+
+
+def normalize_http_status_codes(value: Any) -> list[int]:
+    raw_values = value if isinstance(value, list) else [value]
+    statuses: list[int] = []
+    for item in raw_values:
+        try:
+            status = int(item)
+        except (TypeError, ValueError):
+            continue
+        if 100 <= status <= 599 and status not in statuses:
+            statuses.append(status)
+    return statuses
+
+
 def environment_readiness_config(profile: dict[str, Any] | None) -> dict[str, Any]:
     configured = (profile or {}).get("environment_readiness")
     if isinstance(configured, dict):
@@ -1150,6 +1215,7 @@ def build_profile_validation_artifact(
             "environment_readiness",
             "probe_targets",
             "quote_intent",
+            "quote_provider",
             "source_peeks",
             "burp_observation_plan",
             "websocket_observation",
@@ -1215,6 +1281,88 @@ def build_profile_validation_artifact(
                     "message": f"Environment readiness target health check `{check_id}` is missing `field`.",
                 }
             )
+
+    raw_quote_provider = profile.get("quote_provider")
+    quote_provider = quote_provider_config(profile)
+    if raw_quote_provider not in (None, {}) and not isinstance(raw_quote_provider, dict):
+        warnings.append(
+            {
+                "id": "quote-provider:not-object",
+                "severity": "warning",
+                "message": "`quote_provider` should be an object with optional `name` and `diagnostics` fields.",
+            }
+        )
+    provider_name = quote_provider.get("name")
+    if provider_name is not None and not isinstance(provider_name, str):
+        warnings.append(
+            {
+                "id": "quote-provider:name-not-string",
+                "severity": "warning",
+                "message": "`quote_provider.name` should be a string.",
+            }
+        )
+    provider_diagnostics = quote_provider.get("diagnostics")
+    if provider_diagnostics is not None and not isinstance(provider_diagnostics, list):
+        warnings.append(
+            {
+                "id": "quote-provider:diagnostics-not-array",
+                "severity": "warning",
+                "message": "`quote_provider.diagnostics` should be an array of diagnostic matcher objects.",
+            }
+        )
+        provider_diagnostics = []
+    for diagnostic_index, diagnostic in enumerate(provider_diagnostics or []):
+        if not isinstance(diagnostic, dict):
+            warnings.append(
+                {
+                    "id": f"quote-provider:diagnostic-{diagnostic_index}:not-object",
+                    "severity": "warning",
+                    "message": "Quote provider diagnostics should be JSON objects.",
+                }
+            )
+            continue
+        diagnostic_id = str(diagnostic.get("id") or f"diagnostic-{diagnostic_index}")
+        if not isinstance(diagnostic.get("classification"), str) or not str(diagnostic.get("classification") or "").strip():
+            warnings.append(
+                {
+                    "id": f"quote-provider:{diagnostic_id}:missing-classification",
+                    "severity": "warning",
+                    "message": f"Quote provider diagnostic `{diagnostic_id}` should define a non-empty `classification`.",
+                }
+            )
+        statuses_raw = (
+            diagnostic.get("statuses")
+            if "statuses" in diagnostic
+            else diagnostic.get("status", diagnostic.get("http_statuses", diagnostic.get("http_status")))
+        )
+        if statuses_raw is not None and not normalize_http_status_codes(statuses_raw):
+            warnings.append(
+                {
+                    "id": f"quote-provider:{diagnostic_id}:invalid-statuses",
+                    "severity": "warning",
+                    "message": f"Quote provider diagnostic `{diagnostic_id}` has no valid HTTP status codes.",
+                }
+            )
+        if not normalize_string_list(diagnostic.get("body_contains") or diagnostic.get("bodyContains") or diagnostic.get("contains")):
+            warnings.append(
+                {
+                    "id": f"quote-provider:{diagnostic_id}:missing-body-matcher",
+                    "severity": "warning",
+                    "message": (
+                        f"Quote provider diagnostic `{diagnostic_id}` has no `body_contains` matcher. "
+                        "Status-only matching is allowed but can be broad."
+                    ),
+                }
+            )
+        for text_field in ["summary", "next_step"]:
+            if diagnostic.get(text_field) is not None and not isinstance(diagnostic.get(text_field), str):
+                warnings.append(
+                    {
+                        "id": f"quote-provider:{diagnostic_id}:{text_field}-not-string",
+                        "severity": "warning",
+                        "message": f"Quote provider diagnostic `{diagnostic_id}` field `{text_field}` should be a string.",
+                    }
+                )
 
     seen_cluster_ids: set[str] = set()
     declared_clusters = profile.get("clusters", [])
@@ -3182,6 +3330,25 @@ def quote_intent_for_discovered_profile(
     return json_clone(configured)
 
 
+def quote_provider_for_discovered_profile(
+    seed_profile: dict[str, Any] | None,
+    clusters: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    has_quote_cluster = any(
+        str(cluster.get("id") or "") == "quote"
+        or str(cluster.get("strategy_set") or "") == "quote-transaction-decoder"
+        for cluster in clusters
+    )
+    if not has_quote_cluster or not seed_profile or uses_builtin_target_defaults(seed_profile):
+        return None
+    if "quote_provider" in set(seed_profile.get("_profile_defaulted_keys") or []):
+        return None
+    configured = seed_profile.get("quote_provider")
+    if not isinstance(configured, dict) or not configured:
+        return None
+    return json_clone(configured)
+
+
 def build_discovered_burp_observation_plan(
     clusters: list[dict[str, Any]],
     probe_targets: dict[str, Any],
@@ -3589,6 +3756,9 @@ def build_discovered_profile(
     quote_intent = quote_intent_for_discovered_profile(seed_profile, clusters)
     if quote_intent is not None:
         profile["quote_intent"] = quote_intent
+    quote_provider = quote_provider_for_discovered_profile(seed_profile, clusters)
+    if quote_provider is not None:
+        profile["quote_provider"] = quote_provider
     return profile
 
 
@@ -8824,9 +8994,7 @@ def build_evidence_gaps(
         for row in results_by_cluster.get("solana-rpc-ws", [])
         if row.get("probe_id") == "ws_resource_connection_limit"
     ]
-    if results_by_cluster.get("solana-rpc-ws") and not (
-        ws_resource_rows and all(row.get("expected") for row in ws_resource_rows)
-    ):
+    if results_by_cluster.get("solana-rpc-ws") and not ws_resource_rows:
         add_gap(
             "GAP-ws-resource-controls",
             "solana-rpc-ws",
@@ -10249,12 +10417,17 @@ def build_blackbox_coverage(
             "evidence": evidence,
         }
 
+    def coverage_open_item_unexpected(row: dict[str, Any]) -> bool:
+        return str(row.get("risk") or "") == "approval-gated-low-volume-websocket-resource-probe"
+
     for cluster in clusters.get("clusters", []):
         cluster_id = cluster["id"]
         cluster_kind = str(cluster.get("kind") or "")
         priority = cluster.get("priority")
         rows = rows_by_cluster.get(cluster_id, [])
         unexpected = [row for row in rows if not row.get("expected")]
+        required_unexpected = [row for row in unexpected if not coverage_open_item_unexpected(row)]
+        open_item_unexpected = [row for row in unexpected if coverage_open_item_unexpected(row)]
         policy_fields = sorted(
             {
                 str(row.get("policy_field"))
@@ -10266,7 +10439,9 @@ def build_blackbox_coverage(
         burp_observed = cluster_id in burp_cluster_ids
         safe_probe_status = (
             "failed"
-            if unexpected
+            if required_unexpected
+            else "warning"
+            if open_item_unexpected
             else ("passed" if rows else ("failed" if active_probe_required else "not-applicable"))
         )
         policy_status = (
@@ -10284,7 +10459,12 @@ def build_blackbox_coverage(
             make_check(
                 "safe-probes-executed",
                 safe_probe_status,
-                {"probe_count": len(rows), "unexpected_count": len(unexpected)},
+                {
+                    "probe_count": len(rows),
+                    "unexpected_count": len(unexpected),
+                    "required_unexpected_count": len(required_unexpected),
+                    "open_item_unexpected_count": len(open_item_unexpected),
+                },
                 required=active_probe_required,
             ),
             make_check(
@@ -21257,6 +21437,19 @@ def build_profile_routing_selftest_profile() -> dict[str, Any]:
                 },
             },
         },
+        "quote_provider": {
+            "name": "SelfTestQuoteProvider",
+            "diagnostics": [
+                {
+                    "id": "selftest-provider-config-missing",
+                    "classification": "selftest-provider-config-missing",
+                    "statuses": [503],
+                    "body_contains": ["SELFTEST_PROVIDER_CONFIG_MISSING"],
+                    "summary": "Self-test quote provider configuration is missing.",
+                    "next_step": "Set SELFTEST_PROVIDER_TOKEN and rerun collect-quote.",
+                }
+            ],
+        },
         "clusters": [
             {
                 "id": "health",
@@ -21376,6 +21569,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         },
         test_profile,
     )
+    quote_provider_diagnosis_sample = diagnose_quote_collection_response(
+        {
+            "status": 503,
+            "body_sample": '{"error":"SELFTEST_PROVIDER_CONFIG_MISSING"}',
+        },
+        None,
+        test_profile,
+    )
     missing_quote_intent_profile = json_clone(test_profile)
     missing_quote_intent_profile["quote_intent"] = {}
     missing_quote_intent_validation = build_profile_validation_artifact(
@@ -21423,6 +21624,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and (missing_quote_body_error or {}).get("message_redacted") is True
         and missing_quote_payload.get("ok") is False
         and ((missing_quote_payload.get("error") or {}).get("message_redacted") is True)
+    )
+    quote_provider_profile_passed = (
+        quote_provider_name(test_profile) == "SelfTestQuoteProvider"
+        and quote_provider_diagnosis_sample.get("classification") == "selftest-provider-config-missing"
+        and quote_provider_diagnosis_sample.get("provider") == "SelfTestQuoteProvider"
+        and quote_provider_diagnosis_sample.get("matched_profile_diagnostic") == "selftest-provider-config-missing"
+        and "SELFTEST_PROVIDER_TOKEN" in str(quote_provider_diagnosis_sample.get("next_step") or "")
     )
     quote_discovery_inventory = {
         "generated_at": utc_now(),
@@ -21501,6 +21709,19 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and quote_direction_mints(discovered_quote_seed_profile, "sell")
         == ("11111111111111111111111111111111", "So11111111111111111111111111111111111111112")
         and "quote_intent" not in discovered_quote_no_seed_profile
+    )
+    discovered_quote_provider_passed = (
+        (discovered_quote_seed_profile.get("quote_provider") or {}).get("name") == "SelfTestQuoteProvider"
+        and (discovered_quote_seed_profile.get("quote_provider") or {}).get("diagnostics", [{}])[0].get("classification")
+        == "selftest-provider-config-missing"
+        and "quote_provider" not in discovered_quote_no_seed_profile
+    )
+    parser = build_parser()
+    default_discover_args = parser.parse_args(["discover-profile"])
+    explicit_discover_args = parser.parse_args(["--profile", str(DEFAULT_PROFILE_PATH), "discover-profile"])
+    discover_profile_seed_cli_passed = (
+        default_discover_args.profile is None
+        and explicit_discover_args.profile == str(DEFAULT_PROFILE_PATH)
     )
     readiness_capabilities = {"target": {"reachable": True, "health_status": 200}}
     non_quote_readiness_profile = json_clone(test_profile)
@@ -22635,6 +22856,77 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and response_delta_endpoint.get("status") == "review-needed"
         and response_delta_endpoint.get("unexpected_count") == 1
     )
+    ws_resource_clusters = {
+        "clusters": [
+            {
+                "id": "solana-rpc-ws",
+                "kind": "websocket-json-rpc-proxy",
+                "path": "/api/rpc/solana/{cluster}",
+                "priority": "high",
+                "strategy_set": "solana-json-rpc-proxy",
+                "match": {"methods": ["WS"], "path_prefixes": ["/api/rpc/solana/"]},
+            }
+        ]
+    }
+    ws_resource_unexpected_row = {
+        "probe_id": "ws_resource_connection_limit",
+        "category": "solana-rpc-ws",
+        "expected": False,
+        "risk": "approval-gated-low-volume-websocket-resource-probe",
+        "policy_field": "connection-limit",
+        "status": 101,
+        "expected_statuses": [429],
+    }
+    ws_resource_source_peeks = {"source_peeks": [{"cluster_ids": ["solana-rpc-ws"]}]}
+    ws_resource_burp_history = [
+        {
+            "method": "WS",
+            "path": "/api/rpc/solana/devnet",
+            "status": 101,
+            "source": "self-test",
+        }
+    ]
+    ws_resource_evidence_gaps = build_evidence_gaps(
+        ws_resource_clusters,
+        [ws_resource_unexpected_row],
+        ws_resource_burp_history,
+        {"candidates_seen": 0},
+        source_peeks=ws_resource_source_peeks,
+    )
+    ws_resource_coverage = build_blackbox_coverage(
+        ws_resource_clusters,
+        [ws_resource_unexpected_row],
+        ws_resource_burp_history,
+        ws_resource_source_peeks,
+        ws_resource_evidence_gaps,
+        {"summary": {"clusters": ["solana-rpc-ws"], "unexpected": 0}},
+        {"status": "ready"},
+        {"status": "passed"},
+    )
+    ws_resource_cluster_coverage = next(
+        (
+            item
+            for item in ws_resource_coverage.get("cluster_coverage", [])
+            if item.get("cluster_id") == "solana-rpc-ws"
+        ),
+        {},
+    )
+    ws_resource_safe_probe_check = next(
+        (
+            item
+            for item in ws_resource_cluster_coverage.get("checks", [])
+            if item.get("id") == "safe-probes-executed"
+        ),
+        {},
+    )
+    ws_resource_open_item_passed = (
+        ws_resource_coverage.get("status") == "covered"
+        and ws_resource_cluster_coverage.get("status") == "covered-with-open-items"
+        and ws_resource_safe_probe_check.get("status") == "warning"
+        and (ws_resource_safe_probe_check.get("evidence") or {}).get("open_item_unexpected_count") == 1
+        and not ws_resource_coverage.get("required_failures")
+        and "GAP-ws-resource-controls" not in {gap.get("id") for gap in ws_resource_evidence_gaps.get("gaps", [])}
+    )
     rewrite_attack_strategy = build_attack_strategy(
         rewrite_clusters,
         [],
@@ -22847,13 +23139,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and not missing_paths
         and generic_attribution_passed
         and response_delta_selftest_passed
+        and ws_resource_open_item_passed
         and unsafe_observation_validation_passed
         and rewrite_discovery_passed
         and configured_nextjs_runtime_passed
         and initial_artifacts_passed
         and target_lock_passed
         and quote_intent_profile_passed
+        and quote_provider_profile_passed
         and discovered_quote_intent_passed
+        and discovered_quote_provider_passed
+        and discover_profile_seed_cli_passed
         and readiness_profile_passed
         and attack_strategy_status_passed
     )
@@ -22898,10 +23194,25 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "missing_quote_body_error": missing_quote_body_error,
             "missing_quote_payload_error": missing_quote_payload.get("error"),
         },
+        "quote_provider_profile_routing": {
+            "status": "passed" if quote_provider_profile_passed else "failed",
+            "provider": quote_provider_name(test_profile),
+            "diagnosis": quote_provider_diagnosis_sample,
+        },
         "discovered_quote_intent_seed_routing": {
             "status": "passed" if discovered_quote_intent_passed else "failed",
             "seeded_quote_intent": discovered_quote_seed_profile.get("quote_intent"),
             "no_seed_has_quote_intent": "quote_intent" in discovered_quote_no_seed_profile,
+        },
+        "discovered_quote_provider_seed_routing": {
+            "status": "passed" if discovered_quote_provider_passed else "failed",
+            "seeded_quote_provider": discovered_quote_seed_profile.get("quote_provider"),
+            "no_seed_has_quote_provider": "quote_provider" in discovered_quote_no_seed_profile,
+        },
+        "discover_profile_seed_cli": {
+            "status": "passed" if discover_profile_seed_cli_passed else "failed",
+            "default_profile_arg": default_discover_args.profile,
+            "explicit_profile_arg": explicit_discover_args.profile,
         },
         "environment_readiness_profile_routing": {
             "status": "passed" if readiness_profile_passed else "failed",
@@ -22917,6 +23228,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "summary": response_delta_selftest.get("summary", {}),
             "cluster": response_delta_cluster,
             "endpoint": response_delta_endpoint,
+        },
+        "ws_resource_open_item_coverage": {
+            "status": "passed" if ws_resource_open_item_passed else "failed",
+            "coverage_status": ws_resource_coverage.get("status"),
+            "cluster": ws_resource_cluster_coverage,
+            "evidence_gap_ids": [gap.get("id") for gap in ws_resource_evidence_gaps.get("gaps", [])],
         },
         "attack_strategy_status": {
             "status": "passed" if attack_strategy_status_passed else "failed",
@@ -24493,7 +24810,7 @@ def run_artifact_health(args: argparse.Namespace) -> int:
 def run_regression_suite(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    default_profile_path = resolve_repo_path(args.profile)
+    default_profile_path = resolve_repo_path(args.profile or DEFAULT_PROFILE_PATH)
     default_artifact_dir = resolve_repo_path(args.default_artifact_dir)
     discovered_artifact_dir = resolve_repo_path(args.discovered_artifact_dir)
     discovered_profile_path = artifact_dir / DISCOVERED_PROFILE_ARTIFACT
@@ -25013,7 +25330,7 @@ def run_discover_profile(args: argparse.Namespace) -> int:
         display_name=display_name,
         target=target,
         source_root=source_root,
-        seed_profile=base_profile,
+        seed_profile=base_profile if args.profile else None,
     )
     output_path = Path(args.output).resolve() if args.output else artifact_dir / DISCOVERED_PROFILE_ARTIFACT
     explicit_output = bool(args.output)
@@ -25380,7 +25697,62 @@ def build_quote_collection_body(
     }
 
 
-def diagnose_quote_collection_response(response: dict[str, Any], saved_payload: str | None) -> dict[str, Any]:
+def quote_provider_diagnostic_matches(diagnostic: dict[str, Any], status: Any, body_sample: str) -> bool:
+    statuses_raw = (
+        diagnostic.get("statuses")
+        if "statuses" in diagnostic
+        else diagnostic.get("status", diagnostic.get("http_statuses", diagnostic.get("http_status")))
+    )
+    statuses = normalize_http_status_codes(statuses_raw)
+    if statuses and status not in statuses:
+        return False
+    contains = normalize_string_list(
+        diagnostic.get("body_contains")
+        or diagnostic.get("bodyContains")
+        or diagnostic.get("contains")
+    )
+    if contains and not any(token in body_sample for token in contains):
+        return False
+    return bool(statuses or contains)
+
+
+def quote_provider_diagnosis_from_profile(
+    profile: dict[str, Any] | None,
+    response: dict[str, Any],
+) -> dict[str, Any] | None:
+    body_sample = response.get("body_sample") or response.get("body_text") or ""
+    provider = quote_provider_name(profile)
+    for index, diagnostic in enumerate(quote_provider_diagnostics(profile)):
+        classification = str(diagnostic.get("classification") or "").strip()
+        if not classification:
+            continue
+        if not quote_provider_diagnostic_matches(diagnostic, response.get("status"), body_sample):
+            continue
+        summary = diagnostic.get("summary")
+        next_step = diagnostic.get("next_step")
+        return {
+            "classification": classification,
+            "summary": (
+                summary
+                if isinstance(summary, str) and summary
+                else f"The target quote route matched quote-provider diagnostic `{classification}` for {provider}."
+            ),
+            "next_step": (
+                next_step
+                if isinstance(next_step, str) and next_step
+                else "Review the configured quote-provider credentials, request policy, and response shape, then rerun collect-quote."
+            ),
+            "provider": provider,
+            "matched_profile_diagnostic": str(diagnostic.get("id") or f"diagnostic-{index}"),
+        }
+    return None
+
+
+def diagnose_quote_collection_response(
+    response: dict[str, Any],
+    saved_payload: str | None,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     status = response.get("status")
     body_sample = response.get("body_sample") or response.get("body_text") or ""
 
@@ -25398,6 +25770,17 @@ def diagnose_quote_collection_response(response: dict[str, Any], saved_payload: 
             "next_step": "Confirm the target server is running and rerun collect-quote.",
         }
 
+    if status == 400 and "Invalid quote request body" in body_sample:
+        return {
+            "classification": "local-quote-policy-rejected",
+            "summary": "The target rejected the quote body during local validation.",
+            "next_step": "Review the generated quote request and local quote policy before rerunning collect-quote.",
+        }
+
+    profile_diagnosis = quote_provider_diagnosis_from_profile(profile, response)
+    if profile_diagnosis is not None:
+        return profile_diagnosis
+
     if status == 500 and "Quote service is not configured" in body_sample:
         return {
             "classification": "m0-config-missing-or-placeholder",
@@ -25410,13 +25793,6 @@ def diagnose_quote_collection_response(response: dict[str, Any], saved_payload: 
             "classification": "m0-upstream-auth-or-policy-rejected",
             "summary": "The target reached M0, but upstream rejected the quote request after local validation.",
             "next_step": "Verify the M0 key, account permissions, route, wallet, and amount, then rerun collect-quote.",
-        }
-
-    if status == 400 and "Invalid quote request body" in body_sample:
-        return {
-            "classification": "local-quote-policy-rejected",
-            "summary": "The target rejected the quote body during local validation.",
-            "next_step": "Review the generated quote request and local quote policy before rerunning collect-quote.",
         }
 
     if status == 502 and "Invalid response shape" in body_sample:
@@ -25537,7 +25913,7 @@ def run_collect_quote(args: argparse.Namespace) -> int:
         output_path.write_text(response["body_text"], encoding="utf-8")
         saved_payload = str(output_path)
 
-    diagnosis = diagnose_quote_collection_response(response, saved_payload)
+    diagnosis = diagnose_quote_collection_response(response, saved_payload, profile)
     quote_collection = {
         "generated_at": utc_now(),
         "profile": profile_summary(profile),
@@ -25756,7 +26132,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="InferForge local greybox runner")
     parser.add_argument(
         "--profile",
-        default=str(DEFAULT_PROFILE_PATH),
+        default=None,
         help="Target profile JSON. Defaults to profiles/infrafi-web.json.",
     )
     parser.add_argument("--target", help="Base URL for the local target. Defaults to the target profile.")

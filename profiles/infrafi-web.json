@@ -67,6 +67,35 @@
       }
     }
   },
+  "quote_provider": {
+    "name": "M0",
+    "diagnostics": [
+      {
+        "id": "m0-config-missing-or-placeholder",
+        "classification": "m0-config-missing-or-placeholder",
+        "statuses": [500],
+        "body_contains": ["Quote service is not configured"],
+        "summary": "The target rejected quote collection before upstream forwarding because the M0 key is missing or still set to a template placeholder.",
+        "next_step": "Configure a real M0_ORCHESTRATION_API_KEY, restart the target server, and rerun collect-quote."
+      },
+      {
+        "id": "m0-upstream-auth-or-policy-rejected",
+        "classification": "m0-upstream-auth-or-policy-rejected",
+        "statuses": [401, 403],
+        "body_contains": ["M0 orchestration quote failed"],
+        "summary": "The target reached M0, but upstream rejected the quote request after local validation.",
+        "next_step": "Verify the M0 key, account permissions, route, wallet, and amount, then rerun collect-quote."
+      },
+      {
+        "id": "m0-response-shape-unexpected",
+        "classification": "m0-response-shape-unexpected",
+        "statuses": [502],
+        "body_contains": ["Invalid response shape"],
+        "summary": "M0 returned a successful HTTP response, but the target did not recognize the quote response shape.",
+        "next_step": "Capture the response shape in a controlled environment and update transaction extraction only after reviewing it."
+      }
+    ]
+  },
   "environment_readiness": {
     "checks": [
       {

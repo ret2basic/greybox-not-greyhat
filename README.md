@@ -196,7 +196,7 @@ whitespace are profile-validation errors. Keep unresolved paths in
 `review_observation_candidates` until one reviewed concrete path is promoted.
 
 When a separate profile file omits target-specific fields such as `clusters`,
-`probe_targets`, `quote_intent`, `environment_readiness`,
+`probe_targets`, `quote_intent`, `quote_provider`, `environment_readiness`,
 `burp_observation_plan`, or `websocket_observation`, InferForge uses neutral
 empty defaults and emits profile-validation warnings. It does not borrow
 `infrafi-web` clusters, probe paths, quote mint intent, or external readiness
@@ -222,6 +222,36 @@ profile:
         "destinationMint": "DESTINATION_MINT_FOR_SELL"
       }
     }
+  }
+}
+```
+
+Quote provider response diagnosis is profile-owned too. Use
+`quote_provider.diagnostics` to map target-specific local/upstream error shapes
+to stable classifications without hard-coding a provider globally:
+
+```json
+{
+  "quote_provider": {
+    "name": "ProviderName",
+    "diagnostics": [
+      {
+        "id": "provider-config-missing",
+        "classification": "provider-config-missing",
+        "statuses": [503],
+        "body_contains": ["Provider configuration missing"],
+        "summary": "The target rejected quote collection before upstream forwarding because provider credentials are missing.",
+        "next_step": "Set PROVIDER_TOKEN, restart the target server, then rerun collect-quote."
+      },
+      {
+        "id": "provider-upstream-policy-rejected",
+        "classification": "provider-upstream-policy-rejected",
+        "statuses": [401, 403],
+        "body_contains": ["Provider quote failed"],
+        "summary": "The target reached the quote provider, but upstream rejected the request after local validation.",
+        "next_step": "Verify provider credentials, account permissions, route, wallet, and amount, then rerun collect-quote."
+      }
+    ]
   }
 }
 ```
@@ -256,8 +286,10 @@ declare its own provider variables or leave this empty:
 
 `discover-profile` copies `quote_intent` into the generated starter profile only
 when the seed profile passed with `--profile` explicitly declares complete
-`buy` and `sell` directions. Running discovery without an explicit profile does
-not copy the built-in regression target mint intent into a new target.
+`buy` and `sell` directions. It copies `quote_provider` only from an explicit
+seed profile that declares it. Running discovery without an explicit profile does
+not copy the built-in regression target mint intent or provider diagnostics into
+a new target.
 
 Use the static routing self-test to guard this invariant:
 
