@@ -93,6 +93,7 @@ DISCOVERED_PROFILE_ARTIFACT = "discovered-profile.json"
 BLACKBOX_PROFILE_ARTIFACT = "blackbox-profile.json"
 BLACKBOX_ASSET_CANDIDATES_ARTIFACT = "blackbox-asset-candidates.json"
 BLACKBOX_ASSET_PROFILE_ARTIFACT = "blackbox-asset-profile.json"
+HOST_TAKEOVER_BASELINE_ARTIFACT = "host-takeover-baseline.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -253,6 +254,7 @@ INDEX_ARTIFACT_ORDER = [
     "probe-ranking.json",
     "probe-results.jsonl",
     "probe-results-summary.json",
+    HOST_TAKEOVER_BASELINE_ARTIFACT,
     "response-delta-analysis.json",
     "warmup-results.json",
     "traffic-index.json",
@@ -5089,6 +5091,221 @@ def external_script_review_summary(
             for url in external_urls[:sample_limit]
         ],
         "safety": "External script URLs are recorded for scope review only; blackbox-asset-map does not fetch them.",
+    }
+
+
+TAKEOVER_CNAME_PROVIDER_SUFFIXES = {
+    "cloudfront.net": "AWS CloudFront",
+    "github.io": "GitHub Pages",
+    "herokudns.com": "Heroku",
+    "herokuapp.com": "Heroku",
+    "azurewebsites.net": "Azure App Service",
+    "trafficmanager.net": "Azure Traffic Manager",
+    "blob.core.windows.net": "Azure Blob Storage",
+    "s3.amazonaws.com": "AWS S3",
+    "amazonaws.com": "AWS",
+    "pages.dev": "Cloudflare Pages",
+    "vercel-dns.com": "Vercel",
+    "netlify.app": "Netlify",
+    "fastly.net": "Fastly",
+}
+
+TAKEOVER_HTTP_FINGERPRINTS = [
+    {
+        "provider": "GitHub Pages",
+        "markers": ["there isn't a github pages site here"],
+        "confidence": "high",
+    },
+    {
+        "provider": "Heroku",
+        "markers": ["no such app"],
+        "confidence": "high",
+    },
+    {
+        "provider": "AWS S3",
+        "markers": ["nosuchbucket"],
+        "confidence": "high",
+    },
+    {
+        "provider": "Azure App Service",
+        "markers": ["404 web site not found"],
+        "confidence": "medium",
+    },
+    {
+        "provider": "Fastly",
+        "markers": ["fastly error: unknown domain"],
+        "confidence": "high",
+    },
+    {
+        "provider": "Vercel",
+        "markers": ["the deployment could not be found"],
+        "confidence": "medium",
+    },
+    {
+        "provider": "CloudFront",
+        "markers": ["the request could not be satisfied", "bad request"],
+        "confidence": "low",
+    },
+]
+
+
+def normalize_explicit_hosts(target: str, host_values: list[str] | None, *, max_hosts: int = 8) -> list[str]:
+    raw_hosts = host_values or [urllib.parse.urlparse(target).netloc]
+    hosts: list[str] = []
+    for raw in raw_hosts:
+        parsed = urllib.parse.urlparse(raw if "://" in raw else f"https://{raw}")
+        host = parsed.netloc or parsed.path
+        host = host.split("@")[-1].split(":")[0].strip().lower().rstrip(".")
+        if not host or "*" in host or "/" in host:
+            raise ValueError(f"host must be explicit, not wildcard or path-like: {raw}")
+        if host not in hosts:
+            hosts.append(host)
+        if len(hosts) > max_hosts:
+            raise ValueError(f"too many hosts for low-volume takeover baseline: max {max_hosts}")
+    return hosts
+
+
+def dig_short_records(host: str, rrtype: str, *, timeout: int) -> dict[str, Any]:
+    command = ["dig", f"+time={max(1, timeout)}", "+tries=1", "+short", rrtype, host]
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(2, timeout + 1),
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+        return {
+            "records": [],
+            "error": redacted_error_summary(error),
+            "resolver": "dig",
+        }
+    records = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    return {
+        "records": records,
+        "error": redacted_error_summary(completed.stderr) if completed.returncode and completed.stderr else None,
+        "resolver": "dig",
+    }
+
+
+def dns_records_for_host(host: str, *, timeout: int) -> dict[str, Any]:
+    cname_raw = dig_short_records(host, "CNAME", timeout=timeout)
+    a_raw = dig_short_records(host, "A", timeout=timeout)
+    aaaa_raw = dig_short_records(host, "AAAA", timeout=timeout)
+
+    def ip_records(rows: list[str], version: int) -> list[str]:
+        output: list[str] = []
+        for row in rows:
+            try:
+                parsed_ip = ipaddress.ip_address(row)
+            except ValueError:
+                continue
+            if parsed_ip.version == version:
+                output.append(str(parsed_ip))
+        return output
+
+    return {
+        "cname": [row.lower().rstrip(".") for row in cname_raw["records"] if not re.match(r"^[0-9a-fA-F:.]+$", row)],
+        "a": ip_records(a_raw["records"], 4),
+        "aaaa": ip_records(aaaa_raw["records"], 6),
+        "errors": {
+            "cname": cname_raw.get("error"),
+            "a": a_raw.get("error"),
+            "aaaa": aaaa_raw.get("error"),
+        },
+    }
+
+
+def takeover_provider_hints(cnames: list[str]) -> list[dict[str, Any]]:
+    hints = []
+    for cname in cnames:
+        for suffix, provider in TAKEOVER_CNAME_PROVIDER_SUFFIXES.items():
+            if cname == suffix or cname.endswith("." + suffix):
+                hints.append({"provider": provider, "cname": cname, "suffix": suffix})
+    return hints
+
+
+def takeover_http_fingerprints(body_text: str) -> list[dict[str, Any]]:
+    lowered = body_text.lower()
+    matches = []
+    for fingerprint in TAKEOVER_HTTP_FINGERPRINTS:
+        markers = fingerprint["markers"]
+        if all(marker in lowered for marker in markers):
+            matches.append(
+                {
+                    "provider": fingerprint["provider"],
+                    "confidence": fingerprint["confidence"],
+                    "markers_sha256": hashlib.sha256("|".join(markers).encode("utf-8")).hexdigest(),
+                }
+            )
+    return matches
+
+
+def build_host_takeover_baseline(
+    *,
+    target: str,
+    hosts: list[str],
+    include_http: bool,
+    timeout: int,
+    max_bytes: int,
+) -> dict[str, Any]:
+    rows = []
+    for host in hosts:
+        dns = dns_records_for_host(host, timeout=timeout)
+        provider_hints = takeover_provider_hints(dns.get("cname", []))
+        http_summary = None
+        fingerprints: list[dict[str, Any]] = []
+        if include_http:
+            response = http_get_url_text_limited(
+                f"https://{host}/",
+                timeout=timeout,
+                max_bytes=max_bytes,
+                user_agent="InferForge-Host-Takeover-Baseline/0.1",
+            )
+            fingerprints = takeover_http_fingerprints(str(response.get("text") or ""))
+            headers = response.get("headers", {}) if isinstance(response.get("headers"), dict) else {}
+            body = str(response.get("text") or "").encode("utf-8", errors="replace")
+            http_summary = {
+                "url": f"https://{host}/",
+                "status": response.get("status"),
+                "ok": response.get("ok"),
+                "duration_ms": response.get("duration_ms"),
+                "bytes": response.get("bytes"),
+                "body_sha256": hashlib.sha256(body).hexdigest() if body else response.get("sha256"),
+                "body_truncated": response.get("truncated"),
+                "content_type": headers.get("Content-Type") or headers.get("content-type"),
+                "server": headers.get("Server") or headers.get("server"),
+                "error": redacted_error_summary(response.get("error")) if response.get("error") else None,
+            }
+        status = "takeover-signal" if fingerprints else "no-takeover-signal"
+        rows.append(
+            {
+                "host": host,
+                "status": status,
+                "dns": dns,
+                "provider_hints": provider_hints,
+                "http": http_summary,
+                "fingerprints": fingerprints,
+                "review_required": bool(fingerprints),
+            }
+        )
+    signal_rows = [row for row in rows if row.get("review_required")]
+    return {
+        "generated_at": utc_now(),
+        "status": "needs-human-review" if signal_rows else "complete",
+        "target": target,
+        "hosts_checked": hosts,
+        "summary": {
+            "hosts": len(rows),
+            "takeover_signals": len(signal_rows),
+            "provider_hint_hosts": sum(1 for row in rows if row.get("provider_hints")),
+            "http_checked": include_http,
+            "max_bytes": max_bytes if include_http else 0,
+        },
+        "hosts": rows,
+        "safety": "Explicit-host takeover baseline only. It does not enumerate subdomains, fuzz DNS, request candidate endpoints, or store response bodies.",
     }
 
 
@@ -14950,6 +15167,44 @@ def build_verification_queue(
             },
         )
 
+    takeover_doc = (
+        load_optional_json(artifact_dir / HOST_TAKEOVER_BASELINE_ARTIFACT)
+        if artifact_dir is not None
+        else None
+    )
+    takeover_signals = [
+        item
+        for item in (takeover_doc or {}).get("hosts", []) or []
+        if isinstance(item, dict) and item.get("review_required")
+    ]
+    if takeover_signals:
+        add_item(
+            "REVIEW-host-takeover-baseline",
+            "Review host takeover baseline signals",
+            "manual-review",
+            "high",
+            f"{len(takeover_signals)} explicit host takeover signal(s) need manual validation before reporting.",
+            commands=[cmd("host-takeover-baseline")],
+            evidence_refs=[HOST_TAKEOVER_BASELINE_ARTIFACT],
+            prerequisites=[
+                "Verify the provider fingerprint manually against the live host and bounty scope.",
+                "Do not claim or configure third-party resources; produce a non-destructive PoC only.",
+                "Submit only if the takeover impact matches the program's in-scope impact categories.",
+            ],
+            safety="Manual validation only. The baseline checks explicit hosts and does not enumerate subdomains.",
+            extra={
+                "signals": [
+                    {
+                        "host": item.get("host"),
+                        "status": item.get("status"),
+                        "provider_hints": item.get("provider_hints"),
+                        "fingerprints": item.get("fingerprints"),
+                    }
+                    for item in takeover_signals[:8]
+                ]
+            },
+        )
+
     status_counts: dict[str, int] = {}
     for item in items:
         status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
@@ -19368,6 +19623,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("blackbox-profile", "run_blackbox_profile"),
         refresh_expectation("blackbox-asset-profile", "run_blackbox_asset_profile"),
         refresh_expectation("blackbox-asset-map", "run_blackbox_asset_map"),
+        refresh_expectation("host-takeover-baseline", "run_host_takeover_baseline"),
         refresh_expectation("collect", "run_collect"),
         refresh_expectation("burp-observe", "run_burp_observe", min_refreshes=3, min_prints=3),
         refresh_expectation("burp-sync", "run_burp_sync", min_refreshes=4, min_prints=4),
@@ -29511,6 +29767,50 @@ def run_blackbox_asset_map(args: argparse.Namespace) -> int:
     return 0 if asset_map["status"] in {"candidates-found", "no-candidates"} else 1
 
 
+def run_host_takeover_baseline(args: argparse.Namespace) -> int:
+    _profile, artifact_dir, target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        hosts = normalize_explicit_hosts(target, args.host, max_hosts=args.max_hosts)
+    except ValueError as error:
+        print(f"Invalid host list: {error}")
+        return 2
+    baseline = build_host_takeover_baseline(
+        target=target,
+        hosts=hosts,
+        include_http=not args.no_http,
+        timeout=args.timeout,
+        max_bytes=args.max_bytes,
+    )
+    output_path = Path(args.output).resolve() if args.output else artifact_dir / HOST_TAKEOVER_BASELINE_ARTIFACT
+    write_json(output_path, baseline)
+    print(f"Host takeover baseline: {baseline['status']}")
+    print(
+        "Hosts: "
+        f"checked={baseline['summary']['hosts']} "
+        f"signals={baseline['summary']['takeover_signals']} "
+        f"provider_hints={baseline['summary']['provider_hint_hosts']} "
+        f"http_checked={baseline['summary']['http_checked']}"
+    )
+    for row in baseline.get("hosts", []):
+        providers = ",".join(sorted({hint.get("provider", "") for hint in row.get("provider_hints", []) if hint.get("provider")}))
+        print(
+            f"- {row.get('host')}: {row.get('status')} "
+            f"cname={','.join(row.get('dns', {}).get('cname', []) or []) or '-'} "
+            f"provider_hints={providers or '-'}"
+        )
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="host-takeover-baseline",
+            output_paths=[output_path],
+        )
+    )
+    return 0 if baseline["status"] in {"complete", "needs-human-review"} else 1
+
+
 def run_adjudicate(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -30463,6 +30763,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow overwriting an existing output artifact.",
     )
     blackbox_asset_map.set_defaults(func=run_blackbox_asset_map)
+
+    host_takeover = sub.add_parser(
+        "host-takeover-baseline",
+        help="Check explicit target hosts for low-volume DNS/HTTP takeover fingerprints",
+    )
+    host_takeover.add_argument(
+        "--host",
+        action="append",
+        help="Explicit host to check. Repeat as needed. Defaults to the configured target host.",
+    )
+    host_takeover.add_argument(
+        "--max-hosts",
+        type=positive_int,
+        default=8,
+        help="Maximum explicit hosts to check. Defaults to 8.",
+    )
+    host_takeover.add_argument(
+        "--no-http",
+        action="store_true",
+        help="Only collect DNS records; skip the bounded HTTPS root request.",
+    )
+    host_takeover.add_argument(
+        "--timeout",
+        type=positive_int,
+        default=6,
+        help="DNS and HTTPS timeout in seconds. Defaults to 6.",
+    )
+    host_takeover.add_argument(
+        "--max-bytes",
+        type=positive_int,
+        default=4096,
+        help="Maximum HTTPS response bytes to inspect locally. Defaults to 4096.",
+    )
+    host_takeover.add_argument(
+        "--output",
+        help="Where to write the baseline artifact. Defaults to ARTIFACT_DIR/host-takeover-baseline.json.",
+    )
+    host_takeover.set_defaults(func=run_host_takeover_baseline)
 
     collect = sub.add_parser("collect", help="Normalize available Burp history observations into traffic artifacts")
     collect.add_argument(

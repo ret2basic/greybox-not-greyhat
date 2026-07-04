@@ -174,6 +174,20 @@ Do not add `--observed-only` for this preview: asset profiles are generated from
 reviewed static candidates, not Burp-observed traffic, so observed-only planning
 will select no clusters until those routes have been observed separately.
 
+For takeover-oriented Web/App scope checks, keep the host list explicit:
+
+```bash
+python3 scripts/inferforge.py --target https://in-scope.example \
+  --artifact-dir .greybox/in-scope-example \
+  host-takeover-baseline \
+  --host in-scope.example
+```
+
+`host-takeover-baseline` checks only the configured target host and any repeated
+`--host` values. It collects DNS CNAME/A/AAAA records and a bounded HTTPS root
+response hash for known dangling-provider fingerprints; it does not enumerate
+subdomains, claim third-party resources, or store response bodies.
+
 The default resource caps are intentionally small: 4 same-origin script assets,
 256 KiB per fetched resource, and 80 retained candidates. Raise `--max-assets`,
 `--max-bytes`, or `--candidate-limit` only when the runner has enough memory and
