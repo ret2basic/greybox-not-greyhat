@@ -288,6 +288,18 @@ discovered rewrite proxies are ranked as offline review items first: review the
 source rewrite, fixed upstream, catch-all path shape, and one approved read-only
 concrete path before probing.
 
+Use `rewrite-review` for the dedicated fixed-upstream rewrite/proxy review:
+
+```bash
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  rewrite-review --no-write --show-next
+```
+
+This command is local and read-only. It flags catch-all rewrites, fixed
+upstreams, unconditional routes, and review-only observation candidates, then
+lists the evidence required before a static rewrite/proxy hypothesis can become
+a reportable issue.
+
 Use `validation-plan` to turn the ranked hypotheses into explicit preconditions,
 allowed commands, required evidence, stop conditions, and forbidden actions:
 

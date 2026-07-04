@@ -105,6 +105,7 @@ HARNESS_LOOP_ARTIFACT = "harness-loop.json"
 HYPOTHESIS_MATRIX_ARTIFACT = "hypothesis-matrix.json"
 VALIDATION_PLAN_ARTIFACT = "validation-plan.json"
 ITERATION_DECISION_ARTIFACT = "iteration-decision.json"
+REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -188,6 +189,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     HYPOTHESIS_MATRIX_ARTIFACT,
     VALIDATION_PLAN_ARTIFACT,
     ITERATION_DECISION_ARTIFACT,
+    REWRITE_REVIEW_ARTIFACT,
     "artifact-health.json",
     "regression-suite.json",
     "orca-baseline.json",
@@ -8141,6 +8143,251 @@ def endpoint_clusters_for_hypothesis_matrix(
     return clusters, "profile-fallback"
 
 
+def rewrite_review_item_for_cluster(cluster: dict[str, Any]) -> dict[str, Any] | None:
+    discovery = cluster.get("discovery") if isinstance(cluster.get("discovery"), dict) else {}
+    rewrites = discovery.get("rewrites", []) if isinstance(discovery.get("rewrites"), list) else []
+    fixed_upstreams = [str(item) for item in discovery.get("fixed_upstreams", []) or [] if str(item).strip()]
+    kind = str(cluster.get("kind") or "")
+    strategy_set = str(cluster.get("strategy_set") or strategy_set_for_cluster(cluster) or "")
+    if kind not in {"rewrite-proxy", "fixed-upstream-proxy"} and strategy_set != "fixed-upstream-proxy" and not rewrites:
+        return None
+
+    path = str(cluster.get("path") or "")
+    source_refs = compact_source_refs([str(ref) for ref in cluster.get("source_refs", []) or []])
+    dynamic_segments = route_dynamic_segments(path)
+    catch_all = any("*" in str(segment) for segment in dynamic_segments) or any(
+        ":path*" in str(rewrite.get("source") or "") or "{path*" in str(rewrite.get("source_pattern") or "")
+        for rewrite in rewrites
+        if isinstance(rewrite, dict)
+    )
+    conditions_present = any(
+        bool((rewrite.get("conditional") if isinstance(rewrite, dict) else False))
+        for rewrite in rewrites
+    )
+    review_candidates = discovery.get("review_observation_candidates", [])
+    priority = "high" if fixed_upstreams and catch_all else "medium"
+    status = "needs-approved-read-only-path" if rewrites and catch_all else "needs-offline-review"
+    if not fixed_upstreams:
+        status = "needs-source-review"
+
+    risk_factors = []
+    if fixed_upstreams:
+        risk_factors.append("fixed-upstream")
+    if catch_all:
+        risk_factors.append("catch-all-path")
+    if rewrites:
+        risk_factors.append("next-config-rewrite")
+    if not conditions_present:
+        risk_factors.append("unconditional-route")
+    if review_candidates:
+        risk_factors.append("review-observation-candidate")
+
+    return {
+        "id": f"REWRITE-{safe_probe_id(cluster.get('id') or path or kind)}",
+        "cluster_id": cluster.get("id"),
+        "status": status,
+        "priority": priority,
+        "kind": kind or strategy_set,
+        "path": path,
+        "method": cluster.get("method"),
+        "fixed_upstreams": fixed_upstreams,
+        "dynamic_segments": dynamic_segments,
+        "catch_all": catch_all,
+        "conditions_present": conditions_present,
+        "risk_factors": risk_factors,
+        "rewrites": rewrites,
+        "review_observation_candidates": review_candidates,
+        "source_refs": source_refs,
+        "validation_questions": [
+            "Does the local rewrite expose a fixed upstream path family that should not be reachable from unauthenticated users?",
+            "Can a catch-all segment reach upstream admin, internal, debug, export, or state-changing paths that the frontend never intended?",
+            "Does the upstream rely on CORS, browser origin, or hidden URLs instead of authorization for sensitive data?",
+            "Does the local proxy forward cookies, authorization headers, or attacker-controlled query strings in a way that changes upstream authorization?",
+        ],
+        "required_evidence": [
+            "Static source reference for the rewrite/proxy route and fixed upstream.",
+            "One approved read-only concrete local path under the rewrite source before any request is sent.",
+            "A response comparison showing sensitive data, authorization bypass, unsafe state change, or equivalent concrete impact.",
+            "Evidence that no wallet signing, transaction submission, broad path enumeration, or out-of-scope upstream probing was used.",
+        ],
+        "reportability_gate": (
+            "Static fixed-upstream rewrite/proxy configuration is not reportable by itself. "
+            "Escalate only with concrete in-scope impact evidence from an approved minimal path."
+        ),
+        "safe_next_step": (
+            "Choose exactly one known safe read-only concrete path, confirm scope, then add it through review-observation promotion."
+            if rewrites and catch_all
+            else "Review source guards and identify whether a single safe read-only validation path exists."
+        ),
+        "references": [
+            "Next.js rewrites act as URL proxies that mask destination paths.",
+            "OWASP recommends positive allowlisting of URL schema, port, and destination for server-side request boundaries.",
+        ],
+        "evidence_refs": compact_source_refs([REWRITE_REVIEW_ARTIFACT, "target-profile.json", "endpoint-clusters.json", *source_refs]),
+        "safety": (
+            "Offline rewrite/proxy review only. Do not request arbitrary upstream paths, fuzz catch-all segments, "
+            "send credentials, mutate upstream state, or treat this static item as a vulnerability finding."
+        ),
+    }
+
+
+def build_rewrite_review_run(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    endpoint_clusters, endpoint_clusters_source = endpoint_clusters_for_hypothesis_matrix(
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
+    items = [
+        item
+        for cluster in endpoint_clusters.get("clusters", []) or []
+        if isinstance(cluster, dict)
+        for item in [rewrite_review_item_for_cluster(cluster)]
+        if item is not None
+    ]
+    items.sort(
+        key=lambda item: (
+            HYPOTHESIS_PRIORITY_RANK.get(str(item.get("priority") or "info"), 9),
+            0 if item.get("catch_all") else 1,
+            str(item.get("path") or ""),
+            str(item.get("id") or ""),
+        )
+    )
+    status_counts: dict[str, int] = {}
+    priority_counts: dict[str, int] = {}
+    risk_counts: dict[str, int] = {}
+    for item in items:
+        increment_count(status_counts, str(item.get("status") or "unknown"))
+        increment_count(priority_counts, str(item.get("priority") or "info"))
+        for risk in item.get("risk_factors", []) or []:
+            increment_count(risk_counts, str(risk))
+
+    status = "has-review-items" if items else "no-rewrite-proxies"
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": str(artifact_dir),
+        "mode": "single-run",
+        "summary": {
+            "items": len(items),
+            "status_counts": dict(sorted(status_counts.items())),
+            "priority_counts": dict(sorted(priority_counts.items())),
+            "risk_counts": dict(sorted(risk_counts.items())),
+            "endpoint_clusters_source": endpoint_clusters_source,
+        },
+        "items": items,
+        "artifact_refs": {
+            "endpoint_clusters": "endpoint-clusters.json",
+            "target_profile": TARGET_PROFILE_ARTIFACT,
+            "route_inventory": ROUTE_INVENTORY_ARTIFACT,
+        },
+        "safety": (
+            "Read-only rewrite/proxy review. It reads local artifacts/profile data only and does not send requests, "
+            "invoke Burp, scan paths, sign wallets, submit transactions, or fetch external hosts."
+        ),
+    }
+
+
+def build_rewrite_review_rollup(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    check_dirs: list[Path],
+) -> dict[str, Any]:
+    runs = []
+    items: list[dict[str, Any]] = []
+    missing = []
+    run_status_counts: dict[str, int] = {}
+    for check_dir in check_dirs:
+        relative_dir = repo_relative_or_absolute(check_dir)
+        if not check_dir.exists():
+            missing.append(relative_dir)
+            increment_count(run_status_counts, "missing-artifact-dir")
+            runs.append({"artifact_dir": relative_dir, "status": "missing-artifact-dir", "summary": {}})
+            continue
+        doc = build_rewrite_review_run(
+            target=target_for_artifact_dir(check_dir, target),
+            profile=None,
+            artifact_dir=check_dir,
+        )
+        run_status = str(doc.get("status") or "unknown")
+        increment_count(run_status_counts, run_status)
+        runs.append({"artifact_dir": relative_dir, "status": run_status, "summary": doc.get("summary", {})})
+        for item in doc.get("items", []) or []:
+            if not isinstance(item, dict):
+                continue
+            row = json_clone(item)
+            original_id = str(row.get("id") or "rewrite")
+            row["id"] = f"RUN-{safe_probe_id(relative_dir)}-{original_id}"
+            row["run_rewrite_review_id"] = original_id
+            row["artifact_dir"] = relative_dir
+            row["evidence_refs"] = compact_source_refs(
+                [
+                    f"{relative_dir}/{ref}" if not str(ref).startswith("/") else str(ref)
+                    for ref in row.get("evidence_refs", []) or []
+                ]
+            )
+            items.append(row)
+
+    items.sort(
+        key=lambda item: (
+            HYPOTHESIS_PRIORITY_RANK.get(str(item.get("priority") or "info"), 9),
+            0 if item.get("catch_all") else 1,
+            str(item.get("artifact_dir") or ""),
+            str(item.get("path") or ""),
+            str(item.get("id") or ""),
+        )
+    )
+    status_counts: dict[str, int] = {}
+    priority_counts: dict[str, int] = {}
+    risk_counts: dict[str, int] = {}
+    for item in items:
+        increment_count(status_counts, str(item.get("status") or "unknown"))
+        increment_count(priority_counts, str(item.get("priority") or "info"))
+        for risk in item.get("risk_factors", []) or []:
+            increment_count(risk_counts, str(risk))
+    if missing:
+        status = "failed"
+    elif items:
+        status = "has-review-items"
+    else:
+        status = "no-rewrite-proxies"
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": str(artifact_dir),
+        "mode": "rollup",
+        "summary": {
+            "runs": len(runs),
+            "items": len(items),
+            "missing_artifact_dirs": missing,
+            "status_counts": dict(sorted(status_counts.items())),
+            "priority_counts": dict(sorted(priority_counts.items())),
+            "risk_counts": dict(sorted(risk_counts.items())),
+            "run_status_counts": dict(sorted(run_status_counts.items())),
+        },
+        "runs": runs,
+        "items": items,
+        "artifact_refs": {
+            "rewrite_review": REWRITE_REVIEW_ARTIFACT,
+            "endpoint_clusters": "endpoint-clusters.json",
+            "target_profile": TARGET_PROFILE_ARTIFACT,
+        },
+        "safety": (
+            "Read-only rewrite/proxy review rollup. It reads child local artifacts only and does not send requests, "
+            "invoke Burp, scan paths, sign wallets, submit transactions, or fetch external hosts."
+        ),
+    }
+
+
 def build_hypothesis_matrix_run(
     *,
     target: str,
@@ -8548,6 +8795,7 @@ def validation_allowed_commands(
     allowed_now_commands = [
         validation_command_for_artifact_dir(artifact_dir, "harness-loop --no-write"),
         validation_command_for_artifact_dir(artifact_dir, "hypothesis-matrix --no-write --show-next"),
+        validation_command_for_artifact_dir(artifact_dir, "rewrite-review --no-write"),
         validation_command_for_artifact_dir(artifact_dir, "verification-queue --no-write"),
     ]
     allowed_after_gate_commands = [
@@ -29892,6 +30140,22 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             if rewrite_cluster is None
             else rewrite_cluster.get("discovery", {}).get("review_observation_candidates", [])
         )
+        rewrite_review_dir = Path(temp_dir) / "rewrite-review-artifacts"
+        rewrite_review_dir.mkdir()
+        rewrite_review_sample = build_rewrite_review_run(
+            target="http://127.0.0.1:9998",
+            profile=rewrite_normalized,
+            artifact_dir=rewrite_review_dir,
+        )
+        rewrite_review_text_sample = json.dumps(rewrite_review_sample, sort_keys=True)
+        rewrite_review_proxy_item = next(
+            (
+                item
+                for item in rewrite_review_sample.get("items", [])
+                if item.get("cluster_id") == "route-api-proxy-path"
+            ),
+            None,
+        )
         rewrite_condition_context = build_request_context(
             "GET",
             "/api/proxy/users/42",
@@ -30384,6 +30648,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rewrite_profile_candidates[0].get("example_path") == "/api/proxy/<approved-read-only-path>"
             and rewrite_cluster_candidates
             and rewrite_cluster_candidates[0].get("status") == "review-only"
+            and rewrite_review_sample.get("status") == "has-review-items"
+            and rewrite_review_sample.get("summary", {}).get("endpoint_clusters_source") == "profile-fallback"
+            and rewrite_review_proxy_item is not None
+            and rewrite_review_proxy_item.get("status") == "needs-approved-read-only-path"
+            and rewrite_review_proxy_item.get("priority") == "high"
+            and rewrite_review_proxy_item.get("catch_all") is True
+            and "fixed-upstream" in rewrite_review_proxy_item.get("risk_factors", [])
+            and "https://api.example.test" in rewrite_review_proxy_item.get("fixed_upstreams", [])
+            and "top-secret" not in rewrite_review_text_sample
+            and "AbC1234567890Token" not in rewrite_review_text_sample
             and "route-api-proxy-path" in classify_endpoint("GET", "/api/proxy/users/42", rewrite_clusters)
             and rewrite_resolution_match is not None
             and str(rewrite_resolution_match.get("source_ref", "")).endswith("next.config.ts")
@@ -34679,6 +34953,103 @@ def run_hypothesis_matrix(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_rewrite_review(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    check_dirs: list[Path] = []
+    for item in args.check_dir or []:
+        check_dirs.append(resolve_repo_path(item))
+    if args.discover_child_runs:
+        check_dirs.extend(discover_harness_loop_dirs(artifact_dir))
+    deduped_dirs = []
+    seen_dirs: set[str] = set()
+    for check_dir in check_dirs:
+        resolved = check_dir.resolve()
+        key = str(resolved)
+        if key in seen_dirs:
+            continue
+        seen_dirs.add(key)
+        deduped_dirs.append(resolved)
+
+    if deduped_dirs:
+        review = build_rewrite_review_rollup(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            check_dirs=deduped_dirs,
+        )
+    else:
+        review = build_rewrite_review_run(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+        )
+
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / REWRITE_REVIEW_ARTIFACT
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, review)
+        if deduped_dirs:
+            refreshed_manifests = refresh_manifests_for_artifact_outputs(
+                output_paths=[output_path],
+                artifact_dir=artifact_dir,
+                check_dirs=deduped_dirs,
+                target=target,
+                command="rewrite-review",
+            )
+        else:
+            refreshed_manifests = refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="rewrite-review",
+                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+            )
+
+    summary = review.get("summary", {}) or {}
+    print(f"Rewrite review: {review['status']}")
+    if review.get("mode") == "rollup":
+        print(
+            "Runs: "
+            f"{summary.get('runs', 0)} checked, "
+            f"run_status_counts={json.dumps(summary.get('run_status_counts', {}), sort_keys=True)}"
+        )
+    print(
+        "Items: "
+        f"{summary.get('items', 0)} total, "
+        f"statuses={json.dumps(summary.get('status_counts', {}), sort_keys=True)} "
+        f"risks={json.dumps(summary.get('risk_counts', {}), sort_keys=True)}"
+    )
+    top_count = max(0, int(args.top))
+    if top_count:
+        print("Top rewrite reviews:")
+        for item in (review.get("items", []) or [])[:top_count]:
+            run_text = f" run={item.get('artifact_dir')}" if item.get("artifact_dir") else ""
+            upstreams = ",".join(str(upstream) for upstream in item.get("fixed_upstreams", []) or [])
+            print(
+                f"- {item.get('priority')} {item.get('status')} path={item.get('path') or '-'} "
+                f"upstreams={upstreams or '-'} catch_all={item.get('catch_all')}{run_text}"
+            )
+            if args.show_next:
+                print(f"  next={inline_summary_text(item.get('safe_next_step'), max_chars=220)}")
+                print(f"  gate={inline_summary_text(item.get('reportability_gate'), max_chars=220)}")
+
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+
+    if review["status"] == "failed":
+        return 1
+    if args.strict and review["status"] != "has-review-items":
+        return 1
+    return 0
+
+
 def run_validation_plan(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -36438,6 +36809,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless ranked or resource-gated hypotheses are present.",
     )
     hypothesis_matrix.set_defaults(func=run_hypothesis_matrix)
+
+    rewrite_review = sub.add_parser(
+        "rewrite-review",
+        help="Review fixed-upstream rewrites/proxies without sending requests",
+    )
+    rewrite_review.add_argument(
+        "--output",
+        help="Where to write rewrite-review.json. Defaults to --artifact-dir/rewrite-review.json.",
+    )
+    rewrite_review.add_argument(
+        "--check-dir",
+        action="append",
+        help="Child artifact directory to include in a rollup. Repeat as needed.",
+    )
+    rewrite_review.add_argument(
+        "--discover-child-runs",
+        action="store_true",
+        help="Build a rollup from child directories under --artifact-dir with harness artifacts.",
+    )
+    rewrite_review.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of rewrite review items to print.",
+    )
+    rewrite_review.add_argument(
+        "--show-next",
+        action="store_true",
+        help="Print next-step and reportability gate details for top rewrite review items.",
+    )
+    rewrite_review.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print rewrite review only; do not write rewrite-review.json or refreshed manifests.",
+    )
+    rewrite_review.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless fixed-upstream rewrite/proxy review items are present.",
+    )
+    rewrite_review.set_defaults(func=run_rewrite_review)
 
     validation_plan = sub.add_parser(
         "validation-plan",
