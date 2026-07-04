@@ -7686,6 +7686,51 @@ HARNESS_LOOP_STAGES = [
     "poc-reporting",
 ]
 
+HARNESS_STAGE_FOCUS_RANK = {
+    "reportable-findings": 0,
+    "needs-poc-report": 1,
+    "finding-candidates": 2,
+    "needs-safe-follow-up": 3,
+    "needs-review": 4,
+    "needs-adjudication": 5,
+    "suspicions-present": 6,
+    "needs-identification": 7,
+    "actionable-leads": 8,
+    "blocked-external-commands": 9,
+    "needs-leads": 10,
+    "needs-coverage-review": 11,
+    "covered-with-source-limits": 12,
+    "needs-recon": 13,
+}
+
+HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
+    "discovery-recon": [
+        "discovery-coverage --no-write",
+        "source-peek-requests --no-write --top 8",
+        "source-peek --no-write --top 8",
+    ],
+    "lead-generation": [
+        "lead-portfolio --no-write --top 8",
+        "verification-queue --no-write",
+        "hypothesis-matrix --no-write --show-next",
+    ],
+    "finding-identification": [
+        "response-deltas --no-write",
+        "transaction-flow-review --no-write --top 8",
+        "hypothesis-matrix --no-write --show-next",
+    ],
+    "issue-validation": [
+        "validation-plan --no-write --limit 8 --show-commands",
+        "deployment-review --no-write --top 8",
+        "transaction-flow-review --no-write --top 8",
+    ],
+    "poc-reporting": [
+        "evidence-chain --no-write",
+        "adjudicate --no-write",
+        "report --no-write",
+    ],
+}
+
 
 def list_count(value: Any) -> int:
     return len(value) if isinstance(value, list) else 0
@@ -7693,6 +7738,74 @@ def list_count(value: Any) -> int:
 
 def dict_summary(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def build_harness_focus(
+    *,
+    stages: list[dict[str, Any]],
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    resource_snapshot: dict[str, Any] | None,
+    external_commands: int,
+) -> dict[str, Any]:
+    ranked = sorted(
+        [
+            (HARNESS_STAGE_FOCUS_RANK.get(str(stage.get("status") or ""), 99), index, stage)
+            for index, stage in enumerate(stages)
+        ],
+        key=lambda item: (item[0], item[1]),
+    )
+    focus_stage = ranked[0][2] if ranked and ranked[0][0] < 99 else None
+    resource_status = artifact_summary_status(resource_snapshot)
+    resource_budget = resource_budget_for_snapshot(resource_snapshot)
+    resource_mode = resource_budget.get("mode") or resource_status
+    if resource_status == "warning":
+        unattended_policy = "offline-only-resource-warning"
+    elif external_commands:
+        unattended_policy = "offline-only-external-approval-required"
+    else:
+        unattended_policy = "offline-first"
+
+    if focus_stage is None:
+        return {
+            "stage": None,
+            "status": "loop-ready",
+            "priority_rank": None,
+            "unattended_policy": unattended_policy,
+            "resource_status": resource_status,
+            "resource_budget_mode": resource_mode,
+            "next_step": "No focused bottleneck was selected from current harness stages.",
+            "offline_followup_commands": [],
+            "command_safety": command_safety_summary([]),
+        }
+
+    stage_id = str(focus_stage.get("stage") or "")
+    commands = [
+        validation_command_ref(
+            validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile),
+            source=f"harness-focus:{stage_id}:{index}",
+        )
+        for index, subcommand in enumerate(
+            HARNESS_STAGE_OFFLINE_FOLLOWUPS.get(stage_id, []),
+            start=1,
+        )
+    ]
+    commands = [command for command in commands if command.get("classification") == "ready"]
+    return {
+        "stage": stage_id,
+        "status": focus_stage.get("status"),
+        "priority_rank": ranked[0][0],
+        "unattended_policy": unattended_policy,
+        "resource_status": resource_status,
+        "resource_budget_mode": resource_mode,
+        "next_step": focus_stage.get("next_step"),
+        "stage_summary": focus_stage.get("summary", {}),
+        "offline_followup_commands": commands,
+        "command_safety": command_safety_summary(commands),
+        "methodology": (
+            "Single-bottleneck harness focus: deepen the highest-ranked unresolved stage before broadening."
+        ),
+    }
 
 
 def artifact_file_status(artifact_dir: Path, name: str) -> str:
@@ -7744,6 +7857,7 @@ def build_harness_loop_run(
     target: str,
     profile: dict[str, Any] | None,
     artifact_dir: Path,
+    current_resource_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     endpoint_clusters = load_optional_json(artifact_dir / "endpoint-clusters.json") or {}
     blackbox_coverage = load_optional_json(artifact_dir / "blackbox-coverage.json") or {}
@@ -7760,8 +7874,9 @@ def build_harness_loop_run(
     findings_doc = load_optional_json(artifact_dir / "findings.json") or {}
     evidence_gaps = load_optional_json(artifact_dir / "evidence-gaps.json") or {}
     evidence_appendix = load_optional_json(artifact_dir / "evidence-appendix.json") or {}
-    review_blockers = load_optional_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT) or {}
-    resource_snapshot = load_optional_json(artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT) or {}
+    review_blockers_doc = load_optional_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT)
+    review_blockers = review_blockers_doc or {}
+    resource_snapshot = current_resource_snapshot or load_optional_json(artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT) or {}
 
     clusters = endpoint_clusters.get("clusters", []) if isinstance(endpoint_clusters, dict) else []
     traffic_endpoints = traffic_index.get("endpoints", []) if isinstance(traffic_index, dict) else []
@@ -7778,6 +7893,7 @@ def build_harness_loop_run(
     adjudication_summary = dict_summary(adjudication.get("summary"))
     gaps_summary = dict_summary(evidence_gaps.get("summary"))
     blockers_summary = dict_summary(review_blockers.get("summary"))
+    review_blockers_status = artifact_summary_status(review_blockers_doc)
     appendix_summary = dict_summary(evidence_appendix.get("summary"))
 
     coverage_status = artifact_summary_status(blackbox_coverage or discovery_coverage)
@@ -7838,7 +7954,7 @@ def build_harness_loop_run(
     elif artifact_summary_status(evidence_gaps) == "needs-safe-follow-up" or gap_count:
         validation_status = "needs-safe-follow-up"
         validation_next = "Use resource and scope gates before running the smallest follow-up that closes the gap."
-    elif artifact_summary_status(review_blockers) not in {"missing", "ready"} or blocker_count:
+    elif review_blockers_status not in {"missing", "ready"} or blocker_count:
         validation_status = "needs-review"
         validation_next = "Resolve review blockers before active validation."
     elif artifact_summary_status(adjudication) == "no-reportable-findings":
@@ -7916,6 +8032,7 @@ def build_harness_loop_run(
                 "evidence_gaps": gap_count,
                 "finding_gate": artifact_summary_status(finding_gate),
                 "review_blockers": blocker_count,
+                "review_blockers_status": review_blockers_status,
             },
             next_step=validation_next,
             artifact_refs=["finding-gate.json", "adjudication.json", "evidence-gaps.json", REVIEW_BLOCKERS_ARTIFACT],
@@ -7933,6 +8050,14 @@ def build_harness_loop_run(
             artifact_refs=["report.md", "reproduction-steps.md", "evidence-appendix.json"],
         ),
     ]
+
+    focus = build_harness_focus(
+        stages=stages,
+        artifact_dir=artifact_dir,
+        profile=profile,
+        resource_snapshot=resource_snapshot,
+        external_commands=external_commands,
+    )
 
     stage_status_counts: dict[str, int] = {}
     for stage in stages:
@@ -7978,8 +8103,12 @@ def build_harness_loop_run(
             "suspicions": suspicion_count,
             "evidence_gaps": gap_count,
             "external_probe_commands": external_commands,
+            "focus_stage": focus.get("stage"),
+            "focus_status": focus.get("status"),
+            "unattended_policy": focus.get("unattended_policy"),
         },
         "stages": stages,
+        "focus": focus,
         "next_steps": next_steps,
         "artifact_refs": {
             "lead_portfolio": LEAD_PORTFOLIO_ARTIFACT,
@@ -8005,6 +8134,7 @@ def build_harness_loop_rollup(
     profile: dict[str, Any] | None,
     artifact_dir: Path,
     check_dirs: list[Path],
+    current_resource_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     runs = []
     missing = []
@@ -8036,6 +8166,7 @@ def build_harness_loop_rollup(
             target=target_for_artifact_dir(check_dir, target),
             profile=None,
             artifact_dir=check_dir,
+            current_resource_snapshot=current_resource_snapshot,
         )
         run_status = str(run_doc.get("status") or "unknown")
         increment_count(status_counts, run_status)
@@ -8044,11 +8175,18 @@ def build_harness_loop_rollup(
             totals[key] += int(run_summary.get(key, 0) or 0)
         for stage, count in dict_summary(run_summary.get("stage_status_counts")).items():
             stage_status_counts[str(stage)] = stage_status_counts.get(str(stage), 0) + int(count or 0)
+        run_focus = run_doc.get("focus") if isinstance(run_doc.get("focus"), dict) else {}
         runs.append(
             {
                 "artifact_dir": relative_dir,
                 "status": run_status,
                 "summary": run_summary,
+                "focus": {
+                    "stage": run_focus.get("stage"),
+                    "status": run_focus.get("status"),
+                    "unattended_policy": run_focus.get("unattended_policy"),
+                    "next_step": run_focus.get("next_step"),
+                },
                 "next_steps": run_doc.get("next_steps", [])[:5],
                 "stages": [
                     {
@@ -8082,6 +8220,12 @@ def build_harness_loop_rollup(
             if str(step or "").strip()
         ]
     )[:12]
+    focus_counts: dict[str, int] = {}
+    for run in runs:
+        focus = run.get("focus") if isinstance(run.get("focus"), dict) else {}
+        focus_stage = focus.get("stage")
+        if focus_stage:
+            increment_count(focus_counts, str(focus_stage))
 
     return {
         "generated_at": utc_now(),
@@ -8095,6 +8239,7 @@ def build_harness_loop_rollup(
             "missing_artifact_dirs": missing,
             "status_counts": dict(sorted(status_counts.items())),
             "stage_status_counts": dict(sorted(stage_status_counts.items())),
+            "focus_stage_counts": dict(sorted(focus_counts.items())),
             **totals,
         },
         "runs": runs,
@@ -34184,12 +34329,21 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and [stage.get("stage") for stage in blackbox_harness_loop_sample.get("stages", [])] == HARNESS_LOOP_STAGES
         and blackbox_harness_loop_sample.get("summary", {}).get("actionable_leads")
         == blackbox_lead_portfolio_sample.get("summary", {}).get("actionable_leads")
+        and blackbox_harness_loop_sample.get("focus", {}).get("stage") == "lead-generation"
+        and blackbox_harness_loop_sample.get("focus", {}).get("status") == "actionable-leads"
+        and blackbox_harness_loop_sample.get("focus", {}).get("unattended_policy")
+        == "offline-first"
+        and blackbox_harness_loop_sample.get("focus", {}).get("command_safety", {}).get("runnable", 0) >= 3
         and any(
             stage.get("stage") == "lead-generation" and stage.get("status") == "actionable-leads"
             for stage in blackbox_harness_loop_sample.get("stages", [])
         )
         and blackbox_harness_loop_rollup_sample.get("status") == "needs-deepening"
         and blackbox_harness_loop_rollup_sample.get("summary", {}).get("runs") == 1
+        and blackbox_harness_loop_rollup_sample.get("summary", {}).get("focus_stage_counts", {}).get("lead-generation")
+        == 1
+        and (blackbox_harness_loop_rollup_sample.get("runs", []) or [{}])[0].get("focus", {}).get("stage")
+        == "lead-generation"
         and blackbox_harness_loop_discovered_dirs == ["run"]
         and blackbox_hypothesis_matrix_sample.get("status") == "has-ranked-hypotheses"
         and blackbox_hypothesis_matrix_sample.get("summary", {}).get("hypotheses", 0) >= 3
@@ -36597,6 +36751,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "coverage_status": blackbox_coverage_sample.get("status"),
             "probe_ids": blackbox_probe_ids_sample,
             "asset_profile_observed_only_notice": blackbox_asset_observed_notice_sample,
+            "harness_loop_status": blackbox_harness_loop_sample.get("status"),
+            "harness_focus": blackbox_harness_loop_sample.get("focus", {}),
+            "harness_rollup_focus_counts": blackbox_harness_loop_rollup_sample.get("summary", {}).get(
+                "focus_stage_counts",
+                {},
+            ),
         },
         "any_method_match_reasons": {
             "status": "passed" if any_method_match_reason_passed else "failed",
@@ -40229,6 +40389,10 @@ def run_harness_loop(args: argparse.Namespace) -> int:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         write_target_profile_artifact(artifact_dir, profile, target, source_root)
 
+    current_resource_snapshot = None
+    if not getattr(args, "skip_current_resource_check", False):
+        current_resource_snapshot = build_default_resource_snapshot(max_processes=8)
+
     check_dirs: list[Path] = []
     for item in args.check_dir or []:
         check_dirs.append(resolve_repo_path(item))
@@ -40250,9 +40414,15 @@ def run_harness_loop(args: argparse.Namespace) -> int:
             profile=profile,
             artifact_dir=artifact_dir,
             check_dirs=deduped_dirs,
+            current_resource_snapshot=current_resource_snapshot,
         )
     else:
-        loop = build_harness_loop_run(target=target, profile=profile, artifact_dir=artifact_dir)
+        loop = build_harness_loop_run(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            current_resource_snapshot=current_resource_snapshot,
+        )
 
     output_path = resolve_repo_path(args.output) if args.output else artifact_dir / HARNESS_LOOP_ARTIFACT
     refreshed_manifests = []
@@ -40291,15 +40461,26 @@ def run_harness_loop(args: argparse.Namespace) -> int:
         f"external_probe_commands={summary.get('external_probe_commands', 0)}"
     )
     print(f"Stage statuses: {json.dumps(summary.get('stage_status_counts', {}), sort_keys=True)}")
+    focus = loop.get("focus") if isinstance(loop.get("focus"), dict) else {}
+    if focus:
+        print(
+            "Focus: "
+            f"stage={focus.get('stage') or '-'} "
+            f"status={focus.get('status') or '-'} "
+            f"policy={focus.get('unattended_policy') or '-'} "
+            f"resource={focus.get('resource_budget_mode') or focus.get('resource_status') or '-'}"
+        )
 
     if loop.get("mode") == "rollup":
         for run in (loop.get("runs", []) or [])[: max(0, int(args.top_runs))]:
             run_summary = run.get("summary", {}) or {}
+            run_focus = run.get("focus") if isinstance(run.get("focus"), dict) else {}
             print(
                 f"- {run.get('artifact_dir')}: {run.get('status')} "
                 f"actionable={run_summary.get('actionable_leads', 0)} "
                 f"suspicions={run_summary.get('suspicions', 0)} "
-                f"reportable={run_summary.get('reportable_findings', 0)}"
+                f"reportable={run_summary.get('reportable_findings', 0)} "
+                f"focus={run_focus.get('stage') or '-'}"
             )
     else:
         print("Stages:")
@@ -40316,6 +40497,14 @@ def run_harness_loop(args: argparse.Namespace) -> int:
             print(f"- {inline_summary_text(step, max_chars=240)}")
     else:
         print("Next steps: none")
+    focus_commands = focus.get("offline_followup_commands", []) if isinstance(focus, dict) else []
+    if focus_commands:
+        print("Focus offline commands:")
+        for ref in focus_commands[: max(0, int(args.top_steps))]:
+            print(
+                f"- {format_command_ref_label(ref)} "
+                f"{inline_summary_text(ref.get('command'), max_chars=360)}"
+            )
 
     if no_write:
         print("No files written (--no-write).")
@@ -42726,6 +42915,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-write",
         action="store_true",
         help="Print harness loop summary only; do not write harness-loop.json or refreshed manifests.",
+    )
+    harness_loop.add_argument(
+        "--skip-current-resource-check",
+        action="store_true",
+        help="Do not include a fresh local /proc resource snapshot in focus selection.",
     )
     harness_loop.add_argument(
         "--strict",
