@@ -23,6 +23,7 @@ import os
 import re
 import shlex
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -6238,6 +6239,7 @@ def build_blackbox_profile_from_asset_candidates(
     clusters: list[dict[str, Any]] = []
     probe_targets: dict[str, Any] = {}
     endpoint_summaries: list[dict[str, Any]] = []
+    burp_observation_plan: list[dict[str, Any]] = []
     for item in rows:
         path = str(item["path"])
         methods = sorted(
@@ -6276,6 +6278,16 @@ def build_blackbox_profile_from_asset_candidates(
         }
         clusters.append(cluster)
         probe_targets[cluster_id] = {"path": path}
+        burp_observation_plan.append(
+            {
+                "id": f"burp_observe_{safe_probe_id(cluster_id)}",
+                "method": "HEAD",
+                "path": path,
+                "headers": {"User-Agent": "InferForge-Burp-Observe/0.1"},
+                "expected_statuses": [200, 204, 301, 302, 307, 308, 400, 403, 404, 405],
+                "cluster": cluster_id,
+            }
+        )
         endpoint_summaries.append(
             {
                 "cluster_id": cluster_id,
@@ -6316,7 +6328,7 @@ def build_blackbox_profile_from_asset_candidates(
         "environment_readiness": {"checks": []},
         "clusters": clusters,
         "source_peeks": [],
-        "burp_observation_plan": [],
+        "burp_observation_plan": burp_observation_plan,
         "review_observation_candidates": [],
         "websocket_observation": None,
         "blackbox": {
@@ -6326,6 +6338,7 @@ def build_blackbox_profile_from_asset_candidates(
             "allowed_triage_classes": sorted(allowed_classes),
             "observed_endpoint_count": 0,
             "asset_endpoint_count": len(clusters),
+            "burp_observation_count": len(burp_observation_plan),
             "max_endpoints": max_endpoints,
             "collapse_route_variants": collapse_route_variants,
             "skipped": skipped,
@@ -6344,6 +6357,7 @@ def build_blackbox_profile_from_asset_candidates(
         "profile": {"name": name, "display_name": display_name},
         "input_candidates": len(candidate_doc.get("candidates", []) or []),
         "generated_clusters": len(clusters),
+        "generated_burp_observations": len(burp_observation_plan),
         "allowed_triage_classes": sorted(allowed_classes),
         "skipped": skipped,
         "route_families": route_families,
@@ -7851,12 +7865,12 @@ def http_request_through_proxy(
     target_url = urllib.parse.urljoin(target.rstrip("/") + "/", path.lstrip("/"))
     parsed_target = urllib.parse.urlparse(target_url)
     parsed_proxy = urllib.parse.urlparse(proxy)
-    if parsed_target.scheme != "http":
+    if parsed_target.scheme not in {"http", "https"} or not parsed_target.hostname:
         return {
             "ok": False,
             "status": None,
             "duration_ms": 0,
-            "error": "burp-observe currently supports HTTP targets only",
+            "error": "burp-observe currently supports only HTTP or HTTPS targets",
             "body_sample": "",
             "body_text": "",
             "body_sha256": None,
@@ -7886,13 +7900,26 @@ def http_request_through_proxy(
         request_headers.setdefault("Content-Length", str(len(raw_body)))
 
     started = time.monotonic()
-    conn = http.client.HTTPConnection(
-        parsed_proxy.hostname,
-        parsed_proxy.port or 8080,
-        timeout=timeout,
-    )
+    if parsed_target.scheme == "https":
+        conn = http.client.HTTPSConnection(
+            parsed_proxy.hostname,
+            parsed_proxy.port or 8080,
+            timeout=timeout,
+            context=ssl._create_unverified_context(),
+        )
+        conn.set_tunnel(parsed_target.hostname, parsed_target.port or 443)
+        request_target = urllib.parse.urlunparse(
+            ("", "", parsed_target.path or "/", "", parsed_target.query, "")
+        )
+    else:
+        conn = http.client.HTTPConnection(
+            parsed_proxy.hostname,
+            parsed_proxy.port or 8080,
+            timeout=timeout,
+        )
+        request_target = target_url
     try:
-        conn.request(method, target_url, body=raw_body, headers=request_headers)
+        conn.request(method, request_target, body=raw_body, headers=request_headers)
         resp = conn.getresponse()
         resp_body = resp.read(MAX_RESPONSE_BYTES + 1)
         response_headers = {key: value for key, value in resp.getheaders()}
@@ -8032,25 +8059,50 @@ def build_burp_observation_plan(target: str, profile: dict[str, Any] | None = No
     ]
 
 
+def burp_history_host_regex(target: str) -> str | None:
+    parsed = urllib.parse.urlparse(target)
+    if not parsed.netloc:
+        return None
+    hosts = {parsed.netloc}
+    if parsed.hostname:
+        hosts.add(parsed.hostname)
+        if parsed.port is None:
+            if parsed.scheme == "https":
+                hosts.add(f"{parsed.hostname}:443")
+            elif parsed.scheme == "http":
+                hosts.add(f"{parsed.hostname}:80")
+    host_terms = "|".join(
+        re.escape(host)
+        for host in sorted(hosts, key=lambda item: (len(item), item), reverse=True)
+    )
+    return rf"Host:\s*(?:{host_terms})"
+
+
 def build_burp_history_regex(
     target: str,
     observation_plan: list[dict[str, Any]],
     *,
     include_ws_upgrade: bool = False,
 ) -> str:
-    history_regex_terms = []
+    signal_terms = []
     for item in observation_plan:
         user_agent = (item.get("headers") or {}).get("User-Agent")
         if user_agent:
-            history_regex_terms.append(re.escape(f"User-Agent: {user_agent}"))
-    if not history_regex_terms:
-        history_regex_terms.extend(
+            signal_terms.append(re.escape(f"User-Agent: {user_agent}"))
+    if not signal_terms:
+        signal_terms.extend(
             re.escape(f"{item['method']} {item['path']}")
             for item in observation_plan
         )
     if include_ws_upgrade:
-        history_regex_terms.append(r"Upgrade: websocket")
-    return "|".join(dict.fromkeys(history_regex_terms))
+        signal_terms.append(r"Upgrade:\s*websocket")
+    signal_regex = "|".join(dict.fromkeys(signal_terms))
+    host_regex = burp_history_host_regex(target)
+    if not signal_regex:
+        return host_regex or ""
+    if not host_regex:
+        return signal_regex
+    return rf"(?:{host_regex}[\s\S]*(?:{signal_regex})|(?:{signal_regex})[\s\S]*{host_regex})"
 
 
 def run_ws_upgrade_observation_through_proxy(
@@ -10990,7 +11042,8 @@ def cluster_matches_endpoint(cluster: dict[str, Any], method: str, path: str) ->
     methods = {str(item).upper() for item in match.get("methods", [])}
     exclude_methods = {str(item).upper() for item in match.get("exclude_methods", [])}
     if methods and "ANY" not in methods and normalized_method not in methods:
-        return False
+        if not (normalized_method == "HEAD" and "GET" in methods):
+            return False
     if exclude_methods and normalized_method in exclude_methods:
         return False
 
@@ -26043,6 +26096,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         cluster.get("path")
         for cluster in blackbox_asset_profile_sample.get("clusters", [])
     }
+    blackbox_asset_profile_observations = blackbox_asset_profile_sample.get("burp_observation_plan", [])
     blackbox_asset_profile_text_sample = json.dumps(blackbox_asset_profile_sample, sort_keys=True)
     blackbox_asset_profile_query_keys = {
         key
@@ -26151,6 +26205,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_asset_map_sample.get("summary", {}).get("triage_risk_counts", {}).get("high") == 1
         and blackbox_asset_profile_summary_sample.get("status") == "generated"
         and blackbox_asset_profile_summary_sample.get("generated_clusters") == 1
+        and blackbox_asset_profile_summary_sample.get("generated_burp_observations") == 1
+        and len(blackbox_asset_profile_observations) == 1
+        and blackbox_asset_profile_observations[0].get("method") == "HEAD"
+        and blackbox_asset_profile_observations[0].get("path") == "/trade/BTCUSD"
         and blackbox_asset_profile_summary_sample.get("skipped", {}).get("other_host") == 1
         and blackbox_asset_profile_summary_sample.get("skipped", {}).get("non_http") == 0
         and blackbox_asset_profile_summary_sample.get("skipped", {}).get("triage_class") == 2
@@ -28851,6 +28909,92 @@ def run_response_deltas(args: argparse.Namespace) -> int:
         )
     )
     return 0 if response_delta_analysis["status"] not in {"review-needed", "no-probe-results"} else 1
+
+
+def run_evidence_gaps(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    clusters_path = artifact_dir / "endpoint-clusters.json"
+    clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
+    results = load_jsonl(artifact_dir / "probe-results.jsonl")
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    traffic_index = build_traffic_index(results, burp_history)
+    traffic_index_path = artifact_dir / "traffic-index.json"
+    write_json(traffic_index_path, sanitize_artifact_samples(traffic_index))
+    source_peeks = load_optional_json(artifact_dir / "source-peek-results.json")
+    transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {"candidates_seen": 0}
+    rpc_method_policy = load_optional_json(artifact_dir / "rpc-method-policy.json")
+    orca_baseline = load_optional_json(artifact_dir / "orca-baseline.json")
+    quote_collection = load_optional_json(artifact_dir / "quote-collection.json")
+    evidence_gaps = build_evidence_gaps(
+        clusters,
+        results,
+        burp_history,
+        transaction_intent,
+        rpc_method_policy,
+        orca_baseline,
+        quote_collection,
+        source_peeks,
+        profile=profile,
+    )
+    evidence_gaps_path = artifact_dir / "evidence-gaps.json"
+    write_json(evidence_gaps_path, evidence_gaps)
+    burp_observation_coverage = build_burp_observation_coverage(
+        target,
+        profile,
+        clusters,
+        burp_history,
+        load_optional_json(artifact_dir / "burp-observation-run.json"),
+        evidence_gaps,
+    )
+    burp_observation_coverage_path = artifact_dir / "burp-observation-coverage.json"
+    write_json(burp_observation_coverage_path, burp_observation_coverage)
+    environment_readiness = load_optional_json(artifact_dir / "environment-readiness.json")
+    transaction_decoder_selftest = load_optional_json(artifact_dir / "transaction-decoder-selftest.json")
+    blackbox_coverage = build_blackbox_coverage(
+        clusters,
+        results,
+        burp_history,
+        source_peeks,
+        evidence_gaps,
+        load_optional_json(artifact_dir / "burp-observation-run.json"),
+        environment_readiness,
+        transaction_decoder_selftest,
+        profile=profile,
+    )
+    blackbox_coverage_path = artifact_dir / "blackbox-coverage.json"
+    write_json(blackbox_coverage_path, sanitize_artifact_samples(blackbox_coverage))
+    suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
+    source_peek_requests = build_source_peek_requests(
+        clusters,
+        traffic_index,
+        source_peeks,
+        suspicions_doc.get("suspicions", []),
+        evidence_gaps,
+    )
+    source_peek_requests_path = artifact_dir / "source-peek-requests.json"
+    write_json(source_peek_requests_path, source_peek_requests)
+    print(f"Evidence gaps: {len(evidence_gaps.get('gaps', []) or [])}")
+    print(f"Burp observation coverage: {burp_observation_coverage['status']}")
+    print(f"Blackbox coverage: {blackbox_coverage['status']}")
+    print(f"Wrote {evidence_gaps_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="evidence-gaps",
+            output_paths=[
+                *target_profile_artifact_paths(artifact_dir),
+                traffic_index_path,
+                evidence_gaps_path,
+                burp_observation_coverage_path,
+                blackbox_coverage_path,
+                source_peek_requests_path,
+            ],
+        )
+    )
+    return 1 if args.strict and evidence_gaps.get("gaps") else 0
 
 
 def run_evidence_chain(args: argparse.Namespace) -> int:
@@ -31721,6 +31865,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recompute response delta analysis from current probe results",
     )
     response_deltas.set_defaults(func=run_response_deltas)
+
+    evidence_gaps = sub.add_parser(
+        "evidence-gaps",
+        help="Recompute evidence gaps and dependent coverage artifacts without probing",
+    )
+    evidence_gaps.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero if any evidence gaps remain.",
+    )
+    evidence_gaps.set_defaults(func=run_evidence_gaps)
 
     evidence_chain = sub.add_parser(
         "evidence-chain",

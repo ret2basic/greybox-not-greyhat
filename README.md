@@ -166,6 +166,10 @@ it promotes only `passive-page-route-review` candidates, strips query values,
 keeps query parameter names, and leaves API, WebSocket, sensitive, and
 state-changing candidates in the review queue. Use `--allow-triage-class` only
 after a candidate class has a safe, read-only reproduction plan.
+For promoted page-route candidates, the generated profile also includes a
+minimal Burp observation plan: one `HEAD` request per promoted route. This lets
+`burp-sync --observe` collect Proxy history automatically after scope review
+without requiring a manual browser click path for static page-route evidence.
 Locale-style route variants such as `/de-DE/trade/BTCUSD` and
 `/en-US/trade/BTCUSD` are collapsed to one representative route family by
 default to keep low-resource probe plans small; pass `--include-route-variants`
@@ -184,6 +188,21 @@ python3 scripts/inferforge.py \
 Do not add `--observed-only` for this preview: asset profiles are generated from
 reviewed static candidates, not Burp-observed traffic, so observed-only planning
 will select no clusters until those routes have been observed separately.
+
+After scope review, collect those page-route observations through Burp Proxy:
+
+```bash
+python3 scripts/inferforge.py \
+  --profile .greybox/in-scope-example/blackbox-asset-profile.json \
+  --target https://in-scope.example \
+  --artifact-dir .greybox/in-scope-example \
+  burp-sync --observe --allow-nonlocal-target --replace
+```
+
+The observation flow supports HTTPS targets through Burp Proxy CONNECT, forces
+Proxy Intercept off by default, does not persist raw MCP history, and filters
+history by both target `Host` and the InferForge observation signal so old local
+traffic cannot crowd out the current target.
 
 For takeover-oriented Web/App scope checks, keep the host list explicit:
 
@@ -745,6 +764,13 @@ Burp observation, safe probe execution, source context, policy-field coverage,
 readiness, and known evidence gaps. The current target can be `covered` or
 `covered-with-external-blocker`; the latter is expected while the quote
 transaction corpus is blocked by placeholder credentials.
+Use `evidence-gaps` to refresh gap state and dependent coverage artifacts from
+existing local evidence without sending new probes:
+
+```bash
+python3 scripts/inferforge.py evidence-gaps
+```
+
 For generated starter profiles, source-discovered surfaces that are intentionally
 not actively probed, such as reviewed-only rewrite proxies, are marked
 `not-applicable` for safe-probe and policy-field coverage until a Burp
