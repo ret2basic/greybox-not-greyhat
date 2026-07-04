@@ -96,6 +96,7 @@ BLACKBOX_ASSET_CANDIDATES_ARTIFACT = "blackbox-asset-candidates.json"
 BLACKBOX_ASSET_PROFILE_ARTIFACT = "blackbox-asset-profile.json"
 DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND = "audit --include-external --ws-resource-probes"
 BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND = "audit --max-probes 6 --no-ws"
+REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND = "audit --max-probes 6 --no-ws"
 HOST_TAKEOVER_BASELINE_ARTIFACT = "host-takeover-baseline.json"
 RESOURCE_SNAPSHOT_ARTIFACT = "resource-snapshot.json"
 SCOPE_POLICY_ARTIFACT = "scope-policy.json"
@@ -4490,7 +4491,7 @@ def build_orca_baseline_review_candidate() -> dict[str, Any]:
         "status": "review-only",
         "command_templates": [
             f"python3 scripts/inferforge.py collect-orca-baseline --address {PLACEHOLDER_APPROVED_POOL_ADDRESS}",
-            "python3 scripts/inferforge.py audit --include-external --ws-resource-probes",
+            f"python3 scripts/inferforge.py {REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND}",
         ],
         "approval_required": [
             "Use one approved known pool address only, or rely on a source-known pool list reviewed for the target.",
@@ -8850,6 +8851,18 @@ def profile_path_for_artifact_dir(artifact_dir: Path) -> str | None:
     return repo_relative_or_absolute(path) if path.is_absolute() else raw_path
 
 
+def profile_path_for_command(profile: dict[str, Any] | None) -> str | None:
+    if not isinstance(profile, dict):
+        return None
+    raw_path = str(profile.get("_profile_path") or profile.get("profile_path") or "")
+    if not raw_path or raw_path in {"builtin-default", "self-test"}:
+        return None
+    path = resolve_repo_path(raw_path)
+    if path.suffix.lower() != ".json":
+        return None
+    return repo_relative_or_absolute(path) if path.is_absolute() else raw_path
+
+
 def validation_artifact_profile_docs(artifact_dir: Path) -> list[dict[str, Any]]:
     docs: list[dict[str, Any]] = []
     config = load_optional_json(artifact_dir / "config.json") or {}
@@ -8875,9 +8888,14 @@ def validation_context_is_blackbox(profile: dict[str, Any] | None, artifact_dir:
     return any(is_blackbox_profile_like(doc) or is_blackbox_asset_candidate_profile(doc) for doc in profile_docs)
 
 
-def validation_command_for_artifact_dir(artifact_dir: Path, subcommand: str) -> str:
+def validation_command_for_artifact_dir(
+    artifact_dir: Path,
+    subcommand: str,
+    *,
+    profile: dict[str, Any] | None = None,
+) -> str:
     parts = ["python3", "scripts/inferforge.py"]
-    profile_path = profile_path_for_artifact_dir(artifact_dir)
+    profile_path = profile_path_for_command(profile) or profile_path_for_artifact_dir(artifact_dir)
     if profile_path:
         parts.extend(["--profile", profile_path])
     parts.extend(["--artifact-dir", repo_relative_or_absolute(artifact_dir)])
@@ -8917,8 +8935,16 @@ def validation_external_probe_replacement_command(
     if "audit" not in validation_command_tokens(command):
         return None
     if hypothesis.get("type") == "cluster-strategy":
-        return validation_command_for_artifact_dir(artifact_dir, "audit --max-probes 1 --no-ws --observed-only")
-    return validation_command_for_artifact_dir(artifact_dir, BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND)
+        return validation_command_for_artifact_dir(
+            artifact_dir,
+            "audit --max-probes 1 --no-ws --observed-only",
+            profile=profile,
+        )
+    return validation_command_for_artifact_dir(
+        artifact_dir,
+        BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND,
+        profile=profile,
+    )
 
 
 def validation_question_for_hypothesis(hypothesis: dict[str, Any]) -> str:
@@ -8974,24 +9000,100 @@ def forbidden_validation_actions(hypothesis: dict[str, Any]) -> list[str]:
     ]
 
 
+def rewrite_review_observation_candidate_id(item: dict[str, Any] | None) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    for candidate in item.get("review_observation_candidates", []) or []:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get("id") or "")
+        if candidate_id and candidate.get("type") == "burp-http-observation":
+            return candidate_id
+    return None
+
+
+def rewrite_review_promotion_preview_commands(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    rewrite_review_item: dict[str, Any] | None,
+    limit: int = 3,
+) -> list[str]:
+    candidate_id = rewrite_review_observation_candidate_id(rewrite_review_item)
+    if not candidate_id:
+        return []
+    reviewed_profile = repo_relative_or_absolute(artifact_dir / "reviewed-profile.json")
+    commands = []
+    for candidate in (rewrite_review_item or {}).get("read_only_path_candidates", []) or []:
+        if not isinstance(candidate, dict):
+            continue
+        local_path = str(candidate.get("local_path") or "")
+        if not is_safe_concrete_local_path(local_path):
+            continue
+        commands.append(
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                (
+                    "promote-observation-candidate "
+                    f"--candidate-id {shlex.quote(candidate_id)} "
+                    f"--path {shlex.quote(local_path)} "
+                    f"--output {shlex.quote(reviewed_profile)} "
+                    "--no-write"
+                ),
+                profile=profile,
+            )
+        )
+        if len(commands) >= limit:
+            break
+    return commands
+
+
+def validation_rewrite_review_context(rewrite_review_item: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(rewrite_review_item, dict):
+        return None
+    read_only = rewrite_review_item.get("read_only_path_candidates", []) or []
+    blocked = rewrite_review_item.get("blocked_path_candidates", []) or []
+    candidate_id = rewrite_review_observation_candidate_id(rewrite_review_item)
+    if not read_only and not blocked and not candidate_id:
+        return None
+    return {
+        "rewrite_review_id": rewrite_review_item.get("id"),
+        "cluster_id": rewrite_review_item.get("cluster_id"),
+        "candidate_id": candidate_id,
+        "read_only_path_candidates": read_only[:5],
+        "blocked_path_candidates": blocked[:5],
+        "approval_required": [
+            "Confirm exactly one read-only candidate is in scope before writing a reviewed profile.",
+            "Run only the no-write promotion preview until scope and data-sensitivity checks are complete.",
+            "Do not execute the follow-up Burp observation or audit commands while resource-snapshot is warning.",
+        ],
+    }
+
+
 def validation_allowed_commands(
     *,
     artifact_dir: Path,
     profile: dict[str, Any] | None,
     hypothesis: dict[str, Any],
     verification_queue: dict[str, Any],
+    rewrite_review_item: dict[str, Any] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
+    def command(subcommand: str) -> str:
+        return validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile)
+
     allowed_now_commands = [
-        validation_command_for_artifact_dir(artifact_dir, "harness-loop --no-write"),
-        validation_command_for_artifact_dir(artifact_dir, "hypothesis-matrix --no-write --show-next"),
-        validation_command_for_artifact_dir(artifact_dir, "rewrite-review --no-write"),
-        validation_command_for_artifact_dir(artifact_dir, "verification-queue --no-write"),
+        command("harness-loop --no-write"),
+        command("hypothesis-matrix --no-write --show-next"),
+        command("rewrite-review --no-write --show-next"),
+        *rewrite_review_promotion_preview_commands(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            rewrite_review_item=rewrite_review_item,
+        ),
+        command("verification-queue --no-write"),
     ]
     allowed_after_gate_commands = [
-        validation_command_for_artifact_dir(
-            artifact_dir,
-            "resource-snapshot --max-processes 8 --watch-port 3100 --watch-port 2455 --no-write --strict",
-        )
+        command("resource-snapshot --max-processes 8 --watch-port 3100 --watch-port 2455 --no-write --strict")
     ]
     blocked_commands: list[dict[str, Any]] = []
     command_replacements: list[dict[str, Any]] = []
@@ -9032,7 +9134,7 @@ def validation_allowed_commands(
             allowed_after_gate_commands.append(command_text)
     elif hypothesis.get("type") == "cluster-strategy":
         allowed_after_gate_commands.append(
-            validation_command_for_artifact_dir(artifact_dir, "audit --max-probes 1 --no-ws --observed-only")
+            command("audit --max-probes 1 --no-ws --observed-only")
         )
     allowed_now = [
         validation_command_ref(command, source=f"{hypothesis.get('id')}:allowed_now[{index}]")
@@ -9056,12 +9158,14 @@ def validation_item_from_hypothesis(
     profile: dict[str, Any] | None,
     hypothesis: dict[str, Any],
     verification_queue: dict[str, Any],
+    rewrite_review_item: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     commands = validation_allowed_commands(
         artifact_dir=artifact_dir,
         profile=profile,
         hypothesis=hypothesis,
         verification_queue=verification_queue,
+        rewrite_review_item=rewrite_review_item,
     )
     allowed_now = commands["allowed_now"]
     allowed_after_gate = commands["allowed_after_resource_gate"]
@@ -9098,6 +9202,9 @@ def validation_item_from_hypothesis(
         preconditions.append("Remove external-probe flags or replace the command with a constrained same-target validation step.")
     if command_replacements:
         preconditions.append("Review command_replacements; allowed commands contain only constrained replacements.")
+    rewrite_review_context = validation_rewrite_review_context(rewrite_review_item)
+    if rewrite_review_context and rewrite_review_context.get("read_only_path_candidates"):
+        preconditions.append("Review rewrite_review.read_only_path_candidates and choose at most one no-write promotion preview.")
 
     return {
         "id": f"VAL-{safe_hypothesis_id(hypothesis.get('id'))}",
@@ -9114,6 +9221,7 @@ def validation_item_from_hypothesis(
         "allowed_after_resource_gate": allowed_after_gate,
         "blocked_commands": blocked_commands,
         "command_replacements": command_replacements,
+        "rewrite_review": rewrite_review_context,
         "command_safety": command_summary,
         "blocked_command_safety": blocked_command_summary,
         "required_evidence": required_evidence_for_hypothesis(hypothesis),
@@ -9160,6 +9268,24 @@ def apply_current_resource_gate_to_hypothesis(
     return gated
 
 
+def find_rewrite_review_item_for_hypothesis(
+    hypothesis: dict[str, Any],
+    rewrite_review: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(rewrite_review, dict):
+        return None
+    cluster_id = str(hypothesis.get("cluster_id") or "")
+    path = str(hypothesis.get("path") or "")
+    for item in rewrite_review.get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if cluster_id and str(item.get("cluster_id") or "") == cluster_id:
+            return item
+        if path and str(item.get("path") or "") == path:
+            return item
+    return None
+
+
 def build_validation_plan_run(
     *,
     target: str,
@@ -9176,12 +9302,18 @@ def build_validation_plan_run(
         if isinstance(item, dict)
         and str(item.get("status") or "") not in {"parked-terminal-lead"}
     ][:limit]
+    rewrite_review = (
+        build_rewrite_review_run(target=target, profile=profile, artifact_dir=artifact_dir)
+        if any(str(hypothesis.get("impact") or "") == "fixed-upstream-proxy-confusion" for hypothesis in hypotheses)
+        else {}
+    )
     items = [
         validation_item_from_hypothesis(
             artifact_dir=artifact_dir,
             profile=profile,
             hypothesis=hypothesis,
             verification_queue=verification_queue,
+            rewrite_review_item=find_rewrite_review_item_for_hypothesis(hypothesis, rewrite_review),
         )
         for hypothesis in hypotheses
     ]
@@ -9228,11 +9360,13 @@ def build_validation_plan_run(
             "command_safety": command_summary,
             "blocked_command_safety": blocked_command_summary,
             "hypothesis_matrix": matrix.get("status"),
+            "rewrite_review": rewrite_review.get("status") if isinstance(rewrite_review, dict) else None,
             "current_resource_snapshot": artifact_summary_status(current_resource_snapshot),
         },
         "items": items,
         "artifact_refs": {
             "hypothesis_matrix": HYPOTHESIS_MATRIX_ARTIFACT,
+            "rewrite_review": REWRITE_REVIEW_ARTIFACT,
             "verification_queue": "verification-queue.json",
             "resource_snapshot": RESOURCE_SNAPSHOT_ARTIFACT,
         },
@@ -18543,7 +18677,6 @@ def review_candidate_command_templates(
     if not candidate_id:
         return []
     reviewed_profile = verification_artifact_path(artifact_dir, "reviewed-profile.json")
-    audit_policy = verification_audit_policy_for_clusters(clusters)
     return [
         cmd
         for cmd in [
@@ -18576,7 +18709,7 @@ def review_candidate_command_templates(
             verification_command_for_profile(
                 reviewed_profile,
                 artifact_dir,
-                audit_policy["subcommand"],
+                REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND,
             ),
         ]
         if cmd
@@ -18590,7 +18723,6 @@ def promoted_observation_followup_commands(
     source_profile: dict[str, Any] | None = None,
 ) -> list[str]:
     reviewed_profile = repo_relative_or_absolute(output_path)
-    audit_policy = verification_audit_policy_for_profile(source_profile)
     return [
         verification_command_for_profile(
             reviewed_profile,
@@ -18600,7 +18732,7 @@ def promoted_observation_followup_commands(
         verification_command_for_profile(
             reviewed_profile,
             artifact_dir,
-            audit_policy["subcommand"],
+            REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND,
         ),
     ]
 
@@ -24400,7 +24532,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Profile validation:" in promote_stdout_text
                 and "Next commands:" in promote_stdout
                 and "burp-sync --observe" in promote_stdout_text
-                and "audit --include-external --ws-resource-probes" in promote_stdout_text
+                and REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND in promote_stdout_text
                 and "No files written (--no-write)." in promote_stdout
                 and not any(
                     output_paths[key]
@@ -30653,7 +30785,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and "reviewed-profile.json" in rewrite_queue_commands[1]
             and "--no-write" not in rewrite_queue_commands[1]
             and "burp-sync --observe" in rewrite_queue_commands[2]
-            and "audit --include-external --ws-resource-probes" in rewrite_queue_commands[3]
+            and REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND in rewrite_queue_commands[3]
             and all(command.count("--profile") <= 1 for command in rewrite_queue_commands)
             and all(command.count("--artifact-dir") == 1 for command in rewrite_queue_commands)
             and rewrite_queue_command_counts.get("manual-template") == 2
@@ -35394,20 +35526,39 @@ def run_validation_plan(args: argparse.Namespace) -> int:
             )
             print(f"  question={inline_summary_text(item.get('validation_question'), max_chars=220)}")
             if args.show_commands:
+                rewrite_review = item.get("rewrite_review") if isinstance(item.get("rewrite_review"), dict) else {}
+                read_only_candidates = rewrite_review.get("read_only_path_candidates", []) or []
+                blocked_candidates = rewrite_review.get("blocked_path_candidates", []) or []
+                if read_only_candidates:
+                    print("  rewrite_read_only_candidates:")
+                    for candidate in read_only_candidates[:3]:
+                        print(
+                            "    - "
+                            f"{candidate.get('method')} {candidate.get('local_path')} "
+                            f"source={candidate.get('source_ref')}"
+                        )
+                if blocked_candidates:
+                    print("  rewrite_blocked_candidates:")
+                    for candidate in blocked_candidates[:3]:
+                        print(
+                            "    - "
+                            f"{candidate.get('method')} {candidate.get('local_path')} "
+                            f"status={candidate.get('status')}"
+                        )
                 now = item.get("allowed_now", []) or []
                 after = item.get("allowed_after_resource_gate", []) or []
                 blocked = item.get("blocked_commands", []) or []
                 if now:
                     print("  allowed_now:")
-                    for ref in now[:3]:
+                    for ref in now[:5]:
                         print(f"    - {format_command_ref_label(ref)} {inline_summary_text(ref.get('command'), max_chars=420)}")
                 if after:
                     print("  allowed_after_resource_gate:")
-                    for ref in after[:3]:
+                    for ref in after[:5]:
                         print(f"    - {format_command_ref_label(ref)} {inline_summary_text(ref.get('command'), max_chars=420)}")
                 if blocked:
                     print("  blocked_commands:")
-                    for ref in blocked[:3]:
+                    for ref in blocked[:5]:
                         print(f"    - {format_command_ref_label(ref)} {inline_summary_text(ref.get('command'), max_chars=420)}")
 
     if no_write:
