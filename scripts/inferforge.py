@@ -10227,6 +10227,7 @@ def validation_resource_preflight_summary(snapshot: dict[str, Any] | None) -> di
         "memory": snapshot.get("memory", {}) or {},
         "resource_budget": snapshot.get("resource_budget", {}) or {},
         "watched_ports": snapshot.get("watched_ports", {}) or {},
+        "release_candidates": snapshot.get("release_candidates", [])[:3] or [],
     }
 
 
@@ -40817,6 +40818,14 @@ def run_validation_plan(args: argparse.Namespace) -> int:
             f"warnings={','.join(warnings) if warnings else 'none'} "
             f"budget={budget.get('mode') or 'unknown'}"
         )
+        for candidate in resource_preflight.get("release_candidates", [])[:3]:
+            print(
+                "  release_candidate="
+                f"{candidate.get('type')} "
+                f"pid={candidate.get('pid')} "
+                f"rss={candidate.get('rss_mib')}MiB "
+                f"action={inline_summary_text(candidate.get('recommendation'), max_chars=140)}"
+            )
     if command_safety:
         print(f"Command safety: {format_command_safety_summary(command_safety)}")
     if blocked_command_safety and blocked_command_safety.get("commands"):
