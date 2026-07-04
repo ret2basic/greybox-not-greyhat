@@ -2342,6 +2342,30 @@ def source_without_js_comments(source: str) -> str:
     return source_without_js_comments_and_strings(source, strip_strings=False)
 
 
+def read_js_string_literal(source: str, quote_index: int) -> tuple[str, int] | None:
+    if quote_index < 0 or quote_index >= len(source):
+        return None
+    quote = source[quote_index]
+    if quote not in {"'", '"', "`"}:
+        return None
+    value: list[str] = []
+    escaped = False
+    index = quote_index + 1
+    while index < len(source):
+        char = source[index]
+        if escaped:
+            value.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == quote:
+            return "".join(value), index + 1
+        else:
+            value.append(char)
+        index += 1
+    return None
+
+
 def extract_export_list_route_methods(source: str) -> set[str]:
     methods: set[str] = set()
     for match in re.finditer(r"\bexport\s+(?!type\b)\{([^}]+)\}(?:\s+from\b[^;]*)?", source, re.S):
@@ -2367,13 +2391,18 @@ def extract_route_methods(source: str) -> list[str]:
 def extract_pages_api_methods(source: str) -> list[str]:
     methods = set(extract_route_methods(source))
     scan_source = source_without_js_comments(source)
-    methods.update(
-        re.findall(
-            r"\b(?:req|request)\.method\s*(?:={2,3}|!={1,2})\s*['\"]([A-Z]+)['\"]",
-            scan_source,
-        )
-    )
-    methods.update(re.findall(r"\bcase\s+['\"]([A-Z]+)['\"]\s*:", scan_source))
+    code_skeleton = source_without_js_comments_and_strings(source)
+    for match in re.finditer(
+        r"\b(?:req|request)\.method\s*(?:={2,3}|!={1,2})\s*(['\"`])",
+        code_skeleton,
+    ):
+        literal = read_js_string_literal(scan_source, match.start(1))
+        if literal:
+            methods.add(literal[0])
+    for match in re.finditer(r"\bcase\s+(['\"`])", code_skeleton):
+        literal = read_js_string_literal(scan_source, match.start(1))
+        if literal and code_skeleton[literal[1] :].lstrip().startswith(":"):
+            methods.add(literal[0])
     return sorted(method for method in methods if method in HTTP_METHODS)
 
 
@@ -23266,15 +23295,26 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "  switch (req.method) { case 'POST': return res.status(200).end() }\n"
             "}\n"
         ),
+        "template_literal_real": extract_pages_api_methods(
+            "export default function handler(req, res) {\n"
+            "  if (request.method === `PUT`) return res.status(200).end()\n"
+            "}\n"
+        ),
         "commented_req_method_ignored": extract_pages_api_methods(
             "// if (req.method === 'DELETE') return res.status(200).end()\n"
             "/* case 'PATCH': return res.status(200).end() */\n"
+        ),
+        "string_fixture_ignored": extract_pages_api_methods(
+            "const fixture = \"if (req.method === 'DELETE') return res.status(200).end()\"\n"
+            "const switchFixture = \"case 'PATCH': return res.status(200).end()\"\n"
         ),
     }
     pages_api_method_samples_passed = (
         pages_api_method_samples.get("req_method_real") == ["GET"]
         and pages_api_method_samples.get("switch_real") == ["POST"]
+        and pages_api_method_samples.get("template_literal_real") == ["PUT"]
         and pages_api_method_samples.get("commented_req_method_ignored") == []
+        and pages_api_method_samples.get("string_fixture_ignored") == []
     )
     any_method_match_reasons = entrypoint_match_reasons(
         {
