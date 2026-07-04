@@ -251,6 +251,22 @@ step, and no endpoint, host, or script is requested by this command. Use
 across multiple child runs that already contain `lead-portfolio.json`; this is
 also offline and prints per-run status counts plus the top actionable leads.
 
+Use `harness-loop` as the high-level autonomous loop dashboard. It maps the
+current artifacts into discovery/recon, lead generation, finding identification,
+issue validation, and PoC/reporting stages, then prints the safest next steps:
+
+```bash
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  harness-loop --no-write
+python3 scripts/inferforge.py --artifact-dir .greybox/target-set \
+  harness-loop --discover-child-runs --no-write
+```
+
+`harness-loop` is also read-only. It is intended for low-memory unattended runs:
+use it after `resource-snapshot --strict` to decide whether to deepen an
+existing lead, regenerate passive leads, refresh adjudication, or stop because
+there is no reportable evidence yet.
+
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:
 

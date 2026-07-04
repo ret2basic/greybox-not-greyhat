@@ -101,6 +101,7 @@ RESOURCE_SNAPSHOT_ARTIFACT = "resource-snapshot.json"
 SCOPE_POLICY_ARTIFACT = "scope-policy.json"
 WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT = "websocket-candidate-review.json"
 LEAD_PORTFOLIO_ARTIFACT = "lead-portfolio.json"
+HARNESS_LOOP_ARTIFACT = "harness-loop.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -180,6 +181,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     "collection-summary.json",
     "environment-readiness.json",
     LEAD_PORTFOLIO_ARTIFACT,
+    HARNESS_LOOP_ARTIFACT,
     "artifact-health.json",
     "regression-suite.json",
     "orca-baseline.json",
@@ -7392,6 +7394,427 @@ def build_lead_portfolio_rollup(
         "safety": (
             "Read-only lead portfolio rollup. It reads child lead-portfolio artifacts only and does not send "
             "HTTP requests, invoke Burp, run Burp Scanner, sign wallets, submit transactions, or fetch external hosts."
+        ),
+    }
+
+
+HARNESS_LOOP_STAGES = [
+    "discovery-recon",
+    "lead-generation",
+    "finding-identification",
+    "issue-validation",
+    "poc-reporting",
+]
+
+
+def list_count(value: Any) -> int:
+    return len(value) if isinstance(value, list) else 0
+
+
+def dict_summary(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def artifact_file_status(artifact_dir: Path, name: str) -> str:
+    path = artifact_dir / name
+    if not path.exists():
+        return "missing"
+    if path.is_file() and path.stat().st_size == 0:
+        return "empty"
+    return "present"
+
+
+def artifact_summary_status(doc: dict[str, Any] | None) -> str:
+    if not isinstance(doc, dict):
+        return "missing"
+    return str(doc.get("status") or "unknown")
+
+
+def harness_stage(
+    *,
+    stage: str,
+    status: str,
+    summary: dict[str, Any],
+    next_step: str,
+    artifact_refs: list[str],
+) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "status": status,
+        "summary": summary,
+        "next_step": next_step,
+        "artifact_refs": artifact_refs,
+    }
+
+
+def build_harness_loop_run(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    endpoint_clusters = load_optional_json(artifact_dir / "endpoint-clusters.json") or {}
+    blackbox_coverage = load_optional_json(artifact_dir / "blackbox-coverage.json") or {}
+    discovery_coverage = load_optional_json(artifact_dir / DISCOVERY_COVERAGE_ARTIFACT) or {}
+    traffic_index = load_optional_json(artifact_dir / "traffic-index.json") or {}
+    source_peek_requests = load_optional_json(artifact_dir / "source-peek-requests.json") or {}
+    asset_candidates = load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT) or {}
+    lead_portfolio = load_optional_json(artifact_dir / LEAD_PORTFOLIO_ARTIFACT) or {}
+    verification_queue = load_optional_json(artifact_dir / "verification-queue.json") or {}
+    response_deltas = load_optional_json(artifact_dir / "response-delta-analysis.json") or {}
+    suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
+    finding_gate = load_optional_json(artifact_dir / "finding-gate.json") or {}
+    adjudication = load_optional_json(artifact_dir / "adjudication.json") or {}
+    findings_doc = load_optional_json(artifact_dir / "findings.json") or {}
+    evidence_gaps = load_optional_json(artifact_dir / "evidence-gaps.json") or {}
+    evidence_appendix = load_optional_json(artifact_dir / "evidence-appendix.json") or {}
+    review_blockers = load_optional_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT) or {}
+    resource_snapshot = load_optional_json(artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT) or {}
+
+    clusters = endpoint_clusters.get("clusters", []) if isinstance(endpoint_clusters, dict) else []
+    traffic_endpoints = traffic_index.get("endpoints", []) if isinstance(traffic_index, dict) else []
+    source_peek_summary = dict_summary(source_peek_requests.get("summary"))
+    source_peek_status_counts = dict_summary(source_peek_summary.get("status_counts"))
+    asset_summary = dict_summary(asset_candidates.get("summary"))
+    lead_summary = dict_summary(lead_portfolio.get("summary"))
+    queue_summary = dict_summary(verification_queue.get("summary"))
+    queue_command_safety = dict_summary(queue_summary.get("command_safety"))
+    delta_summary = dict_summary(response_deltas.get("summary"))
+    suspicion_rows = suspicions_doc.get("suspicions", suspicions_doc.get("items", []))
+    findings_rows = findings_doc.get("findings", findings_doc.get("items", []))
+    gate_summary = dict_summary(finding_gate.get("summary"))
+    adjudication_summary = dict_summary(adjudication.get("summary"))
+    gaps_summary = dict_summary(evidence_gaps.get("summary"))
+    blockers_summary = dict_summary(review_blockers.get("summary"))
+    appendix_summary = dict_summary(evidence_appendix.get("summary"))
+
+    coverage_status = artifact_summary_status(blackbox_coverage or discovery_coverage)
+    if list_count(clusters) == 0 and list_count(traffic_endpoints) == 0:
+        discovery_status = "needs-recon"
+        discovery_next = "Collect or import a bounded traffic/profile baseline before generating leads."
+    elif source_peek_status_counts.get("needs-resolution"):
+        discovery_status = "covered-with-source-limits"
+        discovery_next = "Resolve source-peek requests when source is available; otherwise keep black-box gates explicit."
+    elif coverage_status in {"covered", "complete", "no-gaps"}:
+        discovery_status = "covered"
+        discovery_next = "Use lead generation and finding identification to deepen from the covered baseline."
+    else:
+        discovery_status = "needs-coverage-review"
+        discovery_next = "Review coverage artifacts and refresh passive indexes before active follow-up."
+
+    actionable_leads = int(lead_summary.get("actionable_leads", 0) or 0)
+    lead_count = int(lead_summary.get("leads", 0) or 0)
+    queue_items = int(queue_summary.get("items", 0) or 0)
+    external_commands = int(queue_command_safety.get("blocked_external", 0) or 0)
+    if actionable_leads:
+        lead_status = "actionable-leads"
+        lead_next = "Deepen the highest-priority in-scope lead before broadening discovery."
+    elif external_commands:
+        lead_status = "blocked-external-commands"
+        lead_next = "Constrain or manually approve external-probe command templates before unattended execution."
+    elif lead_count:
+        lead_status = "leads-indexed"
+        lead_next = "All indexed leads are terminal; generate a new hypothesis or deepen existing evidence."
+    elif queue_items:
+        lead_status = "ready-queue"
+        lead_next = "Use verification queue previews to choose a low-risk deepening step."
+    else:
+        lead_status = "needs-leads"
+        lead_next = "Run passive lead generation from existing traffic/assets before probing."
+
+    suspicion_count = list_count(suspicion_rows)
+    finding_count = list_count(findings_rows)
+    reportable_findings = int(adjudication_summary.get("reportable_findings", 0) or 0)
+    if reportable_findings or finding_count:
+        finding_status = "finding-candidates"
+        finding_next = "Validate reportability gates and keep PoC evidence minimal and reproducible."
+    elif suspicion_count:
+        finding_status = "suspicions-present"
+        finding_next = "Run finding gate/adjudication and collect only evidence needed to prove impact."
+    elif artifact_summary_status(response_deltas) == "stable":
+        finding_status = "stable-no-candidates"
+        finding_next = "No anomalous response deltas are indexed; shift to targeted hypothesis generation."
+    else:
+        finding_status = "needs-identification"
+        finding_next = "Refresh response deltas, transaction intent, and suspicion synthesis from existing evidence."
+
+    gap_count = int(gaps_summary.get("gaps", 0) or 0)
+    blocker_count = int(blockers_summary.get("blockers", 0) or 0)
+    if reportable_findings:
+        validation_status = "reportable-findings"
+        validation_next = "Prepare final PoC/report artifacts and avoid unnecessary additional probing."
+    elif artifact_summary_status(evidence_gaps) == "needs-safe-follow-up" or gap_count:
+        validation_status = "needs-safe-follow-up"
+        validation_next = "Use resource and scope gates before running the smallest follow-up that closes the gap."
+    elif artifact_summary_status(review_blockers) not in {"missing", "ready"} or blocker_count:
+        validation_status = "needs-review"
+        validation_next = "Resolve review blockers before active validation."
+    elif artifact_summary_status(adjudication) == "no-reportable-findings":
+        validation_status = "no-reportable-findings"
+        validation_next = "No validated finding is present; return to lead generation or finding identification."
+    else:
+        validation_status = "needs-adjudication"
+        validation_next = "Refresh finding gate and adjudication from current suspicions."
+
+    report_status = artifact_file_status(artifact_dir, "report.md")
+    reproduction_status = artifact_file_status(artifact_dir, "reproduction-steps.md")
+    appendix_status = artifact_summary_status(evidence_appendix)
+    if reportable_findings and (report_status != "present" or reproduction_status != "present"):
+        poc_status = "needs-poc-report"
+        poc_next = "Write minimal reproduction steps and report artifacts for the validated finding."
+    elif report_status == "present" and reproduction_status == "present" and appendix_status != "missing":
+        poc_status = "report-artifacts-present"
+        poc_next = "Keep report artifacts synced only after validation changes."
+    else:
+        poc_status = "not-applicable-no-reportable"
+        poc_next = "Do not spend PoC effort until validation produces a reportable finding."
+
+    stages = [
+        harness_stage(
+            stage="discovery-recon",
+            status=discovery_status,
+            summary={
+                "clusters": list_count(clusters),
+                "traffic_endpoints": list_count(traffic_endpoints),
+                "coverage": coverage_status,
+                "source_peek_requests": artifact_summary_status(source_peek_requests),
+                "source_peek_status_counts": source_peek_status_counts,
+                "asset_candidates": asset_summary.get("candidate_count", asset_summary.get("candidates", 0)),
+            },
+            next_step=discovery_next,
+            artifact_refs=[
+                "endpoint-clusters.json",
+                "traffic-index.json",
+                "blackbox-coverage.json",
+                DISCOVERY_COVERAGE_ARTIFACT,
+                "source-peek-requests.json",
+            ],
+        ),
+        harness_stage(
+            stage="lead-generation",
+            status=lead_status,
+            summary={
+                "leads": lead_count,
+                "actionable_leads": actionable_leads,
+                "verification_queue_items": queue_items,
+                "external_probe_commands": external_commands,
+                "lead_status_counts": dict_summary(lead_summary.get("status_counts")),
+            },
+            next_step=lead_next,
+            artifact_refs=[LEAD_PORTFOLIO_ARTIFACT, "verification-queue.json"],
+        ),
+        harness_stage(
+            stage="finding-identification",
+            status=finding_status,
+            summary={
+                "suspicions": suspicion_count,
+                "findings": finding_count,
+                "response_deltas": artifact_summary_status(response_deltas),
+                "unexpected_probes": delta_summary.get("unexpected_probes", 0),
+            },
+            next_step=finding_next,
+            artifact_refs=["response-delta-analysis.json", "suspicions.json", "findings.json"],
+        ),
+        harness_stage(
+            stage="issue-validation",
+            status=validation_status,
+            summary={
+                "adjudication": artifact_summary_status(adjudication),
+                "reportable_findings": reportable_findings,
+                "evidence_gaps": gap_count,
+                "finding_gate": artifact_summary_status(finding_gate),
+                "review_blockers": blocker_count,
+            },
+            next_step=validation_next,
+            artifact_refs=["finding-gate.json", "adjudication.json", "evidence-gaps.json", REVIEW_BLOCKERS_ARTIFACT],
+        ),
+        harness_stage(
+            stage="poc-reporting",
+            status=poc_status,
+            summary={
+                "report_md": report_status,
+                "reproduction_steps_md": reproduction_status,
+                "evidence_appendix": appendix_status,
+                "appendix_probe_rows": appendix_summary.get("probe_rows", 0),
+            },
+            next_step=poc_next,
+            artifact_refs=["report.md", "reproduction-steps.md", "evidence-appendix.json"],
+        ),
+    ]
+
+    stage_status_counts: dict[str, int] = {}
+    for stage in stages:
+        increment_count(stage_status_counts, str(stage.get("status") or "unknown"))
+
+    if reportable_findings:
+        status = "reportable-findings"
+    elif actionable_leads or suspicion_count or gap_count:
+        status = "needs-deepening"
+    elif discovery_status.startswith("needs") or lead_status == "needs-leads" or validation_status == "needs-adjudication":
+        status = "needs-setup"
+    else:
+        status = "loop-ready-no-reportable"
+
+    next_steps = ordered_unique_strings(
+        [
+            *[
+                str(stage.get("next_step"))
+                for stage in stages
+                if str(stage.get("next_step") or "").strip()
+                and str(stage.get("status") or "") not in {"covered", "report-artifacts-present"}
+            ],
+            *(
+                ["Resource snapshot is warning; run resource-snapshot --strict before active work."]
+                if artifact_summary_status(resource_snapshot) == "warning"
+                else []
+            ),
+        ]
+    )[:8]
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": str(artifact_dir),
+        "mode": "single-run",
+        "summary": {
+            "stages": len(stages),
+            "stage_status_counts": dict(sorted(stage_status_counts.items())),
+            "reportable_findings": reportable_findings,
+            "actionable_leads": actionable_leads,
+            "suspicions": suspicion_count,
+            "evidence_gaps": gap_count,
+            "external_probe_commands": external_commands,
+        },
+        "stages": stages,
+        "next_steps": next_steps,
+        "artifact_refs": {
+            "lead_portfolio": LEAD_PORTFOLIO_ARTIFACT,
+            "verification_queue": "verification-queue.json",
+            "adjudication": "adjudication.json",
+            "evidence_gaps": "evidence-gaps.json",
+            "report": "report.md",
+        },
+        "methodology": (
+            "Harness loop view: discovery/recon, lead generation, finding identification, "
+            "issue validation, and PoC/reporting. This command only reads local artifacts."
+        ),
+        "safety": (
+            "Read-only harness loop summary. It sends no HTTP requests, invokes no Burp tools, "
+            "runs no scanners, signs no wallets, and submits no transactions."
+        ),
+    }
+
+
+def build_harness_loop_rollup(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    check_dirs: list[Path],
+) -> dict[str, Any]:
+    runs = []
+    missing = []
+    status_counts: dict[str, int] = {}
+    stage_status_counts: dict[str, int] = {}
+    totals = {
+        "reportable_findings": 0,
+        "actionable_leads": 0,
+        "suspicions": 0,
+        "evidence_gaps": 0,
+        "external_probe_commands": 0,
+    }
+
+    for check_dir in check_dirs:
+        relative_dir = repo_relative_or_absolute(check_dir)
+        if not check_dir.exists():
+            missing.append(relative_dir)
+            increment_count(status_counts, "missing-artifact-dir")
+            runs.append(
+                {
+                    "artifact_dir": relative_dir,
+                    "status": "missing-artifact-dir",
+                    "summary": {},
+                    "stages": [],
+                }
+            )
+            continue
+        run_doc = build_harness_loop_run(target=target, profile=None, artifact_dir=check_dir)
+        run_status = str(run_doc.get("status") or "unknown")
+        increment_count(status_counts, run_status)
+        run_summary = dict_summary(run_doc.get("summary"))
+        for key in totals:
+            totals[key] += int(run_summary.get(key, 0) or 0)
+        for stage, count in dict_summary(run_summary.get("stage_status_counts")).items():
+            stage_status_counts[str(stage)] = stage_status_counts.get(str(stage), 0) + int(count or 0)
+        runs.append(
+            {
+                "artifact_dir": relative_dir,
+                "status": run_status,
+                "summary": run_summary,
+                "next_steps": run_doc.get("next_steps", [])[:5],
+                "stages": [
+                    {
+                        "stage": stage.get("stage"),
+                        "status": stage.get("status"),
+                        "next_step": stage.get("next_step"),
+                    }
+                    for stage in run_doc.get("stages", []) or []
+                ],
+            }
+        )
+
+    if missing:
+        status = "failed"
+    elif totals["reportable_findings"]:
+        status = "reportable-findings"
+    elif totals["actionable_leads"] or totals["suspicions"] or totals["evidence_gaps"]:
+        status = "needs-deepening"
+    elif not runs:
+        status = "no-runs"
+    elif status_counts.get("needs-setup"):
+        status = "needs-setup"
+    else:
+        status = "loop-ready-no-reportable"
+
+    next_steps = ordered_unique_strings(
+        [
+            step
+            for run in runs
+            for step in run.get("next_steps", []) or []
+            if str(step or "").strip()
+        ]
+    )[:12]
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": str(artifact_dir),
+        "mode": "rollup",
+        "summary": {
+            "runs": len(runs),
+            "missing_artifact_dirs": missing,
+            "status_counts": dict(sorted(status_counts.items())),
+            "stage_status_counts": dict(sorted(stage_status_counts.items())),
+            **totals,
+        },
+        "runs": runs,
+        "next_steps": next_steps,
+        "artifact_refs": {
+            "harness_loop": HARNESS_LOOP_ARTIFACT,
+            "lead_portfolio": LEAD_PORTFOLIO_ARTIFACT,
+            "verification_queue": "verification-queue.json",
+        },
+        "methodology": (
+            "Rollup view for the harness loop stages: discovery/recon, lead generation, "
+            "finding identification, issue validation, and PoC/reporting."
+        ),
+        "safety": (
+            "Read-only harness loop rollup. It reads child artifacts only and does not send HTTP requests, "
+            "invoke Burp, run scanners, sign wallets, submit transactions, or fetch external hosts."
         ),
     }
 
@@ -20293,6 +20716,13 @@ def discover_lead_portfolio_dirs(root_dir: Path) -> list[Path]:
     )
 
 
+def discover_harness_loop_dirs(root_dir: Path) -> list[Path]:
+    dirs: set[Path] = set()
+    for artifact_name in [MANIFEST_NAME, "verification-queue.json", LEAD_PORTFOLIO_ARTIFACT, "adjudication.json"]:
+        dirs.update(path.parent for path in root_dir.glob(f"*/{artifact_name}"))
+    return sorted(dirs, key=lambda item: str(item))
+
+
 def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
     directories = [build_single_artifact_health(path.resolve()) for path in artifact_dirs]
     status_counts: dict[str, int] = {}
@@ -27398,6 +27828,48 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         blackbox_lead_rollup_discovered_dirs = [
             path.name for path in discover_lead_portfolio_dirs(lead_rollup_root)
         ]
+    with tempfile.TemporaryDirectory(prefix="inferforge-harness-loop-selftest-") as harness_loop_temp_dir:
+        harness_loop_root = Path(harness_loop_temp_dir)
+        harness_loop_run_dir = harness_loop_root / "run"
+        harness_loop_run_dir.mkdir()
+        write_json(harness_loop_run_dir / "endpoint-clusters.json", blackbox_clusters_sample)
+        write_json(harness_loop_run_dir / "blackbox-coverage.json", blackbox_coverage_sample)
+        write_json(harness_loop_run_dir / "source-peek-requests.json", blackbox_source_peeks_sample)
+        write_json(harness_loop_run_dir / LEAD_PORTFOLIO_ARTIFACT, blackbox_lead_portfolio_sample)
+        write_json(harness_loop_run_dir / "verification-queue.json", blackbox_verification_queue_sample)
+        write_json(
+            harness_loop_run_dir / "response-delta-analysis.json",
+            {"generated_at": utc_now(), "status": "stable", "summary": {"unexpected_probes": 0}},
+        )
+        write_json(harness_loop_run_dir / "suspicions.json", {"generated_at": utc_now(), "suspicions": []})
+        write_json(harness_loop_run_dir / "finding-gate.json", {"generated_at": utc_now(), "status": "no-suspicions", "summary": {}})
+        write_json(
+            harness_loop_run_dir / "adjudication.json",
+            {"generated_at": utc_now(), "status": "no-reportable-findings", "summary": {"reportable_findings": 0}},
+        )
+        write_json(harness_loop_run_dir / "findings.json", {"generated_at": utc_now(), "findings": []})
+        write_json(
+            harness_loop_run_dir / "evidence-gaps.json",
+            {"generated_at": utc_now(), "status": "no-evidence-gaps", "summary": {"gaps": 0}},
+        )
+        write_json(
+            harness_loop_run_dir / "evidence-appendix.json",
+            {"generated_at": utc_now(), "status": "indexed", "summary": {"probe_rows": 0}},
+        )
+        blackbox_harness_loop_sample = build_harness_loop_run(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_run_dir,
+        )
+        blackbox_harness_loop_rollup_sample = build_harness_loop_rollup(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_root,
+            check_dirs=[harness_loop_run_dir],
+        )
+        blackbox_harness_loop_discovered_dirs = [
+            path.name for path in discover_harness_loop_dirs(harness_loop_root)
+        ]
     blackbox_asset_profile_paths = {
         cluster.get("path")
         for cluster in blackbox_asset_profile_sample.get("clusters", [])
@@ -27574,6 +28046,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         )
         and "top-secret" not in blackbox_lead_rollup_text_sample
         and "AbC1234567890Token" not in blackbox_lead_rollup_text_sample
+        and blackbox_harness_loop_sample.get("status") == "needs-deepening"
+        and [stage.get("stage") for stage in blackbox_harness_loop_sample.get("stages", [])] == HARNESS_LOOP_STAGES
+        and blackbox_harness_loop_sample.get("summary", {}).get("actionable_leads")
+        == blackbox_lead_portfolio_sample.get("summary", {}).get("actionable_leads")
+        and any(
+            stage.get("stage") == "lead-generation" and stage.get("status") == "actionable-leads"
+            for stage in blackbox_harness_loop_sample.get("stages", [])
+        )
+        and blackbox_harness_loop_rollup_sample.get("status") == "needs-deepening"
+        and blackbox_harness_loop_rollup_sample.get("summary", {}).get("runs") == 1
+        and blackbox_harness_loop_discovered_dirs == ["run"]
         and blackbox_asset_clusters_sample.get("profile", {}).get("asset_candidate_profile") is True
         and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_verification_command_text
         and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_asset_verification_command_text
@@ -32479,6 +32962,114 @@ def run_lead_portfolio(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_harness_loop(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    check_dirs: list[Path] = []
+    for item in args.check_dir or []:
+        check_dirs.append(resolve_repo_path(item))
+    if args.discover_child_runs:
+        check_dirs.extend(discover_harness_loop_dirs(artifact_dir))
+    deduped_dirs = []
+    seen_dirs: set[str] = set()
+    for check_dir in check_dirs:
+        resolved = check_dir.resolve()
+        key = str(resolved)
+        if key in seen_dirs:
+            continue
+        seen_dirs.add(key)
+        deduped_dirs.append(resolved)
+
+    if deduped_dirs:
+        loop = build_harness_loop_rollup(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            check_dirs=deduped_dirs,
+        )
+    else:
+        loop = build_harness_loop_run(target=target, profile=profile, artifact_dir=artifact_dir)
+
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / HARNESS_LOOP_ARTIFACT
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, loop)
+        if deduped_dirs:
+            refreshed_manifests = refresh_manifests_for_artifact_outputs(
+                output_paths=[output_path],
+                artifact_dir=artifact_dir,
+                check_dirs=deduped_dirs,
+                target=target,
+                command="harness-loop",
+            )
+        else:
+            refreshed_manifests = refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="harness-loop",
+                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+            )
+
+    summary = loop.get("summary", {}) or {}
+    print(f"Harness loop: {loop['status']}")
+    if loop.get("mode") == "rollup":
+        print(
+            "Runs: "
+            f"{summary.get('runs', 0)} checked, "
+            f"status_counts={json.dumps(summary.get('status_counts', {}), sort_keys=True)}"
+        )
+    print(
+        "Totals: "
+        f"reportable={summary.get('reportable_findings', 0)} "
+        f"actionable_leads={summary.get('actionable_leads', 0)} "
+        f"suspicions={summary.get('suspicions', 0)} "
+        f"gaps={summary.get('evidence_gaps', 0)} "
+        f"external_probe_commands={summary.get('external_probe_commands', 0)}"
+    )
+    print(f"Stage statuses: {json.dumps(summary.get('stage_status_counts', {}), sort_keys=True)}")
+
+    if loop.get("mode") == "rollup":
+        for run in (loop.get("runs", []) or [])[: max(0, int(args.top_runs))]:
+            run_summary = run.get("summary", {}) or {}
+            print(
+                f"- {run.get('artifact_dir')}: {run.get('status')} "
+                f"actionable={run_summary.get('actionable_leads', 0)} "
+                f"suspicions={run_summary.get('suspicions', 0)} "
+                f"reportable={run_summary.get('reportable_findings', 0)}"
+            )
+    else:
+        print("Stages:")
+        for stage in loop.get("stages", []) or []:
+            print(
+                f"- {stage.get('stage')}: {stage.get('status')} "
+                f"next={inline_summary_text(stage.get('next_step'), max_chars=180)}"
+            )
+
+    next_steps = loop.get("next_steps", []) or []
+    if next_steps:
+        print("Next steps:")
+        for step in next_steps[: max(0, int(args.top_steps))]:
+            print(f"- {inline_summary_text(step, max_chars=240)}")
+    else:
+        print("Next steps: none")
+
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+
+    if loop["status"] == "failed":
+        return 1
+    if args.strict and loop["status"] not in {"loop-ready-no-reportable", "reportable-findings"}:
+        return 1
+    return 0
+
+
 def run_decode_transactions(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -33905,6 +34496,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero when actionable leads remain.",
     )
     lead_portfolio.set_defaults(func=run_lead_portfolio)
+
+    harness_loop = sub.add_parser(
+        "harness-loop",
+        help="Summarize discovery, leads, finding identification, validation, and PoC/reporting loop state",
+    )
+    harness_loop.add_argument(
+        "--output",
+        help="Where to write harness-loop.json. Defaults to --artifact-dir/harness-loop.json.",
+    )
+    harness_loop.add_argument(
+        "--check-dir",
+        action="append",
+        help="Child artifact directory to include in a rollup. Repeat as needed.",
+    )
+    harness_loop.add_argument(
+        "--discover-child-runs",
+        action="store_true",
+        help="Build a rollup from child directories under --artifact-dir with harness artifacts.",
+    )
+    harness_loop.add_argument(
+        "--top-runs",
+        type=positive_int,
+        default=8,
+        help="Number of child runs to print in rollup mode.",
+    )
+    harness_loop.add_argument(
+        "--top-steps",
+        type=positive_int,
+        default=8,
+        help="Number of next steps to print.",
+    )
+    harness_loop.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print harness loop summary only; do not write harness-loop.json or refreshed manifests.",
+    )
+    harness_loop.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless the loop is ready with no reportable findings or has reportable findings.",
+    )
+    harness_loop.set_defaults(func=run_harness_loop)
 
     decode = sub.add_parser(
         "decode-transactions",
