@@ -5922,7 +5922,7 @@ def run_ws_upgrade_observation_through_proxy(
             "expected_statuses": [],
             "error": "WebSocket observation disabled by target profile.",
         }
-    ws_path = str(ws_profile.get("path") or "/api/rpc/solana/devnet")
+    ws_path = str(ws_profile.get("path") or "")
     ws_cluster = str(ws_profile.get("cluster") or "solana-rpc-ws")
     ws_expected_statuses = list(ws_profile.get("expected_statuses") or [101])
     subscribe_method = str(ws_profile.get("subscribe_method") or "slotSubscribe")
@@ -7359,7 +7359,7 @@ def run_ws_probes(
                 "skipped": True,
             }
         ]
-    ws_path = str(ws_profile.get("path") or "/api/rpc/solana/devnet")
+    ws_path = str(ws_profile.get("path") or "")
     ws_cluster = str(ws_profile.get("cluster") or "solana-rpc-ws")
     subscribe_method = str(ws_profile.get("subscribe_method") or "slotSubscribe")
     node_path = Path(node)
@@ -7550,7 +7550,7 @@ def run_ws_resource_probes(
                 "skipped": True,
             }
         ]
-    ws_path = str(ws_profile.get("path") or "/api/rpc/solana/devnet")
+    ws_path = str(ws_profile.get("path") or "")
     ws_cluster = str(ws_profile.get("cluster") or "solana-rpc-ws")
     node_path = Path(node)
     if not node_path.exists():
@@ -22766,6 +22766,38 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and not (no_default_ws_path_profile.get("probe_targets") or {}).get("solana-rpc-ws")
         and "/api/rpc/solana/devnet" not in json.dumps(no_default_ws_path_profile, sort_keys=True)
     )
+    no_default_ws_probe_results = run_ws_probes(
+        "http://127.0.0.1:9995",
+        "/definitely/missing-node",
+        ROOT,
+        no_default_ws_path_profile,
+    )
+    no_default_ws_resource_results = run_ws_resource_probes(
+        "http://127.0.0.1:9995",
+        "/definitely/missing-node",
+        ROOT,
+        no_default_ws_path_profile,
+    )
+    no_default_ws_observation = run_ws_upgrade_observation_through_proxy(
+        "http://127.0.0.1:9995",
+        "http://127.0.0.1:8080",
+        "/definitely/missing-node",
+        ROOT,
+        no_default_ws_path_profile,
+    )
+    no_default_ws_execution_payload = {
+        "ws_probes": no_default_ws_probe_results,
+        "ws_resource_probes": no_default_ws_resource_results,
+        "ws_observation": no_default_ws_observation,
+    }
+    no_default_ws_execution_passed = (
+        no_default_ws_probe_results
+        and no_default_ws_probe_results[0].get("path") is None
+        and no_default_ws_resource_results
+        and no_default_ws_resource_results[0].get("path") is None
+        and no_default_ws_observation.get("path") is None
+        and "/api/rpc/solana/devnet" not in json.dumps(no_default_ws_execution_payload, sort_keys=True)
+    )
     profile_seeded_route_discovery_passed = False
     profile_seeded_route_discovery: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(prefix="inferforge-profile-seeded-discovery-") as temp_dir:
@@ -24548,6 +24580,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and discovered_quote_response_passed
         and discovered_quote_provider_passed
         and no_default_ws_path_passed
+        and no_default_ws_execution_passed
         and profile_seeded_route_discovery_passed
         and discover_profile_seed_cli_passed
         and readiness_profile_passed
@@ -24666,6 +24699,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "websocket_observation": no_default_ws_path_profile.get("websocket_observation"),
             "probe_targets": no_default_ws_path_profile.get("probe_targets", {}),
             "contains_default_ws_path": "/api/rpc/solana/devnet" in json.dumps(no_default_ws_path_profile, sort_keys=True),
+        },
+        "no_default_websocket_execution": {
+            "status": "passed" if no_default_ws_execution_passed else "failed",
+            "results": no_default_ws_execution_payload,
+            "contains_default_ws_path": "/api/rpc/solana/devnet"
+            in json.dumps(no_default_ws_execution_payload, sort_keys=True),
         },
         "profile_seeded_route_discovery": {
             "status": "passed" if profile_seeded_route_discovery_passed else "failed",
