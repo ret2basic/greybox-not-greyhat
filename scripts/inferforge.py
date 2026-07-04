@@ -3389,7 +3389,73 @@ def route_dynamic_segments(path: str) -> list[str]:
     return re.findall(r"\{([^{}]+)\}", path)
 
 
-def cluster_id_from_route_path(path: str) -> str:
+def quote_route_match_cluster(profile: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not profile:
+        return None
+    configured = explicit_probe_target_config(profile, "quote")
+    declared = declared_cluster_by_id(profile, "quote")
+    match = json_clone((declared or {}).get("match") or {})
+    candidate_paths = [
+        str(value)
+        for value in [
+            (declared or {}).get("path"),
+            configured.get("path"),
+            configured.get("path_template"),
+        ]
+        if isinstance(value, str) and value.strip()
+    ]
+    if not match and candidate_paths:
+        match = route_match_for_path(candidate_paths[0], normalize_string_list((declared or {}).get("method")))
+    for candidate in candidate_paths:
+        target = "path_patterns" if "{" in candidate else "paths"
+        values = match.setdefault(target, [])
+        if candidate not in values:
+            values.append(candidate)
+        prefix = catchall_prefix_for_path(candidate) if "{" in candidate else None
+        if prefix:
+            prefixes = match.setdefault("path_prefixes", [])
+            if prefix not in prefixes:
+                prefixes.append(prefix)
+    if not any(match.get(key) for key in ["paths", "path_patterns", "path_prefixes"]):
+        return None
+    return {
+        "id": "quote",
+        "path": candidate_paths[0] if candidate_paths else (declared or {}).get("path", ""),
+        "match": match,
+    }
+
+
+def route_matches_profile_quote(
+    profile: dict[str, Any] | None,
+    path: str,
+    methods: list[str] | None = None,
+    alternate_paths: list[str] | None = None,
+) -> bool:
+    cluster = quote_route_match_cluster(profile)
+    if cluster is None:
+        return False
+    path_candidates = [path]
+    for candidate in alternate_paths or []:
+        if candidate and candidate not in path_candidates:
+            path_candidates.append(candidate)
+    method_candidates = [str(method).upper() for method in (methods or []) if str(method).strip()]
+    if not method_candidates:
+        method_candidates = [str((declared_cluster_by_id(profile, "quote") or {}).get("method") or "POST").upper()]
+    return any(
+        cluster_matches_endpoint(cluster, method, candidate_path)
+        for candidate_path in path_candidates
+        for method in method_candidates
+    )
+
+
+def cluster_id_from_route_path(
+    path: str,
+    profile: dict[str, Any] | None = None,
+    methods: list[str] | None = None,
+    alternate_paths: list[str] | None = None,
+) -> str:
+    if route_matches_profile_quote(profile, path, methods, alternate_paths):
+        return "quote"
     if path == "/health":
         return "health"
     if path == "/api/quote":
@@ -3402,7 +3468,14 @@ def cluster_id_from_route_path(path: str) -> str:
     return f"route-{slug or 'root'}"
 
 
-def infer_route_strategy(path: str, methods: list[str], source: str, upstreams: list[str]) -> dict[str, Any]:
+def infer_route_strategy(
+    path: str,
+    methods: list[str],
+    source: str,
+    upstreams: list[str],
+    profile: dict[str, Any] | None = None,
+    alternate_paths: list[str] | None = None,
+) -> dict[str, Any]:
     lowered = source.lower()
     reasons = []
     if path == "/health":
@@ -3411,6 +3484,13 @@ def infer_route_strategy(path: str, methods: list[str], source: str, upstreams: 
             "kind": "health",
             "priority": "low",
             "reasons": ["path:/health"],
+        }
+    if route_matches_profile_quote(profile, path, methods, alternate_paths):
+        return {
+            "strategy_set": "quote-transaction-decoder",
+            "kind": "orchestration-proxy",
+            "priority": "high",
+            "reasons": ["profile-quote-route-match"],
         }
     if path == "/api/quote" or "quote" in path.lower() or "m0" in lowered:
         if "quote" in path.lower():
@@ -3453,7 +3533,7 @@ def infer_route_strategy(path: str, methods: list[str], source: str, upstreams: 
     }
 
 
-def discover_nextjs_routes(source_root: Path) -> dict[str, Any]:
+def discover_nextjs_routes(source_root: Path, profile: dict[str, Any] | None = None) -> dict[str, Any]:
     discovered_app_roots = app_roots(source_root)
     api_roots = pages_api_roots(source_root)
     routes = []
@@ -3483,10 +3563,11 @@ def discover_nextjs_routes(source_root: Path) -> dict[str, Any]:
                 continue
             methods = extract_route_methods(source)
             upstreams = extract_fixed_upstreams(source)
-            inference = infer_route_strategy(source_path, methods, source, upstreams)
+            runtime_match_paths = [route_path, *runtime.get("variants", [])]
+            inference = infer_route_strategy(source_path, methods, source, upstreams, profile, runtime_match_paths)
             routes.append(
                 {
-                    "cluster_id": cluster_id_from_route_path(source_path),
+                    "cluster_id": cluster_id_from_route_path(source_path, profile, methods, runtime_match_paths),
                     "path": route_path,
                     "source_path": source_path,
                     "methods": methods,
@@ -3521,10 +3602,11 @@ def discover_nextjs_routes(source_root: Path) -> dict[str, Any]:
                 continue
             methods = extract_pages_api_methods(source)
             upstreams = extract_fixed_upstreams(source)
-            inference = infer_route_strategy(source_path, methods, source, upstreams)
+            runtime_match_paths = [route_path, *runtime.get("variants", [])]
+            inference = infer_route_strategy(source_path, methods, source, upstreams, profile, runtime_match_paths)
             routes.append(
                 {
-                    "cluster_id": cluster_id_from_route_path(source_path),
+                    "cluster_id": cluster_id_from_route_path(source_path, profile, methods, runtime_match_paths),
                     "path": route_path,
                     "source_path": source_path,
                     "methods": methods,
@@ -22377,6 +22459,69 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         == "selftest-provider-config-missing"
         and "quote_provider" not in discovered_quote_no_seed_profile
     )
+    profile_seeded_route_discovery_passed = False
+    profile_seeded_route_discovery: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory(prefix="inferforge-profile-seeded-discovery-") as temp_dir:
+        seeded_source_root = Path(temp_dir) / "seeded-app"
+        (seeded_source_root / "src/app/bridge/swap").mkdir(parents=True)
+        (seeded_source_root / "src/app/bridge/swap/route.ts").write_text(
+            "export async function POST() {\n"
+            "  await fetch('https://gateway.example.invalid/swap')\n"
+            "  return Response.json({ ok: true })\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        profile_seed = json_clone(test_profile)
+        profile_seed["probe_targets"]["quote"]["path"] = "/bridge/swap"
+        for cluster in profile_seed.get("clusters", []):
+            if cluster.get("id") != "quote":
+                continue
+            cluster["path"] = "/bridge/swap"
+            cluster["match"] = {"methods": ["POST"], "paths": ["/bridge/swap"]}
+        seeded_inventory = discover_nextjs_routes(seeded_source_root, profile_seed)
+        neutral_inventory = discover_nextjs_routes(seeded_source_root)
+        seeded_route = next(
+            (route for route in seeded_inventory.get("routes", []) if route.get("source_path") == "/bridge/swap"),
+            None,
+        )
+        neutral_route = next(
+            (route for route in neutral_inventory.get("routes", []) if route.get("source_path") == "/bridge/swap"),
+            None,
+        )
+        seeded_profile = build_discovered_profile(
+            seeded_inventory,
+            name="profile-seeded-route-discovery",
+            display_name="Profile Seeded Route Discovery",
+            target="http://127.0.0.1:9995",
+            source_root=seeded_source_root,
+            seed_profile=profile_seed,
+        )
+        neutral_profile = build_discovered_profile(
+            neutral_inventory,
+            name="neutral-route-discovery",
+            display_name="Neutral Route Discovery",
+            target="http://127.0.0.1:9995",
+            source_root=seeded_source_root,
+        )
+        profile_seeded_route_discovery_passed = (
+            seeded_route is not None
+            and seeded_route.get("cluster_id") == "quote"
+            and seeded_route.get("strategy_set") == "quote-transaction-decoder"
+            and "profile-quote-route-match" in seeded_route.get("inference_reasons", [])
+            and (seeded_profile.get("probe_targets") or {}).get("quote", {}).get("path") == "/bridge/swap"
+            and (seeded_profile.get("quote_provider") or {}).get("name") == "SelfTestQuoteProvider"
+            and neutral_route is not None
+            and neutral_route.get("cluster_id") == "route-bridge-swap"
+            and neutral_route.get("strategy_set") == "fixed-upstream-proxy"
+            and "quote_provider" not in neutral_profile
+        )
+        profile_seeded_route_discovery = {
+            "seeded_route": seeded_route,
+            "neutral_route": neutral_route,
+            "seeded_probe_targets": seeded_profile.get("probe_targets"),
+            "neutral_strategy_sets": neutral_profile.get("strategy_sets", []),
+            "neutral_has_quote_provider": "quote_provider" in neutral_profile,
+        }
     parser = build_parser()
     default_discover_args = parser.parse_args(["discover-profile"])
     explicit_discover_args = parser.parse_args(["--profile", str(DEFAULT_PROFILE_PATH), "discover-profile"])
@@ -23821,6 +23966,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and discovered_quote_request_passed
         and discovered_quote_response_passed
         and discovered_quote_provider_passed
+        and profile_seeded_route_discovery_passed
         and discover_profile_seed_cli_passed
         and readiness_profile_passed
         and attack_strategy_status_passed
@@ -23910,6 +24056,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "status": "passed" if discovered_quote_provider_passed else "failed",
             "seeded_quote_provider": discovered_quote_seed_profile.get("quote_provider"),
             "no_seed_has_quote_provider": "quote_provider" in discovered_quote_no_seed_profile,
+        },
+        "profile_seeded_route_discovery": {
+            "status": "passed" if profile_seeded_route_discovery_passed else "failed",
+            **profile_seeded_route_discovery,
         },
         "discover_profile_seed_cli": {
             "status": "passed" if discover_profile_seed_cli_passed else "failed",
@@ -26020,7 +26170,8 @@ def run_promote_observation_candidate(args: argparse.Namespace) -> int:
 def run_discover_profile(args: argparse.Namespace) -> int:
     base_profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    route_inventory = discover_nextjs_routes(source_root)
+    seed_profile = base_profile if args.profile else None
+    route_inventory = discover_nextjs_routes(source_root, seed_profile)
     write_json(artifact_dir / ROUTE_INVENTORY_ARTIFACT, route_inventory)
 
     default_name = re.sub(r"[^A-Za-z0-9_-]+", "-", source_root.name.lower()).strip("-") or "discovered-target"
@@ -26032,7 +26183,7 @@ def run_discover_profile(args: argparse.Namespace) -> int:
         display_name=display_name,
         target=target,
         source_root=source_root,
-        seed_profile=base_profile if args.profile else None,
+        seed_profile=seed_profile,
     )
     output_path = Path(args.output).resolve() if args.output else artifact_dir / DISCOVERED_PROFILE_ARTIFACT
     explicit_output = bool(args.output)

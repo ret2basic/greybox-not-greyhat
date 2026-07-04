@@ -350,6 +350,12 @@ discovery without an explicit profile does not copy the built-in regression
 target mint intent, request/response shape, or provider diagnostics into a new
 target.
 
+When an explicit seed profile declares a `quote` cluster or
+`probe_targets.quote.path`, static discovery also uses that profile-owned path
+to classify a non-standard route as `quote-transaction-decoder`. Without
+`--profile`, the generated starter profile stays neutral and uses only generic
+source/path heuristics.
+
 Use the static routing self-test to guard this invariant:
 
 ```bash
