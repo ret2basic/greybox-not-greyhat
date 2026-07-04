@@ -10793,12 +10793,28 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "self-test-transactions",
 ]
 
+ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
+    "plan": "plan --no-write",
+    "response-deltas": "response-deltas --no-write",
+    "source-peek-requests": "source-peek-requests --no-write",
+    "source-peek": "source-peek --no-write",
+    "evidence-gaps": "evidence-gaps --no-write",
+    "evidence-chain": "evidence-chain --no-write",
+    "evidence-appendix": "evidence-appendix --no-write",
+    "gate": "gate --no-write",
+    "adjudicate": "adjudicate --no-write",
+    "verification-queue": "verification-queue --no-write",
+    "review-blockers": "review-blockers --no-write",
+    "report": "report --no-write",
+}
+
 
 def artifact_health_repair_commands(
     artifact_health: dict[str, Any],
     *,
     profile: dict[str, Any] | None,
     fallback_artifact_dir: Path,
+    no_write_preview: bool = False,
 ) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -10811,7 +10827,12 @@ def artifact_health_repair_commands(
         reason: str,
         artifacts: list[str],
     ) -> None:
-        command = validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile)
+        command_subcommand = subcommand
+        if no_write_preview:
+            command_subcommand = ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS.get(subcommand, "")
+            if not command_subcommand:
+                return
+        command = validation_command_for_artifact_dir(artifact_dir, command_subcommand, profile=profile)
         if command in seen:
             return
         ref = validation_command_ref(command, source=source, item_status="ready")
@@ -10820,6 +10841,8 @@ def artifact_health_repair_commands(
         seen.add(command)
         ref["artifact_dir"] = repo_relative_or_absolute(artifact_dir)
         ref["reason"] = reason
+        ref["repair_mode"] = "no-write-preview" if no_write_preview else "write-refresh"
+        ref["repair_subcommand"] = subcommand
         ref["repair_artifacts"] = ordered_unique_strings(artifacts)
         refs.append(ref)
 
@@ -10911,10 +10934,12 @@ def build_iteration_decision_from_plan(
         if resource_status not in {"healthy", "not-run"}:
             offline_preview_limit = min(limit, DEFAULT_RESOURCE_DEGRADED_OFFLINE_COMMAND_LIMIT)
     artifact_health_status = artifact_summary_status(artifact_health)
+    repair_no_write_preview = resource_status not in {"healthy", "not-run"}
     artifact_repair = artifact_health_repair_commands(
         artifact_health,
         profile=profile,
         fallback_artifact_dir=artifact_dir,
+        no_write_preview=repair_no_write_preview,
     )
     allowed_command_summary = command_safety_summary([*artifact_repair, *offline, *resource_checks, *active_after_gate])
     blocked_command_summary = command_safety_summary(blocked)
@@ -10940,10 +10965,10 @@ def build_iteration_decision_from_plan(
         )
     if artifact_health_blocks_active and artifact_repair:
         repair_reason = "Artifact health is not clean; run offline artifact refresh commands before active validation."
-        if resource_status not in {"healthy", "not-run"}:
+        if repair_no_write_preview:
             repair_reason = (
                 f"Artifact health is not clean and resource budget mode is {resource_budget_mode}; "
-                "run only capped offline repair commands."
+                "run only capped no-write artifact repair previews."
             )
         actions.append(
             iteration_action(
@@ -27790,6 +27815,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         source_peek_output_dir = root / "source-peek-output"
         source_peek_requests_output_dir = root / "source-peek-requests-output"
         evidence_gaps_output_dir = root / "evidence-gaps-output"
+        report_output_dir = root / "report-output"
         promote_output_dir = root / "promote-output"
         invalid_promote_output_dir = root / "invalid-promote-output"
         import_history_output_dir = root / "import-history-output"
@@ -27925,6 +27951,20 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--no-write",
                 ]
             )
+            report_return_code, report_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(report_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "report",
+                    "--no-write",
+                ]
+            )
             promote_return_code, promote_stdout = run_cli(
                 [
                     "--profile",
@@ -28042,6 +28082,11 @@ def build_no_write_selftest() -> dict[str, Any]:
                 evidence_gaps_output_dir / "source-peek-requests.json"
             ).exists(),
             "evidence_gaps_manifest": (evidence_gaps_output_dir / MANIFEST_NAME).exists(),
+            "report_dir": report_output_dir.exists(),
+            "report_target_profile_json": (report_output_dir / TARGET_PROFILE_ARTIFACT).exists(),
+            "report_markdown": (report_output_dir / "report.md").exists(),
+            "report_index": (report_output_dir / "index.html").exists(),
+            "report_manifest": (report_output_dir / MANIFEST_NAME).exists(),
             "promote_dir": promote_output_dir.exists(),
             "promote_reviewed_profile": (promote_output_dir / "reviewed-profile.json").exists(),
             "promote_validation": (promote_output_dir / "reviewed-profile-validation.json").exists(),
@@ -28072,6 +28117,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     source_peek_stdout_text = "\n".join(source_peek_stdout)
     source_peek_requests_stdout_text = "\n".join(source_peek_requests_stdout)
     evidence_gaps_stdout_text = "\n".join(evidence_gaps_stdout)
+    report_stdout_text = "\n".join(report_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
     invalid_promote_stdout_text = "\n".join(invalid_promote_stdout)
     import_history_limit_stdout_text = "\n".join(import_history_limit_stdout)
@@ -28249,6 +28295,33 @@ def build_no_write_selftest() -> dict[str, Any]:
         available_tools=["get_proxy_http_history"],
     )
     plain_only_action_text = json.dumps(plain_only_audit_artifact.get("mcp_actions", []), sort_keys=True)
+    harness_followup_parse_errors: list[dict[str, Any]] = []
+    for stage, commands in HARNESS_STAGE_OFFLINE_FOLLOWUPS.items():
+        for command_text in commands:
+            argv = [
+                "--profile",
+                str(profile_path),
+                "--artifact-dir",
+                str(root / "harness-followup-parse-output"),
+                "--target",
+                target,
+                "--source-root",
+                str(root),
+                *shlex.split(command_text),
+            ]
+            stderr_buffer = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(stderr_buffer):
+                    build_parser().parse_args(argv)
+            except SystemExit as error:
+                harness_followup_parse_errors.append(
+                    {
+                        "stage": stage,
+                        "command": command_text,
+                        "return_code": int(error.code) if isinstance(error.code, int) else 2,
+                        "stderr": stderr_buffer.getvalue().splitlines(),
+                    }
+                )
     assertions = [
         {
             "id": "review-candidates-no-write-skips-artifacts",
@@ -28545,6 +28618,40 @@ def build_no_write_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "report-no-write-skips-artifacts",
+            "passed": (
+                report_return_code == 0
+                and "Report refresh: preview" in report_stdout
+                and "Report bytes:" in report_stdout_text
+                and "No files written (--no-write)." in report_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "report_dir",
+                        "report_target_profile_json",
+                        "report_markdown",
+                        "report_index",
+                        "report_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in report_stdout)
+            ),
+            "expected": "report --no-write renders the report in memory without writing report, HTML, profile, or manifest artifacts",
+            "actual": {
+                "return_code": report_return_code,
+                "stdout": report_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "harness-offline-followups-parse",
+            "passed": not harness_followup_parse_errors,
+            "expected": "every harness offline follow-up command parses, including --no-write previews",
+            "actual": {
+                "parse_errors": harness_followup_parse_errors,
+            },
+        },
+        {
             "id": "regression-suite-final-summary-lines-surface-health-gates",
             "passed": (
                 regression_health_summary_line.startswith("Artifact health gate:")
@@ -28829,6 +28936,10 @@ def build_no_write_selftest() -> dict[str, Any]:
             "evidence_gaps": {
                 "return_code": evidence_gaps_return_code,
                 "stdout": evidence_gaps_stdout,
+            },
+            "report": {
+                "return_code": report_return_code,
+                "stdout": report_stdout,
             },
             "outputs_exist": output_paths,
         },
@@ -31213,6 +31324,7 @@ def generate_report(
     evidence_appendix: dict[str, Any] | None = None,
     verification_queue: dict[str, Any] | None = None,
     profile: dict[str, Any] | None = None,
+    write_files: bool = True,
 ) -> str:
     profile_name = profile_display_name(profile)
     report_title = f"InferForge {profile_name} Greybox Run"
@@ -31610,28 +31722,29 @@ Burp MCP is installed and reachable on `127.0.0.1:9876`. Codex can send approved
 2. Add program-specific transaction intent parsers after a real quote payload corpus is available.
 3. Add manually approved WebSocket pending-queue and connection-limit probes with strict low-volume bounds.
 """
-    (artifact_dir / "report.md").write_text(report, encoding="utf-8")
-    generate_index_html(
-        artifact_dir,
-        target,
-        results,
-        suspicions,
-        capabilities,
-        transaction_intent,
-        warmup_results,
-        evidence_gaps,
-        rpc_method_policy,
-        environment_readiness,
-        transaction_decoder_selftest,
-        blackbox_coverage,
-        evidence_chain,
-        hardening_notes,
-        adjudication,
-        evidence_appendix,
-        verification_queue,
-        profile,
-        attack_strategy=attack_strategy,
-    )
+    if write_files:
+        (artifact_dir / "report.md").write_text(report, encoding="utf-8")
+        generate_index_html(
+            artifact_dir,
+            target,
+            results,
+            suspicions,
+            capabilities,
+            transaction_intent,
+            warmup_results,
+            evidence_gaps,
+            rpc_method_policy,
+            environment_readiness,
+            transaction_decoder_selftest,
+            blackbox_coverage,
+            evidence_chain,
+            hardening_notes,
+            adjudication,
+            evidence_appendix,
+            verification_queue,
+            profile,
+            attack_strategy=attack_strategy,
+        )
     return report
 
 
@@ -34471,8 +34584,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             action.get("id") == "artifact-repair" and action.get("status") == "ready"
             for action in artifact_repair_iteration_decision_sample.get("actions", [])
         )
-        and "verification-queue" in artifact_repair_iteration_command_text_sample
-        and " report" in artifact_repair_iteration_command_text_sample
+        and "verification-queue --no-write" in artifact_repair_iteration_command_text_sample
+        and "report --no-write" in artifact_repair_iteration_command_text_sample
         and "audit " not in artifact_repair_iteration_command_text_sample
         and blackbox_asset_clusters_sample.get("profile", {}).get("asset_candidate_profile") is True
         and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_verification_command_text
@@ -37714,12 +37827,37 @@ def run_gate(args: argparse.Namespace) -> int:
     artifact_dir = Path(args.artifact_dir).resolve()
     profile = load_target_profile(args.profile)
     target = resolve_target(args, profile)
+    no_write = bool(args.no_write)
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
     suspicions_path = artifact_dir / "suspicions.json"
     if not suspicions_path.exists():
         output_path = artifact_dir / "finding-gate.json"
-        write_json(output_path, build_finding_gate([], burp_history))
-        print("No suspicions.json found; wrote empty finding gate")
+        gate = build_finding_gate([], burp_history)
+        if no_write:
+            print("No suspicions.json found; empty finding gate preview")
+            print("No files written (--no-write).")
+        else:
+            write_json(output_path, gate)
+            print("No suspicions.json found; wrote empty finding gate")
+            print_refreshed_manifests(
+                refresh_current_artifact_manifest(
+                    artifact_dir=artifact_dir,
+                    target=target,
+                    command="gate",
+                    output_paths=[output_path],
+                )
+            )
+        return 0
+
+    suspicions_doc = json.loads(read_text(suspicions_path))
+    suspicions = suspicions_doc.get("suspicions", [])
+    gate = build_finding_gate(suspicions, burp_history)
+    output_path = artifact_dir / "finding-gate.json"
+    print(f"Gated {len(gate['gates'])} suspicions")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        write_json(output_path, gate)
         print_refreshed_manifests(
             refresh_current_artifact_manifest(
                 artifact_dir=artifact_dir,
@@ -37728,22 +37866,6 @@ def run_gate(args: argparse.Namespace) -> int:
                 output_paths=[output_path],
             )
         )
-        return 0
-
-    suspicions_doc = json.loads(read_text(suspicions_path))
-    suspicions = suspicions_doc.get("suspicions", [])
-    gate = build_finding_gate(suspicions, burp_history)
-    output_path = artifact_dir / "finding-gate.json"
-    write_json(output_path, gate)
-    print(f"Gated {len(gate['gates'])} suspicions")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="gate",
-            output_paths=[output_path],
-        )
-    )
     return 0
 
 
@@ -37818,16 +37940,19 @@ def run_burp_observation_coverage(args: argparse.Namespace) -> int:
 
 def run_discovery_coverage(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
 
     route_inventory_path = resolve_repo_path(args.route_inventory) if args.route_inventory else artifact_dir / ROUTE_INVENTORY_ARTIFACT
     if route_inventory_path.exists():
         route_inventory = json.loads(read_text(route_inventory_path))
     else:
         route_inventory = discover_nextjs_routes(source_root)
-        route_inventory_path.parent.mkdir(parents=True, exist_ok=True)
-        write_json(route_inventory_path, route_inventory)
+        if not no_write:
+            route_inventory_path.parent.mkdir(parents=True, exist_ok=True)
+            write_json(route_inventory_path, route_inventory)
 
     clusters = build_clusters(profile, source_root)
     coverage = build_discovery_coverage(
@@ -37841,7 +37966,6 @@ def run_discovery_coverage(args: argparse.Namespace) -> int:
         probe_results=load_jsonl(artifact_dir / "probe-results.jsonl"),
     )
     output_path = resolve_repo_path(args.output) if args.output else artifact_dir / DISCOVERY_COVERAGE_ARTIFACT
-    write_json(output_path, coverage)
 
     print(f"Discovery coverage: {coverage['status']}")
     print(
@@ -37850,19 +37974,23 @@ def run_discovery_coverage(args: argparse.Namespace) -> int:
         f"status_counts={json.dumps(coverage['summary']['status_counts'], sort_keys=True)}"
     )
     print(f"Route inventory: {route_inventory_path}")
-    print(f"Wrote {output_path}")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="discovery-coverage",
-            output_paths=[
-                *target_profile_artifact_paths(artifact_dir),
-                route_inventory_path,
-                output_path,
-            ],
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        write_json(output_path, coverage)
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="discovery-coverage",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    route_inventory_path,
+                    output_path,
+                ],
+            )
         )
-    )
 
     if coverage["status"] in {"uncovered", "profile-error", "missing-route-inventory", "failed", "no-surfaces"}:
         return 1
@@ -37902,8 +38030,10 @@ def run_discovery_coverage_selftest(args: argparse.Namespace) -> int:
 
 def run_response_deltas(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     clusters_path = artifact_dir / "endpoint-clusters.json"
     clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
     response_delta_analysis = build_response_delta_analysis(
@@ -37911,7 +38041,6 @@ def run_response_deltas(args: argparse.Namespace) -> int:
         load_jsonl(artifact_dir / "probe-results.jsonl"),
     )
     output_path = artifact_dir / "response-delta-analysis.json"
-    write_json(output_path, sanitize_artifact_samples(response_delta_analysis))
     print(f"Response delta analysis: {response_delta_analysis['status']}")
     print(
         "Deltas: "
@@ -37919,15 +38048,19 @@ def run_response_deltas(args: argparse.Namespace) -> int:
         f"review_needed={response_delta_analysis['summary']['review_needed_groups']}, "
         f"expected_deltas={response_delta_analysis['summary']['expected_delta_groups']}"
     )
-    print(f"Wrote {output_path}")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="response-deltas",
-            output_paths=[output_path],
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        write_json(output_path, sanitize_artifact_samples(response_delta_analysis))
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="response-deltas",
+                output_paths=[output_path],
+            )
         )
-    )
     return 0 if response_delta_analysis["status"] not in {"review-needed", "no-probe-results"} else 1
 
 
@@ -38046,8 +38179,10 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
 
 def run_evidence_chain(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     clusters_path = artifact_dir / "endpoint-clusters.json"
     clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
     results = load_jsonl(artifact_dir / "probe-results.jsonl")
@@ -38085,7 +38220,6 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
         transaction_decoder_selftest,
     )
     output_path = artifact_dir / "evidence-chain.json"
-    write_json(output_path, evidence_chain)
     print(f"Evidence chain: {evidence_chain['status']}")
     print(
         "Indexed: "
@@ -38093,15 +38227,19 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
         f"{evidence_chain['summary']['probes']} probes, "
         f"{evidence_chain['summary']['burp_observations']} Burp observations"
     )
-    print(f"Wrote {output_path}")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="evidence-chain",
-            output_paths=[output_path],
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        write_json(output_path, evidence_chain)
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="evidence-chain",
+                output_paths=[output_path],
+            )
         )
-    )
     return 0 if evidence_chain["status"] in {"covered", "covered-with-external-blocker"} else 1
 
 
@@ -38250,8 +38388,10 @@ def run_source_peek_requests(args: argparse.Namespace) -> int:
 
 def run_evidence_appendix(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     clusters_path = artifact_dir / "endpoint-clusters.json"
     clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
     results = load_jsonl(artifact_dir / "probe-results.jsonl")
@@ -38267,7 +38407,6 @@ def run_evidence_appendix(args: argparse.Namespace) -> int:
         load_optional_json(artifact_dir / "environment-readiness.json"),
     )
     output_path = artifact_dir / "evidence-appendix.json"
-    write_json(output_path, evidence_appendix)
     print(f"Evidence appendix: {evidence_appendix['status']}")
     print(
         "Indexed: "
@@ -38275,22 +38414,28 @@ def run_evidence_appendix(args: argparse.Namespace) -> int:
         f"{evidence_appendix['summary']['representative_probe_examples']} representative probe examples, "
         f"{evidence_appendix['summary']['burp_observations']} Burp observations"
     )
-    print(f"Wrote {output_path}")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="evidence-appendix",
-            output_paths=[output_path],
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        write_json(output_path, evidence_appendix)
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="evidence-appendix",
+                output_paths=[output_path],
+            )
         )
-    )
     return 0 if evidence_appendix["status"] != "missing-evidence" else 1
 
 
 def run_report(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     clusters_path = artifact_dir / "endpoint-clusters.json"
     clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
     results = load_jsonl(artifact_dir / "probe-results.jsonl")
@@ -38338,10 +38483,11 @@ def run_report(args: argparse.Namespace) -> int:
         load_optional_json(artifact_dir / "evidence-appendix.json"),
         load_optional_json(artifact_dir / "verification-queue.json"),
         profile,
+        write_files=not no_write,
     )
     report_path = artifact_dir / "report.md"
     index_path = artifact_dir / "index.html"
-    print("Report refresh: written")
+    print("Report refresh: preview" if no_write else "Report refresh: written")
     print(
         "Inputs: "
         f"{len(results)} probe rows, "
@@ -38349,20 +38495,23 @@ def run_report(args: argparse.Namespace) -> int:
         f"{len(suspicions)} suspicions"
     )
     print(f"Report bytes: {len(report.encode('utf-8'))}")
-    print(f"Wrote {report_path}")
-    print(f"Wrote {index_path}")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="report",
-            output_paths=[
-                *target_profile_artifact_paths(artifact_dir),
-                report_path,
-                index_path,
-            ],
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {report_path}")
+        print(f"Wrote {index_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="report",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    report_path,
+                    index_path,
+                ],
+            )
         )
-    )
     return 0
 
 
@@ -39886,8 +40035,10 @@ def run_host_takeover_baseline(args: argparse.Namespace) -> int:
 
 def run_adjudicate(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
     suspicions = suspicions_doc.get("suspicions", [])
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
@@ -39895,8 +40046,9 @@ def run_adjudicate(args: argparse.Namespace) -> int:
     wrote_finding_gate = False
     if finding_gate is None:
         finding_gate = build_finding_gate(suspicions, burp_history)
-        write_json(artifact_dir / "finding-gate.json", finding_gate)
-        wrote_finding_gate = True
+        if not no_write:
+            write_json(artifact_dir / "finding-gate.json", finding_gate)
+            wrote_finding_gate = True
 
     findings = build_findings(suspicions, finding_gate)
     hardening_notes = build_hardening_notes(suspicions, finding_gate)
@@ -39920,12 +40072,6 @@ def run_adjudicate(args: argparse.Namespace) -> int:
     output_paths = [findings_path, hardening_notes_path, adjudication_path]
     if wrote_finding_gate:
         output_paths.append(artifact_dir / "finding-gate.json")
-    write_json(findings_path, {"generated_at": utc_now(), "findings": findings})
-    write_json(
-        hardening_notes_path,
-        {"generated_at": utc_now(), "hardening_notes": hardening_notes},
-    )
-    write_json(adjudication_path, adjudication)
     print(f"Adjudication: {adjudication['status']}")
     print(
         "Decisions: "
@@ -39934,15 +40080,24 @@ def run_adjudicate(args: argparse.Namespace) -> int:
         f"{adjudication['summary']['manual_review']} manual review, "
         f"{adjudication['summary']['blocked']} blocked"
     )
-    print(f"Wrote {adjudication_path}")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="adjudicate",
-            output_paths=output_paths,
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        write_json(findings_path, {"generated_at": utc_now(), "findings": findings})
+        write_json(
+            hardening_notes_path,
+            {"generated_at": utc_now(), "hardening_notes": hardening_notes},
         )
-    )
+        write_json(adjudication_path, adjudication)
+        print(f"Wrote {adjudication_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="adjudicate",
+                output_paths=output_paths,
+            )
+        )
     return 0 if adjudication["status"] not in {"manual-review", "blocked"} else 1
 
 
@@ -42458,6 +42613,11 @@ def build_parser() -> argparse.ArgumentParser:
     audit.set_defaults(func=run_audit, ws=True, ws_resource_probes=False)
 
     gate = sub.add_parser("gate", help="Recompute finding gate decisions from suspicions and evidence")
+    gate.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print finding gate summary only; do not write finding-gate.json or refreshed manifests.",
+    )
     gate.set_defaults(func=run_gate)
 
     coverage = sub.add_parser("coverage", help="Recompute black-box coverage gate from current artifacts")
@@ -42486,11 +42646,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Return non-zero unless every discovered surface is fully covered with no human-review gates.",
     )
+    discovery_coverage.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print discovery coverage only; do not write discovery-coverage.json, route inventory, or refreshed manifests.",
+    )
     discovery_coverage.set_defaults(func=run_discovery_coverage)
 
     response_deltas = sub.add_parser(
         "response-deltas",
         help="Recompute response delta analysis from current probe results",
+    )
+    response_deltas.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print response delta summary only; do not write response-delta-analysis.json or refreshed manifests.",
     )
     response_deltas.set_defaults(func=run_response_deltas)
 
@@ -42513,6 +42683,11 @@ def build_parser() -> argparse.ArgumentParser:
     evidence_chain = sub.add_parser(
         "evidence-chain",
         help="Recompute machine-readable evidence chain from current artifacts",
+    )
+    evidence_chain.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print evidence-chain summary only; do not write evidence-chain.json or refreshed manifests.",
     )
     evidence_chain.set_defaults(func=run_evidence_chain)
 
@@ -42577,11 +42752,21 @@ def build_parser() -> argparse.ArgumentParser:
         "evidence-appendix",
         help="Recompute compact request/response evidence appendix from current artifacts",
     )
+    evidence_appendix.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print evidence appendix summary only; do not write evidence-appendix.json or refreshed manifests.",
+    )
     evidence_appendix.set_defaults(func=run_evidence_appendix)
 
     report = sub.add_parser(
         "report",
         help="Refresh report.md and index.html from current artifacts without probing",
+    )
+    report.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Preview report refresh only; do not write report.md, index.html, or refreshed manifests.",
     )
     report.set_defaults(func=run_report)
 
@@ -42787,6 +42972,11 @@ def build_parser() -> argparse.ArgumentParser:
     adjudicate = sub.add_parser(
         "adjudicate",
         help="Recompute reportability decisions from finding gate and current artifacts",
+    )
+    adjudicate.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print adjudication summary only; do not write findings/adjudication artifacts or refreshed manifests.",
     )
     adjudicate.set_defaults(func=run_adjudicate)
 
