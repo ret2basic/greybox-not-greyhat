@@ -303,7 +303,7 @@ manifest remains complete. Missing Burp browser-flow evidence is still recorded
 as an evidence gap and coverage open item; run `burp-sync --observe` when you
 want Burp Proxy history attached to the same artifact directory.
 
-Use `--include-external` only when a bounded set of low-risk M0 quote validation
+Use `--include-external` only when a bounded set of low-risk quote-provider validation
 probes is acceptable. Omit it for a purely local run; the local run still covers
 missing fields, malformed JSON, wrong primitive types, RPC controls, WS controls,
 and Orca path validation. Use `plan --no-write` to preview endpoint selection,
@@ -435,7 +435,7 @@ only when a quote cluster is active, then refreshes the managed artifact
 manifest. `self-test-transactions` writes
 `.greybox/transaction-decoder-selftest.json`; it generates a synthetic local
 Solana versioned transaction to prove the candidate extractor, decoder, and
-intent-policy checks work, but it is not a substitute for a real M0 quote corpus.
+intent-policy checks work, but it is not a substitute for a real quote-provider corpus.
 
 `burp-sync` is the preferred automatic Burp loop. It can force Proxy Intercept
 off, optionally run the deterministic `burp-observe` flow, read matching Burp
@@ -489,7 +489,7 @@ but blocks repeatable runs.
 `coverage` writes `.greybox/blackbox-coverage.json`, a gate-style summary of
 Burp observation, safe probe execution, source context, policy-field coverage,
 readiness, and known evidence gaps. The current target can be `covered` or
-`covered-with-external-blocker`; the latter is expected while the M0 quote
+`covered-with-external-blocker`; the latter is expected while the quote
 transaction corpus is blocked by placeholder credentials.
 For generated starter profiles, source-discovered surfaces that are intentionally
 not actively probed, such as reviewed-only rewrite proxies, are marked

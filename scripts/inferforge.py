@@ -5994,7 +5994,7 @@ def build_probe_plan(
     probes.extend(generic_route_probes())
 
     if include_external:
-        external_quote_risk = "bounded-m0-validation-probe"
+        external_quote_risk = "bounded-quote-provider-validation-probe"
         probes.extend(
             [
                 quote_probe(
@@ -8214,7 +8214,7 @@ def build_attack_strategy(
         },
         {
             "id": "strategy-quote",
-            "title": "M0 quote orchestration proxy strategy",
+            "title": "Quote orchestration proxy strategy",
             "applies_to": ["quote"],
             "attacker_model": "Unauthenticated client that can POST quote requests to the same-origin quote proxy.",
             "primary_questions": [
@@ -8717,7 +8717,7 @@ def build_evidence_gaps(
         quote_diagnosis = (quote_collection or {}).get("diagnosis", {})
         quote_classification = quote_diagnosis.get("classification")
         quote_reason = "The transaction decoder is implemented, but this run did not receive a successful quote response containing a transaction candidate."
-        quote_next_step = "Run collect-quote with a test wallet and amount once M0 returns a 200 quote, then compare decoded account keys, signer, mints, and program IDs against intent."
+        quote_next_step = "Run collect-quote with a test wallet and amount once the quote provider returns a 200 quote, then compare decoded account keys, signer, mints, and program IDs against intent."
         if quote_classification == "m0-config-missing-or-placeholder":
             quote_reason = (
                 "The transaction decoder is implemented, but the last quote collection did not reach M0 with real credentials: "
@@ -8765,7 +8765,7 @@ def build_evidence_gaps(
             "Business-policy quote probes not executed",
             "medium",
             "The current run did not include chain, mint, wallet, recipient, amount, maxNumQuotes, and unknown-field policy probes.",
-            "Rerun audit with --include-external when bounded M0-facing validation probes are acceptable.",
+            "Rerun audit with --include-external when bounded quote-provider validation probes are acceptable.",
             "Stop if any probe would require a real signature, broad enumeration, or repeated upstream traffic.",
         )
 
@@ -10316,7 +10316,7 @@ def build_blackbox_coverage(
                 make_check(
                     "real-transaction-corpus",
                     "blocked",
-                    "Waiting for a successful M0 quote transaction payload corpus.",
+                    "Waiting for a successful quote transaction payload corpus.",
                     required=False,
                 )
             )
@@ -10656,7 +10656,7 @@ def build_suspicions(
                 "id": "SUSP-quote-validation-002",
                 "status": "hardening-note",
                 "entrypoint": "POST /api/quote",
-                "hypothesis": "Shape-valid but business-invalid quote bodies are forwarded to M0 before local policy validation.",
+                "hypothesis": "Shape-valid but business-invalid quote bodies are forwarded to the upstream quote provider before local policy validation.",
                 "blackbox_evidence": forwarded_policy_probes,
                 "source_questions": [
                     "Does the server validate chain, mint, wallet, amount, recipient, and maxNumQuotes before forwarding?"
@@ -18407,7 +18407,7 @@ def ensure_initial_audit_artifacts(artifact_dir: Path) -> None:
                 "success": False,
                 "diagnosis": {
                     "classification": "quote-collection-not-run",
-                    "next_step": "Run collect-quote after M0 configuration is ready; decode only, with no signing or Solana submission.",
+                    "next_step": "Run collect-quote after quote-provider configuration is ready; decode only, with no signing or Solana submission.",
                 },
                 "safety": "Placeholder only. No quote request was sent and no transaction payload was collected.",
             },
@@ -20069,8 +20069,8 @@ Burp MCP is installed and reachable on `127.0.0.1:9876`. Codex can send approved
 
 ## Next Steps
 
-1. Feed a successful M0 quote response into `transaction-intent.json` so decoded instructions can be checked against wallet, direction, and mint intent.
-2. Add program-specific transaction intent parsers after a real M0 payload corpus is available.
+1. Feed a successful quote-provider response into `transaction-intent.json` so decoded instructions can be checked against wallet, direction, and mint intent.
+2. Add program-specific transaction intent parsers after a real quote payload corpus is available.
 3. Add manually approved WebSocket pending-queue and connection-limit probes with strict low-volume bounds.
 """
     (artifact_dir / "report.md").write_text(report, encoding="utf-8")
@@ -22668,18 +22668,25 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         [],
         [{"method": "GET", "path": "/opaque", "status": 200, "source": "self-test"}],
     )
+    quote_strategy_clusters = {
+        "clusters": [
+            {
+                "id": "quote",
+                "kind": "quote",
+                "strategy_set": "quote-transaction-decoder",
+            }
+        ]
+    }
     external_attack_strategy = build_attack_strategy(
-        {
-            "clusters": [
-                {
-                    "id": "quote",
-                    "kind": "quote",
-                    "strategy_set": "quote-transaction-decoder",
-                }
-            ]
-        },
+        quote_strategy_clusters,
         [],
         [{"method": "POST", "path": "/bridge/quote", "status": 400, "source": "self-test"}],
+    )
+    external_evidence_gaps = build_evidence_gaps(
+        quote_strategy_clusters,
+        [],
+        [{"method": "POST", "path": "/bridge/quote", "status": 400, "source": "self-test"}],
+        {"candidates_seen": 0},
     )
     unknown_waiting_actions = waiting_attack_strategy_actions(unknown_attack_strategy)
     external_waiting_summaries = [
@@ -22713,7 +22720,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
     )
     strategy_external_queue = build_verification_queue(
         "http://127.0.0.1:9998",
-        {"clusters": [{"id": "quote", "kind": "quote", "strategy_set": "quote-transaction-decoder"}]},
+        quote_strategy_clusters,
         {"clusters": []},
         {"gaps": []},
         {"status": "covered"},
@@ -22735,6 +22742,26 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         profile=rewrite_profile,
         artifact_dir=queue_artifact_dir,
         verification_queue=strategy_external_queue,
+    )
+    provider_neutral_quote_output_blob = json.dumps(
+        {
+            "attack_strategy": external_attack_strategy,
+            "evidence_gaps": external_evidence_gaps,
+            "verification_queue": strategy_external_queue,
+        },
+        sort_keys=True,
+    )
+    provider_neutral_quote_output_passed = (
+        "m0" not in provider_neutral_quote_output_blob.lower()
+        and any(
+            item.get("id") == "strategy-quote"
+            and item.get("title") == "Quote orchestration proxy strategy"
+            for item in external_attack_strategy.get("strategies", [])
+        )
+        and any(
+            "quote-provider validation probes" in str(item.get("safe_next_step") or "")
+            for item in external_evidence_gaps.get("gaps", [])
+        )
     )
     attack_strategy_status_passed = (
         rewrite_attack_strategy.get("status") == "ready-for-regression"
@@ -22773,6 +22800,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             blocker.get("id") == "QUEUE-RESOLVE-attack-strategy-external-evidence"
             for blocker in strategy_external_blockers.get("blockers", [])
         )
+        and provider_neutral_quote_output_passed
     )
 
     probe_paths = {probe.path for probe in probes}
@@ -22900,6 +22928,23 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "external_status": external_attack_strategy.get("status"),
             "external_summary": external_attack_strategy.get("summary", {}),
             "external_waiting_summaries": external_waiting_summaries,
+            "provider_neutral_quote_output": {
+                "status": "passed" if provider_neutral_quote_output_passed else "failed",
+                "contains_m0": "m0" in provider_neutral_quote_output_blob.lower(),
+                "quote_strategy_title": next(
+                    (
+                        item.get("title")
+                        for item in external_attack_strategy.get("strategies", [])
+                        if item.get("id") == "strategy-quote"
+                    ),
+                    None,
+                ),
+                "quote_gap_next_steps": [
+                    item.get("safe_next_step")
+                    for item in external_evidence_gaps.get("gaps", [])
+                    if item.get("cluster_id") == "quote"
+                ],
+            },
             "strategy_review_queue": {
                 "status": strategy_review_queue.get("status"),
                 "summary": strategy_review_queue.get("summary", {}),
@@ -25956,7 +26001,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_history.set_defaults(func=run_import_burp_history)
 
     plan = sub.add_parser("plan", help="Generate endpoint-aware safe probe plan without running probes")
-    plan.add_argument("--include-external", action="store_true", help="Plan bounded M0 quote validation probes")
+    plan.add_argument("--include-external", action="store_true", help="Plan bounded quote-provider validation probes")
     plan.add_argument("--max-probes", type=positive_int, help="Limit planned HTTP probes to the top-ranked N")
     plan.add_argument("--no-ws", dest="ws", action="store_false", help="Skip WebSocket probes")
     plan.add_argument(
@@ -25988,7 +26033,7 @@ def build_parser() -> argparse.ArgumentParser:
     attack_strategy.set_defaults(func=run_attack_strategy)
 
     audit = sub.add_parser("audit", help="Run safe probes, source peeks, clustering, and report generation")
-    audit.add_argument("--include-external", action="store_true", help="Allow bounded M0 quote validation probes")
+    audit.add_argument("--include-external", action="store_true", help="Allow bounded quote-provider validation probes")
     audit.add_argument("--max-probes", type=positive_int, help="Limit executed HTTP probes to the top-ranked N")
     audit.add_argument("--no-ws", dest="ws", action="store_false", help="Skip WebSocket probes")
     audit.add_argument(
