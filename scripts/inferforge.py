@@ -103,6 +103,7 @@ WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT = "websocket-candidate-review.json"
 LEAD_PORTFOLIO_ARTIFACT = "lead-portfolio.json"
 HARNESS_LOOP_ARTIFACT = "harness-loop.json"
 HYPOTHESIS_MATRIX_ARTIFACT = "hypothesis-matrix.json"
+VALIDATION_PLAN_ARTIFACT = "validation-plan.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -184,6 +185,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     LEAD_PORTFOLIO_ARTIFACT,
     HARNESS_LOOP_ARTIFACT,
     HYPOTHESIS_MATRIX_ARTIFACT,
+    VALIDATION_PLAN_ARTIFACT,
     "artifact-health.json",
     "regression-suite.json",
     "orca-baseline.json",
@@ -7983,6 +7985,7 @@ def hypothesis_from_queue_item(
         "priority": priority,
         "host": None,
         "path": None,
+        "queue_item_id": item_id,
         "cluster_id": item.get("cluster_id"),
         "scope_decision": "in-scope-explicit-host",
         "source_status": status,
@@ -8339,6 +8342,495 @@ def build_hypothesis_matrix_rollup(
         "safety": (
             "Read-only hypothesis matrix rollup. It reads child artifacts only and does not send requests, "
             "invoke Burp, run scanners, sign wallets, submit transactions, or fetch external hosts."
+        ),
+    }
+
+
+def profile_path_for_artifact_dir(artifact_dir: Path) -> str | None:
+    config = load_optional_json(artifact_dir / "config.json") or {}
+    profile_doc = config.get("profile") if isinstance(config.get("profile"), dict) else {}
+    raw_path = (
+        profile_doc.get("profile_path")
+        or profile_doc.get("_profile_path")
+        or (load_optional_json(artifact_dir / TARGET_PROFILE_ARTIFACT) or {}).get("profile_path")
+    )
+    if not isinstance(raw_path, str) or not raw_path.strip() or raw_path == "builtin-default":
+        return None
+    path = Path(raw_path)
+    return repo_relative_or_absolute(path) if path.is_absolute() else raw_path
+
+
+def validation_artifact_profile_docs(artifact_dir: Path) -> list[dict[str, Any]]:
+    docs: list[dict[str, Any]] = []
+    config = load_optional_json(artifact_dir / "config.json") or {}
+    config_profile = config.get("profile") if isinstance(config.get("profile"), dict) else None
+    if isinstance(config_profile, dict):
+        docs.append(config_profile)
+
+    target_profile = load_optional_json(artifact_dir / TARGET_PROFILE_ARTIFACT) or {}
+    if isinstance(target_profile, dict):
+        docs.append(target_profile)
+
+    profile_path = profile_path_for_artifact_dir(artifact_dir)
+    if profile_path:
+        loaded_profile = load_optional_json(resolve_repo_path(profile_path)) or {}
+        if isinstance(loaded_profile, dict):
+            docs.append(loaded_profile)
+    return docs
+
+
+def validation_context_is_blackbox(profile: dict[str, Any] | None, artifact_dir: Path) -> bool:
+    profile_docs = [doc for doc in [profile] if isinstance(doc, dict)]
+    profile_docs.extend(validation_artifact_profile_docs(artifact_dir))
+    return any(is_blackbox_profile_like(doc) or is_blackbox_asset_candidate_profile(doc) for doc in profile_docs)
+
+
+def validation_command_for_artifact_dir(artifact_dir: Path, subcommand: str) -> str:
+    parts = ["python3", "scripts/inferforge.py"]
+    profile_path = profile_path_for_artifact_dir(artifact_dir)
+    if profile_path:
+        parts.extend(["--profile", profile_path])
+    parts.extend(["--artifact-dir", repo_relative_or_absolute(artifact_dir)])
+    return f"{' '.join(shlex.quote(part) for part in parts)} {subcommand}"
+
+
+def validation_command_ref(command: str, *, source: str, item_status: str = "ready") -> dict[str, Any]:
+    return classify_verification_command(command, source=source, item_status=item_status)
+
+
+def validation_queue_items_by_id(verification_queue: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(item.get("id")): item
+        for item in verification_queue.get("items", []) or []
+        if isinstance(item, dict) and item.get("id")
+    }
+
+
+def validation_command_tokens(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return str(command).split()
+
+
+def validation_external_probe_replacement_command(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    hypothesis: dict[str, Any],
+    command: str,
+) -> str | None:
+    if not external_probe_flags_in_command(command):
+        return None
+    if not validation_context_is_blackbox(profile, artifact_dir):
+        return None
+    if "audit" not in validation_command_tokens(command):
+        return None
+    if hypothesis.get("type") == "cluster-strategy":
+        return validation_command_for_artifact_dir(artifact_dir, "audit --max-probes 1 --no-ws --observed-only")
+    return validation_command_for_artifact_dir(artifact_dir, BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND)
+
+
+def validation_question_for_hypothesis(hypothesis: dict[str, Any]) -> str:
+    impact = str(hypothesis.get("impact") or "")
+    if impact == "unauthorized-state-change":
+        return "Can the endpoint perform a state-changing or authenticated action without the expected user-controlled authorization boundary?"
+    if impact == "transaction-integrity":
+        return "Can transaction or quote construction alter sender, recipient, mint, amount, or signing intent in a way that creates user or funds impact?"
+    if impact == "rpc-proxy-abuse":
+        return "Can the RPC proxy expose disallowed methods, bypass origin or rate limits, or disclose upstream-sensitive details?"
+    if impact == "fixed-upstream-proxy-confusion":
+        return "Can fixed upstream routing be confused into SSRF, path traversal, or sensitive upstream data exposure?"
+    if impact == "browser-route-exposure":
+        return "Can this browser-observed route expose sensitive state, unsafe cache behavior, or a pivot to a higher-impact workflow?"
+    return str(hypothesis.get("impact_hypothesis") or "What concrete in-scope impact can this hypothesis produce?")
+
+
+def required_evidence_for_hypothesis(hypothesis: dict[str, Any]) -> list[str]:
+    impact = str(hypothesis.get("impact") or "")
+    common = [
+        "One concrete in-scope request/response pair or offline artifact reference.",
+        "A finding-gate decision showing concrete impact rather than configuration presence.",
+        "A reproduction note that avoids credentials, wallet signing, transaction submission, and high-volume probing.",
+    ]
+    if impact == "unauthorized-state-change":
+        return [
+            "Evidence that a protected action, order, account state, or equivalent user-controlled state changes unexpectedly.",
+            "Authorization context showing why the action should not be permitted.",
+            *common,
+        ]
+    if impact == "transaction-integrity":
+        return [
+            "Decoded transaction or quote intent showing an unexpected sender, recipient, mint, amount, program, or signer requirement.",
+            "Evidence that the altered intent can affect user funds or orders before any signing/submission.",
+            *common,
+        ]
+    if impact == "rpc-proxy-abuse":
+        return [
+            "Evidence that a disallowed or sensitive RPC method is reachable, or that origin/rate controls are bypassed.",
+            "Evidence of practical user, funds, availability, or sensitive-data impact without DoS testing.",
+            *common,
+        ]
+    return common
+
+
+def forbidden_validation_actions(hypothesis: dict[str, Any]) -> list[str]:
+    return [
+        "Do not run Burp Scanner or Intruder.",
+        "Do not fuzz, brute force directories, or perform rate/DoS testing.",
+        "Do not sign wallets, submit transactions, place trades, or mutate user/account state.",
+        "Do not fetch out-of-scope hosts or external script hosts without explicit scope confirmation.",
+        "Do not persist raw Burp history or unredacted response bodies.",
+    ]
+
+
+def validation_allowed_commands(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    hypothesis: dict[str, Any],
+    verification_queue: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    allowed_now_commands = [
+        validation_command_for_artifact_dir(artifact_dir, "harness-loop --no-write"),
+        validation_command_for_artifact_dir(artifact_dir, "hypothesis-matrix --no-write --show-next"),
+        validation_command_for_artifact_dir(artifact_dir, "verification-queue --no-write"),
+    ]
+    allowed_after_gate_commands = [
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "resource-snapshot --max-processes 8 --watch-port 3100 --watch-port 2455 --no-write --strict",
+        )
+    ]
+    blocked_commands: list[dict[str, Any]] = []
+    command_replacements: list[dict[str, Any]] = []
+
+    queue_item_id = str(hypothesis.get("queue_item_id") or "")
+    queue_item = validation_queue_items_by_id(verification_queue).get(queue_item_id)
+    if queue_item:
+        for index, command in enumerate(queue_item.get("commands", []) or [], start=1):
+            command_text = str(command)
+            source = f"{hypothesis.get('id')}:queue_command[{index}]"
+            replacement = validation_external_probe_replacement_command(
+                artifact_dir=artifact_dir,
+                profile=profile,
+                hypothesis=hypothesis,
+                command=command_text,
+            )
+            if replacement:
+                allowed_after_gate_commands.append(replacement)
+                command_replacements.append(
+                    {
+                        "source": source,
+                        "reason": "Replaced stale external-probe audit flags with a constrained same-target black-box audit command.",
+                        "removed_external_probe_flags": external_probe_flags_in_command(command_text),
+                        "replacement": validation_command_ref(
+                            replacement,
+                            source=f"{source}:replacement",
+                        ),
+                    }
+                )
+                continue
+            if external_probe_flags_in_command(command_text):
+                blocked_commands.append(validation_command_ref(command_text, source=source))
+                continue
+            blocked_ref = validation_command_ref(command_text, source=source)
+            if blocked_ref.get("classification") in {"unsafe-template", "manual-template", "review-gated"}:
+                blocked_commands.append(blocked_ref)
+                continue
+            allowed_after_gate_commands.append(command_text)
+    elif hypothesis.get("type") == "cluster-strategy":
+        allowed_after_gate_commands.append(
+            validation_command_for_artifact_dir(artifact_dir, "audit --max-probes 1 --no-ws --observed-only")
+        )
+    allowed_now = [
+        validation_command_ref(command, source=f"{hypothesis.get('id')}:allowed_now[{index}]")
+        for index, command in enumerate(ordered_unique_strings(allowed_now_commands), start=1)
+    ]
+    allowed_after_gate = [
+        validation_command_ref(command, source=f"{hypothesis.get('id')}:allowed_after_resource_gate[{index}]")
+        for index, command in enumerate(ordered_unique_strings(allowed_after_gate_commands), start=1)
+    ]
+    return {
+        "allowed_now": allowed_now,
+        "allowed_after_resource_gate": allowed_after_gate,
+        "blocked_commands": blocked_commands,
+        "command_replacements": command_replacements,
+    }
+
+
+def validation_item_from_hypothesis(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    hypothesis: dict[str, Any],
+    verification_queue: dict[str, Any],
+) -> dict[str, Any]:
+    commands = validation_allowed_commands(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        hypothesis=hypothesis,
+        verification_queue=verification_queue,
+    )
+    allowed_now = commands["allowed_now"]
+    allowed_after_gate = commands["allowed_after_resource_gate"]
+    blocked_commands = commands["blocked_commands"]
+    command_replacements = commands["command_replacements"]
+    command_summary = command_safety_summary([*allowed_now, *allowed_after_gate])
+    blocked_command_summary = command_safety_summary(blocked_commands)
+    status = str(hypothesis.get("status") or "unknown")
+    if command_summary.get("unsafe_template_count") or blocked_command_summary.get("unsafe_template_count"):
+        plan_status = "blocked-unsafe-command"
+    elif command_summary.get("blocked_external") or blocked_command_summary.get("blocked_external"):
+        plan_status = "blocked-external-command"
+    elif status == "needs-scope-review":
+        plan_status = "blocked-scope"
+    elif status == "resource-gated":
+        plan_status = "blocked-resource"
+    elif status == "ready-for-offline-review":
+        plan_status = "ready-offline"
+    elif status == "ready-for-low-risk-validation":
+        plan_status = "ready-after-resource-gate"
+    else:
+        plan_status = "parked"
+
+    preconditions = [
+        "Confirm target host and program scope are unchanged.",
+        "Run resource-snapshot --strict immediately before any command that can send target traffic.",
+        "Review command_safety and execute only commands classified as ready.",
+    ]
+    if plan_status == "blocked-scope":
+        preconditions.append("Resolve scope decision before any network request.")
+    if plan_status == "blocked-resource":
+        preconditions.append("Wait until local resource snapshot is healthy; current matrix marks this hypothesis resource-gated.")
+    if plan_status == "blocked-external-command":
+        preconditions.append("Remove external-probe flags or replace the command with a constrained same-target validation step.")
+    if command_replacements:
+        preconditions.append("Review command_replacements; allowed commands contain only constrained replacements.")
+
+    return {
+        "id": f"VAL-{safe_hypothesis_id(hypothesis.get('id'))}",
+        "status": plan_status,
+        "priority": hypothesis.get("priority"),
+        "hypothesis_id": hypothesis.get("id"),
+        "hypothesis_type": hypothesis.get("type"),
+        "host": hypothesis.get("host"),
+        "path": hypothesis.get("path"),
+        "impact": hypothesis.get("impact"),
+        "validation_question": validation_question_for_hypothesis(hypothesis),
+        "preconditions": preconditions,
+        "allowed_now": allowed_now,
+        "allowed_after_resource_gate": allowed_after_gate,
+        "blocked_commands": blocked_commands,
+        "command_replacements": command_replacements,
+        "command_safety": command_summary,
+        "blocked_command_safety": blocked_command_summary,
+        "required_evidence": required_evidence_for_hypothesis(hypothesis),
+        "stop_conditions": [
+            "Stop after the first unexpected target-side behavior and refresh evidence-chain/gate/adjudication.",
+            "Stop if any command would require wallet signing, transaction submission, trading, fuzzing, or external-scope access.",
+            "Stop if resource-snapshot --strict returns non-zero.",
+        ],
+        "forbidden": forbidden_validation_actions(hypothesis),
+        "reportability_gate": hypothesis.get("reportability_gate"),
+        "evidence_refs": hypothesis.get("evidence_refs", []),
+        "safety": "Validation plan only. It does not execute commands or prove a vulnerability.",
+    }
+
+
+def build_validation_plan_run(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    limit: int,
+) -> dict[str, Any]:
+    matrix = build_hypothesis_matrix_run(target=target, profile=profile, artifact_dir=artifact_dir)
+    verification_queue = load_optional_json(artifact_dir / "verification-queue.json") or {}
+    hypotheses = [
+        item
+        for item in matrix.get("hypotheses", []) or []
+        if isinstance(item, dict)
+        and str(item.get("status") or "") not in {"parked-terminal-lead"}
+    ][:limit]
+    items = [
+        validation_item_from_hypothesis(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            hypothesis=hypothesis,
+            verification_queue=verification_queue,
+        )
+        for hypothesis in hypotheses
+    ]
+
+    status_counts: dict[str, int] = {}
+    priority_counts: dict[str, int] = {}
+    command_refs: list[dict[str, Any]] = []
+    blocked_command_refs: list[dict[str, Any]] = []
+    for item in items:
+        increment_count(status_counts, str(item.get("status") or "unknown"))
+        increment_count(priority_counts, str(item.get("priority") or "info"))
+        command_refs.extend(item.get("allowed_now", []) or [])
+        command_refs.extend(item.get("allowed_after_resource_gate", []) or [])
+        blocked_command_refs.extend(item.get("blocked_commands", []) or [])
+    command_summary = command_safety_summary(command_refs)
+    blocked_command_summary = command_safety_summary(blocked_command_refs)
+
+    if status_counts.get("blocked-unsafe-command"):
+        status = "blocked-unsafe-command"
+    elif status_counts.get("blocked-external-command"):
+        status = "blocked-external-command"
+    elif status_counts.get("ready-after-resource-gate") or status_counts.get("ready-offline"):
+        status = "ready"
+    elif status_counts.get("blocked-resource"):
+        status = "resource-gated"
+    elif status_counts.get("blocked-scope"):
+        status = "needs-scope-review"
+    elif items:
+        status = "parked"
+    else:
+        status = "no-validation-items"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": str(artifact_dir),
+        "mode": "single-run",
+        "summary": {
+            "items": len(items),
+            "status_counts": dict(sorted(status_counts.items())),
+            "priority_counts": dict(sorted(priority_counts.items())),
+            "command_safety": command_summary,
+            "blocked_command_safety": blocked_command_summary,
+            "hypothesis_matrix": matrix.get("status"),
+        },
+        "items": items,
+        "artifact_refs": {
+            "hypothesis_matrix": HYPOTHESIS_MATRIX_ARTIFACT,
+            "verification_queue": "verification-queue.json",
+            "resource_snapshot": RESOURCE_SNAPSHOT_ARTIFACT,
+        },
+        "safety": (
+            "Read-only validation plan. It prepares gated validation steps from local artifacts only; "
+            "it does not execute commands, send requests, invoke Burp, sign wallets, or submit transactions."
+        ),
+    }
+
+
+def build_validation_plan_rollup(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    check_dirs: list[Path],
+    limit: int,
+) -> dict[str, Any]:
+    runs = []
+    items: list[dict[str, Any]] = []
+    missing = []
+    run_status_counts: dict[str, int] = {}
+    per_run_limit = max(1, limit)
+    for check_dir in check_dirs:
+        relative_dir = repo_relative_or_absolute(check_dir)
+        if not check_dir.exists():
+            missing.append(relative_dir)
+            increment_count(run_status_counts, "missing-artifact-dir")
+            runs.append({"artifact_dir": relative_dir, "status": "missing-artifact-dir", "summary": {}})
+            continue
+        doc = build_validation_plan_run(
+            target=target_for_artifact_dir(check_dir, target),
+            profile=None,
+            artifact_dir=check_dir,
+            limit=per_run_limit,
+        )
+        run_status = str(doc.get("status") or "unknown")
+        increment_count(run_status_counts, run_status)
+        runs.append({"artifact_dir": relative_dir, "status": run_status, "summary": doc.get("summary", {})})
+        for item in doc.get("items", []) or []:
+            if not isinstance(item, dict):
+                continue
+            row = json_clone(item)
+            original_id = str(row.get("id") or "validation")
+            row["id"] = f"RUN-{safe_probe_id(relative_dir)}-{original_id}"
+            row["run_validation_id"] = original_id
+            row["artifact_dir"] = relative_dir
+            row["evidence_refs"] = compact_source_refs(
+                [
+                    f"{relative_dir}/{ref}" if not str(ref).startswith("/") else str(ref)
+                    for ref in row.get("evidence_refs", []) or []
+                ]
+            )
+            items.append(row)
+
+    items.sort(
+        key=lambda item: (
+            HYPOTHESIS_STATUS_RANK.get(str(item.get("status") or "").replace("blocked-resource", "resource-gated"), 9),
+            HYPOTHESIS_PRIORITY_RANK.get(str(item.get("priority") or "info"), 9),
+            str(item.get("artifact_dir") or ""),
+            str(item.get("id") or ""),
+        )
+    )
+    items = items[:limit]
+
+    status_counts: dict[str, int] = {}
+    priority_counts: dict[str, int] = {}
+    command_refs: list[dict[str, Any]] = []
+    blocked_command_refs: list[dict[str, Any]] = []
+    for item in items:
+        increment_count(status_counts, str(item.get("status") or "unknown"))
+        increment_count(priority_counts, str(item.get("priority") or "info"))
+        command_refs.extend(item.get("allowed_now", []) or [])
+        command_refs.extend(item.get("allowed_after_resource_gate", []) or [])
+        blocked_command_refs.extend(item.get("blocked_commands", []) or [])
+    command_summary = command_safety_summary(command_refs)
+    blocked_command_summary = command_safety_summary(blocked_command_refs)
+
+    if missing:
+        status = "failed"
+    elif status_counts.get("blocked-unsafe-command"):
+        status = "blocked-unsafe-command"
+    elif status_counts.get("blocked-external-command"):
+        status = "blocked-external-command"
+    elif status_counts.get("ready-after-resource-gate") or status_counts.get("ready-offline"):
+        status = "ready"
+    elif status_counts.get("blocked-resource"):
+        status = "resource-gated"
+    elif status_counts.get("blocked-scope"):
+        status = "needs-scope-review"
+    elif items:
+        status = "parked"
+    else:
+        status = "no-validation-items"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": str(artifact_dir),
+        "mode": "rollup",
+        "summary": {
+            "runs": len(runs),
+            "items": len(items),
+            "missing_artifact_dirs": missing,
+            "status_counts": dict(sorted(status_counts.items())),
+            "priority_counts": dict(sorted(priority_counts.items())),
+            "run_status_counts": dict(sorted(run_status_counts.items())),
+            "command_safety": command_summary,
+            "blocked_command_safety": blocked_command_summary,
+        },
+        "runs": runs,
+        "items": items,
+        "artifact_refs": {
+            "validation_plan": VALIDATION_PLAN_ARTIFACT,
+            "hypothesis_matrix": HYPOTHESIS_MATRIX_ARTIFACT,
+            "verification_queue": "verification-queue.json",
+        },
+        "safety": (
+            "Read-only validation plan rollup. It reads child artifacts only and does not execute commands, "
+            "send requests, invoke Burp, sign wallets, submit transactions, or fetch external hosts."
         ),
     }
 
@@ -28356,11 +28848,19 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         harness_loop_root = Path(harness_loop_temp_dir)
         harness_loop_run_dir = harness_loop_root / "run"
         harness_loop_run_dir.mkdir()
+        blackbox_stale_verification_queue_sample = json_clone(blackbox_verification_queue_sample)
+        for item in blackbox_stale_verification_queue_sample.get("items", []) or []:
+            if item.get("id") == "VERIFY-safe-audit-loop":
+                item["commands"] = [
+                    "python3 scripts/inferforge.py --profile .greybox/selftest/blackbox-profile.json "
+                    f"--artifact-dir .greybox/selftest {DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND}"
+                ]
+                break
         write_json(harness_loop_run_dir / "endpoint-clusters.json", blackbox_clusters_sample)
         write_json(harness_loop_run_dir / "blackbox-coverage.json", blackbox_coverage_sample)
         write_json(harness_loop_run_dir / "source-peek-requests.json", blackbox_source_peeks_sample)
         write_json(harness_loop_run_dir / LEAD_PORTFOLIO_ARTIFACT, blackbox_lead_portfolio_sample)
-        write_json(harness_loop_run_dir / "verification-queue.json", blackbox_verification_queue_sample)
+        write_json(harness_loop_run_dir / "verification-queue.json", blackbox_stale_verification_queue_sample)
         write_json(
             harness_loop_run_dir / "response-delta-analysis.json",
             {"generated_at": utc_now(), "status": "stable", "summary": {"unexpected_probes": 0}},
@@ -28406,6 +28906,31 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             check_dirs=[harness_loop_run_dir],
         )
         blackbox_hypothesis_matrix_text_sample = json.dumps(blackbox_hypothesis_matrix_sample, sort_keys=True)
+        blackbox_validation_plan_sample = build_validation_plan_run(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_run_dir,
+            limit=5,
+        )
+        blackbox_validation_plan_rollup_sample = build_validation_plan_rollup(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_root,
+            check_dirs=[harness_loop_run_dir],
+            limit=5,
+        )
+        blackbox_validation_plan_text_sample = json.dumps(blackbox_validation_plan_sample, sort_keys=True)
+        blackbox_validation_allowed_command_text_sample = "\n".join(
+            str(ref.get("command") or "")
+            for item in blackbox_validation_plan_sample.get("items", [])
+            for ref in [*(item.get("allowed_now", []) or []), *(item.get("allowed_after_resource_gate", []) or [])]
+            if isinstance(ref, dict)
+        )
+        blackbox_validation_replacement_count = sum(
+            len(item.get("command_replacements", []) or [])
+            for item in blackbox_validation_plan_sample.get("items", [])
+            if isinstance(item, dict)
+        )
     blackbox_asset_profile_paths = {
         cluster.get("path")
         for cluster in blackbox_asset_profile_sample.get("clusters", [])
@@ -28604,6 +29129,24 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_hypothesis_matrix_rollup_sample.get("status") == "has-ranked-hypotheses"
         and "top-secret" not in blackbox_hypothesis_matrix_text_sample
         and "AbC1234567890Token" not in blackbox_hypothesis_matrix_text_sample
+        and blackbox_validation_plan_sample.get("status") in {"ready", "resource-gated"}
+        and blackbox_validation_plan_sample.get("summary", {}).get("items") == 5
+        and blackbox_validation_plan_sample.get("summary", {}).get("command_safety", {}).get("unsafe_template_count") == 0
+        and blackbox_validation_plan_sample.get("summary", {}).get("command_safety", {}).get("blocked_external") == 0
+        and blackbox_validation_plan_sample.get("summary", {}).get("blocked_command_safety", {}).get("commands") == 0
+        and blackbox_validation_replacement_count >= 1
+        and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_validation_allowed_command_text_sample
+        and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_validation_allowed_command_text_sample
+        and all(
+            item.get("required_evidence")
+            and item.get("forbidden")
+            and item.get("allowed_now")
+            for item in blackbox_validation_plan_sample.get("items", [])
+        )
+        and blackbox_validation_plan_rollup_sample.get("summary", {}).get("runs") == 1
+        and blackbox_validation_plan_rollup_sample.get("summary", {}).get("items") == 5
+        and "top-secret" not in blackbox_validation_plan_text_sample
+        and "AbC1234567890Token" not in blackbox_validation_plan_text_sample
         and blackbox_asset_clusters_sample.get("profile", {}).get("asset_candidate_profile") is True
         and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_verification_command_text
         and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_asset_verification_command_text
@@ -33713,6 +34256,125 @@ def run_hypothesis_matrix(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_validation_plan(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    check_dirs: list[Path] = []
+    for item in args.check_dir or []:
+        check_dirs.append(resolve_repo_path(item))
+    if args.discover_child_runs:
+        check_dirs.extend(discover_harness_loop_dirs(artifact_dir))
+    deduped_dirs = []
+    seen_dirs: set[str] = set()
+    for check_dir in check_dirs:
+        resolved = check_dir.resolve()
+        key = str(resolved)
+        if key in seen_dirs:
+            continue
+        seen_dirs.add(key)
+        deduped_dirs.append(resolved)
+
+    if deduped_dirs:
+        plan = build_validation_plan_rollup(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            check_dirs=deduped_dirs,
+            limit=max(1, int(args.limit)),
+        )
+    else:
+        plan = build_validation_plan_run(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            limit=max(1, int(args.limit)),
+        )
+
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / VALIDATION_PLAN_ARTIFACT
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, plan)
+        if deduped_dirs:
+            refreshed_manifests = refresh_manifests_for_artifact_outputs(
+                output_paths=[output_path],
+                artifact_dir=artifact_dir,
+                check_dirs=deduped_dirs,
+                target=target,
+                command="validation-plan",
+            )
+        else:
+            refreshed_manifests = refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="validation-plan",
+                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+            )
+
+    summary = plan.get("summary", {}) or {}
+    command_safety = summary.get("command_safety", {}) or {}
+    blocked_command_safety = summary.get("blocked_command_safety", {}) or {}
+    print(f"Validation plan: {plan['status']}")
+    if plan.get("mode") == "rollup":
+        print(
+            "Runs: "
+            f"{summary.get('runs', 0)} checked, "
+            f"run_status_counts={json.dumps(summary.get('run_status_counts', {}), sort_keys=True)}"
+        )
+    print(
+        "Items: "
+        f"{summary.get('items', 0)} total, "
+        f"status_counts={json.dumps(summary.get('status_counts', {}), sort_keys=True)}"
+    )
+    if command_safety:
+        print(f"Command safety: {format_command_safety_summary(command_safety)}")
+    if blocked_command_safety and blocked_command_safety.get("commands"):
+        print(f"Blocked command safety: {format_command_safety_summary(blocked_command_safety)}")
+
+    top_count = max(0, int(args.top))
+    if top_count:
+        print("Top validation items:")
+        for item in (plan.get("items", []) or [])[:top_count]:
+            run_text = f" run={item.get('artifact_dir')}" if item.get("artifact_dir") else ""
+            print(
+                f"- {item.get('priority')} {item.get('status')} "
+                f"{item.get('hypothesis_type')} host={item.get('host') or '-'} "
+                f"path={item.get('path') or '-'}{run_text}"
+            )
+            print(f"  question={inline_summary_text(item.get('validation_question'), max_chars=220)}")
+            if args.show_commands:
+                now = item.get("allowed_now", []) or []
+                after = item.get("allowed_after_resource_gate", []) or []
+                blocked = item.get("blocked_commands", []) or []
+                if now:
+                    print("  allowed_now:")
+                    for ref in now[:3]:
+                        print(f"    - {format_command_ref_label(ref)} {inline_summary_text(ref.get('command'), max_chars=420)}")
+                if after:
+                    print("  allowed_after_resource_gate:")
+                    for ref in after[:3]:
+                        print(f"    - {format_command_ref_label(ref)} {inline_summary_text(ref.get('command'), max_chars=420)}")
+                if blocked:
+                    print("  blocked_commands:")
+                    for ref in blocked[:3]:
+                        print(f"    - {format_command_ref_label(ref)} {inline_summary_text(ref.get('command'), max_chars=420)}")
+
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+
+    if plan["status"] in {"failed", "blocked-unsafe-command"}:
+        return 1
+    if args.strict and plan["status"] not in {"ready", "resource-gated"}:
+        return 1
+    return 0
+
+
 def run_decode_transactions(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -35222,6 +35884,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless ranked or resource-gated hypotheses are present.",
     )
     hypothesis_matrix.set_defaults(func=run_hypothesis_matrix)
+
+    validation_plan = sub.add_parser(
+        "validation-plan",
+        help="Build gated validation steps from the ranked hypothesis matrix without executing them",
+    )
+    validation_plan.add_argument(
+        "--output",
+        help="Where to write validation-plan.json. Defaults to --artifact-dir/validation-plan.json.",
+    )
+    validation_plan.add_argument(
+        "--check-dir",
+        action="append",
+        help="Child artifact directory to include in a rollup. Repeat as needed.",
+    )
+    validation_plan.add_argument(
+        "--discover-child-runs",
+        action="store_true",
+        help="Build a rollup from child directories under --artifact-dir with harness artifacts.",
+    )
+    validation_plan.add_argument(
+        "--limit",
+        type=positive_int,
+        default=8,
+        help="Maximum validation items to include.",
+    )
+    validation_plan.add_argument(
+        "--top",
+        type=positive_int,
+        default=6,
+        help="Number of validation items to print.",
+    )
+    validation_plan.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print allowed command previews and command-safety labels.",
+    )
+    validation_plan.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print validation plan summary only; do not write validation-plan.json or refreshed manifests.",
+    )
+    validation_plan.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless the plan has ready or resource-gated validation items.",
+    )
+    validation_plan.set_defaults(func=run_validation_plan)
 
     decode = sub.add_parser(
         "decode-transactions",

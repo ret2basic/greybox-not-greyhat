@@ -282,6 +282,20 @@ The matrix is not a finding list. It labels reportability gates, scope/resource
 gates, and impact hypotheses so the harness can choose whether to do offline
 review, wait for memory pressure to clear, or run one low-risk validation step.
 
+Use `validation-plan` to turn the ranked hypotheses into explicit preconditions,
+allowed commands, required evidence, stop conditions, and forbidden actions:
+
+```bash
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  validation-plan --no-write --show-commands
+python3 scripts/inferforge.py --artifact-dir .greybox/target-set \
+  validation-plan --discover-child-runs --no-write --show-commands
+```
+
+The plan is still read-only. It does not run the commands it prints; it exists
+so unattended work can stop at scope, resource, command-safety, and
+reportability gates before any validation traffic is sent.
+
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:
 
