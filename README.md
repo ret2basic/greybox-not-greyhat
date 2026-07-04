@@ -404,6 +404,16 @@ default local target application port for the checked-in profile, not Burp's
 proxy or Burp's built-in browser. Keep it closed unless a local app regression
 actually needs the dev server.
 
+`burp-sync`, `audit`, `validation-plan`, `iteration-decision`, and
+`regression-suite` also take an internal current-resource preflight before
+memory-sensitive work. The internal gate is intentionally conservative
+(`MemAvailable` below 2048 MiB or used swap above 1024 MiB is a warning).
+When `audit` or `regression-suite` hits that gate, it writes a resource-gate
+artifact and exits before active probes, Burp history reads, Node transaction
+decoding, or the full regression step schedule. Use `--allow-resource-warning`
+only after reviewing local pressure and narrowing the command with limits or
+skip flags.
+
 Review program scope, authentication context, and endpoint criticality before
 any active probes:
 
@@ -1215,14 +1225,20 @@ before audit so reruns do not accumulate stale probe rows. It does not run Burp
 Scanner, fuzz broadly, invoke Server Actions, sign wallets, or submit
 transactions.
 
+On constrained VPS hosts, `regression-suite` now blocks at startup while the
+resource gate is warning unless `--allow-resource-warning` is passed. This avoids
+queuing self-tests, Burp observe/sync, Orca baselines, active audits, and report
+rollups when swap pressure is already high.
+
 ```bash
 python3 scripts/inferforge.py regression-suite --include-external --ws-resource-probes
 ```
 
 Use `--skip-self-tests`, `--skip-discovery-coverage`, `--skip-review-blockers`,
 `--skip-burp-sync`, `--skip-orca-baseline`, `--skip-audit`, or
-`--skip-discovered` for narrower local checks. Use `--strict` when human-review
-or external-configuration blockers should fail the command.
+`--skip-discovered` for narrower local checks. Combine those skip flags with
+`--allow-resource-warning` only after explicit review. Use `--strict` when
+human-review or external-configuration blockers should fail the command.
 
 `adjudicate` writes `.greybox/adjudication.json` and refreshes
 `.greybox/findings.json` plus `.greybox/hardening-notes.json`. The adjudicator

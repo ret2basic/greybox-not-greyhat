@@ -83,6 +83,9 @@ DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_BURP_HISTORY_INPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_BURP_SYNC_COUNT = 50
 DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES = 512 * 1024
+DEFAULT_RESOURCE_WARN_AVAILABLE_MIB = 2048
+DEFAULT_RESOURCE_WARN_SWAP_USED_MIB = 1024
+DEFAULT_RESOURCE_WATCH_PORTS = [3100, 2455]
 MAX_REQUEST_CONTEXTS_PER_ENDPOINT = 6
 REDACTED_VALUE = "[redacted]"
 GENERIC_HTTP_ROUTE_STRATEGY_SETS = {"nextjs-api-routes", "blackbox-http-observed"}
@@ -6755,6 +6758,49 @@ def build_resource_snapshot(
     }
 
 
+def build_default_resource_snapshot(*, max_processes: int = 8) -> dict[str, Any]:
+    return build_resource_snapshot(
+        max_processes=max_processes,
+        watch_ports=DEFAULT_RESOURCE_WATCH_PORTS,
+        warn_available_mib=DEFAULT_RESOURCE_WARN_AVAILABLE_MIB,
+        warn_swap_used_mib=DEFAULT_RESOURCE_WARN_SWAP_USED_MIB,
+    )
+
+
+def resource_gate_warnings_text(resource_snapshot: dict[str, Any] | None) -> str:
+    warnings = (resource_snapshot or {}).get("warnings", []) if isinstance(resource_snapshot, dict) else []
+    return ",".join(str(item) for item in warnings) if warnings else "none"
+
+
+def resource_gate_blocked_artifact(
+    *,
+    command: str,
+    target: str,
+    profile: dict[str, Any] | None,
+    resource_snapshot: dict[str, Any],
+    blocked_actions: list[str],
+    allow_flag: str = "--allow-resource-warning",
+) -> dict[str, Any]:
+    return {
+        "generated_at": utc_now(),
+        "status": "blocked-resource-gate",
+        "command": command,
+        "target": target,
+        "profile": profile_summary(profile),
+        "resource_preflight": validation_resource_preflight_summary(resource_snapshot),
+        "resource_snapshot": resource_snapshot,
+        "blocked_actions": blocked_actions,
+        "next_step": (
+            "Free memory or rerun after explicit review with "
+            f"{allow_flag} and the smallest practical target/probe/history limits."
+        ),
+        "safety": [
+            "No active target probes, Burp history reads, scanner actions, fuzzing, wallet signing, or transaction submission were run.",
+            "The command stopped before long-running or memory-sensitive work because the local memory/swap gate is warning.",
+        ],
+    }
+
+
 def normalize_scope_host(host: Any) -> str:
     return str(host or "").lower().strip().strip(".")
 
@@ -9760,12 +9806,7 @@ def build_validation_plan_rollup(
 def iteration_resource_preflight_snapshot(skip_current_resource_check: bool) -> dict[str, Any] | None:
     if skip_current_resource_check:
         return None
-    return build_resource_snapshot(
-        max_processes=8,
-        watch_ports=[3100, 2455],
-        warn_available_mib=2048,
-        warn_swap_used_mib=1024,
-    )
+    return build_default_resource_snapshot(max_processes=8)
 
 
 def command_ref_is_resource_check(ref: dict[str, Any]) -> bool:
@@ -29262,8 +29303,52 @@ def run_audit(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     ensure_burp_transaction_candidates_artifact(artifact_dir)
-    ensure_initial_audit_artifacts(artifact_dir, target=target)
+    initial_artifact_paths = ensure_initial_audit_artifacts(artifact_dir, target=target)
     write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    resource_snapshot = build_default_resource_snapshot(max_processes=8)
+    resource_status = artifact_summary_status(resource_snapshot)
+    if resource_status != "healthy" and not args.allow_resource_warning:
+        resource_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
+        blocked_path = artifact_dir / "audit-resource-gate.json"
+        write_json(resource_path, resource_snapshot)
+        write_json(
+            blocked_path,
+            resource_gate_blocked_artifact(
+                command="audit",
+                target=target,
+                profile=profile,
+                resource_snapshot=resource_snapshot,
+                blocked_actions=[
+                    "audit warmup requests",
+                    "HTTP probe execution",
+                    "WebSocket probes",
+                    "transaction candidate decoding",
+                    "capability checks that may touch the target or Burp",
+                ],
+            ),
+        )
+        print(
+            "Audit blocked by resource gate: "
+            f"{resource_status} warnings={resource_gate_warnings_text(resource_snapshot)}"
+        )
+        print("No audit probes or transaction decoding were run.")
+        print(f"Wrote {resource_path}")
+        print(f"Wrote {blocked_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="audit",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    *initial_artifact_paths,
+                    resource_path,
+                    blocked_path,
+                ],
+            )
+        )
+        return 2
 
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
     clusters = build_clusters(profile, source_root)
@@ -33972,12 +34057,7 @@ def run_burp_sync(args: argparse.Namespace) -> int:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     write_target_profile_artifact(artifact_dir, profile, target, source_root)
 
-    resource_snapshot = build_resource_snapshot(
-        max_processes=8,
-        watch_ports=[3100, 2455],
-        warn_available_mib=2048,
-        warn_swap_used_mib=1024,
-    )
+    resource_snapshot = build_default_resource_snapshot(max_processes=8)
     resource_status = artifact_summary_status(resource_snapshot)
     if resource_status != "healthy" and not args.allow_resource_warning:
         sync_path = artifact_dir / "burp-mcp-sync.json"
@@ -35655,6 +35735,75 @@ def run_regression_suite(args: argparse.Namespace) -> int:
     preparation: list[dict[str, Any]] = []
     suite_stopped = False
 
+    resource_snapshot = build_default_resource_snapshot(max_processes=8)
+    resource_status = artifact_summary_status(resource_snapshot)
+    if resource_status != "healthy" and not args.allow_resource_warning:
+        profile_doc = write_target_profile_artifact(artifact_dir, profile, target, source_root)
+        resource_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
+        write_json(resource_path, resource_snapshot)
+        suite = {
+            "generated_at": utc_now(),
+            "status": "blocked-resource-gate",
+            "target": target,
+            "source_root": repo_relative_or_absolute(source_root),
+            "profile": profile_summary(profile),
+            "target_profile": profile_doc,
+            "artifact_dirs": {
+                "suite": repo_relative_or_absolute(artifact_dir),
+                "default": repo_relative_or_absolute(default_artifact_dir),
+                "discovered": None if args.skip_discovered else repo_relative_or_absolute(discovered_artifact_dir),
+                "discovered_profile": None if args.skip_discovered else repo_relative_or_absolute(discovered_profile_path),
+            },
+            "options": {
+                "include_external": bool(args.include_external),
+                "ws_resource_probes": bool(args.ws_resource_probes),
+                "burp_count": args.burp_count,
+                "allow_resource_warning": bool(args.allow_resource_warning),
+                "skip_discovered": bool(args.skip_discovered),
+                "skip_burp_sync": bool(args.skip_burp_sync),
+                "skip_orca_baseline": bool(args.skip_orca_baseline),
+                "skip_audit": bool(args.skip_audit),
+                "skip_discover_profile": bool(args.skip_discover_profile),
+                "skip_discovery_coverage": bool(args.skip_discovery_coverage),
+                "skip_self_tests": bool(args.skip_self_tests),
+                "skip_review_blockers": bool(args.skip_review_blockers),
+                "keep_probe_results": bool(args.keep_probe_results),
+                "strict": bool(args.strict),
+            },
+            "preparation": preparation,
+            "steps": steps,
+            "resource_preflight": validation_resource_preflight_summary(resource_snapshot),
+            "resource_snapshot": resource_snapshot,
+            "blocked_actions": [
+                "static self-test suite",
+                "profile discovery",
+                "Burp observe/sync",
+                "Orca baseline collection",
+                "active audit probes",
+                "report and rollup refresh",
+            ],
+            "next_step": (
+                "Free memory, then rerun regression-suite. Use --allow-resource-warning only after "
+                "explicit review and with narrow skip flags when a warning state is acceptable."
+            ),
+            "safety": [
+                "Regression suite stopped before scheduling subcommands because the local memory/swap gate is warning.",
+                "No target requests, Burp MCP history reads, scanner actions, fuzzing, wallet signing, or transaction submission were run.",
+            ],
+        }
+        write_json(artifact_dir / "regression-suite.json", suite)
+        artifact_manifest = write_artifact_manifest(artifact_dir, target, command="regression-suite")
+        print(
+            "Regression suite blocked by resource gate: "
+            f"{resource_status} warnings={resource_gate_warnings_text(resource_snapshot)}"
+        )
+        print("No regression subcommands were scheduled.")
+        print(f"Wrote {resource_path}")
+        print(f"Wrote {artifact_dir / 'regression-suite.json'}")
+        print(f"Artifact manifest: {artifact_manifest['status']}")
+        print(f"Wrote {artifact_dir / MANIFEST_NAME}")
+        return 2
+
     def run_step(label: str, command: list[str]) -> bool:
         nonlocal suite_stopped
         print(f"[suite] {label}: {shlex.join(command)}")
@@ -35816,6 +35965,8 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             audit_args.append("--include-external")
         if args.ws_resource_probes:
             audit_args.append("--ws-resource-probes")
+        if args.allow_resource_warning:
+            audit_args.append("--allow-resource-warning")
         command = inferforge_cli_command(
             args,
             profile_path=default_profile_path,
@@ -35912,6 +36063,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             "include_external": bool(args.include_external),
             "ws_resource_probes": bool(args.ws_resource_probes),
             "burp_count": args.burp_count,
+            "allow_resource_warning": bool(args.allow_resource_warning),
             "skip_discovered": bool(args.skip_discovered),
             "skip_burp_sync": bool(args.skip_burp_sync),
             "skip_orca_baseline": bool(args.skip_orca_baseline),
@@ -37351,12 +37503,7 @@ def run_validation_plan(args: argparse.Namespace) -> int:
 
     current_resource_snapshot = None
     if not getattr(args, "skip_current_resource_check", False):
-        current_resource_snapshot = build_resource_snapshot(
-            max_processes=8,
-            watch_ports=[3100, 2455],
-            warn_available_mib=2048,
-            warn_swap_used_mib=1024,
-        )
+        current_resource_snapshot = build_default_resource_snapshot(max_processes=8)
 
     check_dirs: list[Path] = []
     for item in args.check_dir or []:
@@ -38631,6 +38778,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run only probes selected from observed traffic, without source-assisted expansion",
     )
+    audit.add_argument(
+        "--allow-resource-warning",
+        action="store_true",
+        help="Allow active audit probes when the local memory/swap resource gate is warning.",
+    )
     add_intent_policy_args(audit)
     audit.set_defaults(func=run_audit, ws=True, ws_resource_probes=False)
 
@@ -38876,7 +39028,7 @@ def build_parser() -> argparse.ArgumentParser:
     regression_suite.add_argument(
         "--allow-resource-warning",
         action="store_true",
-        help="Pass --allow-resource-warning to burp-sync steps.",
+        help="Allow regression steps and child Burp/audit commands when the local memory/swap resource gate is warning.",
     )
     regression_suite.add_argument(
         "--include-external",
