@@ -14956,8 +14956,6 @@ def deployment_review_match_categories() -> dict[str, list[str]]:
             "monitor",
             "metrics",
             "prometheus",
-            "livenessProbe",
-            "readinessProbe",
         ],
         "deployment_env_injection": [
             "env:",
@@ -14970,6 +14968,23 @@ def deployment_review_match_categories() -> dict[str, list[str]]:
             "annotations:",
         ],
     }
+
+
+def deployment_review_token_matches(category: str, token: str, lowered_line: str) -> bool:
+    if token.lower() not in lowered_line:
+        return False
+    if category != "fallback_monitoring":
+        return True
+    resource_context = [
+        "rate",
+        "limit",
+        "redis",
+        "upstash",
+        "memory",
+        "resource",
+        "external store",
+    ]
+    return any(context in lowered_line for context in resource_context)
 
 
 def build_deployment_resource_review(
@@ -15021,7 +15036,7 @@ def build_deployment_resource_review(
             for category, tokens in categories.items():
                 for line_no, line, lowered in lowered_lines:
                     for token in tokens:
-                        if token.lower() not in lowered:
+                        if not deployment_review_token_matches(category, token, lowered):
                             continue
                         match = {
                             "category": category,
