@@ -97,6 +97,7 @@ BLACKBOX_ASSET_PROFILE_ARTIFACT = "blackbox-asset-profile.json"
 HOST_TAKEOVER_BASELINE_ARTIFACT = "host-takeover-baseline.json"
 RESOURCE_SNAPSHOT_ARTIFACT = "resource-snapshot.json"
 SCOPE_POLICY_ARTIFACT = "scope-policy.json"
+WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT = "websocket-candidate-review.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -260,6 +261,7 @@ INDEX_ARTIFACT_ORDER = [
     HOST_TAKEOVER_BASELINE_ARTIFACT,
     RESOURCE_SNAPSHOT_ARTIFACT,
     SCOPE_POLICY_ARTIFACT,
+    WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT,
     "response-delta-analysis.json",
     "warmup-results.json",
     "traffic-index.json",
@@ -6838,6 +6840,261 @@ def scope_policy_decision_counts_for_hosts(scope_policy: dict[str, Any] | None, 
     for host in sorted({normalize_scope_host(item) for item in hosts if normalize_scope_host(item)}):
         increment_count(counts, decisions.get(host) or "missing-policy-decision")
     return dict(sorted(counts.items()))
+
+
+def websocket_candidate_rows(asset_candidates_doc: dict[str, Any] | None) -> list[dict[str, Any]]:
+    doc = asset_candidates_doc if isinstance(asset_candidates_doc, dict) else {}
+    return [
+        item
+        for item in doc.get("candidates", []) or []
+        if isinstance(item, dict)
+        and ((item.get("triage", {}) or {}).get("class") == "websocket-handshake-review")
+    ]
+
+
+def websocket_candidate_url(candidate: dict[str, Any], target: str) -> str:
+    target_scheme = urllib.parse.urlparse(target).scheme
+    scheme = "wss" if target_scheme == "https" else "ws"
+    host = normalize_scope_host(candidate.get("host"))
+    path = str(candidate.get("path") or "/")
+    if not path.startswith("/"):
+        path = "/" + path
+    return urllib.parse.urlunparse((scheme, host, path, "", "", ""))
+
+
+def build_websocket_candidate_review(
+    *,
+    target: str,
+    asset_candidates_doc: dict[str, Any] | None,
+    scope_policy: dict[str, Any] | None,
+    baseline_results: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    scope_decisions = scope_policy_decision_map(scope_policy)
+    baseline_by_id = {
+        str(item.get("candidate_id") or ""): item
+        for item in baseline_results or []
+        if isinstance(item, dict)
+    }
+    candidates = []
+    decision_counts: dict[str, int] = {}
+    baseline_status_counts: dict[str, int] = {}
+    for candidate in websocket_candidate_rows(asset_candidates_doc):
+        candidate_id = str(candidate.get("id") or "")
+        host = normalize_scope_host(candidate.get("host"))
+        scope_decision = scope_decisions.get(host) or "missing-policy-decision"
+        path_problem = concrete_local_path_problem(candidate.get("path") or "/")
+        if scope_decision == "in-scope-explicit-host" and not path_problem:
+            decision = "handshake-baseline-ready"
+            safe_next_step = "At most one handshake-only connection may be used for baseline evidence; do not send frames."
+        elif scope_decision == "out-of-scope-by-default":
+            decision = "out-of-scope-by-default"
+            safe_next_step = "Do not request this WebSocket host from automation."
+        elif path_problem:
+            decision = "blocked-unsafe-path"
+            safe_next_step = f"Do not connect until the path is concrete and safe: {path_problem}."
+        else:
+            decision = "needs-scope-review"
+            safe_next_step = "Confirm explicit bounty scope before any WebSocket handshake."
+        baseline = baseline_by_id.get(candidate_id)
+        if baseline:
+            increment_count(baseline_status_counts, str(baseline.get("status") or "unknown"))
+        increment_count(decision_counts, decision)
+        candidates.append(
+            {
+                "id": candidate_id,
+                "host": host,
+                "path": candidate.get("path") or "/",
+                "url": websocket_candidate_url(candidate, target),
+                "scope_decision": scope_decision,
+                "decision": decision,
+                "safe_next_step": safe_next_step,
+                "triage": candidate.get("triage", {}),
+                "source_refs": candidate.get("sources", [])[:3],
+                "baseline": baseline,
+            }
+        )
+
+    unresolved = [
+        item["id"]
+        for item in candidates
+        if item.get("decision") not in {"handshake-baseline-ready", "out-of-scope-by-default"}
+    ]
+    ready_count = sum(1 for item in candidates if item.get("decision") == "handshake-baseline-ready")
+    baseline_expected = [
+        item
+        for item in candidates
+        if isinstance(item.get("baseline"), dict) and item["baseline"].get("expected")
+    ]
+    status = "no-websocket-candidates"
+    if candidates:
+        if unresolved:
+            status = "needs-human-review"
+        elif ready_count and len(baseline_expected) == ready_count:
+            status = "baseline-complete"
+        elif ready_count:
+            status = "ready-for-handshake-baseline"
+        else:
+            status = "complete"
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "summary": {
+            "candidate_count": len(candidates),
+            "ready_for_handshake_baseline": ready_count,
+            "unresolved_count": len(unresolved),
+            "decision_counts": dict(sorted(decision_counts.items())),
+            "baseline_status_counts": dict(sorted(baseline_status_counts.items())),
+        },
+        "candidates": candidates,
+        "safety": (
+            "WebSocket candidate review only. Handshake baselines, when requested, perform one HTTP Upgrade "
+            "attempt per in-scope candidate and send no WebSocket frames, subscriptions, wallet payloads, or trade messages."
+        ),
+    }
+
+
+def read_http_headers_from_socket(sock: socket.socket, *, max_bytes: int = 65536) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while total < max_bytes:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if b"\r\n\r\n" in b"".join(chunks):
+            break
+    return b"".join(chunks)[:max_bytes]
+
+
+def parse_http_status_and_headers(raw: bytes) -> tuple[int | None, dict[str, str], str]:
+    text = raw.decode("iso-8859-1", errors="replace")
+    head = text.split("\r\n\r\n", 1)[0]
+    lines = head.split("\r\n") if head else []
+    status = None
+    if lines:
+        parts = lines[0].split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            status = int(parts[1])
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        key, sep, value = line.partition(":")
+        if sep:
+            headers[key.strip().lower()] = value.strip()
+    return status, headers, lines[0] if lines else ""
+
+
+def websocket_handshake_baseline_once(
+    *,
+    url: str,
+    origin: str,
+    proxy: str | None,
+    timeout: int,
+) -> dict[str, Any]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
+        return {"status": "blocked-invalid-url", "expected": False, "error": "candidate URL must be ws:// or wss://"}
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+    path = urllib.parse.urlunparse(("", "", parsed.path or "/", "", parsed.query, ""))
+    proxy_parsed = urllib.parse.urlparse(proxy or "")
+    started = time.monotonic()
+    raw_sock: socket.socket | None = None
+    sock: socket.socket | ssl.SSLSocket | None = None
+    sec_key = base64.b64encode(os.urandom(16)).decode("ascii")
+    try:
+        if proxy:
+            if proxy_parsed.scheme != "http" or not proxy_parsed.hostname:
+                return {"status": "blocked-invalid-proxy", "expected": False, "error": "proxy must be an http://host:port URL"}
+            raw_sock = socket.create_connection((proxy_parsed.hostname, proxy_parsed.port or 8080), timeout=timeout)
+            raw_sock.settimeout(timeout)
+            connect_target = f"{host}:{port}"
+            connect_request = (
+                f"CONNECT {connect_target} HTTP/1.1\r\n"
+                f"Host: {connect_target}\r\n"
+                "Proxy-Connection: close\r\n"
+                "\r\n"
+            ).encode("ascii")
+            raw_sock.sendall(connect_request)
+            proxy_raw = read_http_headers_from_socket(raw_sock)
+            proxy_status, _proxy_headers, proxy_status_line = parse_http_status_and_headers(proxy_raw)
+            if proxy_status != 200:
+                raw_sock.close()
+                return {
+                    "status": "proxy-connect-failed",
+                    "expected": False,
+                    "proxy_status": proxy_status,
+                    "proxy_status_line": proxy_status_line[:160],
+                    "duration_ms": round((time.monotonic() - started) * 1000),
+                }
+        else:
+            raw_sock = socket.create_connection((host, port), timeout=timeout)
+            raw_sock.settimeout(timeout)
+
+        if parsed.scheme == "wss":
+            context = ssl._create_unverified_context() if proxy else ssl.create_default_context()
+            sock = context.wrap_socket(raw_sock, server_hostname=host)
+        else:
+            sock = raw_sock
+        sock.settimeout(timeout)
+        host_header = parsed.netloc
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host_header}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {sec_key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            f"Origin: {origin}\r\n"
+            "User-Agent: InferForge-WS-Handshake/0.1\r\n"
+            "\r\n"
+        ).encode("ascii")
+        sock.sendall(request)
+        raw_response = read_http_headers_from_socket(sock)
+        response_status, response_headers, response_status_line = parse_http_status_and_headers(raw_response)
+        expected = response_status in {101, 400, 401, 403, 404, 426}
+        result_status = "handshake-upgraded" if response_status == 101 else "handshake-rejected"
+        if response_status is None:
+            result_status = "transport-error"
+            expected = False
+        elif response_status >= 500:
+            result_status = "server-error"
+            expected = False
+        return {
+            "status": result_status,
+            "expected": expected,
+            "url": url,
+            "response_status": response_status,
+            "response_status_line": response_status_line[:160],
+            "response_headers": redact_headers(response_headers),
+            "duration_ms": round((time.monotonic() - started) * 1000),
+            "request": {
+                "method": "GET",
+                "path": path,
+                "host": host_header,
+                "origin": origin,
+                "user_agent": "InferForge-WS-Handshake/0.1",
+                "sec_websocket_key_sha256": hashlib.sha256(sec_key.encode("ascii")).hexdigest(),
+            },
+            "frames_sent": 0,
+        }
+    except (OSError, ssl.SSLError, TimeoutError) as error:
+        return {
+            "status": "transport-error",
+            "expected": False,
+            "url": url,
+            "error": redacted_error_summary(error),
+            "duration_ms": round((time.monotonic() - started) * 1000),
+            "frames_sent": 0,
+        }
+    finally:
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                sock.close()
+        elif raw_sock is not None:
+            with contextlib.suppress(OSError):
+                raw_sock.close()
 
 
 def contains_unredacted_secret_text(value: str) -> bool:
@@ -15893,6 +16150,11 @@ def build_verification_queue(
         if artifact_dir is not None
         else None
     )
+    websocket_candidate_review_doc = (
+        load_optional_json(artifact_dir / WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT)
+        if artifact_dir is not None
+        else None
+    )
     asset_candidates = (asset_candidates_doc or {}).get("candidates", []) or []
     external_scripts_doc = (asset_candidates_doc or {}).get("external_scripts", {}) if isinstance(asset_candidates_doc, dict) else {}
     if isinstance(external_scripts_doc, dict) and external_scripts_doc.get("review_required"):
@@ -16077,30 +16339,89 @@ def build_verification_queue(
             for item in pending_asset_candidates
         ):
             pending_hosts = [str(item.get("host") or "") for item in pending_asset_candidates]
-            add_item(
-                "REVIEW-blackbox-websocket-candidates",
-                "Review static asset WebSocket candidates",
-                "manual-review",
-                "medium",
-                (
-                    f"{len(pending_asset_candidates)} WebSocket handshake candidate(s) remain after "
-                    f"{len(promoted_candidate_ids)} low-risk page-route candidate(s) were promoted into the asset profile."
-                ),
-                evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT, BLACKBOX_ASSET_PROFILE_ARTIFACT, SCOPE_POLICY_ARTIFACT],
-                prerequisites=[
-                    "Confirm each WebSocket endpoint is in scope and handshake-only validation is acceptable.",
-                    "Do not send subscription messages, trading requests, wallet payloads, or high-volume connection tests from this queue item.",
-                    "Add a bounded WebSocket handshake profile only after semantics and scope are reviewed.",
-                ],
-                safety="Manual review only. Does not authorize WebSocket connections or messages.",
-                extra={
-                    "asset_candidate_count": len(asset_candidates),
-                    "promoted_candidate_count": len(promoted_candidate_ids),
-                    "pending_websocket_candidate_count": len(pending_asset_candidates),
-                    "scope_policy_decision_counts": scope_policy_decision_counts_for_hosts(scope_policy_doc, pending_hosts),
-                    "asset_candidate_preview": candidate_preview,
-                },
-            )
+            ws_review_status = str((websocket_candidate_review_doc or {}).get("status") or "")
+            ws_review_summary = (websocket_candidate_review_doc or {}).get("summary", {}) or {}
+            ws_scope_counts = scope_policy_decision_counts_for_hosts(scope_policy_doc, pending_hosts)
+            if ws_review_status == "baseline-complete":
+                add_item(
+                    "VERIFY-blackbox-websocket-candidates",
+                    "Verify WebSocket handshake candidate baselines",
+                    "ready",
+                    "low",
+                    f"{len(pending_asset_candidates)} WebSocket candidate(s) have handshake-only baseline evidence.",
+                    commands=[cmd("websocket-candidate-review")],
+                    evidence_refs=[
+                        BLACKBOX_ASSET_CANDIDATES_ARTIFACT,
+                        BLACKBOX_ASSET_PROFILE_ARTIFACT,
+                        SCOPE_POLICY_ARTIFACT,
+                        WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT,
+                    ],
+                    prerequisites=[
+                        "Review websocket-candidate-review.json before treating handshake behavior as coverage.",
+                        "Handshake baseline evidence is not a vulnerability by itself.",
+                    ],
+                    safety="Read-only artifact verification. Does not send WebSocket frames.",
+                    extra={
+                        "websocket_candidate_review_status": ws_review_status,
+                        "websocket_candidate_review_summary": ws_review_summary,
+                    },
+                )
+            elif scope_policy_doc and set(ws_scope_counts) <= {"in-scope-explicit-host"}:
+                add_item(
+                    "VERIFY-blackbox-websocket-handshakes",
+                    "Run WebSocket handshake-only baseline",
+                    "ready",
+                    "medium",
+                    (
+                        f"{len(pending_asset_candidates)} in-scope WebSocket handshake candidate(s) remain after "
+                        f"{len(promoted_candidate_ids)} low-risk page-route candidate(s) were promoted into the asset profile."
+                    ),
+                    commands=[
+                        cmd(
+                            "websocket-candidate-review --handshake-baseline "
+                            "--allow-nonlocal-target --proxy http://127.0.0.1:8080"
+                        )
+                    ],
+                    evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT, BLACKBOX_ASSET_PROFILE_ARTIFACT, SCOPE_POLICY_ARTIFACT],
+                    prerequisites=[
+                        "Scope policy marks every pending WebSocket candidate host as in-scope-explicit-host.",
+                        "The handshake baseline sends only HTTP Upgrade requests and no WebSocket frames.",
+                        "Do not add subscription messages, trading requests, wallet payloads, or resource-pressure tests to this queue item.",
+                    ],
+                    safety="At most one handshake-only connection per candidate through Burp Proxy. No frames are sent.",
+                    extra={
+                        "asset_candidate_count": len(asset_candidates),
+                        "promoted_candidate_count": len(promoted_candidate_ids),
+                        "pending_websocket_candidate_count": len(pending_asset_candidates),
+                        "scope_policy_decision_counts": ws_scope_counts,
+                        "asset_candidate_preview": candidate_preview,
+                    },
+                )
+            else:
+                add_item(
+                    "REVIEW-blackbox-websocket-candidates",
+                    "Review static asset WebSocket candidates",
+                    "manual-review",
+                    "medium",
+                    (
+                        f"{len(pending_asset_candidates)} WebSocket handshake candidate(s) remain after "
+                        f"{len(promoted_candidate_ids)} low-risk page-route candidate(s) were promoted into the asset profile."
+                    ),
+                    evidence_refs=[BLACKBOX_ASSET_CANDIDATES_ARTIFACT, BLACKBOX_ASSET_PROFILE_ARTIFACT, SCOPE_POLICY_ARTIFACT],
+                    prerequisites=[
+                        "Confirm each WebSocket endpoint is in scope and handshake-only validation is acceptable.",
+                        "Do not send subscription messages, trading requests, wallet payloads, or high-volume connection tests from this queue item.",
+                        "Add a bounded WebSocket handshake profile only after semantics and scope are reviewed.",
+                    ],
+                    safety="Manual review only. Does not authorize WebSocket connections or messages.",
+                    extra={
+                        "asset_candidate_count": len(asset_candidates),
+                        "promoted_candidate_count": len(promoted_candidate_ids),
+                        "pending_websocket_candidate_count": len(pending_asset_candidates),
+                        "scope_policy_decision_counts": ws_scope_counts,
+                        "asset_candidate_preview": candidate_preview,
+                    },
+                )
         else:
             add_item(
                 "REVIEW-blackbox-asset-candidates",
@@ -31218,6 +31539,112 @@ def run_scope_policy(args: argparse.Namespace) -> int:
     return 1 if args.strict and policy["status"] != "complete" else 0
 
 
+def run_websocket_candidate_review(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    asset_candidates_doc = load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT)
+    scope_policy = load_optional_json(artifact_dir / SCOPE_POLICY_ARTIFACT)
+    review = build_websocket_candidate_review(
+        target=target,
+        asset_candidates_doc=asset_candidates_doc,
+        scope_policy=scope_policy,
+    )
+    proxy = None if args.no_proxy else args.proxy
+    if args.handshake_baseline:
+        if not args.allow_nonlocal_target and not is_loopback_target(target):
+            print("websocket-candidate-review refuses non-loopback handshake baselines unless --allow-nonlocal-target is set")
+            return 2
+        baseline_results = []
+        try:
+            with TargetProbeLock(target, purpose="websocket-candidate-review"):
+                for item in review.get("candidates", []) or []:
+                    if item.get("decision") != "handshake-baseline-ready":
+                        continue
+                    result = websocket_handshake_baseline_once(
+                        url=str(item.get("url") or ""),
+                        origin=origin_for(target),
+                        proxy=proxy,
+                        timeout=args.timeout,
+                    )
+                    result["candidate_id"] = item.get("id")
+                    result["candidate_host"] = item.get("host")
+                    result["candidate_path"] = item.get("path")
+                    result["proxy"] = proxy
+                    baseline_results.append(result)
+        except RuntimeError as error:
+            output_path = artifact_dir / "target-probe-lock.json"
+            write_json(
+                output_path,
+                target_probe_lock_blocked_payload(
+                    target=target,
+                    error=error,
+                    safety="Only one active WebSocket candidate baseline may target this run at a time.",
+                ),
+            )
+            print(f"Target probe lock blocked websocket-candidate-review: {error}")
+            print(f"Wrote {output_path}")
+            print_refreshed_manifests(
+                refresh_current_artifact_manifest(
+                    artifact_dir=artifact_dir,
+                    target=target,
+                    command="websocket-candidate-review",
+                    output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+                )
+            )
+            return 2
+        review = build_websocket_candidate_review(
+            target=target,
+            asset_candidates_doc=asset_candidates_doc,
+            scope_policy=scope_policy,
+            baseline_results=baseline_results,
+        )
+        review["handshake_baseline"] = {
+            "executed": True,
+            "proxy": proxy,
+            "timeout": args.timeout,
+            "results": baseline_results,
+            "safety": "One HTTP Upgrade attempt per ready candidate. No WebSocket frames are sent.",
+        }
+    else:
+        review["handshake_baseline"] = {
+            "executed": False,
+            "safety": "Review-only mode. No WebSocket connections were opened.",
+        }
+
+    output_path = artifact_dir / WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT
+    if not args.no_write:
+        write_json(output_path, review)
+    print(f"WebSocket candidate review: {review['status']}")
+    print(
+        "Candidates: "
+        f"{review['summary']['candidate_count']} total, "
+        f"ready={review['summary']['ready_for_handshake_baseline']}, "
+        f"unresolved={review['summary']['unresolved_count']}, "
+        f"decisions={json.dumps(review['summary']['decision_counts'], sort_keys=True)}"
+    )
+    if args.handshake_baseline:
+        print(f"Handshake baseline results: {json.dumps(review['summary'].get('baseline_status_counts', {}), sort_keys=True)}")
+    if args.no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="websocket-candidate-review",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    output_path,
+                ],
+            )
+        )
+    if args.strict and review["status"] not in {"baseline-complete", "complete", "no-websocket-candidates"}:
+        return 1
+    return 0
+
+
 def run_decode_transactions(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -32561,6 +32988,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless every observed host has an allowlist or deny-by-default decision.",
     )
     scope_policy.set_defaults(func=run_scope_policy)
+
+    websocket_candidate_review = sub.add_parser(
+        "websocket-candidate-review",
+        help="Review static asset WebSocket candidates and optionally run handshake-only baselines",
+    )
+    websocket_candidate_review.add_argument(
+        "--handshake-baseline",
+        action="store_true",
+        help="Run at most one HTTP Upgrade handshake per in-scope candidate and send no WebSocket frames.",
+    )
+    websocket_candidate_review.add_argument(
+        "--allow-nonlocal-target",
+        action="store_true",
+        help="Allow handshake baselines when --target is not loopback.",
+    )
+    websocket_candidate_review.add_argument(
+        "--proxy",
+        default="http://127.0.0.1:8080",
+        help="HTTP proxy used for handshake baselines. Defaults to Burp Proxy.",
+    )
+    websocket_candidate_review.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help="Connect directly instead of using --proxy for handshake baselines.",
+    )
+    websocket_candidate_review.add_argument(
+        "--timeout",
+        type=positive_int,
+        default=8,
+        help="Timeout in seconds for each handshake baseline.",
+    )
+    websocket_candidate_review.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print review summary only; do not write websocket-candidate-review.json or refresh manifests.",
+    )
+    websocket_candidate_review.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless review is complete or baselines are complete.",
+    )
+    websocket_candidate_review.set_defaults(func=run_websocket_candidate_review)
 
     decode = sub.add_parser(
         "decode-transactions",

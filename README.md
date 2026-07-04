@@ -222,6 +222,20 @@ queues use this artifact to avoid turning passive runtime config or external
 script references into manual blockers when the explicit scope already excludes
 them.
 
+For in-scope WebSocket candidates extracted from static assets, keep validation
+to handshake-only unless a separate message-level plan has been reviewed:
+
+```bash
+python3 scripts/inferforge.py --target https://in-scope.example \
+  --artifact-dir .greybox/in-scope-example \
+  websocket-candidate-review --handshake-baseline --allow-nonlocal-target
+```
+
+`websocket-candidate-review` opens at most one HTTP Upgrade attempt per
+in-scope candidate, sends no WebSocket frames, subscriptions, wallet payloads,
+or trading messages, and records only response headers plus a hash of the random
+`Sec-WebSocket-Key`. It is coverage evidence, not a vulnerability finding.
+
 For takeover-oriented Web/App scope checks, keep the host list explicit:
 
 ```bash
