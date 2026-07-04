@@ -6781,6 +6781,20 @@ def parse_proc_cgroup_context(pid: int) -> dict[str, Any] | None:
     return context
 
 
+def process_context_label(context: Any) -> str:
+    if not isinstance(context, dict):
+        return "host"
+    label = str(context.get("label") or "").strip()
+    if label:
+        return label
+    runtime = str(context.get("runtime") or "").strip()
+    container_id = str(context.get("container_id_short") or context.get("container_id") or "").strip()
+    if runtime and container_id:
+        return f"{runtime}:{container_id[:12]}"
+    scope = str(context.get("scope") or "").strip()
+    return scope or "host"
+
+
 def top_rss_processes(limit: int) -> list[dict[str, Any]]:
     proc_root = Path("/proc")
     processes: list[dict[str, Any]] = []
@@ -7806,6 +7820,11 @@ def build_harness_focus(
     resource_status = artifact_summary_status(resource_snapshot)
     resource_budget = resource_budget_for_snapshot(resource_snapshot)
     resource_mode = resource_budget.get("mode") or resource_status
+    release_candidates = (
+        resource_snapshot.get("release_candidates", [])[:3]
+        if isinstance(resource_snapshot, dict)
+        else []
+    )
     if resource_status == "warning":
         unattended_policy = "offline-only-resource-warning"
     elif external_commands:
@@ -7821,6 +7840,7 @@ def build_harness_focus(
             "unattended_policy": unattended_policy,
             "resource_status": resource_status,
             "resource_budget_mode": resource_mode,
+            "release_candidates": release_candidates,
             "next_step": "No focused bottleneck was selected from current harness stages.",
             "offline_followup_commands": [],
             "command_safety": command_safety_summary([]),
@@ -7845,6 +7865,7 @@ def build_harness_focus(
         "unattended_policy": unattended_policy,
         "resource_status": resource_status,
         "resource_budget_mode": resource_mode,
+        "release_candidates": release_candidates,
         "next_step": focus_stage.get("next_step"),
         "stage_summary": focus_stage.get("summary", {}),
         "offline_followup_commands": commands,
@@ -40406,24 +40427,20 @@ def run_resource_snapshot(args: argparse.Namespace) -> int:
     )
     print(f"Watched ports: {port_text if port_text else 'none'}")
     for process in snapshot.get("top_rss_processes", [])[: min(5, args.max_processes)]:
-        process_context = process.get("cgroup_context") if isinstance(process.get("cgroup_context"), dict) else {}
-        context_label = process_context.get("label") or "host"
         print(
             "RSS: "
             f"pid={process.get('pid')} "
             f"rss={process.get('rss_mib')}MiB "
             f"name={process.get('name')} "
-            f"context={context_label}"
+            f"context={process_context_label(process.get('cgroup_context'))}"
         )
     for candidate in snapshot.get("release_candidates", [])[:3]:
-        process_context = candidate.get("process_context") if isinstance(candidate.get("process_context"), dict) else {}
-        context_label = process_context.get("label") or "host"
         print(
             "Release candidate: "
             f"pid={candidate.get('pid')} "
             f"type={candidate.get('type')} "
             f"rss={candidate.get('rss_mib')}MiB "
-            f"context={context_label} "
+            f"context={process_context_label(candidate.get('process_context'))} "
             f"action={candidate.get('recommendation')}"
         )
     if no_write:
@@ -40826,6 +40843,15 @@ def run_harness_loop(args: argparse.Namespace) -> int:
             f"policy={focus.get('unattended_policy') or '-'} "
             f"resource={focus.get('resource_budget_mode') or focus.get('resource_status') or '-'}"
         )
+        release_candidates = focus.get("release_candidates", []) if isinstance(focus.get("release_candidates"), list) else []
+        for candidate in release_candidates[:2]:
+            print(
+                "  release_candidate="
+                f"{candidate.get('type')} "
+                f"pid={candidate.get('pid')} "
+                f"rss={candidate.get('rss_mib')}MiB "
+                f"context={process_context_label(candidate.get('process_context'))}"
+            )
 
     if loop.get("mode") == "rollup":
         for run in (loop.get("runs", []) or [])[: max(0, int(args.top_runs))]:
@@ -41369,6 +41395,7 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                 f"{candidate.get('type')} "
                 f"pid={candidate.get('pid')} "
                 f"rss={candidate.get('rss_mib')}MiB "
+                f"context={process_context_label(candidate.get('process_context'))} "
                 f"action={inline_summary_text(candidate.get('recommendation'), max_chars=140)}"
             )
     if command_safety:
