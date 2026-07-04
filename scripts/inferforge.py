@@ -912,6 +912,7 @@ def render_path_template(path: str, replacements: dict[str, str] | None = None) 
     for key, value in (replacements or {}).items():
         rendered = rendered.replace("{" + key + "}", str(value))
         rendered = rendered.replace("{" + key + "*}", str(value))
+        rendered = rendered.replace("{" + key + "*?}", str(value))
     return rendered
 
 
@@ -2194,7 +2195,7 @@ def route_segment_to_path_segment(segment: str) -> str | None:
     if segment.startswith("@"):
         return None
     if segment.startswith("[[...") and segment.endswith("]]"):
-        return "{" + segment[5:-2] + "*}"
+        return "{" + segment[5:-2] + "*?}"
     if segment.startswith("[...") and segment.endswith("]"):
         return "{" + segment[4:-1] + "*}"
     if segment.startswith("[") and segment.endswith("]"):
@@ -2600,7 +2601,7 @@ def next_runtime_reasons(runtime: dict[str, Any]) -> list[str]:
 
 
 def catchall_prefix_for_path(path: str) -> str | None:
-    match = re.search(r"\{[^{}]+\*\}", path)
+    match = re.search(r"\{[^{}]+\*\??\}", path)
     if not match:
         return None
     prefix = path[: match.start()]
@@ -8680,6 +8681,8 @@ def build_clusters(
 
 def path_pattern_matches(pattern: str, path: str) -> bool:
     escaped = re.escape(pattern)
+    escaped = re.sub(r"/\\\{[^/{}]+\\\*\\\?\\\}", r"(?:/.*)?", escaped)
+    escaped = re.sub(r"\\\{[^/{}]+\\\*\\\?\\\}", r".*", escaped)
     escaped = re.sub(r"\\\{[^/{}]+\\\*\\\}", r".*", escaped)
     regex = re.sub(r"\\\{[^/{}]+\\\}", r"[^/]+", escaped)
     return re.fullmatch(regex, path) is not None
@@ -23129,6 +23132,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "export async function POST() { return Response.json({ ok: true }) }\n",
             encoding="utf-8",
         )
+        (rewrite_source_root / "src/app/api/optional/[[...slug]]").mkdir(parents=True)
+        (rewrite_source_root / "src/app/api/optional/[[...slug]]/route.ts").write_text(
+            "export async function GET() { return Response.json({ ok: true }) }\n",
+            encoding="utf-8",
+        )
         (rewrite_source_root / "src/app/actions.ts").write_text(
             textwrap.dedent(
                 """
@@ -23352,6 +23360,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             ),
             None,
         )
+        optional_app_cluster = next(
+            (
+                cluster
+                for cluster in rewrite_clusters.get("clusters", [])
+                if cluster.get("id") == "route-api-optional-slug"
+            ),
+            None,
+        )
         server_action_entries = rewrite_inventory.get("server_actions", [])
         rewrite_cluster_candidates = (
             []
@@ -23459,6 +23475,34 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 match
                 for match in root_app_resolution.get("matches", [])
                 if match.get("cluster_id") == "route-api-root"
+            ),
+            None,
+        )
+        optional_base_resolution = resolve_endpoint_sources(
+            rewrite_source_root,
+            "GET",
+            "/api/optional",
+            rewrite_inventory,
+        )
+        optional_nested_resolution = resolve_endpoint_sources(
+            rewrite_source_root,
+            "GET",
+            "/api/optional/a/b",
+            rewrite_inventory,
+        )
+        optional_base_resolution_match = next(
+            (
+                match
+                for match in optional_base_resolution.get("matches", [])
+                if match.get("cluster_id") == "route-api-optional-slug"
+            ),
+            None,
+        )
+        optional_nested_resolution_match = next(
+            (
+                match
+                for match in optional_nested_resolution.get("matches", [])
+                if match.get("cluster_id") == "route-api-optional-slug"
             ),
             None,
         )
@@ -23761,7 +23805,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         rewrite_server_action_report_lines = rewrite_source_resolver_report.get("server_action_lines", [])
         rewrite_discovery_passed = (
             rewrite_inventory.get("summary", {}).get("rewrite_count") == 1
-            and rewrite_inventory.get("summary", {}).get("app_router_route_count") == 2
+            and rewrite_inventory.get("summary", {}).get("app_router_route_count") == 3
             and rewrite_inventory.get("summary", {}).get("pages_router_api_route_count") == 1
             and rewrite_inventory.get("summary", {}).get("middleware_count") == 1
             and rewrite_inventory.get("summary", {}).get("server_action_file_count") == 1
@@ -23827,6 +23871,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             )
             and root_app_resolution_match is not None
             and str(root_app_resolution_match.get("source_ref", "")).endswith("app/api/root/route.ts")
+            and optional_app_cluster is not None
+            and optional_app_cluster.get("path") == "/api/optional/{slug*?}"
+            and "/api/optional/" in (optional_app_cluster.get("match") or {}).get("path_prefixes", [])
+            and optional_base_resolution_match is not None
+            and str(optional_base_resolution_match.get("source_ref", "")).endswith(
+                "src/app/api/optional/[[...slug]]/route.ts"
+            )
+            and optional_nested_resolution_match is not None
+            and str(optional_nested_resolution_match.get("source_ref", "")).endswith(
+                "src/app/api/optional/[[...slug]]/route.ts"
+            )
             and len(server_action_entries) == 1
             and {"updateWidget", "deleteWidget"}.issubset(set(server_action_entries[0].get("action_names", [])))
             and not any(str(cluster.get("id", "")).startswith("server_action") for cluster in rewrite_clusters.get("clusters", []))
