@@ -793,6 +793,7 @@ def default_target_profile() -> dict[str, Any]:
                 "cluster": "orca-pools",
             },
         ],
+        "review_observation_candidates": [],
         "websocket_observation": {
             "id": "burp_observe_ws_upgrade",
             "path": "/api/rpc/solana/devnet",
@@ -12643,10 +12644,28 @@ def build_evidence_gaps(
     priority_order = {"high": 0, "medium": 1, "low": 2}
     gaps.sort(key=lambda item: (priority_order.get(item["priority"], 9), item["cluster_id"], item["id"]))
     next_probe_candidates.sort(key=lambda item: (priority_order.get(item["priority"], 9), item["id"]))
+    gap_priority_counts: dict[str, int] = {}
+    gap_cluster_counts: dict[str, int] = {}
+    coverage_status_counts: dict[str, int] = {}
+    for gap in gaps:
+        increment_count(gap_priority_counts, str(gap.get("priority") or "unknown"))
+        increment_count(gap_cluster_counts, str(gap.get("cluster_id") or "unknown"))
+    for row in coverage_by_cluster:
+        increment_count(coverage_status_counts, str(row.get("coverage_status") or "unknown"))
 
     return {
         "generated_at": utc_now(),
+        "status": "needs-safe-follow-up" if gaps else "no-evidence-gaps",
         "methodology": "Evidence gaps are not findings; they are the next safe questions to answer before escalating risk.",
+        "summary": {
+            "clusters": len(coverage_by_cluster),
+            "gaps": len(gaps),
+            "gap_priority_counts": gap_priority_counts,
+            "gap_cluster_counts": gap_cluster_counts,
+            "coverage_status_counts": coverage_status_counts,
+            "burp_observed_clusters": sum(1 for row in coverage_by_cluster if row.get("burp_browser_observed")),
+            "next_probe_candidates": len(next_probe_candidates),
+        },
         "coverage_by_cluster": coverage_by_cluster,
         "gaps": gaps,
         "next_probe_candidates": next_probe_candidates,
@@ -26563,6 +26582,18 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and approval_statuses.get("observed_send_http1_request") == "ok_after_target_request_approval"
         and "127.0.0.1_3100" not in json.dumps(approval_statuses, sort_keys=True)
     )
+    try:
+        missing_profile_fallback = load_target_profile(str(ROOT / ".greybox/nonexistent-profile-selftest.json"))
+        missing_profile_fallback_error = None
+    except Exception as error:
+        missing_profile_fallback = {}
+        missing_profile_fallback_error = str(error)
+    missing_profile_fallback_passed = (
+        missing_profile_fallback_error is None
+        and isinstance(missing_profile_fallback.get("review_observation_candidates"), list)
+        and "websocket_observation" in missing_profile_fallback
+        and missing_profile_fallback.get("_profile_loaded_from") == "builtin-default"
+    )
     unsafe_observation_profile = json_clone(test_profile)
     unsafe_observation_profile["burp_observation_plan"] = [
         {
@@ -28360,6 +28391,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and ws_resource_cluster_coverage.get("status") == "covered-with-open-items"
         and ws_resource_safe_probe_check.get("status") == "warning"
         and (ws_resource_safe_probe_check.get("evidence") or {}).get("open_item_unexpected_count") == 1
+        and ws_resource_evidence_gaps.get("status") == "no-evidence-gaps"
+        and ws_resource_evidence_gaps.get("summary", {}).get("gaps") == 0
+        and ws_resource_evidence_gaps.get("summary", {}).get("coverage_status_counts", {}).get("probe-review-needed") == 1
         and not ws_resource_coverage.get("required_failures")
         and "GAP-ws-resource-controls" not in {gap.get("id") for gap in ws_resource_evidence_gaps.get("gaps", [])}
         and ws_resource_response_delta.get("status") == "expected-deltas-indexed"
@@ -28493,6 +28527,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "quote-provider validation probes" in str(item.get("safe_next_step") or "")
             for item in external_evidence_gaps.get("gaps", [])
         )
+        and external_evidence_gaps.get("status") == "needs-safe-follow-up"
+        and external_evidence_gaps.get("summary", {}).get("gaps") == 3
+        and external_evidence_gaps.get("summary", {}).get("gap_priority_counts", {}).get("high") == 1
+        and external_evidence_gaps.get("summary", {}).get("gap_priority_counts", {}).get("medium") == 1
+        and external_evidence_gaps.get("summary", {}).get("gap_priority_counts", {}).get("low") == 1
     )
     attack_strategy_status_passed = (
         rewrite_attack_strategy.get("status") == "ready-for-regression"
@@ -28607,6 +28646,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and discover_profile_seed_cli_passed
         and readiness_profile_passed
         and approval_status_profile_neutral_passed
+        and missing_profile_fallback_passed
         and attack_strategy_status_passed
     )
 
@@ -28772,6 +28812,15 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         "approval_status_profile_neutral": {
             "status": "passed" if approval_status_profile_neutral_passed else "failed",
             "approval_statuses": approval_statuses,
+        },
+        "missing_profile_fallback": {
+            "status": "passed" if missing_profile_fallback_passed else "failed",
+            "error": missing_profile_fallback_error,
+            "loaded_from": missing_profile_fallback.get("_profile_loaded_from"),
+            "has_review_observation_candidates": isinstance(
+                missing_profile_fallback.get("review_observation_candidates"), list
+            ),
+            "has_websocket_observation": "websocket_observation" in missing_profile_fallback,
         },
         "response_delta_analysis": {
             "status": "passed" if response_delta_selftest_passed else "failed",
