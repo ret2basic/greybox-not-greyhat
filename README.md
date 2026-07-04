@@ -267,6 +267,21 @@ use it after `resource-snapshot --strict` to decide whether to deepen an
 existing lead, regenerate passive leads, refresh adjudication, or stop because
 there is no reportable evidence yet.
 
+When the loop is ready but no reportable evidence exists, use
+`hypothesis-matrix` to rank the next research questions from current local
+artifacts:
+
+```bash
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  hypothesis-matrix --no-write --show-next
+python3 scripts/inferforge.py --artifact-dir .greybox/target-set \
+  hypothesis-matrix --discover-child-runs --no-write --show-next
+```
+
+The matrix is not a finding list. It labels reportability gates, scope/resource
+gates, and impact hypotheses so the harness can choose whether to do offline
+review, wait for memory pressure to clear, or run one low-risk validation step.
+
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:
 

@@ -102,6 +102,7 @@ SCOPE_POLICY_ARTIFACT = "scope-policy.json"
 WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT = "websocket-candidate-review.json"
 LEAD_PORTFOLIO_ARTIFACT = "lead-portfolio.json"
 HARNESS_LOOP_ARTIFACT = "harness-loop.json"
+HYPOTHESIS_MATRIX_ARTIFACT = "hypothesis-matrix.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -182,6 +183,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     "environment-readiness.json",
     LEAD_PORTFOLIO_ARTIFACT,
     HARNESS_LOOP_ARTIFACT,
+    HYPOTHESIS_MATRIX_ARTIFACT,
     "artifact-health.json",
     "regression-suite.json",
     "orca-baseline.json",
@@ -7430,6 +7432,18 @@ def artifact_summary_status(doc: dict[str, Any] | None) -> str:
     return str(doc.get("status") or "unknown")
 
 
+def target_for_artifact_dir(artifact_dir: Path, fallback: str) -> str:
+    config = load_optional_json(artifact_dir / "config.json") or {}
+    target = config.get("target") if isinstance(config, dict) else None
+    if isinstance(target, str) and target.strip():
+        return target
+    target_profile = load_optional_json(artifact_dir / TARGET_PROFILE_ARTIFACT) or {}
+    default_target = target_profile.get("default_target") if isinstance(target_profile, dict) else None
+    if isinstance(default_target, str) and default_target.strip():
+        return default_target
+    return fallback
+
+
 def harness_stage(
     *,
     stage: str,
@@ -7740,7 +7754,11 @@ def build_harness_loop_rollup(
                 }
             )
             continue
-        run_doc = build_harness_loop_run(target=target, profile=None, artifact_dir=check_dir)
+        run_doc = build_harness_loop_run(
+            target=target_for_artifact_dir(check_dir, target),
+            profile=None,
+            artifact_dir=check_dir,
+        )
         run_status = str(run_doc.get("status") or "unknown")
         increment_count(status_counts, run_status)
         run_summary = dict_summary(run_doc.get("summary"))
@@ -7814,6 +7832,512 @@ def build_harness_loop_rollup(
         ),
         "safety": (
             "Read-only harness loop rollup. It reads child artifacts only and does not send HTTP requests, "
+            "invoke Burp, run scanners, sign wallets, submit transactions, or fetch external hosts."
+        ),
+    }
+
+
+HYPOTHESIS_PRIORITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+HYPOTHESIS_STATUS_RANK = {
+    "ready-for-low-risk-validation": 0,
+    "resource-gated": 1,
+    "ready-for-offline-review": 2,
+    "needs-scope-review": 3,
+    "parked-terminal-lead": 4,
+}
+
+
+def hypothesis_priority_from_values(*values: Any) -> str:
+    best = "info"
+    best_rank = HYPOTHESIS_PRIORITY_RANK[best]
+    for value in values:
+        text = str(value or "").lower()
+        if text in HYPOTHESIS_PRIORITY_RANK and HYPOTHESIS_PRIORITY_RANK[text] < best_rank:
+            best = text
+            best_rank = HYPOTHESIS_PRIORITY_RANK[text]
+    return best
+
+
+def hypothesis_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        HYPOTHESIS_STATUS_RANK.get(str(item.get("status") or ""), 9),
+        HYPOTHESIS_PRIORITY_RANK.get(str(item.get("priority") or "info"), 9),
+        0 if str(item.get("scope_decision") or "") == "in-scope-explicit-host" else 1,
+        str(item.get("host") or ""),
+        str(item.get("path") or ""),
+        str(item.get("id") or ""),
+    )
+
+
+def safe_hypothesis_id(*parts: Any) -> str:
+    return safe_probe_id("-".join(str(part or "") for part in parts if str(part or "").strip())) or "hypothesis"
+
+
+def matrix_resource_gated(resource_snapshot: dict[str, Any] | None) -> bool:
+    return artifact_summary_status(resource_snapshot) != "healthy"
+
+
+def hypothesis_status_for_followup(
+    *,
+    scope_decision: str,
+    resource_gated: bool,
+    offline_only: bool = False,
+    terminal: bool = False,
+) -> str:
+    if terminal:
+        return "parked-terminal-lead"
+    if scope_decision in {"missing-policy-decision", "needs-scope-review"}:
+        return "needs-scope-review"
+    if resource_gated and not offline_only:
+        return "resource-gated"
+    return "ready-for-offline-review" if offline_only else "ready-for-low-risk-validation"
+
+
+def add_hypothesis(hypotheses: list[dict[str, Any]], item: dict[str, Any]) -> None:
+    item["id"] = str(item.get("id") or f"HYP-{len(hypotheses) + 1}")
+    item["evidence_refs"] = compact_source_refs(item.get("evidence_refs", []) or [])
+    item["safety"] = str(
+        item.get("safety")
+        or "Hypothesis only. Do not report or probe without explicit scope, resource, and impact gates."
+    )
+    hypotheses.append(item)
+
+
+def hypothesis_from_lead(
+    lead: dict[str, Any],
+    *,
+    resource_gated: bool,
+) -> dict[str, Any]:
+    status = str(lead.get("status") or "")
+    terminal = is_terminal_lead_status(status)
+    scope_decision = str(lead.get("scope_decision") or "missing-policy-decision")
+    lead_type = str(lead.get("type") or "lead")
+    host = str(lead.get("host") or "")
+    path = lead.get("path")
+    if status == "out-of-scope-by-default":
+        terminal = True
+    if status == "no-takeover-signal":
+        terminal = True
+    priority = hypothesis_priority_from_values(lead.get("priority"), "medium" if lead_type == "runtime-config-host" else None)
+    if terminal and priority in {"critical", "high"}:
+        priority = "medium"
+    return {
+        "id": f"HYP-lead-{safe_hypothesis_id(lead.get('id'), host, path)}",
+        "type": f"lead:{lead_type}",
+        "status": hypothesis_status_for_followup(
+            scope_decision=scope_decision,
+            resource_gated=resource_gated,
+            offline_only=terminal,
+            terminal=terminal and status in {"out-of-scope-by-default", "no-takeover-signal"},
+        ),
+        "priority": priority,
+        "host": host,
+        "path": path,
+        "scope_decision": scope_decision,
+        "source_status": status,
+        "impact_hypothesis": (
+            "Validate whether this lead can produce concrete user, funds, order, sensitive-data, takeover, or persistent content impact."
+        ),
+        "reportability_gate": lead.get("reportability_gate") or "Lead is not reportable without concrete in-scope impact evidence.",
+        "next_step": (
+            "Keep parked unless scope or takeover evidence changes."
+            if status in {"out-of-scope-by-default", "no-takeover-signal"}
+            else (
+                "Review existing evidence and define one minimal validation question before probing."
+                if terminal
+                else "Run the smallest in-scope validation step after resource-snapshot --strict is healthy."
+            )
+        ),
+        "evidence_refs": lead.get("evidence_refs", []) or [LEAD_PORTFOLIO_ARTIFACT],
+        "safety": "Lead-derived hypothesis. It does not prove impact and must pass scope/resource gates before validation.",
+    }
+
+
+def hypothesis_from_queue_item(
+    item: dict[str, Any],
+    *,
+    resource_gated: bool,
+) -> dict[str, Any] | None:
+    item_id = str(item.get("id") or "")
+    status = str(item.get("status") or "")
+    if status not in {"ready", "manual-review"}:
+        return None
+    command_safety = dict_summary(dict_summary(item.get("command_safety")).get("summary"))
+    external_commands = int(command_safety.get("blocked_external", 0) or 0)
+    offline_only = not bool(item.get("commands"))
+    if item_id.startswith("VERIFY-evidence") or item_id.startswith("VERIFY-reportability"):
+        offline_only = True
+    priority = hypothesis_priority_from_values(item.get("priority"), "medium")
+    return {
+        "id": f"HYP-queue-{safe_hypothesis_id(item_id)}",
+        "type": "verification-queue",
+        "status": (
+            "needs-scope-review"
+            if external_commands
+            else hypothesis_status_for_followup(
+                scope_decision="in-scope-explicit-host",
+                resource_gated=resource_gated,
+                offline_only=offline_only,
+            )
+        ),
+        "priority": priority,
+        "host": None,
+        "path": None,
+        "cluster_id": item.get("cluster_id"),
+        "scope_decision": "in-scope-explicit-host",
+        "source_status": status,
+        "impact_hypothesis": "Use this queued step to deepen or refresh evidence for a concrete impact hypothesis.",
+        "reportability_gate": "Queue item is procedural; reportability still requires a validated finding gate decision.",
+        "next_step": (
+            "Preview command safety and remove external-probe flags before unattended execution."
+            if external_commands
+            else (
+                "Run the offline refresh step now; it should not send target traffic."
+                if offline_only
+                else "Run only after resource-snapshot --strict is healthy and scope gates are still satisfied."
+            )
+        ),
+        "evidence_refs": ["verification-queue.json", "reproduction-steps.md"],
+        "safety": "Queue-derived hypothesis. It is a next-step candidate, not vulnerability evidence.",
+    }
+
+
+def cluster_impact_hypotheses(cluster: dict[str, Any]) -> list[dict[str, str]]:
+    strategy_set = str(cluster.get("strategy_set") or strategy_set_for_cluster(cluster) or "")
+    kind = str(cluster.get("kind") or "")
+    method = str(cluster.get("method") or "").upper()
+    path = str(cluster.get("path") or "")
+    hypotheses: list[dict[str, str]] = []
+    if strategy_set == "quote-transaction-decoder" or "quote" in path:
+        hypotheses.append(
+            {
+                "impact": "transaction-integrity",
+                "priority": "high",
+                "question": "Can quote or transaction construction be influenced to change sender, recipient, mint, amount, or downstream signing intent?",
+            }
+        )
+    if strategy_set == "solana-json-rpc-proxy" or "rpc" in path:
+        hypotheses.append(
+            {
+                "impact": "rpc-proxy-abuse",
+                "priority": "high",
+                "question": "Can the RPC proxy expose disallowed methods, bypass origin/rate limits, or leak upstream credentials through errors?",
+            }
+        )
+    if strategy_set == "fixed-upstream-proxy":
+        hypotheses.append(
+            {
+                "impact": "fixed-upstream-proxy-confusion",
+                "priority": "high",
+                "question": "Can fixed upstream proxy path handling create SSRF, path confusion, or sensitive upstream data exposure?",
+            }
+        )
+    if method in {"POST", "PUT", "PATCH", "DELETE"} or kind in {"observed-api-endpoint", "state-changing-api-review"}:
+        hypotheses.append(
+            {
+                "impact": "unauthorized-state-change",
+                "priority": "medium",
+                "question": "Can the endpoint perform an unauthorized authenticated action or accept unsafe cross-origin input?",
+            }
+        )
+    if not hypotheses:
+        hypotheses.append(
+            {
+                "impact": "browser-route-exposure",
+                "priority": "low",
+                "question": "Does the observed route expose sensitive state, unsafe cache behavior, or client-side configuration that can lead to higher-impact pivots?",
+            }
+        )
+    return hypotheses
+
+
+def hypothesis_from_cluster(
+    cluster: dict[str, Any],
+    *,
+    target_host: str,
+    resource_gated: bool,
+) -> list[dict[str, Any]]:
+    cluster_id = str(cluster.get("id") or safe_hypothesis_id(cluster.get("method"), cluster.get("path")))
+    path = cluster.get("path")
+    items = []
+    for impact in cluster_impact_hypotheses(cluster):
+        priority = hypothesis_priority_from_values(impact.get("priority"), cluster.get("priority"))
+        add_item = {
+            "id": f"HYP-cluster-{safe_hypothesis_id(cluster_id, impact.get('impact'))}",
+            "type": "cluster-strategy",
+            "status": hypothesis_status_for_followup(
+                scope_decision="in-scope-explicit-host",
+                resource_gated=resource_gated,
+                offline_only=False,
+            ),
+            "priority": priority,
+            "host": target_host,
+            "path": path,
+            "method": cluster.get("method"),
+            "cluster_id": cluster_id,
+            "strategy_set": cluster.get("strategy_set") or strategy_set_for_cluster(cluster),
+            "scope_decision": "in-scope-explicit-host",
+            "impact_hypothesis": impact.get("question"),
+            "impact": impact.get("impact"),
+            "reportability_gate": "Requires concrete evidence of unauthorized action, sensitive-data exposure, funds/order impact, or equivalent program impact.",
+            "next_step": "Turn this into one minimal validation question; run only after resource and scope gates pass.",
+            "evidence_refs": ["endpoint-clusters.json", "attack-strategy.json", "verification-queue.json"],
+            "safety": "Cluster-derived hypothesis. Prefer offline review and existing evidence before any target request.",
+        }
+        items.append(add_item)
+    return items
+
+
+def build_hypothesis_matrix_run(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    resource_snapshot = load_optional_json(artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT) or {}
+    lead_portfolio = load_optional_json(artifact_dir / LEAD_PORTFOLIO_ARTIFACT) or {}
+    verification_queue = load_optional_json(artifact_dir / "verification-queue.json") or {}
+    endpoint_clusters = load_optional_json(artifact_dir / "endpoint-clusters.json") or {}
+    asset_candidates = load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT) or {}
+    harness_loop = build_harness_loop_run(target=target, profile=profile, artifact_dir=artifact_dir)
+
+    resource_gated = matrix_resource_gated(resource_snapshot)
+    target_host = normalize_scope_host(urllib.parse.urlparse(target).hostname or "")
+    hypotheses: list[dict[str, Any]] = []
+
+    for lead in lead_portfolio.get("leads", []) or []:
+        if not isinstance(lead, dict):
+            continue
+        scope_decision = str(lead.get("scope_decision") or "")
+        source_status = str(lead.get("status") or "")
+        if scope_decision == "out-of-scope-by-default" and source_status != "out-of-scope-by-default":
+            continue
+        if source_status in {"out-of-scope-by-default", "no-takeover-signal"}:
+            continue
+        add_hypothesis(hypotheses, hypothesis_from_lead(lead, resource_gated=resource_gated))
+
+    for item in verification_queue.get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        hypothesis = hypothesis_from_queue_item(item, resource_gated=resource_gated)
+        if hypothesis:
+            add_hypothesis(hypotheses, hypothesis)
+
+    for cluster in endpoint_clusters.get("clusters", []) or []:
+        if not isinstance(cluster, dict):
+            continue
+        for hypothesis in hypothesis_from_cluster(cluster, target_host=target_host, resource_gated=resource_gated):
+            add_hypothesis(hypotheses, hypothesis)
+
+    config_hosts = asset_candidates.get("config_hosts", {}) if isinstance(asset_candidates.get("config_hosts"), dict) else {}
+    for host_item in config_hosts.get("hosts", []) or []:
+        if not isinstance(host_item, dict):
+            continue
+        host = normalize_scope_host(host_item.get("host"))
+        triage = host_item.get("triage") if isinstance(host_item.get("triage"), dict) else {}
+        scope_decision = str(triage.get("scope_decision") or host_item.get("scope_status") or "")
+        if scope_decision == "out-of-scope-by-default":
+            continue
+        for impact in triage.get("impact_hypotheses", []) or []:
+            if not isinstance(impact, dict):
+                continue
+            add_hypothesis(
+                hypotheses,
+                {
+                    "id": f"HYP-config-host-{safe_hypothesis_id(host, impact.get('impact'))}",
+                    "type": "runtime-config-host",
+                    "status": hypothesis_status_for_followup(
+                        scope_decision="in-scope-explicit-host" if host == target_host else "needs-scope-review",
+                        resource_gated=resource_gated,
+                        offline_only=True,
+                    ),
+                    "priority": hypothesis_priority_from_values(triage.get("priority"), "medium"),
+                    "host": host,
+                    "path": None,
+                    "scope_decision": "in-scope-explicit-host" if host == target_host else "needs-scope-review",
+                    "impact": impact.get("impact"),
+                    "impact_hypothesis": impact.get("question") or impact.get("summary") or impact.get("impact"),
+                    "reportability_gate": triage.get("reportability_gate") or "Configuration reference is not reportable without concrete PoC.",
+                    "next_step": "Confirm scope and map this host to an existing run before any request.",
+                    "evidence_refs": [BLACKBOX_ASSET_CANDIDATES_ARTIFACT, SCOPE_POLICY_ARTIFACT],
+                    "safety": "Runtime config hypothesis only. Do not fetch unconfirmed hosts from automation.",
+                },
+            )
+
+    deduped: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str, str, str]] = set()
+    for item in hypotheses:
+        key = (
+            str(item.get("type") or ""),
+            str(item.get("host") or ""),
+            str(item.get("path") or ""),
+            str(item.get("impact") or item.get("impact_hypothesis") or ""),
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(item)
+    deduped.sort(key=hypothesis_sort_key)
+
+    status_counts: dict[str, int] = {}
+    priority_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
+    ready_count = 0
+    resource_gated_count = 0
+    for item in deduped:
+        item_status = str(item.get("status") or "unknown")
+        increment_count(status_counts, item_status)
+        increment_count(priority_counts, str(item.get("priority") or "info"))
+        increment_count(type_counts, str(item.get("type") or "unknown"))
+        if item_status in {"ready-for-offline-review", "ready-for-low-risk-validation"}:
+            ready_count += 1
+        if item_status == "resource-gated":
+            resource_gated_count += 1
+
+    if ready_count:
+        status = "has-ranked-hypotheses"
+    elif resource_gated_count:
+        status = "resource-gated"
+    elif deduped:
+        status = "hypotheses-indexed"
+    else:
+        status = "no-hypotheses"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": str(artifact_dir),
+        "mode": "single-run",
+        "summary": {
+            "hypotheses": len(deduped),
+            "ready_hypotheses": ready_count,
+            "resource_gated_hypotheses": resource_gated_count,
+            "status_counts": dict(sorted(status_counts.items())),
+            "priority_counts": dict(sorted(priority_counts.items())),
+            "type_counts": dict(sorted(type_counts.items())),
+            "harness_loop": harness_loop.get("status"),
+            "resource_snapshot": artifact_summary_status(resource_snapshot),
+        },
+        "hypotheses": deduped,
+        "artifact_refs": {
+            "harness_loop": HARNESS_LOOP_ARTIFACT,
+            "lead_portfolio": LEAD_PORTFOLIO_ARTIFACT,
+            "verification_queue": "verification-queue.json",
+            "endpoint_clusters": "endpoint-clusters.json",
+            "asset_candidates": BLACKBOX_ASSET_CANDIDATES_ARTIFACT,
+            "resource_snapshot": RESOURCE_SNAPSHOT_ARTIFACT,
+        },
+        "safety": (
+            "Read-only hypothesis matrix. It synthesizes candidate research questions from local artifacts only; "
+            "it does not send requests, invoke Burp, run scanners, sign wallets, or submit transactions."
+        ),
+    }
+
+
+def build_hypothesis_matrix_rollup(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    check_dirs: list[Path],
+) -> dict[str, Any]:
+    hypotheses: list[dict[str, Any]] = []
+    runs = []
+    missing = []
+    run_status_counts: dict[str, int] = {}
+    for check_dir in check_dirs:
+        relative_dir = repo_relative_or_absolute(check_dir)
+        if not check_dir.exists():
+            missing.append(relative_dir)
+            increment_count(run_status_counts, "missing-artifact-dir")
+            runs.append({"artifact_dir": relative_dir, "status": "missing-artifact-dir", "summary": {}})
+            continue
+        doc = build_hypothesis_matrix_run(
+            target=target_for_artifact_dir(check_dir, target),
+            profile=None,
+            artifact_dir=check_dir,
+        )
+        run_status = str(doc.get("status") or "unknown")
+        increment_count(run_status_counts, run_status)
+        runs.append(
+            {
+                "artifact_dir": relative_dir,
+                "status": run_status,
+                "summary": doc.get("summary", {}),
+            }
+        )
+        for item in doc.get("hypotheses", []) or []:
+            if not isinstance(item, dict):
+                continue
+            row = json_clone(item)
+            original_id = str(row.get("id") or "hypothesis")
+            row["id"] = f"RUN-{safe_probe_id(relative_dir)}-{original_id}"
+            row["run_hypothesis_id"] = original_id
+            row["artifact_dir"] = relative_dir
+            row["evidence_refs"] = compact_source_refs(
+                [
+                    f"{relative_dir}/{ref}" if not str(ref).startswith("/") else str(ref)
+                    for ref in row.get("evidence_refs", []) or []
+                ]
+            )
+            hypotheses.append(row)
+
+    hypotheses.sort(key=hypothesis_sort_key)
+    status_counts: dict[str, int] = {}
+    priority_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
+    ready_count = 0
+    resource_gated_count = 0
+    for item in hypotheses:
+        item_status = str(item.get("status") or "unknown")
+        increment_count(status_counts, item_status)
+        increment_count(priority_counts, str(item.get("priority") or "info"))
+        increment_count(type_counts, str(item.get("type") or "unknown"))
+        if item_status in {"ready-for-offline-review", "ready-for-low-risk-validation"}:
+            ready_count += 1
+        if item_status == "resource-gated":
+            resource_gated_count += 1
+
+    if missing:
+        status = "failed"
+    elif ready_count:
+        status = "has-ranked-hypotheses"
+    elif resource_gated_count:
+        status = "resource-gated"
+    elif hypotheses:
+        status = "hypotheses-indexed"
+    else:
+        status = "no-hypotheses"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": str(artifact_dir),
+        "mode": "rollup",
+        "summary": {
+            "runs": len(runs),
+            "hypotheses": len(hypotheses),
+            "ready_hypotheses": ready_count,
+            "resource_gated_hypotheses": resource_gated_count,
+            "missing_artifact_dirs": missing,
+            "status_counts": dict(sorted(status_counts.items())),
+            "priority_counts": dict(sorted(priority_counts.items())),
+            "type_counts": dict(sorted(type_counts.items())),
+            "run_status_counts": dict(sorted(run_status_counts.items())),
+        },
+        "runs": runs,
+        "hypotheses": hypotheses,
+        "artifact_refs": {
+            "hypothesis_matrix": HYPOTHESIS_MATRIX_ARTIFACT,
+            "harness_loop": HARNESS_LOOP_ARTIFACT,
+            "lead_portfolio": LEAD_PORTFOLIO_ARTIFACT,
+        },
+        "safety": (
+            "Read-only hypothesis matrix rollup. It reads child artifacts only and does not send requests, "
             "invoke Burp, run scanners, sign wallets, submit transactions, or fetch external hosts."
         ),
     }
@@ -27870,6 +28394,18 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         blackbox_harness_loop_discovered_dirs = [
             path.name for path in discover_harness_loop_dirs(harness_loop_root)
         ]
+        blackbox_hypothesis_matrix_sample = build_hypothesis_matrix_run(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_run_dir,
+        )
+        blackbox_hypothesis_matrix_rollup_sample = build_hypothesis_matrix_rollup(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_root,
+            check_dirs=[harness_loop_run_dir],
+        )
+        blackbox_hypothesis_matrix_text_sample = json.dumps(blackbox_hypothesis_matrix_sample, sort_keys=True)
     blackbox_asset_profile_paths = {
         cluster.get("path")
         for cluster in blackbox_asset_profile_sample.get("clusters", [])
@@ -28057,6 +28593,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_harness_loop_rollup_sample.get("status") == "needs-deepening"
         and blackbox_harness_loop_rollup_sample.get("summary", {}).get("runs") == 1
         and blackbox_harness_loop_discovered_dirs == ["run"]
+        and blackbox_hypothesis_matrix_sample.get("status") == "has-ranked-hypotheses"
+        and blackbox_hypothesis_matrix_sample.get("summary", {}).get("hypotheses", 0) >= 3
+        and blackbox_hypothesis_matrix_sample.get("summary", {}).get("ready_hypotheses", 0) >= 1
+        and any(
+            item.get("type") == "cluster-strategy"
+            for item in blackbox_hypothesis_matrix_sample.get("hypotheses", [])
+        )
+        and blackbox_hypothesis_matrix_rollup_sample.get("summary", {}).get("runs") == 1
+        and blackbox_hypothesis_matrix_rollup_sample.get("status") == "has-ranked-hypotheses"
+        and "top-secret" not in blackbox_hypothesis_matrix_text_sample
+        and "AbC1234567890Token" not in blackbox_hypothesis_matrix_text_sample
         and blackbox_asset_clusters_sample.get("profile", {}).get("asset_candidate_profile") is True
         and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_verification_command_text
         and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_asset_verification_command_text
@@ -33070,6 +33617,102 @@ def run_harness_loop(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_hypothesis_matrix(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    check_dirs: list[Path] = []
+    for item in args.check_dir or []:
+        check_dirs.append(resolve_repo_path(item))
+    if args.discover_child_runs:
+        check_dirs.extend(discover_harness_loop_dirs(artifact_dir))
+    deduped_dirs = []
+    seen_dirs: set[str] = set()
+    for check_dir in check_dirs:
+        resolved = check_dir.resolve()
+        key = str(resolved)
+        if key in seen_dirs:
+            continue
+        seen_dirs.add(key)
+        deduped_dirs.append(resolved)
+
+    if deduped_dirs:
+        matrix = build_hypothesis_matrix_rollup(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            check_dirs=deduped_dirs,
+        )
+    else:
+        matrix = build_hypothesis_matrix_run(target=target, profile=profile, artifact_dir=artifact_dir)
+
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / HYPOTHESIS_MATRIX_ARTIFACT
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, matrix)
+        if deduped_dirs:
+            refreshed_manifests = refresh_manifests_for_artifact_outputs(
+                output_paths=[output_path],
+                artifact_dir=artifact_dir,
+                check_dirs=deduped_dirs,
+                target=target,
+                command="hypothesis-matrix",
+            )
+        else:
+            refreshed_manifests = refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="hypothesis-matrix",
+                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+            )
+
+    summary = matrix.get("summary", {}) or {}
+    print(f"Hypothesis matrix: {matrix['status']}")
+    if matrix.get("mode") == "rollup":
+        print(
+            "Runs: "
+            f"{summary.get('runs', 0)} checked, "
+            f"run_status_counts={json.dumps(summary.get('run_status_counts', {}), sort_keys=True)}"
+        )
+    print(
+        "Hypotheses: "
+        f"{summary.get('hypotheses', 0)} total, "
+        f"ready={summary.get('ready_hypotheses', 0)}, "
+        f"resource_gated={summary.get('resource_gated_hypotheses', 0)}, "
+        f"statuses={json.dumps(summary.get('status_counts', {}), sort_keys=True)}"
+    )
+    print(f"Types: {json.dumps(summary.get('type_counts', {}), sort_keys=True)}")
+
+    top_count = max(0, int(args.top))
+    if top_count:
+        print("Top hypotheses:")
+        for item in (matrix.get("hypotheses", []) or [])[:top_count]:
+            run_text = f" run={item.get('artifact_dir')}" if item.get("artifact_dir") else ""
+            print(
+                f"- {item.get('priority')} {item.get('status')} {item.get('type')} "
+                f"host={item.get('host') or '-'} path={item.get('path') or '-'} "
+                f"impact={inline_summary_text(item.get('impact') or item.get('impact_hypothesis'), max_chars=90)}{run_text}"
+            )
+            if args.show_next:
+                print(f"  next={inline_summary_text(item.get('next_step'), max_chars=220)}")
+                print(f"  gate={inline_summary_text(item.get('reportability_gate'), max_chars=220)}")
+
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+
+    if matrix["status"] == "failed":
+        return 1
+    if args.strict and matrix["status"] not in {"has-ranked-hypotheses", "resource-gated"}:
+        return 1
+    return 0
+
+
 def run_decode_transactions(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -34538,6 +35181,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless the loop is ready with no reportable findings or has reportable findings.",
     )
     harness_loop.set_defaults(func=run_harness_loop)
+
+    hypothesis_matrix = sub.add_parser(
+        "hypothesis-matrix",
+        help="Rank offline vulnerability hypotheses from harness loop, leads, queue, clusters, and config hosts",
+    )
+    hypothesis_matrix.add_argument(
+        "--output",
+        help="Where to write hypothesis-matrix.json. Defaults to --artifact-dir/hypothesis-matrix.json.",
+    )
+    hypothesis_matrix.add_argument(
+        "--check-dir",
+        action="append",
+        help="Child artifact directory to include in a rollup. Repeat as needed.",
+    )
+    hypothesis_matrix.add_argument(
+        "--discover-child-runs",
+        action="store_true",
+        help="Build a rollup from child directories under --artifact-dir with harness artifacts.",
+    )
+    hypothesis_matrix.add_argument(
+        "--top",
+        type=positive_int,
+        default=10,
+        help="Number of top hypotheses to print.",
+    )
+    hypothesis_matrix.add_argument(
+        "--show-next",
+        action="store_true",
+        help="Print next-step and reportability gate details for top hypotheses.",
+    )
+    hypothesis_matrix.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print hypothesis summary only; do not write hypothesis-matrix.json or refreshed manifests.",
+    )
+    hypothesis_matrix.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless ranked or resource-gated hypotheses are present.",
+    )
+    hypothesis_matrix.set_defaults(func=run_hypothesis_matrix)
 
     decode = sub.add_parser(
         "decode-transactions",
