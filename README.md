@@ -237,6 +237,8 @@ python3 scripts/inferforge.py --target https://in-scope.example \
 python3 scripts/inferforge.py --target https://in-scope.example \
   --artifact-dir .greybox/in-scope-example \
   lead-portfolio --no-write
+python3 scripts/inferforge.py --artifact-dir .greybox/target-set \
+  lead-portfolio --discover-child-runs --no-write
 ```
 
 `lead-portfolio` reads existing local artifacts only. It combines static asset
@@ -244,7 +246,10 @@ endpoint candidates, WebSocket handshake candidates, runtime configuration
 hosts, external script hosts, scope-policy decisions, generated asset profiles,
 handshake review results, and takeover baselines. The output is a triage queue,
 not evidence of impact: every entry keeps a reportability gate and a safe next
-step, and no endpoint, host, or script is requested by this command.
+step, and no endpoint, host, or script is requested by this command. Use
+`--check-dir` repeatedly or `--discover-child-runs` to build a root-level rollup
+across multiple child runs that already contain `lead-portfolio.json`; this is
+also offline and prints per-run status counts plus the top actionable leads.
 
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:
@@ -284,14 +289,16 @@ starting unattended work:
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
-  resource-snapshot --watch-port 3100 --watch-port 2455
+  resource-snapshot --watch-port 3100 --watch-port 2455 --strict
 ```
 
 `resource-snapshot` reads local `/proc` memory, swap, TCP listener, and top RSS
-process metadata only; it sends no network requests. Port `3100` is the default
-local target application port for the checked-in profile, not Burp's proxy or
-Burp's built-in browser. Keep it closed unless a local app regression actually
-needs the dev server.
+process metadata only; it sends no network requests. With `--strict`, it returns
+non-zero when the configured memory or swap warning thresholds are exceeded, so
+unattended scripts can stop before launching heavier work. Port `3100` is the
+default local target application port for the checked-in profile, not Burp's
+proxy or Burp's built-in browser. Keep it closed unless a local app regression
+actually needs the dev server.
 
 Review program scope, authentication context, and endpoint criticality before
 any active probes:

@@ -6998,6 +6998,34 @@ def lead_status_from_scope(scope_decision: str, *, default: str = "needs-review"
     return default
 
 
+LEAD_TERMINAL_STATUSES = {
+    "out-of-scope-by-default",
+    "no-takeover-signal",
+    "promoted-to-asset-profile",
+    "scope-covered-reference",
+    "websocket-baseline-complete",
+}
+
+LEAD_PRIORITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+
+
+def is_terminal_lead_status(status: Any) -> bool:
+    return str(status or "") in LEAD_TERMINAL_STATUSES
+
+
+def lead_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        1 if is_terminal_lead_status(item.get("status")) else 0,
+        0 if str(item.get("scope_decision") or "") == "in-scope-explicit-host" else 1,
+        LEAD_PRIORITY_ORDER.get(str(item.get("priority") or "info"), 9),
+        str(item.get("status") or ""),
+        str(item.get("type") or ""),
+        str(item.get("host") or ""),
+        str(item.get("path") or ""),
+        str(item.get("artifact_dir") or ""),
+    )
+
+
 def build_lead_portfolio(
     *,
     target: str,
@@ -7166,25 +7194,7 @@ def build_lead_portfolio(
             }
         )
 
-    terminal_statuses = {
-        "out-of-scope-by-default",
-        "no-takeover-signal",
-        "promoted-to-asset-profile",
-        "scope-covered-reference",
-        "websocket-baseline-complete",
-    }
-    priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-    leads.sort(
-        key=lambda item: (
-            1 if str(item.get("status") or "") in terminal_statuses else 0,
-            0 if str(item.get("scope_decision") or "") == "in-scope-explicit-host" else 1,
-            priority_order.get(str(item.get("priority") or "info"), 9),
-            str(item.get("status") or ""),
-            str(item.get("type") or ""),
-            str(item.get("host") or ""),
-            str(item.get("path") or ""),
-        )
-    )
+    leads.sort(key=lead_sort_key)
     status_counts: dict[str, int] = {}
     priority_counts: dict[str, int] = {}
     type_counts: dict[str, int] = {}
@@ -7196,7 +7206,7 @@ def build_lead_portfolio(
         increment_count(priority_counts, str(lead.get("priority") or "info"))
         increment_count(type_counts, str(lead.get("type") or "unknown"))
         increment_count(scope_counts, str(lead.get("scope_decision") or "missing-policy-decision"))
-        if status not in terminal_statuses:
+        if not is_terminal_lead_status(status):
             actionable_count += 1
 
     return {
@@ -7222,6 +7232,153 @@ def build_lead_portfolio(
         "safety": (
             "Lead portfolio is passive triage over existing local artifacts. It sends no requests, "
             "does not prove impact, and must not be treated as a reportable finding without a concrete PoC."
+        ),
+    }
+
+
+def compact_rollup_lead(lead: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for field in [
+        "id",
+        "run_lead_id",
+        "artifact_dir",
+        "type",
+        "status",
+        "priority",
+        "host",
+        "path",
+        "method_hint",
+        "scope_decision",
+        "triage_class",
+        "reportability_gate",
+        "next_step",
+        "source_lead_portfolio",
+    ]:
+        if lead.get(field) not in (None, "", []):
+            compact[field] = lead.get(field)
+    refs = compact_source_refs(lead.get("evidence_refs", []) or [])
+    if refs:
+        compact["evidence_refs"] = refs
+    return compact
+
+
+def build_lead_portfolio_rollup(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    check_dirs: list[Path],
+) -> dict[str, Any]:
+    leads: list[dict[str, Any]] = []
+    runs = []
+    missing = []
+    run_status_counts: dict[str, int] = {}
+
+    for check_dir in check_dirs:
+        path = check_dir / LEAD_PORTFOLIO_ARTIFACT
+        relative_dir = repo_relative_or_absolute(check_dir)
+        if not path.exists():
+            missing.append(relative_dir)
+            increment_count(run_status_counts, "missing-lead-portfolio")
+            runs.append(
+                {
+                    "artifact_dir": relative_dir,
+                    "status": "missing-lead-portfolio",
+                    "lead_portfolio": repo_relative_or_absolute(path),
+                    "summary": {},
+                }
+            )
+            continue
+
+        doc = load_optional_json(path) or {}
+        run_status = str(doc.get("status") or "unknown")
+        increment_count(run_status_counts, run_status)
+        runs.append(
+            {
+                "artifact_dir": relative_dir,
+                "target": doc.get("target"),
+                "status": run_status,
+                "lead_portfolio": repo_relative_or_absolute(path),
+                "summary": doc.get("summary", {}),
+            }
+        )
+        for index, lead in enumerate(doc.get("leads", []) or [], start=1):
+            if not isinstance(lead, dict):
+                continue
+            row = json_clone(lead)
+            original_id = str(row.get("id") or f"lead-{index}")
+            row["id"] = f"RUN-{safe_probe_id(relative_dir)}-{original_id}"
+            row["run_lead_id"] = original_id
+            row["artifact_dir"] = relative_dir
+            row["source_lead_portfolio"] = repo_relative_or_absolute(path)
+            row["evidence_refs"] = compact_source_refs(
+                [
+                    f"{relative_dir}/{ref}" if not str(ref).startswith("/") else str(ref)
+                    for ref in row.get("evidence_refs", []) or []
+                ]
+            )
+            leads.append(row)
+
+    leads.sort(key=lead_sort_key)
+    status_counts: dict[str, int] = {}
+    priority_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
+    scope_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    actionable_count = 0
+    for lead in leads:
+        status = str(lead.get("status") or "unknown")
+        increment_count(status_counts, status)
+        increment_count(priority_counts, str(lead.get("priority") or "info"))
+        increment_count(type_counts, str(lead.get("type") or "unknown"))
+        increment_count(scope_counts, str(lead.get("scope_decision") or "missing-policy-decision"))
+        increment_count(source_counts, str(lead.get("artifact_dir") or "unknown"))
+        if not is_terminal_lead_status(status):
+            actionable_count += 1
+
+    if missing:
+        status = "failed"
+    elif actionable_count:
+        status = "has-actionable-leads"
+    elif leads:
+        status = "leads-indexed"
+    else:
+        status = "no-leads"
+
+    top_actionable = [
+        compact_rollup_lead(lead)
+        for lead in leads
+        if not is_terminal_lead_status(lead.get("status"))
+    ][:20]
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": str(artifact_dir),
+        "mode": "rollup",
+        "summary": {
+            "runs": len(runs),
+            "leads": len(leads),
+            "actionable_leads": actionable_count,
+            "missing_lead_portfolios": missing,
+            "status_counts": dict(sorted(status_counts.items())),
+            "priority_counts": dict(sorted(priority_counts.items())),
+            "type_counts": dict(sorted(type_counts.items())),
+            "scope_decision_counts": dict(sorted(scope_counts.items())),
+            "source_counts": dict(sorted(source_counts.items())),
+            "run_status_counts": dict(sorted(run_status_counts.items())),
+        },
+        "runs": runs,
+        "top_actionable_leads": top_actionable,
+        "leads": leads,
+        "artifact_refs": {
+            "lead_portfolio": LEAD_PORTFOLIO_ARTIFACT,
+        },
+        "safety": (
+            "Read-only lead portfolio rollup. It reads child lead-portfolio artifacts only and does not send "
+            "HTTP requests, invoke Burp, run Burp Scanner, sign wallets, submit transactions, or fetch external hosts."
         ),
     }
 
@@ -20065,6 +20222,13 @@ def discover_review_blocker_dirs(root_dir: Path) -> list[Path]:
     )
 
 
+def discover_lead_portfolio_dirs(root_dir: Path) -> list[Path]:
+    return sorted(
+        {path.parent for path in root_dir.glob(f"*/{LEAD_PORTFOLIO_ARTIFACT}")},
+        key=lambda item: str(item),
+    )
+
+
 def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
     directories = [build_single_artifact_health(path.resolve()) for path in artifact_dirs]
     status_counts: dict[str, int] = {}
@@ -27109,6 +27273,52 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         host_takeover_baseline=blackbox_takeover_baseline_sample,
     )
     blackbox_lead_portfolio_text_sample = json.dumps(blackbox_lead_portfolio_sample, sort_keys=True)
+    with tempfile.TemporaryDirectory(prefix="inferforge-lead-rollup-selftest-") as lead_rollup_temp_dir:
+        lead_rollup_root = Path(lead_rollup_temp_dir)
+        lead_rollup_default_dir = lead_rollup_root / "default"
+        lead_rollup_quote_dir = lead_rollup_root / "quote"
+        lead_rollup_default_dir.mkdir()
+        lead_rollup_quote_dir.mkdir()
+        quote_terminal_portfolio = {
+            "generated_at": utc_now(),
+            "status": "leads-indexed",
+            "target": "https://quote.blackbox.test",
+            "summary": {
+                "leads": 1,
+                "actionable_leads": 0,
+                "status_counts": {"scope-covered-reference": 1},
+                "priority_counts": {"info": 1},
+                "type_counts": {"runtime-config-host": 1},
+                "scope_decision_counts": {"in-scope-explicit-host": 1},
+            },
+            "leads": [
+                {
+                    "id": "runtime-host:quote.blackbox.test",
+                    "type": "runtime-config-host",
+                    "status": "scope-covered-reference",
+                    "priority": "info",
+                    "host": "quote.blackbox.test",
+                    "scope_decision": "in-scope-explicit-host",
+                    "reportability_gate": "A runtime host reference is not reportable without concrete impact.",
+                    "next_step": "Use host-specific runs for concrete evidence.",
+                    "evidence_refs": [BLACKBOX_ASSET_CANDIDATES_ARTIFACT, SCOPE_POLICY_ARTIFACT],
+                    "safety": "Synthetic terminal lead for rollup self-test.",
+                }
+            ],
+            "safety": "Synthetic local lead portfolio for rollup self-test.",
+        }
+        write_json(lead_rollup_default_dir / LEAD_PORTFOLIO_ARTIFACT, blackbox_lead_portfolio_sample)
+        write_json(lead_rollup_quote_dir / LEAD_PORTFOLIO_ARTIFACT, quote_terminal_portfolio)
+        blackbox_lead_rollup_sample = build_lead_portfolio_rollup(
+            target="https://blackbox.test",
+            profile=blackbox_asset_profile_sample,
+            artifact_dir=lead_rollup_root,
+            check_dirs=[lead_rollup_default_dir, lead_rollup_quote_dir],
+        )
+        blackbox_lead_rollup_text_sample = json.dumps(blackbox_lead_rollup_sample, sort_keys=True)
+        blackbox_lead_rollup_discovered_dirs = [
+            path.name for path in discover_lead_portfolio_dirs(lead_rollup_root)
+        ]
     blackbox_asset_profile_paths = {
         cluster.get("path")
         for cluster in blackbox_asset_profile_sample.get("clusters", [])
@@ -27266,6 +27476,23 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_lead_portfolio_sample.get("summary", {}).get("scope_decision_counts", {}).get("out-of-scope-by-default") == 3
         and "top-secret" not in blackbox_lead_portfolio_text_sample
         and "AbC1234567890Token" not in blackbox_lead_portfolio_text_sample
+        and blackbox_lead_rollup_sample.get("status") == "has-actionable-leads"
+        and blackbox_lead_rollup_sample.get("mode") == "rollup"
+        and blackbox_lead_rollup_sample.get("summary", {}).get("runs") == 2
+        and blackbox_lead_rollup_sample.get("summary", {}).get("leads")
+        == blackbox_lead_portfolio_sample.get("summary", {}).get("leads") + 1
+        and blackbox_lead_rollup_sample.get("summary", {}).get("actionable_leads")
+        == blackbox_lead_portfolio_sample.get("summary", {}).get("actionable_leads")
+        and blackbox_lead_rollup_sample.get("summary", {}).get("run_status_counts", {}).get("has-actionable-leads") == 1
+        and blackbox_lead_rollup_sample.get("summary", {}).get("run_status_counts", {}).get("leads-indexed") == 1
+        and blackbox_lead_rollup_discovered_dirs == ["default", "quote"]
+        and bool(blackbox_lead_rollup_sample.get("top_actionable_leads"))
+        and all(
+            lead.get("artifact_dir") and lead.get("run_lead_id")
+            for lead in blackbox_lead_rollup_sample.get("top_actionable_leads", [])
+        )
+        and "top-secret" not in blackbox_lead_rollup_text_sample
+        and "AbC1234567890Token" not in blackbox_lead_rollup_text_sample
         and blackbox_asset_clusters_sample.get("profile", {}).get("asset_candidate_profile") is True
         and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_verification_command_text
         and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_asset_verification_command_text
@@ -31915,6 +32142,8 @@ def run_resource_snapshot(args: argparse.Namespace) -> int:
                 output_paths=[output_path],
             )
         )
+    if args.strict and snapshot["status"] != "healthy":
+        return 1
     return 0
 
 
@@ -32074,20 +32303,63 @@ def run_websocket_candidate_review(args: argparse.Namespace) -> int:
 
 def run_lead_portfolio(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
     if not args.no_write:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         write_target_profile_artifact(artifact_dir, profile, target, source_root)
-    portfolio = build_lead_portfolio(
-        target=target,
-        asset_candidates_doc=load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT),
-        scope_policy=load_optional_json(artifact_dir / SCOPE_POLICY_ARTIFACT),
-        asset_profile=load_optional_json(artifact_dir / BLACKBOX_ASSET_PROFILE_ARTIFACT),
-        websocket_candidate_review=load_optional_json(artifact_dir / WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT),
-        host_takeover_baseline=load_optional_json(artifact_dir / HOST_TAKEOVER_BASELINE_ARTIFACT),
-    )
-    output_path = artifact_dir / LEAD_PORTFOLIO_ARTIFACT
-    if not args.no_write:
+    check_dirs: list[Path] = []
+    for item in args.check_dir or []:
+        check_dirs.append(resolve_repo_path(item))
+    if args.discover_child_runs:
+        check_dirs.extend(discover_lead_portfolio_dirs(artifact_dir))
+    deduped_dirs = []
+    seen_dirs: set[str] = set()
+    for check_dir in check_dirs:
+        resolved = check_dir.resolve()
+        key = str(resolved)
+        if key in seen_dirs:
+            continue
+        seen_dirs.add(key)
+        deduped_dirs.append(resolved)
+
+    if deduped_dirs:
+        portfolio = build_lead_portfolio_rollup(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            check_dirs=deduped_dirs,
+        )
+    else:
+        portfolio = build_lead_portfolio(
+            target=target,
+            asset_candidates_doc=load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT),
+            scope_policy=load_optional_json(artifact_dir / SCOPE_POLICY_ARTIFACT),
+            asset_profile=load_optional_json(artifact_dir / BLACKBOX_ASSET_PROFILE_ARTIFACT),
+            websocket_candidate_review=load_optional_json(artifact_dir / WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT),
+            host_takeover_baseline=load_optional_json(artifact_dir / HOST_TAKEOVER_BASELINE_ARTIFACT),
+        )
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / LEAD_PORTFOLIO_ARTIFACT
+    refreshed_manifests = []
+    if not no_write:
         write_json(output_path, portfolio)
+        if deduped_dirs:
+            refreshed_manifests = refresh_manifests_for_artifact_outputs(
+                output_paths=[output_path],
+                artifact_dir=artifact_dir,
+                check_dirs=deduped_dirs,
+                target=target,
+                command="lead-portfolio",
+            )
+        else:
+            refreshed_manifests = refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="lead-portfolio",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    output_path,
+                ],
+            )
     summary = portfolio.get("summary", {}) or {}
     print(f"Lead portfolio: {portfolio['status']}")
     print(
@@ -32098,30 +32370,29 @@ def run_lead_portfolio(args: argparse.Namespace) -> int:
     )
     print(f"Statuses: {json.dumps(summary.get('status_counts', {}), sort_keys=True)}")
     print(f"Scope decisions: {json.dumps(summary.get('scope_decision_counts', {}), sort_keys=True)}")
+    if portfolio.get("mode") == "rollup":
+        print(
+            "Runs: "
+            f"{summary.get('runs', 0)} checked, "
+            f"run_status_counts={json.dumps(summary.get('run_status_counts', {}), sort_keys=True)}"
+        )
     top_count = max(0, int(args.top))
     if top_count:
         print("Top leads:")
         for lead in portfolio.get("leads", [])[:top_count]:
+            run_text = f" run={lead.get('artifact_dir')}" if lead.get("artifact_dir") else ""
             print(
                 f"- {lead.get('priority')} {lead.get('type')} {lead.get('status')} "
                 f"host={lead.get('host')} path={lead.get('path') or '-'} "
-                f"scope={lead.get('scope_decision')}"
+                f"scope={lead.get('scope_decision')}{run_text}"
             )
-    if args.no_write:
+    if no_write:
         print("No files written (--no-write).")
     else:
         print(f"Wrote {output_path}")
-        print_refreshed_manifests(
-            refresh_current_artifact_manifest(
-                artifact_dir=artifact_dir,
-                target=target,
-                command="lead-portfolio",
-                output_paths=[
-                    *target_profile_artifact_paths(artifact_dir),
-                    output_path,
-                ],
-            )
-        )
+        print_refreshed_manifests(refreshed_manifests)
+    if portfolio["status"] == "failed":
+        return 1
     if args.strict and portfolio["status"] == "has-actionable-leads":
         return 1
     return 0
@@ -33434,6 +33705,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print resource status only; do not write resource-snapshot.json or refresh manifests.",
     )
+    resource_snapshot.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero when memory or swap thresholds are exceeded.",
+    )
     resource_snapshot.set_defaults(func=run_resource_snapshot)
 
     scope_policy = sub.add_parser(
@@ -33516,6 +33792,20 @@ def build_parser() -> argparse.ArgumentParser:
     lead_portfolio = sub.add_parser(
         "lead-portfolio",
         help="Build a passive prioritized portfolio from black-box asset, scope, WebSocket, and takeover leads",
+    )
+    lead_portfolio.add_argument(
+        "--output",
+        help="Where to write lead-portfolio.json. Defaults to --artifact-dir/lead-portfolio.json.",
+    )
+    lead_portfolio.add_argument(
+        "--check-dir",
+        action="append",
+        help="Child artifact directory to include in a rollup. Repeat as needed.",
+    )
+    lead_portfolio.add_argument(
+        "--discover-child-runs",
+        action="store_true",
+        help="Build a rollup from child directories under --artifact-dir that contain lead-portfolio.json.",
     )
     lead_portfolio.add_argument(
         "--top",
