@@ -10093,6 +10093,20 @@ def select_cluster_ids(
     }
 
 
+def plan_observed_only_notice(profile: dict[str, Any], selection: dict[str, Any]) -> str | None:
+    blackbox = profile.get("blackbox", {}) if isinstance(profile.get("blackbox"), dict) else {}
+    if not blackbox.get("asset_candidate_profile"):
+        return None
+    if selection.get("mode") != "observed-only":
+        return None
+    if selection.get("selected_cluster_ids"):
+        return None
+    return (
+        "Note: this is a reviewed asset-candidate profile, not Burp-observed traffic. "
+        "Use plan --no-write without --observed-only after scope review to preview its candidate probes."
+    )
+
+
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -24938,6 +24952,20 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         for cluster in blackbox_asset_profile_sample.get("clusters", [])
         for key in cluster.get("discovery", {}).get("query_keys", [])
     }
+    blackbox_asset_normalized_profile = normalize_target_profile(
+        blackbox_asset_profile_sample,
+        profile_path=ROOT / "scripts/inferforge.py",
+    )
+    blackbox_asset_clusters_sample = build_clusters(blackbox_asset_normalized_profile, ROOT)
+    blackbox_asset_observed_selection_sample = select_cluster_ids(
+        {"endpoints": []},
+        blackbox_asset_clusters_sample,
+        source_assisted=False,
+    )
+    blackbox_asset_observed_notice_sample = plan_observed_only_notice(
+        blackbox_asset_normalized_profile,
+        blackbox_asset_observed_selection_sample,
+    )
     blackbox_probe_ids_sample = [
         probe.id
         for probe in build_probe_plan(
@@ -25003,6 +25031,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_asset_profile_summary_sample.get("skipped", {}).get("triage_class") == 2
         and blackbox_asset_profile_paths == {"/trade/BTCUSD"}
         and blackbox_asset_profile_query_keys == {"debug", "from"}
+        and blackbox_asset_observed_selection_sample.get("selected_cluster_ids") == []
+        and "asset-candidate profile" in str(blackbox_asset_observed_notice_sample)
         and "/api/orders" not in blackbox_asset_profile_text_sample
         and "/api/v1/markets" not in blackbox_asset_profile_text_sample
         and "/ws/v1/quotes" not in blackbox_asset_profile_text_sample
@@ -26698,6 +26728,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "source_peek_status": blackbox_source_peeks_sample.get("status"),
             "coverage_status": blackbox_coverage_sample.get("status"),
             "probe_ids": blackbox_probe_ids_sample,
+            "asset_profile_observed_only_notice": blackbox_asset_observed_notice_sample,
         },
         "any_method_match_reasons": {
             "status": "passed" if any_method_match_reason_passed else "failed",
@@ -27381,6 +27412,9 @@ def run_plan(args: argparse.Namespace) -> int:
     print(f"WebSocket probes: {'enabled' if ws_enabled else 'disabled'}")
     print(f"Selection mode: {selection['mode']}")
     print(f"Selected clusters: {', '.join(selection['selected_cluster_ids']) or '(none)'}")
+    observed_only_notice = plan_observed_only_notice(profile, selection)
+    if observed_only_notice:
+        print(observed_only_notice)
     if no_write:
         probe_summaries = top_probe_plan_summaries(probes, ranking)
         if probe_summaries:
@@ -29100,7 +29134,7 @@ def run_blackbox_asset_profile(args: argparse.Namespace) -> int:
     print(f"Wrote {output_path}")
     print(f"Wrote {validation_path}")
     print(f"Wrote {summary_path}")
-    print("Next: run plan --observed-only --no-write with this profile before any active probes.")
+    print("Next: run plan --no-write with this profile before any active probes.")
     print_refreshed_manifests(
         refresh_current_artifact_manifest(
             artifact_dir=artifact_dir,

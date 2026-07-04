@@ -153,6 +153,20 @@ keeps query parameter names, and leaves API, WebSocket, sensitive, and
 state-changing candidates in the review queue. Use `--allow-triage-class` only
 after a candidate class has a safe, read-only reproduction plan.
 
+Preview the promoted route probes without sending them:
+
+```bash
+python3 scripts/inferforge.py \
+  --profile .greybox/in-scope-example/blackbox-asset-profile.json \
+  --target https://in-scope.example \
+  --artifact-dir .greybox/in-scope-example \
+  plan --no-write
+```
+
+Do not add `--observed-only` for this preview: asset profiles are generated from
+reviewed static candidates, not Burp-observed traffic, so observed-only planning
+will select no clusters until those routes have been observed separately.
+
 The default resource caps are intentionally small: 4 same-origin script assets,
 256 KiB per fetched resource, and 80 retained candidates. Raise `--max-assets`,
 `--max-bytes`, or `--candidate-limit` only when the runner has enough memory and
