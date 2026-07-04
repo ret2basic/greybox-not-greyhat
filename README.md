@@ -308,8 +308,11 @@ It scans only bounded local TS/JS source files, skips dependency/build
 directories, and distinguishes remote quote transaction payloads flowing toward
 wallet signing from locally constructed transaction signing helpers. The output
 `.greybox/transaction-flow-review.json` lists dataflow refs, required decoded
-intent comparisons, and forbidden actions. It sends no requests, does not open a
-wallet, and never signs or submits transactions.
+intent comparisons, forbidden actions, and an intent-policy scaffold derived
+from profile `quote_intent` directions. The scaffold records which buy/sell
+mint pairs and `allowedPrograms` are already known and which runtime values
+still need an approved quote corpus, wallet, and raw `amountIn`. It sends no
+requests, does not open a wallet, and never signs or submits transactions.
 When RPC source shows client-keyed in-memory rate-limit fallback behavior, the
 matrix can add a `resource-abuse-review` hypothesis. This is also offline-only:
 review deployment proxy header trust, external rate-limit store configuration,

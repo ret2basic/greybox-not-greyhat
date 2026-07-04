@@ -8296,6 +8296,11 @@ def hypothesis_from_rpc_method_policy(
     ]
     flow_artifact = transaction_flow_review if isinstance(transaction_flow_review, dict) else {}
     flow_summary = flow_artifact.get("summary") if isinstance(flow_artifact.get("summary"), dict) else {}
+    policy_scaffold = (
+        flow_artifact.get("intent_policy_scaffold")
+        if isinstance(flow_artifact.get("intent_policy_scaffold"), dict)
+        else {}
+    )
     flow_dataflows = [
         item for item in flow_artifact.get("dataflows", []) or [] if isinstance(item, dict)
     ]
@@ -8372,6 +8377,8 @@ def hypothesis_from_rpc_method_policy(
             "remote_payload_to_wallet_signing": bool(remote_payload_flow),
             "remote_signing_sink_ref_count": flow_summary.get("remote_signing_sink_refs", 0),
             "local_signing_sink_ref_count": flow_summary.get("local_signing_sink_refs", 0),
+            "intent_policy_scaffold_status": policy_scaffold.get("status") or "missing",
+            "configured_intent_direction_count": policy_scaffold.get("configured_direction_count", 0),
             "static_signal_count": static_intent_review.get("signal_count", 0),
             "static_intent_review": static_intent_review,
             "dataflows": flow_dataflows[:5],
@@ -15521,6 +15528,76 @@ def transaction_intent_review_summary(transaction_intent: dict[str, Any] | None)
     }
 
 
+def build_transaction_intent_policy_scaffold(profile: dict[str, Any] | None) -> dict[str, Any]:
+    config = quote_intent_config(profile)
+    directions = config.get("directions") if isinstance(config.get("directions"), dict) else {}
+    direction_names = ordered_unique_strings([
+        "buy",
+        "sell",
+        *[str(item) for item in directions.keys()],
+    ])
+    rows = []
+    for direction in direction_names:
+        if direction not in directions and direction not in {"buy", "sell"}:
+            continue
+        expected = expected_mints_for_direction(direction, profile)
+        direction_config = quote_direction_config(profile, direction)
+        source_mint = expected[0] if expected else direction_config.get("sourceMint") or direction_config.get("source_mint")
+        destination_mint = (
+            expected[1]
+            if expected
+            else direction_config.get("destinationMint") or direction_config.get("destination_mint")
+        )
+        allowed_programs = quote_allowed_programs(profile, direction)
+        missing_fields = []
+        if not source_mint:
+            missing_fields.append("sourceMint")
+        if not destination_mint:
+            missing_fields.append("destinationMint")
+        missing_fields.extend(["wallet", "amountIn", "quote transaction payload"])
+        rows.append(
+            {
+                "direction": direction,
+                "sourceMint": source_mint,
+                "destinationMint": destination_mint,
+                "allowedPrograms": allowed_programs,
+                "valid_profile_mints": bool(source_mint and destination_mint),
+                "missing_runtime_fields": missing_fields,
+                "sidecar_template": {
+                    "direction": direction,
+                    "wallet": PLACEHOLDER_REAL_WALLET,
+                    "amountIn": "REPLACE_WITH_RAW_AMOUNT",
+                    "sourceMint": source_mint or "REPLACE_WITH_SOURCE_MINT",
+                    "destinationMint": destination_mint or "REPLACE_WITH_DESTINATION_MINT",
+                    **({"allowedPrograms": allowed_programs} if allowed_programs else {}),
+                },
+            }
+        )
+
+    configured_rows = [row for row in rows if row.get("valid_profile_mints")]
+    if configured_rows:
+        status = "profile-quote-intent-indexed"
+    elif rows:
+        status = "profile-quote-intent-incomplete"
+    else:
+        status = "missing-profile-quote-intent"
+    return {
+        "status": status,
+        "directions": rows,
+        "direction_count": len(rows),
+        "configured_direction_count": len(configured_rows),
+        "missing_before_decode": [
+            "One approved quote transaction payload corpus.",
+            "The executing wallet address for the quote.",
+            "The requested raw amountIn used for the quote.",
+        ],
+        "safety": (
+            "Offline policy scaffold only. Placeholder wallet/amount values must be replaced before decode-transactions, "
+            "and no wallet signing or transaction submission is performed."
+        ),
+    }
+
+
 def build_transaction_flow_review(
     source_root: Path,
     profile: dict[str, Any] | None = None,
@@ -15623,6 +15700,7 @@ def build_transaction_flow_review(
         increment_count(priority_counts, str(item.get("priority") or "info"))
 
     intent_summary = transaction_intent_review_summary(transaction_intent)
+    policy_scaffold = build_transaction_intent_policy_scaffold(profile)
     rpc_review = (
         rpc_method_policy.get("remote_transaction_signing_review")
         if isinstance(rpc_method_policy, dict)
@@ -15673,6 +15751,7 @@ def build_transaction_flow_review(
         },
         "dataflows": dataflows,
         "transaction_intent": intent_summary,
+        "intent_policy_scaffold": policy_scaffold,
         "rpc_method_policy_context": {
             "status": rpc_review.get("status") or "missing",
             "priority": rpc_review.get("priority") or "info",
@@ -33516,6 +33595,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "client-recent-blockhash-rewrite",
             }.issubset(transaction_static_signal_ids)
             and rewrite_transaction_flow_review.get("status") == "needs-transaction-intent-corpus"
+            and rewrite_transaction_flow_review.get("intent_policy_scaffold", {}).get("status")
+            == "profile-quote-intent-indexed"
+            and rewrite_transaction_flow_review.get("intent_policy_scaffold", {}).get("configured_direction_count", 0) >= 2
             and "remote-payload-to-wallet-signing" in transaction_flow_review_dataflow_ids
             and rewrite_transaction_matrix.get("summary", {}).get("rpc_method_policy_source") == "profile-fallback"
             and rewrite_transaction_hypothesis is not None
@@ -33529,6 +33611,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("remote_payload_to_wallet_signing")
             is True
             and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("remote_signing_sink_ref_count", 0) >= 1
+            and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("intent_policy_scaffold_status")
+            == "profile-quote-intent-indexed"
+            and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("configured_intent_direction_count", 0)
+            >= 2
             and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
             and TRANSACTION_FLOW_REVIEW_ARTIFACT in (rewrite_transaction_hypothesis.get("evidence_refs", []) or [])
             and rewrite_transaction_validation_item is not None
@@ -38444,6 +38530,7 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
 
     summary = review.get("summary", {}) or {}
     intent = review.get("transaction_intent", {}) or {}
+    scaffold = review.get("intent_policy_scaffold", {}) or {}
     print(f"Transaction flow review: {review['status']}")
     print(
         "Source refs: "
@@ -38459,6 +38546,11 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
         f"candidates={intent.get('candidates_seen', 0)}, "
         f"decoded={intent.get('decoded_transactions', 0)}, "
         f"policy={intent.get('intent_policy_status')}"
+    )
+    print(
+        "Policy scaffold: "
+        f"status={scaffold.get('status')}, "
+        f"directions={scaffold.get('configured_direction_count', 0)}/{scaffold.get('direction_count', 0)}"
     )
     top_count = max(0, int(args.top))
     if top_count:
@@ -38604,7 +38696,8 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         f"remote_tx_refs={transaction_flow.get('remote_transaction_material_ref_count', 0)} "
                         f"static_signals={transaction_flow.get('static_signal_count', 0)} "
                         f"dataflows={transaction_flow.get('dataflow_count', 0)} "
-                        f"remote_signing_sinks={transaction_flow.get('remote_signing_sink_ref_count', 0)}"
+                        f"remote_signing_sinks={transaction_flow.get('remote_signing_sink_ref_count', 0)} "
+                        f"policy_scaffold={transaction_flow.get('intent_policy_scaffold_status', 'missing')}"
                     )
                 resource_review = (
                     item.get("resource_abuse_review")
