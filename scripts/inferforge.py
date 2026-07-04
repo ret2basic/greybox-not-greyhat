@@ -5138,6 +5138,10 @@ def parse_http_headers(lines: list[str]) -> dict[str, str]:
     for line in lines:
         if not line or ":" not in line:
             continue
+        if line.startswith(":") and ":" in line[1:]:
+            key, value = line[1:].split(":", 1)
+            headers[f":{key.strip().lower()}"] = value.strip()
+            continue
         key, value = line.split(":", 1)
         headers[key.strip().lower()] = value.strip()
     return headers
@@ -5163,14 +5167,15 @@ def normalize_request_path(target: str) -> str:
 def parse_raw_http_request(raw: str) -> dict[str, Any]:
     start_line, header_lines, _ = split_http_message(raw)
     parts = start_line.split()
-    method = parts[0].upper() if parts else ""
-    path = normalize_request_path(parts[1]) if len(parts) > 1 else "/"
     headers = parse_http_headers(header_lines)
+    method = parts[0].upper() if parts else str(headers.get(":method") or "").upper()
+    path = normalize_request_path(parts[1]) if len(parts) > 1 else normalize_request_path(headers.get(":path") or "/")
+    host = headers.get("host") or headers.get(":authority") or ""
     return {
         "method": method,
         "path": path,
         "headers": headers,
-        "host": headers.get("host", ""),
+        "host": host,
         "user_agent": headers.get("user-agent", ""),
     }
 
@@ -5188,6 +5193,11 @@ def parse_raw_http_response(raw: str) -> dict[str, Any]:
         except ValueError:
             status = None
     headers = parse_http_headers(header_lines)
+    if status is None and headers.get(":status"):
+        try:
+            status = int(str(headers.get(":status")))
+        except ValueError:
+            status = None
     return {"status": status, "headers": headers, "body": body}
 
 
@@ -5283,6 +5293,122 @@ def decode_mcp_text_payload(text: str) -> str:
     return text
 
 
+def decode_loose_json_string_fragment(value: str) -> str:
+    try:
+        return json.loads(f'"{value}"', strict=False)
+    except json.JSONDecodeError:
+        pass
+
+    decoded: list[str] = []
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char != "\\" or index + 1 >= len(value):
+            decoded.append(char)
+            index += 1
+            continue
+
+        escaped = value[index + 1]
+        replacements = {
+            '"': '"',
+            "\\": "\\",
+            "/": "/",
+            "b": "\b",
+            "f": "\f",
+            "n": "\n",
+            "r": "\r",
+            "t": "\t",
+        }
+        if escaped == "u" and index + 6 <= len(value):
+            hex_value = value[index + 2 : index + 6]
+            try:
+                decoded.append(chr(int(hex_value, 16)))
+                index += 6
+                continue
+            except ValueError:
+                pass
+        if escaped in replacements:
+            decoded.append(replacements[escaped])
+            index += 2
+            continue
+        decoded.append(escaped)
+        index += 2
+
+    return "".join(decoded)
+
+
+def parse_loose_burp_mcp_history_item(record: str) -> dict[str, Any] | None:
+    stripped = record.strip()
+    if not stripped:
+        return None
+
+    try:
+        parsed = json.loads(stripped, strict=False)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+
+    request_marker = '"request":"'
+    response_marker = '","response":"'
+    request_start = stripped.find(request_marker)
+    if request_start < 0:
+        return None
+    request_start += len(request_marker)
+    response_start = stripped.find(response_marker, request_start)
+    if response_start < 0:
+        return None
+
+    request_fragment = stripped[request_start:response_start]
+    response_fragment_start = response_start + len(response_marker)
+    notes_marker = '","notes":"'
+    notes_start = stripped.rfind(notes_marker)
+    truncated = notes_start < response_fragment_start
+    notes_fragment = ""
+
+    if truncated:
+        response_fragment = stripped[response_fragment_start:]
+        if response_fragment.endswith('"}'):
+            response_fragment = response_fragment[:-2]
+            truncated = False
+        elif response_fragment.endswith("}"):
+            response_fragment = response_fragment[:-1]
+    else:
+        response_fragment = stripped[response_fragment_start:notes_start]
+        notes_value_start = notes_start + len(notes_marker)
+        notes_value_end = stripped.rfind('"}')
+        if notes_value_end < notes_value_start:
+            notes_value_end = len(stripped)
+            truncated = True
+        notes_fragment = stripped[notes_value_start:notes_value_end]
+
+    item: dict[str, Any] = {
+        "request": decode_loose_json_string_fragment(request_fragment),
+        "response": decode_loose_json_string_fragment(response_fragment),
+        "notes": decode_loose_json_string_fragment(notes_fragment),
+    }
+    if truncated:
+        item["_burp_mcp_truncated"] = True
+    return item
+
+
+def parse_loose_burp_mcp_history_items(payload: str) -> list[dict[str, Any]]:
+    stripped = payload.strip()
+    if not stripped:
+        return []
+
+    records = re.split(r"\n\s*\n(?=\{\"request\"\s*:)", stripped)
+    if len(records) <= 1:
+        records = stripped.splitlines()
+
+    items: list[dict[str, Any]] = []
+    for record in records:
+        item = parse_loose_burp_mcp_history_item(record)
+        if item is not None:
+            items.append(item)
+    return items
+
+
 def parse_burp_mcp_history_items(text: str) -> list[dict[str, Any]]:
     payload = decode_mcp_text_payload(text)
     stripped = payload.strip()
@@ -5310,6 +5436,9 @@ def parse_burp_mcp_history_items(text: str) -> list[dict[str, Any]]:
         try:
             item, next_index = decoder.raw_decode(payload, index)
         except json.JSONDecodeError as error:
+            loose_items = parse_loose_burp_mcp_history_items(payload)
+            if loose_items:
+                return loose_items
             snippet = payload[index:index + 120].replace("\n", "\\n")
             raise ValueError(f"Could not parse Burp MCP history item near offset {index}: {snippet}") from error
         if isinstance(item, dict):
@@ -9037,12 +9166,52 @@ def build_orca_baseline(
     }
 
 
-def build_rpc_method_policy(source_root: Path, results: list[dict[str, Any]]) -> dict[str, Any]:
+def build_rpc_method_policy(
+    source_root: Path,
+    results: list[dict[str, Any]],
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     rpc_path = source_root / "src/app/api/rpc/_shared.ts"
+    high_impact_methods = ["sendTransaction", "simulateTransaction"]
+    if is_blackbox_assessment(profile):
+        return {
+            "generated_at": utc_now(),
+            "status": "not-applicable",
+            "source": "not-applicable",
+            "policy_posture": "not-applicable-blackbox",
+            "default_allowed_methods": [],
+            "transaction_methods": [],
+            "high_impact_methods": high_impact_methods,
+            "default_high_impact_methods": [],
+            "explicit_transaction_method_gate_present": False,
+            "runner_environment": {
+                "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS": os.environ.get("SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS"),
+                "SOLANA_RPC_PROXY_ALLOWED_METHODS_set": os.environ.get("SOLANA_RPC_PROXY_ALLOWED_METHODS") is not None,
+            },
+            "transaction_probe_results": [],
+            "safety": "Pure black-box profile: local Solana RPC source policy is not inspected.",
+        }
+    if not rpc_path.exists():
+        return {
+            "generated_at": utc_now(),
+            "status": "source-unavailable",
+            "source": repo_relative_or_absolute(rpc_path),
+            "policy_posture": "source-unavailable",
+            "default_allowed_methods": [],
+            "transaction_methods": [],
+            "high_impact_methods": high_impact_methods,
+            "default_high_impact_methods": [],
+            "explicit_transaction_method_gate_present": False,
+            "runner_environment": {
+                "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS": os.environ.get("SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS"),
+                "SOLANA_RPC_PROXY_ALLOWED_METHODS_set": os.environ.get("SOLANA_RPC_PROXY_ALLOWED_METHODS") is not None,
+            },
+            "transaction_probe_results": [],
+            "safety": "Source file was unavailable, so RPC method policy was not inferred from local source.",
+        }
     rpc_source = read_text(rpc_path)
     default_methods = parse_typescript_string_set(rpc_source, "DEFAULT_ALLOWED_METHODS")
     transaction_methods = parse_typescript_string_set(rpc_source, "TRANSACTION_METHODS")
-    high_impact_methods = ["sendTransaction", "simulateTransaction"]
     transaction_probe_ids = {
         "rpc_send_transaction_invalid_payload",
         "rpc_simulate_transaction_invalid_payload",
@@ -19402,7 +19571,71 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
             ),
         }
 
+    loose_burp_history_text = (
+        json.dumps(
+            {
+                "request": (
+                    "HEAD /strict HTTP/1.1\r\n"
+                    "Host: loose.test\r\n"
+                    "User-Agent: InferForge-Burp-Observe/0.1\r\n"
+                    "\r\n"
+                ),
+                "response": "HTTP/1.1 204 No Content\r\n\r\n",
+                "notes": "",
+            }
+        )
+        + "\n\n"
+        + (
+            '{"request":"GET /shell?view=summary HTTP/2\\r\\n'
+            ':authority: loose.test\\r\\n'
+            'User-Agent: InferForge-Burp-Observe/0.1\\r\\n\\r\\n",'
+            '"response":"HTTP/2 200 OK\\r\\n'
+            'Content-Type: text/html\\r\\n\\r\\n'
+            '<!doctype html><meta name=\\"renderer\\" content=\\"webkit\\">\\n'
+            '  ... (truncated)'
+        )
+    )
+    loose_burp_items = parse_burp_mcp_history_items(loose_burp_history_text)
+    loose_burp_observations = normalize_burp_history_items(
+        loose_burp_items,
+        target_netloc="loose.test",
+        source="self-test-loose-burp-history",
+    )
+    loose_burp_history_parser_passed = (
+        len(loose_burp_items) == 2
+        and loose_burp_items[1].get("_burp_mcp_truncated") is True
+        and len(loose_burp_observations) == 2
+        and loose_burp_observations[0].get("method") == "HEAD"
+        and loose_burp_observations[0].get("path") == "/strict"
+        and loose_burp_observations[0].get("status") == 204
+        and loose_burp_observations[1].get("method") == "GET"
+        and loose_burp_observations[1].get("host") == "loose.test"
+        and loose_burp_observations[1].get("path") == "/shell?view=summary"
+        and loose_burp_observations[1].get("request_context", {}).get("query_keys") == ["view"]
+        and loose_burp_observations[1].get("request_context", {}).get("query", {}).get("view") == ["summary"]
+        and loose_burp_observations[1].get("status") == 200
+    )
+
     assertions = [
+        {
+            "id": "loose-truncated-burp-mcp-history-imports",
+            "passed": loose_burp_history_parser_passed,
+            "expected": "Burp MCP history parser imports newline-delimited JSON objects when the final HTTP/2 HTML response object is truncated",
+            "actual": {
+                "items": len(loose_burp_items),
+                "observations": [
+                    {
+                        "method": row.get("method"),
+                        "host": row.get("host"),
+                        "path": row.get("path"),
+                        "status": row.get("status"),
+                        "query_keys": row.get("request_context", {}).get("query_keys"),
+                    }
+                    for row in loose_burp_observations
+                ],
+                "truncated": loose_burp_items[1].get("_burp_mcp_truncated") if len(loose_burp_items) > 1 else None,
+            },
+        },
         {
             "id": "profile-validation-failure-redacts-error",
             "passed": (
@@ -20798,6 +21031,45 @@ def approval_sensitive_tool_statuses(history_status: str) -> dict[str, str]:
     }
 
 
+def blackbox_target_info_from_artifacts(target: str, artifact_dir: Path) -> dict[str, Any]:
+    observed_sources = [
+        ("blackbox-probe-results", artifact_dir / "probe-results.jsonl"),
+        ("blackbox-burp-history", artifact_dir / "burp-history-observations.jsonl"),
+    ]
+    for source, path in observed_sources:
+        for row in load_jsonl(path):
+            status = row.get("status")
+            if not isinstance(status, int):
+                continue
+            return {
+                "base_url": target,
+                "health_path": None,
+                "health_status": status,
+                "reachable": True,
+                "service": None,
+                "health_fields": {},
+                "m0_key_present": None,
+                "health_source": source,
+                "observed_path": row.get("path"),
+                "observed_method": row.get("method"),
+                "note": "Pure black-box profile: no synthetic /health request was sent.",
+            }
+
+    return {
+        "base_url": target,
+        "health_path": None,
+        "health_status": None,
+        "reachable": False,
+        "service": None,
+        "health_fields": {},
+        "m0_key_present": None,
+        "health_source": "blackbox-no-observed-http-status",
+        "observed_path": None,
+        "observed_method": None,
+        "note": "Pure black-box profile has no observed HTTP status yet; import Burp history or run an observed-path probe first.",
+    }
+
+
 def build_capabilities(target: str, artifact_dir: Path, profile: dict[str, Any] | None = None) -> dict[str, Any]:
     codex = command_result(["codex", "mcp", "get", "burp"], timeout=10)
     script = ROOT / "scripts/check-burp-mcp.sh"
@@ -20819,20 +21091,20 @@ def build_capabilities(target: str, artifact_dir: Path, profile: dict[str, Any] 
         "mcp_actions": [],
         "safety": "Skipped tools/list because the Burp MCP port was closed.",
     }
-    health_path = probe_target_path(profile, "health", "path", "/health")
-    health = http_request(target, "GET", health_path)
-    health_json = parse_json_object(health.get("body_text") or "")
-    health_fields = collect_target_health_fields(health_json, target_health_field_names(profile))
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
     history_status = (
         "ok_reads_builtin_browser_proxy_history"
         if burp_history
         else "not_observed_by_cli_run"
     )
-
-    return {
-        "generated_at": utc_now(),
-        "target": {
+    if is_blackbox_assessment(profile):
+        target_info = blackbox_target_info_from_artifacts(target, artifact_dir)
+    else:
+        health_path = probe_target_path(profile, "health", "path", "/health")
+        health = http_request(target, "GET", health_path)
+        health_json = parse_json_object(health.get("body_text") or "")
+        health_fields = collect_target_health_fields(health_json, target_health_field_names(profile))
+        target_info = {
             "base_url": target,
             "health_path": health_path,
             "health_status": health["status"],
@@ -20840,7 +21112,11 @@ def build_capabilities(target: str, artifact_dir: Path, profile: dict[str, Any] 
             "service": (health_json or {}).get("service"),
             "health_fields": health_fields,
             "m0_key_present": health_fields.get("m0_key_present", (health_json or {}).get("m0KeyPresent")),
-        },
+        }
+
+    return {
+        "generated_at": utc_now(),
+        "target": target_info,
         "burp": {
             "mcp_endpoint": mcp_endpoint,
             "mcp_port_open": mcp_port_open,
@@ -22161,7 +22437,7 @@ def run_audit(args: argparse.Namespace) -> int:
         amount_in=args.intent_amount_in or "1000000",
     )
     write_json(artifact_dir / "transaction-decoder-selftest.json", transaction_decoder_selftest)
-    rpc_method_policy = build_rpc_method_policy(source_root, results)
+    rpc_method_policy = build_rpc_method_policy(source_root, results, profile=profile)
     write_json(artifact_dir / "rpc-method-policy.json", sanitize_artifact_samples(rpc_method_policy))
     orca_baseline_path = artifact_dir / "orca-baseline.json"
     orca_baseline = json.loads(read_text(orca_baseline_path)) if orca_baseline_path.exists() else None
@@ -23764,6 +24040,22 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         {"status": "failed"},
         profile=blackbox_normalized_profile,
     )
+    blackbox_rpc_method_policy_sample = build_rpc_method_policy(ROOT, [], profile=blackbox_normalized_profile)
+    with tempfile.TemporaryDirectory(prefix="inferforge-blackbox-target-info-selftest-") as blackbox_info_dir:
+        blackbox_info_path = Path(blackbox_info_dir)
+        append_jsonl(
+            blackbox_info_path / "burp-history-observations.jsonl",
+            [
+                {
+                    "method": "GET",
+                    "path": "/",
+                    "host": "blackbox.test",
+                    "status": 404,
+                    "content_type": "application/json",
+                }
+            ],
+        )
+        blackbox_target_info_sample = blackbox_target_info_from_artifacts("http://blackbox.test", blackbox_info_path)
     blackbox_probe_ids_sample = [
         probe.id
         for probe in build_probe_plan(
@@ -23806,6 +24098,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_source_peeks_sample.get("status") == "not-applicable"
         and blackbox_coverage_sample.get("status") == "covered"
         and blackbox_coverage_sample.get("assessment_mode") == "blackbox"
+        and blackbox_rpc_method_policy_sample.get("policy_posture") == "not-applicable-blackbox"
+        and blackbox_target_info_sample.get("reachable") is True
+        and blackbox_target_info_sample.get("health_status") == 404
+        and blackbox_target_info_sample.get("health_path") is None
+        and blackbox_target_info_sample.get("health_source") == "blackbox-burp-history"
         and all(check.get("status") == "not-applicable" for check in blackbox_source_context_checks)
         and any(probe_id.startswith("blackbox_") for probe_id in blackbox_probe_ids_sample)
         and "quote" not in stale_cluster_selection_sample.get("selected_cluster_ids", [])
@@ -28398,7 +28695,7 @@ def run_collect_quote(args: argparse.Namespace) -> int:
     rpc_method_policy = (
         json.loads(read_text(rpc_policy_path))
         if rpc_policy_path.exists()
-        else build_rpc_method_policy(source_root, results)
+        else build_rpc_method_policy(source_root, results, profile=profile)
     )
     orca_baseline_path = artifact_dir / "orca-baseline.json"
     orca_baseline = json.loads(read_text(orca_baseline_path)) if orca_baseline_path.exists() else None
@@ -28528,7 +28825,7 @@ def run_collect_orca_baseline(args: argparse.Namespace) -> int:
     rpc_method_policy = (
         json.loads(read_text(rpc_policy_path))
         if rpc_policy_path.exists()
-        else build_rpc_method_policy(source_root, results)
+        else build_rpc_method_policy(source_root, results, profile=profile)
     )
     quote_collection_path = artifact_dir / "quote-collection.json"
     quote_collection = json.loads(read_text(quote_collection_path)) if quote_collection_path.exists() else None
