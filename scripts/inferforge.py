@@ -2227,6 +2227,8 @@ def nextjs_route_path(route_file: Path, source_root: Path) -> str | None:
         return None
     if relative.name not in ROUTE_FILE_NAMES:
         return None
+    if any(segment.startswith("_") for segment in relative.parent.parts):
+        return None
     segments = []
     for segment in relative.parent.parts:
         path_segment = route_segment_to_path_segment(segment)
@@ -23207,6 +23209,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "export { handler as GET, handler as POST }\n",
             encoding="utf-8",
         )
+        (rewrite_source_root / "src/app/_private/diagnostic").mkdir(parents=True)
+        (rewrite_source_root / "src/app/_private/diagnostic/route.ts").write_text(
+            "export async function GET() { return Response.json({ ok: true }) }\n",
+            encoding="utf-8",
+        )
         (rewrite_source_root / "src/app/actions.ts").write_text(
             textwrap.dedent(
                 """
@@ -23346,6 +23353,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
         rewrite_inventory = discover_nextjs_routes(rewrite_source_root)
+        private_app_routes = [
+            route
+            for route in rewrite_inventory.get("routes", [])
+            if str(route.get("source_path") or "").startswith("/_private")
+        ]
         rewrite_profile = build_discovered_profile(
             rewrite_inventory,
             name="rewrite-discovery-selftest",
@@ -23927,6 +23939,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rewrite_inventory.get("summary", {}).get("redirect_count") == 1
             and rewrite_inventory.get("summary", {}).get("header_route_count") == 1
             and rewrite_inventory.get("summary", {}).get("custom_server_entrypoint_count") == 1
+            and private_app_routes == []
             and "health" in rewrite_observation_clusters
             and "route-api-widgets" in rewrite_observation_clusters
             and "route-api-root" in rewrite_observation_clusters
@@ -25024,6 +25037,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "fixed_upstreams": []
             if rewrite_cluster is None
             else rewrite_cluster.get("discovery", {}).get("fixed_upstreams", []),
+            "private_app_routes": private_app_routes,
             "classification_check_path": "/api/proxy/users/42",
             "endpoint_resolution": rewrite_resolution,
             "websocket_endpoint_resolution": ws_resolution,
