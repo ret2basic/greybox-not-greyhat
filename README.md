@@ -348,6 +348,12 @@ This command is local and read-only. It flags catch-all rewrites, fixed
 upstreams, unconditional routes, and review-only observation candidates, then
 lists the evidence required before a static rewrite/proxy hypothesis can become
 a reportable issue.
+For source-backed fixed-upstream API routes, it also scans the referenced route
+source for fixed upstream fetches, positive route-parameter guards, query
+forwarding, credential/header forwarding, upstream status forwarding, and cache
+controls. These `source_guard_review` decisions let validation plans keep a
+fixed-upstream item in offline review while memory or swap pressure blocks
+active baseline requests.
 For catch-all rewrites, it also scans local frontend client code for concrete
 HTTP `GET` / `HEAD` path literals and maps them to local rewrite paths as
 reviewable read-only candidates. Dynamic templates such as ``/users/${id}`` and

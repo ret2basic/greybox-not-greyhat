@@ -8186,13 +8186,16 @@ def hypothesis_from_cluster(
     discovery = cluster.get("discovery") if isinstance(cluster.get("discovery"), dict) else {}
     rewrites = discovery.get("rewrites", []) if isinstance(discovery.get("rewrites"), list) else []
     fixed_upstreams = discovery.get("fixed_upstreams", []) if isinstance(discovery.get("fixed_upstreams"), list) else []
-    rewrite_proxy = cluster.get("kind") == "rewrite-proxy" or bool(rewrites)
+    strategy_set = str(cluster.get("strategy_set") or strategy_set_for_cluster(cluster) or "")
+    kind = str(cluster.get("kind") or "")
+    rewrite_proxy = kind == "rewrite-proxy" or bool(rewrites)
+    fixed_upstream_proxy = kind == "fixed-upstream-proxy" or strategy_set == "fixed-upstream-proxy" or bool(fixed_upstreams)
     items = []
     for impact in cluster_impact_hypotheses(cluster):
         priority = hypothesis_priority_from_values(impact.get("priority"), cluster.get("priority"))
-        offline_only = rewrite_proxy and impact.get("impact") == "fixed-upstream-proxy-confusion"
+        offline_only = (rewrite_proxy or fixed_upstream_proxy) and impact.get("impact") == "fixed-upstream-proxy-confusion"
         next_step = (
-            "Review rewrite source, fixed upstream, catch-all path shape, and one approved read-only concrete path before probing."
+            "Review fixed-upstream source, route guards, path shape, and one approved read-only concrete path before probing."
             if offline_only
             else "Turn this into one minimal validation question; run only after resource and scope gates pass."
         )
@@ -8202,6 +8205,7 @@ def hypothesis_from_cluster(
                 [
                     "target-profile.json",
                     "route-inventory.json",
+                    REWRITE_REVIEW_ARTIFACT,
                     *[str(ref) for ref in cluster.get("source_refs", []) or []],
                 ]
             )
@@ -8611,10 +8615,194 @@ def rewrite_path_candidates_for_cluster(
     return {"read_only": read_only[:20], "blocked": blocked[:20]}
 
 
+def rewrite_source_review_token_categories() -> dict[str, list[str]]:
+    return {
+        "method_handlers": ["export async function GET", "export async function HEAD", "export async function POST"],
+        "route_param_reads": ["context.params", "params", "address"],
+        "positive_param_guards": [
+            "^[1-9A-HJ-NP-Za-km-z]{32,44}$",
+            "PublicKey",
+            "isBase58",
+            "base58",
+        ],
+        "invalid_param_responses": ["invalid address", "status: 400", "status: 404"],
+        "fixed_upstream_fetches": ["fetch(`https://", "fetch('https://", 'fetch("https://', "new URL('https://", 'new URL("https://'],
+        "attacker_param_interpolation": ["${address}", "${slug}", "${path}", "${id}"],
+        "query_forwarding": ["searchParams", ".search", "req.url", "_req.url", "nextUrl"],
+        "credential_forwarding": ["authorization", "cookie", "req.headers", "_req.headers", "headers.get"],
+        "upstream_status_forwarding": ["upstream.status", "response.status"],
+        "upstream_body_forwarding": ["upstream.json()", "response.json()"],
+        "cache_controls": ["revalidate", "cache:", "Cache-Control"],
+    }
+
+
+def build_rewrite_source_guard_review(
+    source_root: Path,
+    source_refs: list[str],
+    *,
+    max_file_bytes: int = DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES,
+    max_files: int = 8,
+) -> dict[str, Any]:
+    categories = rewrite_source_review_token_categories()
+    matches: dict[str, list[dict[str, Any]]] = {category: [] for category in categories}
+    files = []
+    skipped = []
+    seen_paths: set[str] = set()
+    for ref in source_refs[: max(1, max_files)]:
+        path = source_ref_to_path(source_root, str(ref).split(":", 1)[0])
+        key = str(path.resolve())
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        rel = source_root_relative_or_repo(path, source_root)
+        try:
+            stat = path.stat()
+        except OSError as error:
+            skipped.append({"file": rel, "reason": "stat-failed", "error": redacted_error_summary(error)})
+            continue
+        if stat.st_size > max_file_bytes:
+            skipped.append(
+                {
+                    "file": rel,
+                    "reason": "file-too-large",
+                    "bytes": stat.st_size,
+                    "max_file_bytes": max_file_bytes,
+                }
+            )
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            skipped.append({"file": rel, "reason": "read-failed", "error": redacted_error_summary(error)})
+            continue
+
+        file_match_count = 0
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            lowered = stripped.lower()
+            for category, tokens in categories.items():
+                for token in tokens:
+                    token_match = token in stripped or token.lower() in lowered
+                    if not token_match:
+                        continue
+                    matches[category].append(
+                        {
+                            "file": rel,
+                            "line": line_no,
+                            "token": token,
+                            "sample": redact_text(stripped, max_chars=220) or "",
+                        }
+                    )
+                    file_match_count += 1
+                    break
+        files.append({"file": rel, "bytes": stat.st_size, "match_count": file_match_count})
+
+    def decision(decision_id: str, status: str, evidence: list[dict[str, Any]], question: str) -> dict[str, Any]:
+        return {
+            "id": decision_id,
+            "status": status,
+            "evidence": evidence[:8],
+            "review_question": question,
+        }
+
+    fixed_fetches = matches["fixed_upstream_fetches"]
+    guards = matches["positive_param_guards"]
+    query_forwarding = matches["query_forwarding"]
+    credential_forwarding = matches["credential_forwarding"]
+    param_interpolation = matches["attacker_param_interpolation"]
+    decisions = [
+        decision(
+            "fixed-upstream-host",
+            "evidence-present" if fixed_fetches else "missing-evidence",
+            fixed_fetches,
+            "Is the upstream host fixed by source rather than controlled by request input?",
+        ),
+        decision(
+            "positive-route-param-guard",
+            "evidence-present" if guards else "missing-evidence",
+            guards,
+            "Does source apply a positive allowlist to dynamic route parameters before upstream fetch?",
+        ),
+        decision(
+            "attacker-param-path-interpolation",
+            "review-required" if param_interpolation else "not-seen",
+            param_interpolation,
+            "Can an attacker-controlled route parameter alter only an intended identifier segment, not host/scheme/path family?",
+        ),
+        decision(
+            "query-forwarding",
+            "review-required" if query_forwarding else "not-seen",
+            query_forwarding,
+            "Are attacker-controlled query strings forwarded to the fixed upstream?",
+        ),
+        decision(
+            "credential-forwarding",
+            "review-required" if credential_forwarding else "not-seen",
+            credential_forwarding,
+            "Are cookies, Authorization, or request headers forwarded to the upstream?",
+        ),
+        decision(
+            "upstream-status-forwarding",
+            "evidence-present" if matches["upstream_status_forwarding"] else "not-seen",
+            matches["upstream_status_forwarding"],
+            "Does the local route forward upstream status codes, and can that leak meaningful upstream existence or policy state?",
+        ),
+        decision(
+            "cache-controls",
+            "evidence-present" if matches["cache_controls"] else "not-seen",
+            matches["cache_controls"],
+            "Is caching bounded for the proxied upstream response?",
+        ),
+    ]
+    decision_status_counts: dict[str, int] = {}
+    for row in decisions:
+        increment_count(decision_status_counts, str(row.get("status") or "unknown"))
+
+    if fixed_fetches and guards and not query_forwarding and not credential_forwarding:
+        status = "source-guard-indexed"
+    elif fixed_fetches or guards:
+        status = "needs-source-review"
+    elif skipped and not files:
+        status = "source-unavailable"
+    else:
+        status = "no-source-guard-evidence"
+
+    return {
+        "status": status,
+        "summary": {
+            "files": len(files),
+            "skipped": len(skipped),
+            "decision_status_counts": dict(sorted(decision_status_counts.items())),
+            "fixed_upstream_fetch_refs": len(fixed_fetches),
+            "positive_guard_refs": len(guards),
+            "query_forwarding_refs": len(query_forwarding),
+            "credential_forwarding_refs": len(credential_forwarding),
+        },
+        "resource_limits": {
+            "max_file_bytes": max_file_bytes,
+            "max_files": max_files,
+            "source_refs_only": True,
+        },
+        "files": files,
+        "skipped": skipped,
+        "matches": {category: refs[:12] for category, refs in matches.items()},
+        "decisions": decisions,
+        "required_evidence": [
+            "Source evidence for the fixed upstream host and route parameter guard.",
+            "Evidence that query strings and credentials are not forwarded unless explicitly intended.",
+            "One approved read-only concrete path and response comparison before any reportability claim.",
+        ],
+        "safety": "Offline bounded source review only. It sends no requests and does not enumerate upstream paths.",
+    }
+
+
 def rewrite_review_item_for_cluster(
     cluster: dict[str, Any],
     *,
     client_candidates: list[dict[str, Any]] | None = None,
+    source_root: Path | None = None,
 ) -> dict[str, Any] | None:
     discovery = cluster.get("discovery") if isinstance(cluster.get("discovery"), dict) else {}
     rewrites = discovery.get("rewrites", []) if isinstance(discovery.get("rewrites"), list) else []
@@ -8644,6 +8832,11 @@ def rewrite_review_item_for_cluster(
     path_candidates = rewrite_path_candidates_for_cluster(cluster, client_candidates or [])
     read_only_candidates = path_candidates["read_only"]
     blocked_candidates = path_candidates["blocked"]
+    source_guard_review = (
+        build_rewrite_source_guard_review(source_root, source_refs)
+        if source_root is not None and source_refs
+        else {}
+    )
 
     risk_factors = []
     if fixed_upstreams:
@@ -8662,6 +8855,15 @@ def rewrite_review_item_for_cluster(
         risk_factors.append("client-non-read-only-path-blocked")
     if any(candidate.get("status") == "blocked-dynamic-template" for candidate in blocked_candidates):
         risk_factors.append("client-dynamic-path-blocked")
+    if source_guard_review.get("status") == "source-guard-indexed":
+        risk_factors.append("source-positive-guard-indexed")
+    if (source_guard_review.get("summary") or {}).get("query_forwarding_refs", 0):
+        risk_factors.append("query-forwarding-review")
+    if (source_guard_review.get("summary") or {}).get("credential_forwarding_refs", 0):
+        risk_factors.append("credential-forwarding-review")
+
+    if status == "needs-source-review" and source_guard_review.get("status") == "source-guard-indexed":
+        status = "source-guard-indexed"
 
     return {
         "id": f"REWRITE-{safe_probe_id(cluster.get('id') or path or kind)}",
@@ -8680,6 +8882,7 @@ def rewrite_review_item_for_cluster(
         "review_observation_candidates": review_candidates,
         "read_only_path_candidates": read_only_candidates,
         "blocked_path_candidates": blocked_candidates,
+        "source_guard_review": source_guard_review,
         "source_refs": source_refs,
         "validation_questions": [
             "Does the local rewrite expose a fixed upstream path family that should not be reachable from unauthenticated users?",
@@ -8728,13 +8931,19 @@ def build_rewrite_review_run(
     )
     clusters = [cluster for cluster in endpoint_clusters.get("clusters", []) or [] if isinstance(cluster, dict)]
     client_candidates: list[dict[str, Any]] = []
+    source_root = source_root_for_review_artifact(profile, artifact_dir)
     if any(cluster_needs_client_http_path_candidates(cluster) for cluster in clusters):
-        source_root = source_root_for_review_artifact(profile, artifact_dir)
         client_candidates = collect_client_http_path_candidates(source_root)
     items = [
         item
         for cluster in clusters
-        for item in [rewrite_review_item_for_cluster(cluster, client_candidates=client_candidates)]
+        for item in [
+            rewrite_review_item_for_cluster(
+                cluster,
+                client_candidates=client_candidates,
+                source_root=source_root,
+            )
+        ]
         if item is not None
     ]
     items.sort(
@@ -9421,7 +9630,12 @@ def validation_rewrite_review_context(rewrite_review_item: dict[str, Any] | None
     read_only = rewrite_review_item.get("read_only_path_candidates", []) or []
     blocked = rewrite_review_item.get("blocked_path_candidates", []) or []
     candidate_id = rewrite_review_observation_candidate_id(rewrite_review_item)
-    if not read_only and not blocked and not candidate_id:
+    source_guard_review = (
+        rewrite_review_item.get("source_guard_review")
+        if isinstance(rewrite_review_item.get("source_guard_review"), dict)
+        else {}
+    )
+    if not read_only and not blocked and not candidate_id and not source_guard_review:
         return None
     return {
         "rewrite_review_id": rewrite_review_item.get("id"),
@@ -9429,6 +9643,7 @@ def validation_rewrite_review_context(rewrite_review_item: dict[str, Any] | None
         "candidate_id": candidate_id,
         "read_only_path_candidates": read_only[:5],
         "blocked_path_candidates": blocked[:5],
+        "source_guard_review": source_guard_review,
         "approval_required": [
             "Confirm exactly one read-only candidate is in scope before writing a reviewed profile.",
             "Run only the no-write promotion preview until scope and data-sensitivity checks are complete.",
@@ -32710,7 +32925,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             + "\n",
             encoding="utf-8",
         )
-        (rewrite_source_root / "src/lib").mkdir(parents=True)
+        (rewrite_source_root / "src/lib").mkdir(parents=True, exist_ok=True)
         (rewrite_source_root / "src/lib/remote-tx.ts").write_text(
             textwrap.dedent(
                 """
@@ -32777,6 +32992,32 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     return
                   }
                   res.status(405).end()
+                }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (rewrite_source_root / "src/lib").mkdir(parents=True, exist_ok=True)
+        (rewrite_source_root / "src/lib/fixed-upstream-selftest.ts").write_text(
+            textwrap.dedent(
+                """
+                import { NextResponse, type NextRequest } from 'next/server'
+
+                type RouteContext = {
+                  params: Promise<{ address: string }>
+                }
+
+                export async function GET(_req: NextRequest, context: RouteContext) {
+                  const { address } = await context.params
+                  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) {
+                    return NextResponse.json({ error: 'invalid address' }, { status: 400 })
+                  }
+                  const upstream = await fetch(`https://api.example.test/v1/pools/${address}`, {
+                    headers: { accept: 'application/json' },
+                    next: { revalidate: 60 },
+                  })
+                  return NextResponse.json(await upstream.json(), { status: upstream.status })
                 }
                 """
             ).strip()
@@ -33112,6 +33353,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 if item.get("cluster_id") == "route-api-proxy-path"
             ),
             None,
+        )
+        fixed_source_guard_review = build_rewrite_source_guard_review(
+            rewrite_source_root,
+            ["src/lib/fixed-upstream-selftest.ts"],
         )
         rewrite_condition_context = build_request_context(
             "GET",
@@ -33705,6 +33950,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and "client-read-only-path-candidate" in rewrite_review_proxy_item.get("risk_factors", [])
             and "client-non-read-only-path-blocked" in rewrite_review_proxy_item.get("risk_factors", [])
             and "https://api.example.test" in rewrite_review_proxy_item.get("fixed_upstreams", [])
+            and fixed_source_guard_review.get("status") == "source-guard-indexed"
+            and fixed_source_guard_review.get("summary", {}).get("fixed_upstream_fetch_refs") == 1
+            and fixed_source_guard_review.get("summary", {}).get("positive_guard_refs", 0) >= 1
+            and fixed_source_guard_review.get("summary", {}).get("query_forwarding_refs") == 0
+            and fixed_source_guard_review.get("summary", {}).get("credential_forwarding_refs") == 0
             and any(
                 candidate.get("method") == "GET"
                 and candidate.get("local_path") == "/api/proxy/users/42"
@@ -38418,6 +38668,17 @@ def run_rewrite_review(args: argparse.Namespace) -> int:
             if args.show_next:
                 print(f"  next={inline_summary_text(item.get('safe_next_step'), max_chars=220)}")
                 print(f"  gate={inline_summary_text(item.get('reportability_gate'), max_chars=220)}")
+                source_guard = item.get("source_guard_review") if isinstance(item.get("source_guard_review"), dict) else {}
+                if source_guard:
+                    source_summary = source_guard.get("summary", {}) or {}
+                    print(
+                        "  source_guard_review="
+                        f"{source_guard.get('status')} "
+                        f"fixed_fetches={source_summary.get('fixed_upstream_fetch_refs', 0)} "
+                        f"guards={source_summary.get('positive_guard_refs', 0)} "
+                        f"query_refs={source_summary.get('query_forwarding_refs', 0)} "
+                        f"credential_refs={source_summary.get('credential_forwarding_refs', 0)}"
+                    )
                 read_only_candidates = item.get("read_only_path_candidates", []) or []
                 blocked_candidates = item.get("blocked_path_candidates", []) or []
                 for candidate in read_only_candidates[:3]:
@@ -38716,6 +38977,21 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         f"static_signals={resource_review.get('signal_count', 0)}"
                     )
                 rewrite_review = item.get("rewrite_review") if isinstance(item.get("rewrite_review"), dict) else {}
+                source_guard = (
+                    rewrite_review.get("source_guard_review")
+                    if isinstance(rewrite_review.get("source_guard_review"), dict)
+                    else {}
+                )
+                if source_guard:
+                    source_summary = source_guard.get("summary", {}) or {}
+                    print(
+                        "  rewrite_source_guard="
+                        f"{source_guard.get('status')} "
+                        f"fixed_fetches={source_summary.get('fixed_upstream_fetch_refs', 0)} "
+                        f"guards={source_summary.get('positive_guard_refs', 0)} "
+                        f"query_refs={source_summary.get('query_forwarding_refs', 0)} "
+                        f"credential_refs={source_summary.get('credential_forwarding_refs', 0)}"
+                    )
                 read_only_candidates = rewrite_review.get("read_only_path_candidates", []) or []
                 blocked_candidates = rewrite_review.get("blocked_path_candidates", []) or []
                 if read_only_candidates:
