@@ -15773,8 +15773,21 @@ def normalize_manual_placeholder_command(command: str) -> str:
     )
 
 
+EXTERNAL_PROBE_COMMAND_FLAGS = ("--include-external", "--ws-resource-probes")
+
+
+def external_probe_flags_in_command(command: str) -> list[str]:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    token_set = set(tokens)
+    return [flag for flag in EXTERNAL_PROBE_COMMAND_FLAGS if flag in token_set]
+
+
 def classify_verification_command(command: str, *, source: str, item_status: str | None = None) -> dict[str, Any]:
     normalized = normalize_manual_placeholder_command(str(command))
+    external_probe_flags = external_probe_flags_in_command(normalized)
     known_placeholders = [
         PLACEHOLDER_REAL_WALLET,
         PLACEHOLDER_APPROVED_POOL_ADDRESS,
@@ -15815,6 +15828,10 @@ def classify_verification_command(command: str, *, source: str, item_status: str
         classification = "review-gated"
         runnable = False
         requires_manual_input = item_status == "manual-review"
+    elif external_probe_flags:
+        classification = "external-probe"
+        runnable = False
+        requires_manual_input = False
     else:
         classification = "ready"
         runnable = True
@@ -15826,7 +15843,8 @@ def classify_verification_command(command: str, *, source: str, item_status: str
         "classification": classification,
         "runnable": runnable,
         "requires_manual_input": requires_manual_input,
-        "blocked_external": item_status == "blocked-external",
+        "blocked_external": item_status == "blocked-external" or bool(external_probe_flags),
+        "external_probe_flags": external_probe_flags,
         "placeholders": placeholders,
         "issues": issues,
     }
@@ -15896,6 +15914,16 @@ def build_command_safety_selftest() -> dict[str, Any]:
             "expected_runnable": True,
             "expected_requires_manual_input": False,
             "expected_blocked_external": False,
+        },
+        {
+            "id": "external-probe-command",
+            "command": "python3 scripts/inferforge.py audit --include-external --ws-resource-probes",
+            "item_status": "ready",
+            "expected_classification": "external-probe",
+            "expected_runnable": False,
+            "expected_requires_manual_input": False,
+            "expected_blocked_external": True,
+            "expected_external_probe_flags": ["--include-external", "--ws-resource-probes"],
         },
         {
             "id": "known-placeholder",
@@ -16007,6 +16035,15 @@ def build_command_safety_selftest() -> dict[str, Any]:
                     "actual": result.get("issues", []),
                 }
             )
+        if "expected_external_probe_flags" in case:
+            assertions.append(
+                {
+                    "id": f"{case['id']}:external-probe-flags",
+                    "passed": result.get("external_probe_flags") == case.get("expected_external_probe_flags"),
+                    "expected": case.get("expected_external_probe_flags"),
+                    "actual": result.get("external_probe_flags"),
+                }
+            )
 
     summary = command_safety_summary([item["result"] for item in results])
     queue_items = [
@@ -16095,8 +16132,8 @@ def build_command_safety_selftest() -> dict[str, Any]:
         },
         {
             "id": "queue-blocked-external-count",
-            "passed": queue_summary.get("blocked_external") == 1,
-            "expected": 1,
+            "passed": queue_summary.get("blocked_external") == 2,
+            "expected": 2,
             "actual": queue_summary.get("blocked_external"),
         },
         {
@@ -16111,7 +16148,7 @@ def build_command_safety_selftest() -> dict[str, Any]:
                 "commands=7" in queue_safety_text
                 and "runnable=1" in queue_safety_text
                 and "manual=5" in queue_safety_text
-                and "external=1" in queue_safety_text
+                and "external=2" in queue_safety_text
                 and "unsafe=1" in queue_safety_text
                 and f'"{PLACEHOLDER_APPROVED_CONCRETE_PATH}": 1' in queue_safety_text
                 and f'"{PLACEHOLDER_REAL_WALLET}": 1' in queue_safety_text
@@ -17309,6 +17346,9 @@ def format_command_ref_label(ref: dict[str, Any]) -> str:
     placeholders = ref.get("placeholders", []) or []
     if placeholders:
         parts.append("placeholders=" + ",".join(str(item) for item in placeholders))
+    external_flags = ref.get("external_probe_flags", []) or []
+    if external_flags:
+        parts.append("external_flags=" + ",".join(str(item) for item in external_flags))
     issues = ref.get("issues", []) or []
     if issues:
         parts.append("issues=" + ",".join(str(item) for item in issues))
