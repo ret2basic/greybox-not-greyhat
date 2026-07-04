@@ -8227,6 +8227,51 @@ def hypothesis_from_rpc_method_policy(
     }
 
 
+def hypothesis_from_rpc_rate_limit_resource_policy(
+    rpc_method_policy: dict[str, Any],
+    *,
+    target_host: str,
+) -> dict[str, Any] | None:
+    review = (
+        rpc_method_policy.get("rate_limit_resource_review")
+        if isinstance(rpc_method_policy.get("rate_limit_resource_review"), dict)
+        else {}
+    )
+    if review.get("status") != "needs-deployment-review":
+        return None
+    source_refs = [
+        f"{ref.get('file')}:{ref.get('line')}"
+        for signal in review.get("signals", []) or []
+        if isinstance(signal, dict)
+        for ref in signal.get("refs", []) or []
+        if isinstance(ref, dict) and ref.get("file") and ref.get("line")
+    ]
+    return {
+        "id": f"HYP-resource-limit-{safe_hypothesis_id(str(review.get('status')), target_host)}",
+        "type": "resource-abuse-review",
+        "status": hypothesis_status_for_followup(
+            scope_decision="in-scope-explicit-host",
+            resource_gated=False,
+            offline_only=True,
+        ),
+        "priority": hypothesis_priority_from_values(review.get("priority"), "medium"),
+        "host": target_host,
+        "path": "/api/rpc/solana/{cluster}",
+        "cluster_id": "solana-rpc-http",
+        "scope_decision": "in-scope-explicit-host",
+        "source_status": review.get("status"),
+        "impact": "resource-exhaustion",
+        "impact_hypothesis": (
+            "Can client-keyed in-memory rate-limit fallback create availability impact under the real deployment proxy trust model?"
+        ),
+        "reportability_gate": review.get("reportability_gate"),
+        "next_step": review.get("next_step"),
+        "evidence_refs": compact_source_refs(["rpc-method-policy.json", *source_refs]),
+        "resource_abuse_review": review,
+        "safety": review.get("safety") or "Offline resource-control review only. Do not run rate or DoS tests.",
+    }
+
+
 def endpoint_clusters_for_hypothesis_matrix(
     *,
     profile: dict[str, Any] | None,
@@ -8731,6 +8776,12 @@ def build_hypothesis_matrix_run(
     rpc_hypothesis = hypothesis_from_rpc_method_policy(rpc_method_policy, target_host=target_host)
     if rpc_hypothesis:
         add_hypothesis(hypotheses, rpc_hypothesis)
+    rpc_resource_hypothesis = hypothesis_from_rpc_rate_limit_resource_policy(
+        rpc_method_policy,
+        target_host=target_host,
+    )
+    if rpc_resource_hypothesis:
+        add_hypothesis(hypotheses, rpc_resource_hypothesis)
 
     config_hosts = asset_candidates.get("config_hosts", {}) if isinstance(asset_candidates.get("config_hosts"), dict) else {}
     for host_item in config_hosts.get("hosts", []) or []:
@@ -9067,6 +9118,8 @@ def validation_question_for_hypothesis(hypothesis: dict[str, Any]) -> str:
         return "Can transaction or quote construction alter sender, recipient, mint, amount, or signing intent in a way that creates user or funds impact?"
     if impact == "rpc-proxy-abuse":
         return "Can the RPC proxy expose disallowed methods, bypass origin or rate limits, or disclose upstream-sensitive details?"
+    if impact == "resource-exhaustion":
+        return "Can resource-control fallback behavior create availability impact under the real deployment proxy trust model?"
     if impact == "fixed-upstream-proxy-confusion":
         return "Can fixed upstream routing be confused into SSRF, path traversal, or sensitive upstream data exposure?"
     if impact == "browser-route-exposure":
@@ -9111,6 +9164,25 @@ def required_evidence_for_hypothesis(hypothesis: dict[str, Any]) -> list[str]:
             "Evidence of practical user, funds, availability, or sensitive-data impact without DoS testing.",
             *common,
         ]
+    if impact == "resource-exhaustion":
+        resource_review = (
+            hypothesis.get("resource_abuse_review")
+            if isinstance(hypothesis.get("resource_abuse_review"), dict)
+            else {}
+        )
+        review_evidence = [
+            str(item)
+            for item in resource_review.get("required_evidence", []) or []
+            if str(item).strip()
+        ]
+        return ordered_unique_strings(
+            [
+                *review_evidence,
+                "Deployment evidence that the fallback is reachable in production and not only a local/dev safeguard.",
+                "Concrete availability impact evidence that does not use flooding, rate-limit stress, or DoS testing.",
+                *common,
+            ]
+        )
     return common
 
 
@@ -9347,6 +9419,7 @@ def validation_item_from_hypothesis(
         "command_replacements": command_replacements,
         "rewrite_review": rewrite_review_context,
         "transaction_flow_review": hypothesis.get("transaction_flow_review"),
+        "resource_abuse_review": hypothesis.get("resource_abuse_review"),
         "command_safety": command_summary,
         "blocked_command_safety": blocked_command_summary,
         "required_evidence": required_evidence_for_hypothesis(hypothesis),
@@ -14248,6 +14321,72 @@ def build_transaction_flow_static_review(
     }
 
 
+def build_rate_limit_resource_review(
+    *,
+    memory_rate_limit_refs: list[dict[str, Any]],
+    client_ip_header_refs: list[dict[str, Any]],
+    external_rate_limit_store_refs: list[dict[str, Any]],
+    rate_limit_guard_refs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    signals = []
+
+    def add_signal(signal_id: str, summary: str, refs: list[dict[str, Any]], review_question: str) -> None:
+        signals.append(
+            {
+                "id": signal_id,
+                "summary": summary,
+                "ref_count": len(refs),
+                "refs": refs[:6],
+                "review_question": review_question,
+            }
+        )
+
+    if memory_rate_limit_refs and client_ip_header_refs:
+        add_signal(
+            "client-keyed-memory-rate-limit-fallback",
+            "Rate limiting can use process memory keyed from request IP header material.",
+            [*memory_rate_limit_refs[:3], *client_ip_header_refs[:3]],
+            "Can deployment guarantees prove the client IP key is trusted and memory buckets are bounded or externally stored?",
+        )
+    if memory_rate_limit_refs and external_rate_limit_store_refs:
+        add_signal(
+            "external-store-fallback-to-memory",
+            "External rate-limit storage can fall back to in-process memory.",
+            [*external_rate_limit_store_refs[:3], *memory_rate_limit_refs[:3]],
+            "Is the fallback acceptable in production, and is there monitoring for external store failures?",
+        )
+    if rate_limit_guard_refs and memory_rate_limit_refs:
+        add_signal(
+            "bounded-rate-limit-guard-review",
+            "Rate-limit guard constants exist alongside the memory fallback.",
+            [*rate_limit_guard_refs[:3], *memory_rate_limit_refs[:3]],
+            "Do configured burst/sustained limits and key lifetimes bound memory growth under the real proxy trust model?",
+        )
+
+    return {
+        "status": "needs-deployment-review" if signals else "no-static-resource-signal",
+        "priority": "medium" if signals else "info",
+        "signal_count": len(signals),
+        "signals": signals,
+        "reportability_gate": (
+            "Static in-memory rate-limit fallback evidence is not reportable by itself. "
+            "Escalate only with deployment evidence showing attacker-controlled key growth, missing external store, "
+            "and concrete availability impact, without rate/DoS testing."
+        ),
+        "next_step": (
+            "Review production proxy header trust, external rate-limit store configuration, key TTL/eviction behavior, "
+            "and monitoring evidence. Do not validate with high-volume traffic."
+        ),
+        "required_evidence": [
+            "Deployment evidence for whether an external rate-limit store is configured and healthy.",
+            "Proxy/header trust evidence showing whether x-forwarded-for or equivalent client IP material is attacker-controlled.",
+            "Source evidence for key TTL/eviction or another bound on in-memory rate-limit bucket growth.",
+            "A finding-gate decision showing concrete availability impact without rate/DoS testing.",
+        ],
+        "safety": "Offline deployment/source review only. Do not perform rate-limit bypass, flooding, or DoS validation.",
+    }
+
+
 def build_remote_transaction_signing_review(
     *,
     frontend_transaction_refs: list[dict[str, Any]],
@@ -14466,6 +14605,11 @@ def build_rpc_method_policy(
                 "priority": "info",
                 "next_step": "Pure black-box profile: collect approved Burp quote responses before transaction-intent decoding.",
             },
+            "rate_limit_resource_review": {
+                "status": "not-applicable-blackbox",
+                "priority": "info",
+                "next_step": "Pure black-box profile: review deployment/resource controls only with approved source or operator evidence.",
+            },
             "transaction_probe_results": [],
             "safety": "Pure black-box profile: local Solana RPC source policy is not inspected.",
         }
@@ -14490,6 +14634,11 @@ def build_rpc_method_policy(
                 "status": "source-unavailable",
                 "priority": "info",
                 "next_step": "Source file was unavailable; use approved quote payload artifacts for transaction-intent review.",
+            },
+            "rate_limit_resource_review": {
+                "status": "source-unavailable",
+                "priority": "info",
+                "next_step": "Source file was unavailable; review deployment/resource controls with approved source or operator evidence.",
             },
             "transaction_probe_results": [],
             "safety": "Source file was unavailable, so RPC method policy was not inferred from local source.",
@@ -14539,6 +14688,10 @@ def build_rpc_method_policy(
             ],
             "recent_blockhash_refs": ["getLatestBlockhash", "recentBlockhash"],
             "quote_amount_refs": ["quote.amountIn", "quote.amountOut", "requestedRawAmount"],
+            "memory_rate_limit_refs": ["memoryRateLimits", "incrementWithMemory", "new Map<string"],
+            "client_ip_header_refs": ["x-forwarded-for", "cf-connecting-ip", "x-real-ip", "getClientIp"],
+            "external_rate_limit_store_refs": ["UPSTASH_REDIS_REST_URL", "KV_REST_API_URL", "incrementWithUpstash"],
+            "rate_limit_guard_refs": ["BURST_LIMIT", "SUSTAINED_LIMIT", "checkRateLimit"],
         },
     )
     frontend_transaction_refs = source_ref_groups["frontend_transaction_refs"]
@@ -14551,6 +14704,12 @@ def build_rpc_method_policy(
         execution_wallet_refs=source_ref_groups["execution_wallet_refs"],
         recent_blockhash_refs=source_ref_groups["recent_blockhash_refs"],
         quote_amount_refs=source_ref_groups["quote_amount_refs"],
+    )
+    rate_limit_resource_review = build_rate_limit_resource_review(
+        memory_rate_limit_refs=source_ref_groups["memory_rate_limit_refs"],
+        client_ip_header_refs=source_ref_groups["client_ip_header_refs"],
+        external_rate_limit_store_refs=source_ref_groups["external_rate_limit_store_refs"],
+        rate_limit_guard_refs=source_ref_groups["rate_limit_guard_refs"],
     )
 
     if default_high_impact:
@@ -14584,6 +14743,7 @@ def build_rpc_method_policy(
             remote_transaction_material_refs=remote_transaction_material_refs,
             static_intent_review=static_intent_review,
         ),
+        "rate_limit_resource_review": rate_limit_resource_review,
         "proxy_connection_refs": proxy_connection_refs,
         "transaction_probe_results": transaction_probe_results,
         "policy_posture": posture,
@@ -30437,6 +30597,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_rpc_method_policy_sample.get("policy_posture") == "not-applicable-blackbox"
         and blackbox_rpc_method_policy_sample.get("remote_transaction_signing_review", {}).get("status")
         == "not-applicable-blackbox"
+        and blackbox_rpc_method_policy_sample.get("rate_limit_resource_review", {}).get("status")
+        == "not-applicable-blackbox"
         and blackbox_target_info_sample.get("reachable") is True
         and blackbox_target_info_sample.get("health_status") == 404
         and blackbox_target_info_sample.get("health_path") is None
@@ -30543,6 +30705,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         )
         and not any(
             item.get("type") == "transaction-flow-review"
+            for item in blackbox_hypothesis_matrix_sample.get("hypotheses", [])
+        )
+        and not any(
+            item.get("type") == "resource-abuse-review"
             for item in blackbox_hypothesis_matrix_sample.get("hypotheses", [])
         )
         and blackbox_hypothesis_matrix_rollup_sample.get("summary", {}).get("runs") == 1
@@ -30690,6 +30856,31 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                   'simulateTransaction',
                 ])
                 const ALLOW_TRANSACTION_METHODS = process.env.SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS === 'true'
+                const BURST_LIMIT = 30
+                const SUSTAINED_LIMIT = 600
+                const memoryRateLimits = new Map<string, { count: number; resetAt: number }>()
+
+                function getClientIp(req) {
+                  return req.headers.get('x-forwarded-for') ?? req.headers.get('cf-connecting-ip') ?? req.headers.get('x-real-ip') ?? 'unknown'
+                }
+
+                async function incrementWithUpstash(key: string) {
+                  if (!process.env.UPSTASH_REDIS_REST_URL && !process.env.KV_REST_API_URL) {
+                    return null
+                  }
+                  return { count: 1, ttl: 10 }
+                }
+
+                function incrementWithMemory(key: string) {
+                  const existing = memoryRateLimits.get(key)
+                  memoryRateLimits.set(key, { count: (existing?.count ?? 0) + 1, resetAt: Date.now() + 10000 })
+                  return memoryRateLimits.get(key)
+                }
+
+                export async function checkRateLimit(req) {
+                  const ip = getClientIp(req)
+                  return (await incrementWithUpstash(ip)) ?? incrementWithMemory(`${BURST_LIMIT}:${SUSTAINED_LIMIT}:${ip}`)
+                }
 
                 export function getAllowedMethods() {
                   const methods = new Set(DEFAULT_ALLOWED_METHODS)
@@ -30963,6 +31154,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             ),
             None,
         )
+        rewrite_resource_hypothesis = next(
+            (
+                item
+                for item in rewrite_transaction_matrix.get("hypotheses", [])
+                if item.get("type") == "resource-abuse-review"
+            ),
+            None,
+        )
         rewrite_transaction_validation_plan = build_validation_plan_run(
             target="http://127.0.0.1:9998",
             profile=rewrite_normalized,
@@ -30974,6 +31173,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 item
                 for item in rewrite_transaction_validation_plan.get("items", [])
                 if item.get("hypothesis_type") == "transaction-flow-review"
+            ),
+            None,
+        )
+        rewrite_resource_validation_item = next(
+            (
+                item
+                for item in rewrite_transaction_validation_plan.get("items", [])
+                if item.get("hypothesis_type") == "resource-abuse-review"
             ),
             None,
         )
@@ -31535,6 +31742,27 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("status")
             == "needs-transaction-intent-corpus"
             and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
+        )
+        rate_limit_resource_review = rewrite_transaction_policy.get("rate_limit_resource_review", {})
+        rate_limit_signal_ids = {
+            signal.get("id")
+            for signal in rate_limit_resource_review.get("signals", [])
+            if isinstance(signal, dict)
+        }
+        rate_limit_resource_review_passed = (
+            rate_limit_resource_review.get("status") == "needs-deployment-review"
+            and {
+                "client-keyed-memory-rate-limit-fallback",
+                "external-store-fallback-to-memory",
+                "bounded-rate-limit-guard-review",
+            }.issubset(rate_limit_signal_ids)
+            and rewrite_resource_hypothesis is not None
+            and rewrite_resource_hypothesis.get("status") == "ready-for-offline-review"
+            and rewrite_resource_hypothesis.get("impact") == "resource-exhaustion"
+            and rewrite_resource_validation_item is not None
+            and rewrite_resource_validation_item.get("status") == "ready-offline"
+            and rewrite_resource_validation_item.get("resource_abuse_review", {}).get("status")
+            == "needs-deployment-review"
         )
         rewrite_server_action_report_lines = rewrite_source_resolver_report.get("server_action_lines", [])
         rewrite_discovery_passed = (
@@ -32435,6 +32663,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and any_method_match_reason_passed
         and rewrite_discovery_passed
         and transaction_flow_hypothesis_passed
+        and rate_limit_resource_review_passed
         and profile_custom_ws_discovery_passed
         and configured_nextjs_runtime_passed
         and initial_artifacts_passed
@@ -32754,6 +32983,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "matrix_summary": rewrite_transaction_matrix.get("summary", {}),
                 "hypothesis": rewrite_transaction_hypothesis,
                 "validation_item": rewrite_transaction_validation_item,
+            },
+            "rate_limit_resource_review": {
+                "status": "passed" if rate_limit_resource_review_passed else "failed",
+                "policy_review": rate_limit_resource_review,
+                "hypothesis": rewrite_resource_hypothesis,
+                "validation_item": rewrite_resource_validation_item,
             },
             "source_resolver_report_summary": rewrite_source_resolver_report,
             "observation_clusters": sorted(rewrite_observation_clusters),
@@ -36133,6 +36368,17 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         f"frontend_refs={transaction_flow.get('frontend_signing_ref_count', 0)} "
                         f"remote_tx_refs={transaction_flow.get('remote_transaction_material_ref_count', 0)} "
                         f"static_signals={transaction_flow.get('static_signal_count', 0)}"
+                    )
+                resource_review = (
+                    item.get("resource_abuse_review")
+                    if isinstance(item.get("resource_abuse_review"), dict)
+                    else {}
+                )
+                if resource_review:
+                    print(
+                        "  resource_abuse_review="
+                        f"{resource_review.get('status')} "
+                        f"static_signals={resource_review.get('signal_count', 0)}"
                     )
                 rewrite_review = item.get("rewrite_review") if isinstance(item.get("rewrite_review"), dict) else {}
                 read_only_candidates = rewrite_review.get("read_only_path_candidates", []) or []

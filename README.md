@@ -297,6 +297,11 @@ preview-wallet versus execution-wallet paths, remote payload deserialization,
 and client-side recent-blockhash refreshes. These signals only define what the
 decoded corpus must be compared against; they are not vulnerability findings on
 their own.
+When RPC source shows client-keyed in-memory rate-limit fallback behavior, the
+matrix can add a `resource-abuse-review` hypothesis. This is also offline-only:
+review deployment proxy header trust, external rate-limit store configuration,
+and bounded key/TTL evidence. Do not validate it with rate-limit stress, flood,
+or DoS testing.
 
 Use `rewrite-review` for the dedicated fixed-upstream rewrite/proxy review:
 
