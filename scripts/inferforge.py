@@ -3558,12 +3558,49 @@ def route_matches_profile_quote(
     )
 
 
+def profile_cluster_for_endpoint(
+    profile: dict[str, Any] | None,
+    path: str,
+    methods: list[str] | None = None,
+    alternate_paths: list[str] | None = None,
+) -> dict[str, Any] | None:
+    if not profile:
+        return None
+    path_candidates = [path]
+    for candidate in alternate_paths or []:
+        if candidate and candidate not in path_candidates:
+            path_candidates.append(candidate)
+    route_methods = [str(method).upper() for method in (methods or []) if str(method or "").strip()]
+    for cluster in profile.get("clusters", []) or []:
+        cluster_id = str(cluster.get("id") or "")
+        if not cluster_id:
+            continue
+        if not strategy_set_enabled(profile, strategy_set_for_cluster(cluster)):
+            continue
+        cluster_methods = {
+            str(cluster.get("method") or "").upper(),
+            *{str(method).upper() for method in (cluster.get("match") or {}).get("methods", []) or []},
+        }
+        cluster_methods.discard("")
+        method_candidates = route_methods or sorted(cluster_methods) or sorted(HTTP_METHODS)
+        if any(
+            cluster_matches_endpoint(cluster, method, candidate_path)
+            for candidate_path in path_candidates
+            for method in method_candidates
+        ):
+            return cluster
+    return None
+
+
 def cluster_id_from_route_path(
     path: str,
     profile: dict[str, Any] | None = None,
     methods: list[str] | None = None,
     alternate_paths: list[str] | None = None,
 ) -> str:
+    profile_cluster = profile_cluster_for_endpoint(profile, path, methods, alternate_paths)
+    if profile_cluster is not None:
+        return str(profile_cluster["id"])
     if route_matches_profile_quote(profile, path, methods, alternate_paths):
         return "quote"
     if path == "/health":
@@ -3588,6 +3625,14 @@ def infer_route_strategy(
 ) -> dict[str, Any]:
     lowered = source.lower()
     reasons = []
+    profile_cluster = profile_cluster_for_endpoint(profile, path, methods, alternate_paths)
+    if profile_cluster is not None:
+        return {
+            "strategy_set": strategy_set_for_cluster(profile_cluster),
+            "kind": str(profile_cluster.get("kind") or "profile-route"),
+            "priority": str(profile_cluster.get("priority") or "medium"),
+            "reasons": [f"profile-cluster-route-match:{profile_cluster.get('id')}"],
+        }
     if path == "/health":
         return {
             "strategy_set": "nextjs-api-routes",
@@ -22658,11 +22703,24 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
     profile_seeded_route_discovery: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(prefix="inferforge-profile-seeded-discovery-") as temp_dir:
         seeded_source_root = Path(temp_dir) / "seeded-app"
+        (seeded_source_root / "src/app/statusz").mkdir(parents=True)
+        (seeded_source_root / "src/app/statusz/route.ts").write_text(
+            "export async function GET() { return Response.json({ ok: true }) }\n",
+            encoding="utf-8",
+        )
         (seeded_source_root / "src/app/bridge/swap").mkdir(parents=True)
         (seeded_source_root / "src/app/bridge/swap/route.ts").write_text(
             "export async function POST() {\n"
             "  await fetch('https://gateway.example.invalid/swap')\n"
             "  return Response.json({ ok: true })\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (seeded_source_root / "src/app/chain/solana/[cluster]").mkdir(parents=True)
+        (seeded_source_root / "src/app/chain/solana/[cluster]/route.ts").write_text(
+            "export async function POST(req: Request) {\n"
+            "  const body = await req.json()\n"
+            "  return Response.json({ jsonrpc: '2.0', id: body.id ?? 1, result: 'ok' })\n"
             "}\n",
             encoding="utf-8",
         )
@@ -22681,6 +22739,30 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         )
         neutral_route = next(
             (route for route in neutral_inventory.get("routes", []) if route.get("source_path") == "/bridge/swap"),
+            None,
+        )
+        seeded_status_route = next(
+            (route for route in seeded_inventory.get("routes", []) if route.get("source_path") == "/statusz"),
+            None,
+        )
+        seeded_rpc_route = next(
+            (
+                route
+                for route in seeded_inventory.get("routes", [])
+                if route.get("source_path") == "/chain/solana/{cluster}"
+            ),
+            None,
+        )
+        neutral_status_route = next(
+            (route for route in neutral_inventory.get("routes", []) if route.get("source_path") == "/statusz"),
+            None,
+        )
+        neutral_rpc_route = next(
+            (
+                route
+                for route in neutral_inventory.get("routes", [])
+                if route.get("source_path") == "/chain/solana/{cluster}"
+            ),
             None,
         )
         seeded_profile = build_discovered_profile(
@@ -22702,17 +22784,33 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             seeded_route is not None
             and seeded_route.get("cluster_id") == "quote"
             and seeded_route.get("strategy_set") == "quote-transaction-decoder"
-            and "profile-quote-route-match" in seeded_route.get("inference_reasons", [])
+            and "profile-cluster-route-match:quote" in seeded_route.get("inference_reasons", [])
+            and seeded_status_route is not None
+            and seeded_status_route.get("cluster_id") == "health"
+            and seeded_status_route.get("kind") == "health"
+            and "profile-cluster-route-match:health" in seeded_status_route.get("inference_reasons", [])
+            and seeded_rpc_route is not None
+            and seeded_rpc_route.get("cluster_id") == "solana-rpc-http"
+            and seeded_rpc_route.get("strategy_set") == "solana-json-rpc-proxy"
+            and "profile-cluster-route-match:solana-rpc-http" in seeded_rpc_route.get("inference_reasons", [])
             and (seeded_profile.get("probe_targets") or {}).get("quote", {}).get("path") == "/bridge/swap"
             and (seeded_profile.get("quote_provider") or {}).get("name") == "SelfTestQuoteProvider"
             and neutral_route is not None
             and neutral_route.get("cluster_id") == "route-bridge-swap"
             and neutral_route.get("strategy_set") == "fixed-upstream-proxy"
+            and neutral_status_route is not None
+            and neutral_status_route.get("cluster_id") == "route-statusz"
+            and neutral_rpc_route is not None
+            and neutral_rpc_route.get("cluster_id") == "route-chain-solana-cluster"
             and "quote_provider" not in neutral_profile
         )
         profile_seeded_route_discovery = {
             "seeded_route": seeded_route,
             "neutral_route": neutral_route,
+            "seeded_status_route": seeded_status_route,
+            "neutral_status_route": neutral_status_route,
+            "seeded_rpc_route": seeded_rpc_route,
+            "neutral_rpc_route": neutral_rpc_route,
             "seeded_probe_targets": seeded_profile.get("probe_targets"),
             "neutral_strategy_sets": neutral_profile.get("strategy_sets", []),
             "neutral_has_quote_provider": "quote_provider" in neutral_profile,
