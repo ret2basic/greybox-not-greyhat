@@ -300,6 +300,20 @@ active validation items back behind the resource gate when memory or swap is
 unhealthy. Use `--skip-current-resource-check` only for deterministic offline
 artifact comparisons.
 
+Use `iteration-decision` as the orchestrator-facing next-step gate. It reads the
+validation plan, artifact health, and current resource snapshot, then separates
+offline commands that can run now from active validation commands that must wait
+behind scope, resource, and command-safety gates:
+
+```bash
+python3 scripts/inferforge.py --artifact-dir .greybox/target-set \
+  iteration-decision --discover-child-runs --no-write --show-commands
+```
+
+The decision artifact is still read-only. It does not run the commands it
+prints; it exists so unattended loops can choose a safe next action without
+guessing from free-form text.
+
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:
 

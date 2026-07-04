@@ -104,6 +104,7 @@ LEAD_PORTFOLIO_ARTIFACT = "lead-portfolio.json"
 HARNESS_LOOP_ARTIFACT = "harness-loop.json"
 HYPOTHESIS_MATRIX_ARTIFACT = "hypothesis-matrix.json"
 VALIDATION_PLAN_ARTIFACT = "validation-plan.json"
+ITERATION_DECISION_ARTIFACT = "iteration-decision.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -186,6 +187,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     HARNESS_LOOP_ARTIFACT,
     HYPOTHESIS_MATRIX_ARTIFACT,
     VALIDATION_PLAN_ARTIFACT,
+    ITERATION_DECISION_ARTIFACT,
     "artifact-health.json",
     "regression-suite.json",
     "orca-baseline.json",
@@ -8871,6 +8873,285 @@ def build_validation_plan_rollup(
             "send requests, invoke Burp, sign wallets, submit transactions, or fetch external hosts."
         ),
     }
+
+
+def iteration_resource_preflight_snapshot(skip_current_resource_check: bool) -> dict[str, Any] | None:
+    if skip_current_resource_check:
+        return None
+    return build_resource_snapshot(
+        max_processes=8,
+        watch_ports=[3100, 2455],
+        warn_available_mib=2048,
+        warn_swap_used_mib=1024,
+    )
+
+
+def command_ref_is_resource_check(ref: dict[str, Any]) -> bool:
+    return "resource-snapshot" in validation_command_tokens(str(ref.get("command") or ""))
+
+
+def append_unique_command_ref(
+    refs: list[dict[str, Any]],
+    seen: set[str],
+    ref: dict[str, Any],
+    *,
+    item: dict[str, Any],
+    reason: str,
+) -> None:
+    command = str(ref.get("command") or "")
+    classification = str(ref.get("classification") or "")
+    key = f"{classification}\0{command}"
+    if not command or key in seen:
+        return
+    seen.add(key)
+    row = json_clone(ref)
+    row["validation_item_id"] = item.get("id")
+    row["validation_item_status"] = item.get("status")
+    row["validation_item_priority"] = item.get("priority")
+    row["validation_item_type"] = item.get("hypothesis_type")
+    row["artifact_dir"] = item.get("artifact_dir")
+    row["reason"] = reason
+    refs.append(row)
+
+
+def collect_iteration_command_sets(validation_plan: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    offline: list[dict[str, Any]] = []
+    resource_checks: list[dict[str, Any]] = []
+    active_after_gate: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    seen_offline: set[str] = set()
+    seen_resource: set[str] = set()
+    seen_active: set[str] = set()
+    seen_blocked: set[str] = set()
+    for item in validation_plan.get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for ref in item.get("allowed_now", []) or []:
+            if isinstance(ref, dict) and ref.get("classification") == "ready":
+                append_unique_command_ref(
+                    offline,
+                    seen_offline,
+                    ref,
+                    item=item,
+                    reason="Safe read-only planning command available before any target traffic.",
+                )
+        for ref in item.get("allowed_after_resource_gate", []) or []:
+            if not isinstance(ref, dict) or ref.get("classification") != "ready":
+                continue
+            if command_ref_is_resource_check(ref):
+                append_unique_command_ref(
+                    resource_checks,
+                    seen_resource,
+                    ref,
+                    item=item,
+                    reason="Resource gate command that must pass before active validation traffic.",
+                )
+            else:
+                append_unique_command_ref(
+                    active_after_gate,
+                    seen_active,
+                    ref,
+                    item=item,
+                    reason="Constrained active validation command allowed only after resource and scope gates pass.",
+                )
+        for ref in item.get("blocked_commands", []) or []:
+            if isinstance(ref, dict):
+                append_unique_command_ref(
+                    blocked,
+                    seen_blocked,
+                    ref,
+                    item=item,
+                    reason="Command is not allowed for unattended execution.",
+                )
+    return {
+        "offline": offline,
+        "resource_checks": resource_checks,
+        "active_after_gate": active_after_gate,
+        "blocked": blocked,
+    }
+
+
+def iteration_action(
+    *,
+    action_id: str,
+    status: str,
+    kind: str,
+    reason: str,
+    commands: list[dict[str, Any]],
+    limit: int,
+) -> dict[str, Any]:
+    return {
+        "id": action_id,
+        "status": status,
+        "kind": kind,
+        "reason": reason,
+        "commands": commands[:limit],
+        "command_safety": command_safety_summary(commands),
+    }
+
+
+def build_iteration_decision_from_plan(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    validation_plan: dict[str, Any],
+    artifact_health: dict[str, Any],
+    current_resource_snapshot: dict[str, Any] | None,
+    limit: int,
+) -> dict[str, Any]:
+    commands = collect_iteration_command_sets(validation_plan)
+    offline = commands["offline"]
+    resource_checks = commands["resource_checks"]
+    active_after_gate = commands["active_after_gate"]
+    blocked = commands["blocked"]
+    resource_preflight = validation_resource_preflight_summary(current_resource_snapshot)
+    resource_status = str(resource_preflight.get("status") or "not-run")
+    artifact_health_status = artifact_summary_status(artifact_health)
+    allowed_command_summary = command_safety_summary([*offline, *resource_checks, *active_after_gate])
+    blocked_command_summary = command_safety_summary(blocked)
+    resource_blocks_active = bool(active_after_gate and resource_status not in {"healthy", "not-run"})
+
+    actions: list[dict[str, Any]] = []
+    if offline:
+        actions.append(
+            iteration_action(
+                action_id="offline-planning",
+                status="ready",
+                kind="offline",
+                reason="Read-only planning commands can run under current resource pressure.",
+                commands=offline,
+                limit=limit,
+            )
+        )
+    if active_after_gate:
+        actions.append(
+            iteration_action(
+                action_id="active-validation",
+                status="blocked-resource" if resource_blocks_active else "ready-after-resource-gate",
+                kind="active-validation",
+                reason=(
+                    "Current resource preflight is not healthy; do not run active validation commands."
+                    if resource_blocks_active
+                    else "Active commands are constrained and still require the resource-check command immediately before execution."
+                ),
+                commands=active_after_gate,
+                limit=limit,
+            )
+        )
+    if resource_checks:
+        actions.append(
+            iteration_action(
+                action_id="resource-check",
+                status="ready",
+                kind="local-gate",
+                reason="Local /proc resource check; no target requests are sent.",
+                commands=resource_checks,
+                limit=limit,
+            )
+        )
+    if blocked:
+        actions.append(
+            iteration_action(
+                action_id="blocked-commands",
+                status="blocked-command-safety",
+                kind="blocked",
+                reason="These commands are isolated from unattended execution.",
+                commands=blocked,
+                limit=limit,
+            )
+        )
+
+    if artifact_health_status in {"failed", "needs-human-review"}:
+        status = "blocked-artifact-health"
+    elif blocked_command_summary.get("unsafe_template_count") or blocked_command_summary.get("blocked_external"):
+        status = "blocked-command-safety"
+    elif offline:
+        status = "ready-offline"
+    elif active_after_gate and resource_blocks_active:
+        status = "blocked-resource"
+    elif active_after_gate:
+        status = "ready-active-validation"
+    elif validation_plan.get("items"):
+        status = "parked"
+    else:
+        status = "no-validation-items"
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": str(artifact_dir),
+        "mode": validation_plan.get("mode") or "single-run",
+        "summary": {
+            "validation_plan": validation_plan.get("status"),
+            "artifact_health": artifact_health_status,
+            "current_resource_snapshot": resource_status,
+            "validation_items": len(validation_plan.get("items", []) or []),
+            "offline_commands": len(offline),
+            "resource_check_commands": len(resource_checks),
+            "active_after_resource_gate_commands": len(active_after_gate),
+            "resource_blocked_active_commands": len(active_after_gate) if resource_blocks_active else 0,
+            "blocked_commands": len(blocked),
+            "command_safety": allowed_command_summary,
+            "blocked_command_safety": blocked_command_summary,
+        },
+        "resource_preflight": resource_preflight,
+        "artifact_health": {
+            "status": artifact_health_status,
+            "summary": artifact_health.get("summary", {}) if isinstance(artifact_health, dict) else {},
+        },
+        "actions": actions,
+        "artifact_refs": {
+            "validation_plan": VALIDATION_PLAN_ARTIFACT,
+            "artifact_health": "artifact-health.json",
+            "resource_snapshot": RESOURCE_SNAPSHOT_ARTIFACT,
+        },
+        "safety": (
+            "Read-only iteration decision. It does not execute commands, send requests, invoke Burp, "
+            "run scanners, sign wallets, submit transactions, or fetch external hosts."
+        ),
+    }
+
+
+def build_iteration_decision(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    check_dirs: list[Path],
+    limit: int,
+    current_resource_snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if check_dirs:
+        validation_plan = build_validation_plan_rollup(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            check_dirs=check_dirs,
+            limit=limit,
+            current_resource_snapshot=current_resource_snapshot,
+        )
+        artifact_health = build_artifact_health(check_dirs)
+    else:
+        validation_plan = build_validation_plan_run(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            limit=limit,
+            current_resource_snapshot=current_resource_snapshot,
+        )
+        artifact_health = build_artifact_health([artifact_dir])
+    return build_iteration_decision_from_plan(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        validation_plan=validation_plan,
+        artifact_health=artifact_health,
+        current_resource_snapshot=current_resource_snapshot,
+        limit=limit,
+    )
 
 
 def read_http_headers_from_socket(sock: socket.socket, *, max_bytes: int = 65536) -> bytes:
@@ -28969,6 +29250,31 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for item in blackbox_validation_plan_sample.get("items", [])
             if isinstance(item, dict)
         )
+        blackbox_iteration_decision_sample = build_iteration_decision_from_plan(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_run_dir,
+            validation_plan=blackbox_validation_plan_sample,
+            artifact_health={
+                "generated_at": utc_now(),
+                "status": "healthy",
+                "summary": {"artifact_dirs": 1, "status_counts": {"healthy": 1}},
+            },
+            current_resource_snapshot={
+                "generated_at": utc_now(),
+                "status": "warning",
+                "warnings": ["swap-usage-above-threshold"],
+                "memory": {"swap_used_pct": 82.0},
+                "watched_ports": {"2455": {"listening": True}, "3100": {"listening": False}},
+            },
+            limit=5,
+        )
+        blackbox_iteration_command_text_sample = "\n".join(
+            str(ref.get("command") or "")
+            for action in blackbox_iteration_decision_sample.get("actions", [])
+            for ref in action.get("commands", []) or []
+            if isinstance(ref, dict)
+        )
     blackbox_asset_profile_paths = {
         cluster.get("path")
         for cluster in blackbox_asset_profile_sample.get("clusters", [])
@@ -29185,6 +29491,18 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_validation_plan_rollup_sample.get("summary", {}).get("items") == 5
         and "top-secret" not in blackbox_validation_plan_text_sample
         and "AbC1234567890Token" not in blackbox_validation_plan_text_sample
+        and blackbox_iteration_decision_sample.get("status") == "ready-offline"
+        and blackbox_iteration_decision_sample.get("summary", {}).get("offline_commands", 0) > 0
+        and blackbox_iteration_decision_sample.get("summary", {}).get("active_after_resource_gate_commands", 0) > 0
+        and blackbox_iteration_decision_sample.get("summary", {}).get("resource_blocked_active_commands", 0) > 0
+        and blackbox_iteration_decision_sample.get("summary", {}).get("command_safety", {}).get("blocked_external") == 0
+        and any(
+            action.get("status") == "blocked-resource" and action.get("kind") == "active-validation"
+            for action in blackbox_iteration_decision_sample.get("actions", [])
+        )
+        and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_iteration_command_text_sample
+        and "top-secret" not in blackbox_iteration_command_text_sample
+        and "AbC1234567890Token" not in blackbox_iteration_command_text_sample
         and blackbox_asset_clusters_sample.get("profile", {}).get("asset_candidate_profile") is True
         and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_verification_command_text
         and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_asset_verification_command_text
@@ -34432,6 +34750,117 @@ def run_validation_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_iteration_decision(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    current_resource_snapshot = iteration_resource_preflight_snapshot(
+        bool(getattr(args, "skip_current_resource_check", False))
+    )
+
+    check_dirs: list[Path] = []
+    for item in args.check_dir or []:
+        check_dirs.append(resolve_repo_path(item))
+    if args.discover_child_runs:
+        check_dirs.extend(discover_harness_loop_dirs(artifact_dir))
+    deduped_dirs = []
+    seen_dirs: set[str] = set()
+    for check_dir in check_dirs:
+        resolved = check_dir.resolve()
+        key = str(resolved)
+        if key in seen_dirs:
+            continue
+        seen_dirs.add(key)
+        deduped_dirs.append(resolved)
+
+    decision = build_iteration_decision(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        check_dirs=deduped_dirs,
+        limit=max(1, int(args.limit)),
+        current_resource_snapshot=current_resource_snapshot,
+    )
+
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / ITERATION_DECISION_ARTIFACT
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, decision)
+        if deduped_dirs:
+            refreshed_manifests = refresh_manifests_for_artifact_outputs(
+                output_paths=[output_path],
+                artifact_dir=artifact_dir,
+                check_dirs=deduped_dirs,
+                target=target,
+                command="iteration-decision",
+            )
+        else:
+            refreshed_manifests = refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="iteration-decision",
+                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+            )
+
+    summary = decision.get("summary", {}) or {}
+    resource_preflight = decision.get("resource_preflight", {}) or {}
+    command_safety = summary.get("command_safety", {}) or {}
+    blocked_command_safety = summary.get("blocked_command_safety", {}) or {}
+    print(f"Iteration decision: {decision['status']}")
+    print(
+        "Inputs: "
+        f"validation_plan={summary.get('validation_plan')} "
+        f"artifact_health={summary.get('artifact_health')} "
+        f"resource={summary.get('current_resource_snapshot')}"
+    )
+    if resource_preflight and resource_preflight.get("status") != "not-run":
+        warnings = resource_preflight.get("warnings", []) or []
+        print(
+            "Current resource gate: "
+            f"{resource_preflight.get('status')} "
+            f"warnings={','.join(warnings) if warnings else 'none'}"
+        )
+    print(
+        "Commands: "
+        f"offline={summary.get('offline_commands', 0)} "
+        f"resource_checks={summary.get('resource_check_commands', 0)} "
+        f"active_after_gate={summary.get('active_after_resource_gate_commands', 0)} "
+        f"resource_blocked_active={summary.get('resource_blocked_active_commands', 0)} "
+        f"blocked={summary.get('blocked_commands', 0)}"
+    )
+    if command_safety:
+        print(f"Command safety: {format_command_safety_summary(command_safety)}")
+    if blocked_command_safety and blocked_command_safety.get("commands"):
+        print(f"Blocked command safety: {format_command_safety_summary(blocked_command_safety)}")
+
+    top_count = max(0, int(args.top))
+    if top_count:
+        print("Actions:")
+        for action in (decision.get("actions", []) or [])[:top_count]:
+            print(
+                f"- {action.get('status')} {action.get('kind')} "
+                f"{inline_summary_text(action.get('reason'), max_chars=220)}"
+            )
+            if args.show_commands:
+                for ref in (action.get("commands", []) or [])[:3]:
+                    print(f"    - {format_command_ref_label(ref)} {inline_summary_text(ref.get('command'), max_chars=420)}")
+
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+
+    if decision["status"] in {"blocked-artifact-health", "blocked-command-safety"}:
+        return 1
+    if args.strict and decision["status"] not in {"ready-offline", "ready-active-validation"}:
+        return 1
+    return 0
+
+
 def run_decode_transactions(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -35993,6 +36422,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless the plan has ready or resource-gated validation items.",
     )
     validation_plan.set_defaults(func=run_validation_plan)
+
+    iteration_decision = sub.add_parser(
+        "iteration-decision",
+        help="Choose the next gated harness action without executing commands",
+    )
+    iteration_decision.add_argument(
+        "--output",
+        help="Where to write iteration-decision.json. Defaults to --artifact-dir/iteration-decision.json.",
+    )
+    iteration_decision.add_argument(
+        "--check-dir",
+        action="append",
+        help="Child artifact directory to include in a rollup. Repeat as needed.",
+    )
+    iteration_decision.add_argument(
+        "--discover-child-runs",
+        action="store_true",
+        help="Build a rollup decision from child directories under --artifact-dir with harness artifacts.",
+    )
+    iteration_decision.add_argument(
+        "--limit",
+        type=positive_int,
+        default=8,
+        help="Maximum validation items and command previews to include.",
+    )
+    iteration_decision.add_argument(
+        "--top",
+        type=positive_int,
+        default=4,
+        help="Number of decision actions to print.",
+    )
+    iteration_decision.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print command previews for each decision action.",
+    )
+    iteration_decision.add_argument(
+        "--skip-current-resource-check",
+        action="store_true",
+        help="Use only artifact resource snapshots instead of checking current /proc memory and watched ports.",
+    )
+    iteration_decision.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print iteration decision only; do not write iteration-decision.json or refreshed manifests.",
+    )
+    iteration_decision.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless the next step is ready offline or ready for active validation.",
+    )
+    iteration_decision.set_defaults(func=run_iteration_decision)
 
     decode = sub.add_parser(
         "decode-transactions",
