@@ -9256,6 +9256,7 @@ def build_evidence_gaps(
     orca_baseline: dict[str, Any] | None = None,
     quote_collection: dict[str, Any] | None = None,
     source_peeks: dict[str, Any] | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     burp_cluster_ids = observed_cluster_ids(build_traffic_index([], burp_history), clusters)
     results_by_cluster: dict[str, list[dict[str, Any]]] = {}
@@ -9382,26 +9383,33 @@ def build_evidence_gaps(
     quote_cluster_present = "quote" in cluster_ids or bool(quote_rows)
     if quote_cluster_present and transaction_intent.get("candidates_seen", 0) == 0:
         quote_diagnosis = (quote_collection or {}).get("diagnosis", {})
-        quote_classification = quote_diagnosis.get("classification")
-        quote_reason = "The transaction decoder is implemented, but this run did not receive a successful quote response containing a transaction candidate."
-        quote_next_step = "Run collect-quote with a test wallet and amount once the quote provider returns a 200 quote, then compare decoded account keys, signer, mints, and program IDs against intent."
-        if quote_classification == "m0-config-missing-or-placeholder":
-            quote_reason = (
-                "The transaction decoder is implemented, but the last quote collection did not reach M0 with real credentials: "
-                "the local M0 orchestration key is missing or still set to a template placeholder."
+        quote_provider = quote_provider_name(profile) if profile is not None else "quote provider"
+        quote_summary = quote_diagnosis.get("summary") if isinstance(quote_diagnosis, dict) else None
+        quote_next_step_hint = quote_diagnosis.get("next_step") if isinstance(quote_diagnosis, dict) else None
+        readiness_config = environment_readiness_config(profile) if profile is not None else {"checks": []}
+        readiness_quote_next_step = readiness_config.get("quote_collection_next_step")
+        quote_reason = (
+            "The transaction decoder is implemented, but the last quote collection did not produce "
+            f"a transaction candidate from {quote_provider}: {quote_summary}"
+            if isinstance(quote_summary, str) and quote_summary
+            else (
+                "The transaction decoder is implemented, but this run did not receive a successful "
+                f"quote response from {quote_provider} containing a transaction candidate."
             )
-            quote_next_step = (
-                "Configure a real M0_ORCHESTRATION_API_KEY, restart the target server, then rerun collect-quote. "
-                "Only decode returned transactions; do not sign or submit them automatically."
+        )
+        quote_next_step = (
+            quote_next_step_hint
+            if isinstance(quote_next_step_hint, str) and quote_next_step_hint
+            else (
+                readiness_quote_next_step
+                if isinstance(readiness_quote_next_step, str) and readiness_quote_next_step
+                else (
+                    "Run collect-quote with a reviewed test wallet and amount once the quote provider "
+                    "returns a 200 quote, then compare decoded account keys, signer, mints, and program "
+                    "IDs against intent."
+                )
             )
-        elif quote_classification == "m0-upstream-auth-or-policy-rejected":
-            quote_reason = (
-                "The transaction decoder is implemented, but the last quote collection was rejected by upstream M0 authorization or business policy."
-            )
-            quote_next_step = (
-                "Confirm the M0 key, account permissions, route, wallet, and amount are eligible, then rerun collect-quote. "
-                "Only decode returned transactions; do not sign or submit them automatically."
-            )
+        )
         add_gap(
             "GAP-quote-transaction-corpus",
             "quote",
@@ -11781,11 +11789,21 @@ def body_length_range(rows: list[dict[str, Any]]) -> dict[str, int | None]:
     return {"min": min(lengths), "max": max(lengths)}
 
 
+def is_approval_gated_open_item_row(row: dict[str, Any]) -> bool:
+    if row.get("expected"):
+        return False
+    risk = str(row.get("risk") or "")
+    return risk.startswith("approval-gated-")
+
+
 def response_delta_flags(rows: list[dict[str, Any]]) -> list[str]:
     statuses = {row.get("status") for row in rows}
     hashes = {row.get("body_sha256") for row in rows if row.get("body_sha256")}
     shapes = {response_shape_signature(row) for row in rows}
     expectation_results = {row.get("expectation_result") for row in rows if row.get("expectation_result")}
+    unexpected_rows = [row for row in rows if not row.get("expected")]
+    approval_gated_open_items = [row for row in unexpected_rows if is_approval_gated_open_item_row(row)]
+    review_unexpected_rows = [row for row in unexpected_rows if not is_approval_gated_open_item_row(row)]
     flags = []
     if len(statuses) > 1:
         flags.append("status-variant")
@@ -11795,11 +11813,13 @@ def response_delta_flags(rows: list[dict[str, Any]]) -> list[str]:
         flags.append("body-shape-variant")
     if len(expectation_results) > 1:
         flags.append("expectation-variant")
-    if any(not row.get("expected") for row in rows):
+    if review_unexpected_rows:
         flags.append("unexpected-response")
-    if any(row.get("interesting") for row in rows):
+    if approval_gated_open_items:
+        flags.append("approval-gated-open-item")
+    if any(row.get("interesting") and not is_approval_gated_open_item_row(row) for row in rows):
         flags.append("interesting-response")
-    if any(row.get("error") and not row.get("expected") for row in rows):
+    if any(row.get("error") for row in review_unexpected_rows):
         flags.append("transport-error")
     elif any(row.get("error") for row in rows):
         flags.append("expected-error-signal")
@@ -19118,9 +19138,10 @@ def collect_transaction_candidates(
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
     candidate_paths = quote_response_candidate_paths(profile)
+    quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
 
     for row in results:
-        if row.get("category") != "quote" and row.get("path") != "/api/quote":
+        if row.get("category") != "quote" and row.get("path") != quote_path:
             continue
         body_text = row.get("body_text") or row.get("body_sample") or ""
         extract_transaction_candidates_from_text(
@@ -21352,6 +21373,7 @@ def run_audit(args: argparse.Namespace) -> int:
         orca_baseline,
         quote_collection,
         source_peeks,
+        profile=profile,
     )
     write_json(artifact_dir / "evidence-gaps.json", evidence_gaps)
     burp_observation_run = load_optional_json(artifact_dir / "burp-observation-run.json")
@@ -22127,6 +22149,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         None,
         test_profile,
     )
+    no_provider_fallback_diagnosis_sample = diagnose_quote_collection_response(
+        {
+            "status": 500,
+            "body_sample": '{"error":"Quote service is not configured"}',
+        },
+        None,
+        {"_profile_loaded_from": "file", "quote_provider": {}},
+    )
     quote_probe_json_bodies: dict[str, dict[str, Any]] = {}
     for probe in probes:
         if probe.category != "quote" or not probe.body:
@@ -22239,6 +22269,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and quote_provider_diagnosis_sample.get("provider") == "SelfTestQuoteProvider"
         and quote_provider_diagnosis_sample.get("matched_profile_diagnostic") == "selftest-provider-config-missing"
         and "SELFTEST_PROVIDER_TOKEN" in str(quote_provider_diagnosis_sample.get("next_step") or "")
+        and no_provider_fallback_diagnosis_sample.get("classification") == "quote-collection-no-payload"
     )
     quote_discovery_inventory = {
         "generated_at": utc_now(),
@@ -23523,6 +23554,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         {"candidates_seen": 0},
         source_peeks=ws_resource_source_peeks,
     )
+    ws_resource_response_delta = build_response_delta_analysis(
+        ws_resource_clusters,
+        [ws_resource_unexpected_row],
+    )
     ws_resource_coverage = build_blackbox_coverage(
         ws_resource_clusters,
         [ws_resource_unexpected_row],
@@ -23556,6 +23591,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and (ws_resource_safe_probe_check.get("evidence") or {}).get("open_item_unexpected_count") == 1
         and not ws_resource_coverage.get("required_failures")
         and "GAP-ws-resource-controls" not in {gap.get("id") for gap in ws_resource_evidence_gaps.get("gaps", [])}
+        and ws_resource_response_delta.get("status") == "expected-deltas-indexed"
+        and "approval-gated-open-item"
+        in set((ws_resource_response_delta.get("clusters") or [{}])[0].get("delta_flags") or [])
     )
     rewrite_attack_strategy = build_attack_strategy(
         rewrite_clusters,
@@ -23851,6 +23889,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "status": "passed" if quote_provider_profile_passed else "failed",
             "provider": quote_provider_name(test_profile),
             "diagnosis": quote_provider_diagnosis_sample,
+            "no_provider_fallback_diagnosis": no_provider_fallback_diagnosis_sample,
         },
         "discovered_quote_intent_seed_routing": {
             "status": "passed" if discovered_quote_intent_passed else "failed",
@@ -26435,27 +26474,6 @@ def diagnose_quote_collection_response(
     if profile_diagnosis is not None:
         return profile_diagnosis
 
-    if status == 500 and "Quote service is not configured" in body_sample:
-        return {
-            "classification": "m0-config-missing-or-placeholder",
-            "summary": "The target rejected quote collection before upstream forwarding because the M0 key is missing or still set to a template placeholder.",
-            "next_step": "Configure a real M0_ORCHESTRATION_API_KEY, restart the target server, and rerun collect-quote.",
-        }
-
-    if status in {401, 403} and "M0 orchestration quote failed" in body_sample:
-        return {
-            "classification": "m0-upstream-auth-or-policy-rejected",
-            "summary": "The target reached M0, but upstream rejected the quote request after local validation.",
-            "next_step": "Verify the M0 key, account permissions, route, wallet, and amount, then rerun collect-quote.",
-        }
-
-    if status == 502 and "Invalid response shape" in body_sample:
-        return {
-            "classification": "m0-response-shape-unexpected",
-            "summary": "M0 returned a successful HTTP response, but the target did not recognize the quote response shape.",
-            "next_step": "Capture the response shape in a controlled environment and update transaction extraction only after reviewing it.",
-        }
-
     return {
         "classification": "quote-collection-no-payload",
         "summary": f"Quote collection returned HTTP {status} without a saved transaction payload.",
@@ -26632,6 +26650,7 @@ def run_collect_quote(args: argparse.Namespace) -> int:
         orca_baseline,
         quote_collection,
         source_peeks,
+        profile=profile,
     )
     write_json(artifact_dir / "evidence-gaps.json", evidence_gaps)
     transaction_decoder_selftest = build_transaction_decoder_selftest(
@@ -26761,6 +26780,7 @@ def run_collect_orca_baseline(args: argparse.Namespace) -> int:
         baseline,
         quote_collection,
         source_peeks,
+        profile=profile,
     )
     write_json(artifact_dir / "evidence-gaps.json", evidence_gaps)
 
