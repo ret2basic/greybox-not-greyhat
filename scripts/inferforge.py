@@ -27970,7 +27970,7 @@ def build_verification_queue(
         "ready",
         "medium",
         "Rebuilds the per-cluster view of Burp history coverage, generated observe flows, active observation paths, and review-only observation candidates.",
-        commands=[cmd("burp-observation-coverage")],
+        commands=[cmd("burp-observation-coverage --no-write")],
         evidence_refs=[
             "burp-observation-coverage.json",
             "burp-history-observations.jsonl",
