@@ -997,7 +997,10 @@ that payload type before the sidecar is marked ready for decode.
 `transaction-sidecar-review --no-write --show-files --show-commands` prints the
 accepted sidecar files, configured candidate paths, and compact JSON/JSONL/TXT
 payload-shape examples when a sidecar is present but no base64 transaction
-candidate can be extracted.
+candidate can be extracted. When a payload sidecar already yields decode-ready
+candidates but `transaction-intent-policy.json` is missing, it also prints the
+matching `prepare-transaction-intent-policy --no-write`, write, and
+`decode-transactions` command sequence for each profile direction.
 
 `transaction-corpus-checklist` is the offline bridge between source-flow review
 and decoding. It reads the current quote collection, Burp transaction candidate,

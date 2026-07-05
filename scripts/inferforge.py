@@ -21115,9 +21115,14 @@ def build_transaction_flow_review(
     }
 
 
-def transaction_corpus_policy_templates(profile: dict[str, Any] | None, artifact_dir: Path) -> list[dict[str, Any]]:
+def transaction_corpus_policy_templates(
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    *,
+    payload_sidecar: str | None = None,
+) -> list[dict[str, Any]]:
     scaffold = build_transaction_intent_policy_scaffold(profile)
-    payload_sidecar = repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl")
+    payload_sidecar = payload_sidecar or repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl")
     templates = []
     for row in scaffold.get("directions", []) or []:
         if not isinstance(row, dict):
@@ -21186,6 +21191,15 @@ def transaction_payload_sidecar_paths(artifact_dir: Path) -> list[Path]:
         artifact_dir / "transaction-payloads.txt",
         artifact_dir / "burp-transaction-candidates.json",
     ]
+
+
+def transaction_decode_input_sidecar_for_candidates(candidates: list[dict[str, Any]], artifact_dir: Path) -> str:
+    accepted_sources = {path.name for path in transaction_payload_sidecar_paths(artifact_dir)}
+    for candidate in candidates:
+        source = str(candidate.get("source") or "").strip()
+        if source in accepted_sources:
+            return repo_relative_or_absolute(artifact_dir / source)
+    return repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl")
 
 
 def build_transaction_payload_shape_guidance(
@@ -21385,6 +21399,27 @@ def build_transaction_sidecar_review(
     else:
         status = "missing-sidecars"
 
+    decode_input_sidecar = transaction_decode_input_sidecar_for_candidates(candidates, artifact_dir)
+    policy_template_commands = []
+    if candidates and payload_contract_allows_decode:
+        for row in transaction_corpus_policy_templates(
+            profile,
+            artifact_dir,
+            payload_sidecar=decode_input_sidecar,
+        ):
+            policy_template_commands.append(
+                {
+                    "direction": row.get("direction"),
+                    "status": row.get("status"),
+                    "sourceMint": row.get("sourceMint"),
+                    "destinationMint": row.get("destinationMint"),
+                    "programAllowlistStatus": row.get("programAllowlistStatus"),
+                    "prepare_preview_command": row.get("prepare_policy_preview_command"),
+                    "prepare_command": row.get("prepare_policy_command"),
+                    "decode_command": row.get("decode_command"),
+                }
+            )
+
     decode_commands = []
     if ready_for_decode:
         decode_commands.append(
@@ -21446,7 +21481,10 @@ def build_transaction_sidecar_review(
             "manual payload-type review."
         )
     elif candidates and not policy.get("configured"):
-        next_step = "Write transaction-intent-policy.json for the approved direction, wallet, amountIn, mints, and reviewed allowedPrograms."
+        next_step = (
+            "Review a prepare_preview command, then write one matching transaction-intent-policy.json for the "
+            "approved direction, wallet, amountIn, mints, and reviewed allowedPrograms."
+        )
     elif candidates:
         next_step = "Fix transaction-intent-policy.json, then rerun transaction-sidecar-review."
     elif present_payload_files and payload_shape_review.get("status") == "evm-payloads-indexed":
@@ -21501,8 +21539,10 @@ def build_transaction_sidecar_review(
             for candidate in candidates[:20]
         ],
         "candidate_sources": sorted({str(candidate.get("source") or "") for candidate in candidates}),
+        "decode_input_sidecar": decode_input_sidecar,
         "warnings": warnings,
         "acceptance_checks": acceptance_checks,
+        "policy_template_commands": policy_template_commands,
         "decode_commands": decode_commands,
         "reportability_gate": (
             "This review only proves the offline sidecars are ready to decode. It does not prove a vulnerability; "
@@ -37111,6 +37151,7 @@ def build_transaction_decoder_selftest(
     )
     decoded_count = sum(1 for item in transactions if item.get("decoded"))
     sidecar_ready_review: dict[str, Any] = {}
+    sidecar_missing_policy_review: dict[str, Any] = {}
     sidecar_mismatch_review: dict[str, Any] = {}
     sidecar_empty_review: dict[str, Any] = {}
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -37141,6 +37182,26 @@ def build_transaction_decoder_selftest(
                     }
                 ]
             },
+        )
+        missing_policy_artifact_dir = Path(temp_dir) / "transaction-sidecar-missing-policy"
+        missing_policy_artifact_dir.mkdir()
+        write_json(
+            missing_policy_artifact_dir / "transaction-payloads.json",
+            {
+                "payloads": [
+                    {
+                        "data": {
+                            "type": "svm",
+                            "transaction": payload["base64"],
+                        }
+                    }
+                ]
+            },
+        )
+        sidecar_missing_policy_review = build_transaction_sidecar_review(
+            target=DEFAULT_TARGET,
+            profile=profile,
+            artifact_dir=missing_policy_artifact_dir,
         )
         write_json(
             ready_artifact_dir / "transaction-intent-policy.json",
@@ -37254,6 +37315,37 @@ def build_transaction_decoder_selftest(
         and payload["base64"] not in sidecar_ready_text
         and sidecar_ready_review.get("decode_commands")
     )
+    sidecar_missing_policy_commands = "\n".join(
+        str(command.get("prepare_preview_command") or "")
+        + "\n"
+        + str(command.get("prepare_command") or "")
+        + "\n"
+        + str(command.get("decode_command") or "")
+        for command in sidecar_missing_policy_review.get("policy_template_commands", []) or []
+        if isinstance(command, dict)
+    )
+    sidecar_missing_policy_preview_commands = "\n".join(
+        str(command.get("prepare_preview_command") or "")
+        for command in sidecar_missing_policy_review.get("policy_template_commands", []) or []
+        if isinstance(command, dict)
+    )
+    sidecar_missing_policy_write_commands = "\n".join(
+        str(command.get("prepare_command") or "")
+        for command in sidecar_missing_policy_review.get("policy_template_commands", []) or []
+        if isinstance(command, dict)
+    )
+    sidecar_missing_policy_passed = (
+        sidecar_missing_policy_review.get("status") == "needs-intent-policy"
+        and sidecar_missing_policy_review.get("summary", {}).get("candidate_count") == 1
+        and sidecar_missing_policy_review.get("summary", {}).get("payload_contract_allows_decode") is True
+        and "prepare-transaction-intent-policy --direction" in sidecar_missing_policy_commands
+        and "decode-transactions --input" in sidecar_missing_policy_commands
+        and "transaction-payloads.json --intent-direction" in sidecar_missing_policy_commands
+        and "--no-write" in sidecar_missing_policy_preview_commands
+        and "--no-write" not in sidecar_missing_policy_write_commands
+        and "prepare_preview" not in sidecar_missing_policy_commands
+        and payload["base64"] not in json.dumps(sidecar_missing_policy_review, sort_keys=True)
+    )
     sidecar_mismatch_passed = (
         sidecar_mismatch_review.get("status") == "payload-contract-not-ready"
         and sidecar_mismatch_review.get("summary", {}).get("candidate_count") == 1
@@ -37295,6 +37387,7 @@ def build_transaction_decoder_selftest(
         and amount_mismatch_gate_passed
         and sidecar_guard_passed
         and sidecar_ready_passed
+        and sidecar_missing_policy_passed
         and sidecar_mismatch_passed
         and sidecar_empty_passed
         and sidecar_evm_passed
@@ -37340,6 +37433,14 @@ def build_transaction_decoder_selftest(
             "payload_contract_review": sidecar_ready_review.get("payload_contract_review", {}),
             "candidate_summaries": sidecar_ready_review.get("candidate_summaries", []),
             "decode_commands": sidecar_ready_review.get("decode_commands", []),
+        },
+        "sidecar_missing_policy_review": {
+            "status": "passed" if sidecar_missing_policy_passed else "failed",
+            "review_status": sidecar_missing_policy_review.get("status"),
+            "summary": sidecar_missing_policy_review.get("summary", {}),
+            "decode_input_sidecar": sidecar_missing_policy_review.get("decode_input_sidecar"),
+            "policy_template_commands": sidecar_missing_policy_review.get("policy_template_commands", []),
+            "next_step": sidecar_missing_policy_review.get("next_step"),
         },
         "sidecar_payload_type_mismatch": {
             "status": "passed" if sidecar_mismatch_passed else "failed",
@@ -49675,6 +49776,26 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
         print("Decode commands:")
         for command_text in (review.get("decode_commands", []) or [])[: max(0, int(args.top))]:
             print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    if (
+        args.show_commands
+        and review.get("policy_template_commands")
+        and review.get("status") != "ready-for-decode"
+    ):
+        print("Policy template commands:")
+        for row in (review.get("policy_template_commands", []) or [])[: max(0, int(args.top))]:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('status')} direction={row.get('direction')} "
+                f"source={row.get('sourceMint') or '-'} destination={row.get('destinationMint') or '-'} "
+                f"program_policy={row.get('programAllowlistStatus') or 'unknown'}"
+            )
+            if row.get("prepare_preview_command"):
+                print(f"  prepare_preview={inline_summary_text(row.get('prepare_preview_command'), max_chars=420)}")
+            if row.get("prepare_command"):
+                print(f"  prepare={inline_summary_text(row.get('prepare_command'), max_chars=420)}")
+            if row.get("decode_command"):
+                print(f"  decode={inline_summary_text(row.get('decode_command'), max_chars=420)}")
     if args.show_commands and review.get("payload_shape_guidance"):
         print_transaction_payload_shape_guidance(
             review.get("payload_shape_guidance", {}),
