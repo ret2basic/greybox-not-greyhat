@@ -1235,6 +1235,14 @@ existing local evidence without sending new probes:
 python3 scripts/inferforge.py evidence-gaps
 ```
 
+When a resource snapshot artifact is present, `evidence-gaps` annotates gaps
+that would require active traffic, Burp observation, browser automation, or
+WebSocket probes with an `active_followup_status`. The printed follow-up
+commands remain no-write/offline previews; an active follow-up marked
+`blocked-resource` or `requires-resource-check` must not be run until
+`resource-snapshot --strict` is healthy. Use `--current-resource-check` only
+when you explicitly want a fresh local `/proc` preflight.
+
 For generated starter profiles, source-discovered surfaces that are intentionally
 not actively probed, such as reviewed-only rewrite proxies, are marked
 `not-applicable` for safe-probe and policy-field coverage until a Burp

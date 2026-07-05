@@ -25911,6 +25911,59 @@ def server_action_review_candidate(action: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+ACTIVE_EVIDENCE_GAP_IDS = {
+    "GAP-quote-business-policy-probes",
+    "GAP-rpc-high-impact-allowed-methods",
+    "GAP-ws-resource-controls",
+    "GAP-orca-real-address-cache-baseline",
+}
+
+ACTIVE_EVIDENCE_GAP_SUFFIXES = (
+    "-burp-observation",
+    "-rewrite-response-evidence",
+)
+
+
+def evidence_gap_requires_active_followup(gap: dict[str, Any]) -> bool:
+    gap_id = str(gap.get("id") or "")
+    if gap_id in ACTIVE_EVIDENCE_GAP_IDS:
+        return True
+    if gap_id.endswith(ACTIVE_EVIDENCE_GAP_SUFFIXES):
+        return True
+    safe_next_step = str(gap.get("safe_next_step") or "").lower()
+    return "collect-quote" in safe_next_step or "burp-sync --observe" in safe_next_step
+
+
+def evidence_gap_active_followup_resource_annotation(
+    gap: dict[str, Any],
+    resource_preflight: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not evidence_gap_requires_active_followup(gap):
+        return {}
+    preflight = resource_preflight if isinstance(resource_preflight, dict) else {"status": "not-run"}
+    status = str(preflight.get("status") or "not-run")
+    budget = preflight.get("resource_budget") if isinstance(preflight.get("resource_budget"), dict) else {}
+    budget_mode = str(budget.get("mode") or ("unchecked" if status == "not-run" else status or "unknown"))
+    if verification_queue_resource_blocks_active(preflight):
+        followup_status = "blocked-resource"
+        reason = (
+            f"Current resource gate is {status}/{budget_mode}; do not run active target traffic, "
+            "Burp observation, browser automation, WebSocket probes, or service starts."
+        )
+    elif status == "healthy":
+        followup_status = "allowed-after-resource-check"
+        reason = "Resource preflight is healthy; still rerun resource-snapshot --strict immediately before active target traffic."
+    else:
+        followup_status = "requires-resource-check"
+        reason = "No current healthy resource preflight is attached; run resource-snapshot --strict before active target traffic."
+    return {
+        "active_followup_status": followup_status,
+        "active_followup_resource_status": status,
+        "active_followup_resource_budget_mode": budget_mode,
+        "active_followup_resource_reason": reason,
+    }
+
+
 def build_evidence_gaps(
     clusters: dict[str, Any],
     results: list[dict[str, Any]],
@@ -25923,7 +25976,9 @@ def build_evidence_gaps(
     profile: dict[str, Any] | None = None,
     deployment_review: dict[str, Any] | None = None,
     rewrite_response_review: dict[str, Any] | None = None,
+    current_resource_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    resource_preflight = validation_resource_preflight_summary(current_resource_snapshot)
     burp_cluster_ids = observed_cluster_ids(build_traffic_index([], burp_history), clusters)
     results_by_cluster: dict[str, list[dict[str, Any]]] = {}
     for row in results:
@@ -26386,6 +26441,24 @@ def build_evidence_gaps(
     for row in coverage_by_cluster:
         increment_count(coverage_status_counts, str(row.get("coverage_status") or "unknown"))
 
+    active_followup_status_counts: dict[str, int] = {}
+    for gap in gaps:
+        annotation = evidence_gap_active_followup_resource_annotation(gap, resource_preflight)
+        if not annotation:
+            continue
+        gap.update(annotation)
+        increment_count(active_followup_status_counts, str(annotation.get("active_followup_status") or "unknown"))
+
+    resource_budget = (
+        resource_preflight.get("resource_budget")
+        if isinstance(resource_preflight.get("resource_budget"), dict)
+        else {}
+    )
+    resource_budget_mode = str(
+        resource_budget.get("mode")
+        or ("unchecked" if resource_preflight.get("status") == "not-run" else resource_preflight.get("status") or "unknown")
+    )
+
     return {
         "generated_at": utc_now(),
         "status": "needs-safe-follow-up" if gaps else "no-evidence-gaps",
@@ -26398,7 +26471,12 @@ def build_evidence_gaps(
             "coverage_status_counts": coverage_status_counts,
             "burp_observed_clusters": sum(1 for row in coverage_by_cluster if row.get("burp_browser_observed")),
             "next_probe_candidates": len(next_probe_candidates),
+            "current_resource_snapshot": resource_preflight.get("status") or "not-run",
+            "resource_budget_mode": resource_budget_mode,
+            "active_followup_status_counts": active_followup_status_counts,
+            "resource_blocked_active_gaps": active_followup_status_counts.get("blocked-resource", 0),
         },
+        "resource_preflight": resource_preflight,
         "coverage_by_cluster": coverage_by_cluster,
         "gaps": gaps,
         "next_probe_candidates": next_probe_candidates,
@@ -37349,6 +37427,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Blackbox coverage:" in evidence_gaps_stdout_text
                 and "required_failures=" in evidence_gaps_stdout_text
                 and "Evidence gap details:" in evidence_gaps_stdout_text
+                and "active_followup=" in evidence_gaps_stdout_text
+                and "requires-resource-check" in evidence_gaps_stdout_text
                 and "followup=[" in evidence_gaps_stdout_text
                 and "No files written (--no-write)." in evidence_gaps_stdout
                 and not any(
@@ -47414,6 +47494,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and "shell-angle-placeholder-or-redirection" in unsafe_command_classification.get("issues", [])
         )
         rewrite_response_gap_id = "GAP-route-api-proxy-path-rewrite-response-evidence"
+        rewrite_response_resource_snapshot = {
+            "status": "warning",
+            "warnings": ["swap-usage-above-threshold"],
+            "memory": {"mem_available_mib": 3700, "swap_used_pct": 62.0},
+            "resource_budget": resource_budget_swap_pressure_sample,
+        }
         rewrite_response_evidence_gaps = build_evidence_gaps(
             rewrite_clusters,
             [],
@@ -47442,6 +47528,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     }
                 ]
             },
+            current_resource_snapshot=rewrite_response_resource_snapshot,
         )
         rewrite_response_gap = next(
             (
@@ -47469,6 +47556,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and "rewrite-review --no-write --show-next" in rewrite_response_gap_followups[1]
             and "rewrite-validation-checklist --no-write --show-candidates --show-commands"
             in rewrite_response_gap_followups[2]
+            and rewrite_response_gap.get("active_followup_status") == "blocked-resource"
+            and rewrite_response_gap.get("active_followup_resource_budget_mode") == "critical"
+            and rewrite_response_evidence_gaps.get("summary", {}).get("resource_blocked_active_gaps", 0) >= 1
+            and rewrite_response_evidence_gaps.get("resource_preflight", {}).get("status") == "warning"
         )
         rewrite_source_peeks = build_source_peeks(
             rewrite_source_root,
@@ -50527,6 +50618,15 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
     if not no_write:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    current_resource_snapshot = None
+    resource_preflight_source = "not-run"
+    if getattr(args, "current_resource_check", False):
+        current_resource_snapshot = build_default_resource_snapshot(max_processes=8)
+        resource_preflight_source = "current-resource-check"
+    elif not getattr(args, "skip_current_resource_check", False):
+        current_resource_snapshot = load_optional_json(artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT)
+        if isinstance(current_resource_snapshot, dict) and current_resource_snapshot:
+            resource_preflight_source = RESOURCE_SNAPSHOT_ARTIFACT
     clusters_path = artifact_dir / "endpoint-clusters.json"
     clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
     results = load_jsonl(artifact_dir / "probe-results.jsonl")
@@ -50573,7 +50673,9 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
         profile=profile,
         deployment_review=deployment_review,
         rewrite_response_review=rewrite_response_review,
+        current_resource_snapshot=current_resource_snapshot,
     )
+    evidence_gaps["resource_preflight_source"] = resource_preflight_source
     evidence_gaps_path = artifact_dir / "evidence-gaps.json"
     if not no_write:
         write_json(evidence_gaps_path, evidence_gaps)
@@ -50643,6 +50745,21 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
         f"open_items={blackbox_summary.get('covered_with_open_items', 0)} "
         f"required_failures={','.join(blackbox_summary.get('required_failures', [])[:6]) or 'none'}"
     )
+    resource_preflight = evidence_gaps.get("resource_preflight", {}) if isinstance(evidence_gaps.get("resource_preflight"), dict) else {}
+    active_followup_counts = evidence_summary.get("active_followup_status_counts", {}) or {}
+    if active_followup_counts or resource_preflight.get("status") not in {None, "", "not-run"}:
+        resource_budget = (
+            resource_preflight.get("resource_budget")
+            if isinstance(resource_preflight.get("resource_budget"), dict)
+            else {}
+        )
+        print(
+            "Resource preflight: "
+            f"status={resource_preflight.get('status') or 'not-run'} "
+            f"source={resource_preflight_source} "
+            f"budget={resource_budget.get('mode') or evidence_summary.get('resource_budget_mode') or 'unknown'} "
+            f"active_followups={json.dumps(active_followup_counts, sort_keys=True)}"
+        )
     if blackbox_summary.get("warnings"):
         print(f"Blackbox warnings: {','.join(blackbox_summary.get('warnings', [])[:6])}")
     if args.show_gaps:
@@ -50661,6 +50778,13 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
                 print(f"  next={inline_summary_text(gap.get('safe_next_step'), max_chars=260)}")
             if gap.get("safety_gate"):
                 print(f"  safety={inline_summary_text(gap.get('safety_gate'), max_chars=220)}")
+            if gap.get("active_followup_status"):
+                print(
+                    f"  active_followup={gap.get('active_followup_status')} "
+                    f"resource={gap.get('active_followup_resource_status') or 'not-run'}/"
+                    f"{gap.get('active_followup_resource_budget_mode') or 'unknown'} "
+                    f"reason={inline_summary_text(gap.get('active_followup_resource_reason'), max_chars=220)}"
+                )
             if args.show_commands:
                 commands = evidence_gap_followup_commands(gap_id, artifact_dir=artifact_dir, profile=profile)
                 for command in commands:
@@ -56976,6 +57100,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-commands",
         action="store_true",
         help="Print safe no-write follow-up commands for known evidence-gap types.",
+    )
+    evidence_gaps.add_argument(
+        "--current-resource-check",
+        action="store_true",
+        help="Run a local /proc resource preflight before classifying active evidence-gap follow-ups.",
+    )
+    evidence_gaps.add_argument(
+        "--skip-current-resource-check",
+        action="store_true",
+        help="Do not load or run a resource preflight; active follow-ups remain marked as requiring a resource check.",
     )
     evidence_gaps.add_argument(
         "--no-write",
