@@ -149,6 +149,7 @@ WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT = "websocket-candidate-review.json"
 LEAD_PORTFOLIO_ARTIFACT = "lead-portfolio.json"
 HARNESS_LOOP_ARTIFACT = "harness-loop.json"
 METHODOLOGY_REVIEW_ARTIFACT = "methodology-review.json"
+LEAD_DOSSIER_ARTIFACT = "lead-dossier.json"
 HYPOTHESIS_MATRIX_ARTIFACT = "hypothesis-matrix.json"
 VALIDATION_PLAN_ARTIFACT = "validation-plan.json"
 ITERATION_DECISION_ARTIFACT = "iteration-decision.json"
@@ -10662,6 +10663,7 @@ def build_methodology_review(
                 "validation_question": item.get("validation_question"),
                 "current_blocker": methodology_blocker_for_hypothesis(item),
                 "reportability_gate": item.get("reportability_gate"),
+                "evidence_refs": item.get("evidence_refs", []),
                 "next_offline_command": command_ref,
                 "required_evidence": item.get("required_evidence", []),
                 "forbidden": item.get("forbidden", []),
@@ -10741,6 +10743,234 @@ def build_methodology_review(
         "safety": (
             "Read-only methodology review. It reads local artifacts and /proc resource state only; it sends no target traffic, "
             "invokes no Burp tools, runs no scanners, signs no wallets, and submits no transactions."
+        ),
+    }
+
+
+def lead_dossier_path_options(thread: dict[str, Any], *, limit: int = 8) -> list[dict[str, Any]]:
+    closure = thread.get("evidence_closure") if isinstance(thread.get("evidence_closure"), dict) else {}
+    options: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_option(method: str, path: str, *, source_ref: Any = None, sensitivity: Any = None, source: str) -> None:
+        if not path or path == "-":
+            return
+        key = (method.upper() or "GET", path)
+        if key in seen:
+            return
+        seen.add(key)
+        row = {
+            "method": method.upper() or "GET",
+            "path": path,
+            "source_ref": source_ref,
+            "source": source,
+        }
+        if isinstance(sensitivity, dict):
+            row["sensitivity"] = sensitivity
+        options.append(row)
+
+    for requirement in closure.get("requirements", []) or []:
+        if not isinstance(requirement, dict):
+            continue
+        requirement_id = str(requirement.get("id") or "")
+        evidence = requirement.get("evidence")
+        if requirement_id == "approved-read-only-path-candidate" and isinstance(evidence, list):
+            for candidate in evidence:
+                if not isinstance(candidate, dict):
+                    continue
+                add_option(
+                    str(candidate.get("method") or "GET"),
+                    str(candidate.get("local_path") or candidate.get("path") or ""),
+                    source_ref=candidate.get("source_ref"),
+                    sensitivity=candidate.get("sensitivity"),
+                    source="approved-read-only-path-candidate",
+                )
+                if len(options) >= max(1, int(limit)):
+                    return options[: max(1, int(limit))]
+    add_option(lead_dossier_thread_method(thread), str(thread.get("path") or ""), source="thread-path")
+    return options[: max(1, int(limit))]
+
+
+def lead_dossier_thread_method(thread: dict[str, Any]) -> str:
+    path = str(thread.get("path") or "")
+    impact = str(thread.get("impact") or "")
+    hypothesis_type = str(thread.get("type") or "")
+    if path == "/api/quote" or impact in {"transaction-integrity", "credentialed-upstream-cost-abuse"}:
+        return "POST"
+    if path.startswith("/api/rpc") or impact in {"rpc-proxy-abuse", "resource-exhaustion"}:
+        return "POST"
+    if hypothesis_type == "transaction-flow-review":
+        return "POST"
+    return "GET"
+
+
+def lead_dossier_code_refs(thread: dict[str, Any], *, limit: int = 12) -> list[str]:
+    refs: list[str] = []
+
+    def add(value: Any) -> None:
+        for item in normalize_string_list(value):
+            if item and item not in refs:
+                refs.append(item)
+
+    add(thread.get("evidence_refs"))
+    for option in lead_dossier_path_options(thread, limit=limit):
+        add(option.get("source_ref"))
+    closure = thread.get("evidence_closure") if isinstance(thread.get("evidence_closure"), dict) else {}
+    for requirement in closure.get("requirements", []) or []:
+        if not isinstance(requirement, dict):
+            continue
+        evidence = requirement.get("evidence")
+        if isinstance(evidence, dict):
+            for key in ["source_ref", "source_refs", "evidence_refs", "config_rewrite_refs", "rewrite_destination_refs"]:
+                add(evidence.get(key))
+        elif isinstance(evidence, list):
+            for row in evidence:
+                if isinstance(row, dict):
+                    for key in ["source_ref", "source_refs", "evidence_refs"]:
+                        add(row.get(key))
+    return sorted(
+        refs,
+        key=lambda ref: (lead_dossier_code_ref_rank(ref), refs.index(ref)),
+    )[: max(1, int(limit))]
+
+
+def lead_dossier_code_ref_rank(ref: str) -> int:
+    text = str(ref or "")
+    if text.startswith("src/") or text.startswith("server.js") or text.startswith("next.config"):
+        return 0
+    if re.search(r"\.(?:ts|tsx|js|jsx):\d+\b", text):
+        return 0
+    if text.endswith(".json") or text.endswith(".jsonl"):
+        return 2
+    return 1
+
+
+def lead_dossier_business_tests(
+    business_logic_map: dict[str, Any],
+    thread_id: Any,
+) -> list[dict[str, Any]]:
+    for row in business_logic_map.get("threads", []) or []:
+        if isinstance(row, dict) and row.get("thread_id") == thread_id:
+            return [
+                test
+                for test in row.get("business_logic_tests", []) or []
+                if isinstance(test, dict)
+            ]
+    return []
+
+
+def build_lead_dossier(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    source_root: Path | None = None,
+    current_resource_snapshot: dict[str, Any] | None = None,
+    limit: int = 8,
+) -> dict[str, Any]:
+    methodology = build_methodology_review(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+        current_resource_snapshot=current_resource_snapshot,
+        limit=max(1, int(limit)),
+    )
+    business_logic_map = (
+        methodology.get("business_logic_map")
+        if isinstance(methodology.get("business_logic_map"), dict)
+        else {}
+    )
+    leads = []
+    priority_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    gate_ready = 0
+    for index, thread in enumerate(methodology.get("high_value_threads", []) or [], start=1):
+        if not isinstance(thread, dict):
+            continue
+        closure = thread.get("evidence_closure") if isinstance(thread.get("evidence_closure"), dict) else {}
+        priority = str(thread.get("priority") or "info")
+        closure_status = str(closure.get("status") or "unknown")
+        increment_count(priority_counts, priority)
+        increment_count(status_counts, closure_status)
+        if closure.get("gate_ready"):
+            gate_ready += 1
+        next_command = thread.get("next_offline_command") if isinstance(thread.get("next_offline_command"), dict) else None
+        leads.append(
+            {
+                "id": thread.get("id") or f"lead-{index}",
+                "rank": index,
+                "priority": priority,
+                "status": thread.get("status"),
+                "closure_status": closure_status,
+                "gate_ready": bool(closure.get("gate_ready")),
+                "type": thread.get("type"),
+                "impact": thread.get("impact"),
+                "host": thread.get("host"),
+                "path": thread.get("path"),
+                "validation_question": thread.get("validation_question"),
+                "scope_and_docs_constraints": {
+                    "target": target,
+                    "profile": profile_summary(profile),
+                    "reportability_gate": thread.get("reportability_gate"),
+                    "forbidden": thread.get("forbidden", []),
+                    "stop_conditions": methodology.get("stop_conditions", []),
+                },
+                "code_refs": lead_dossier_code_refs(thread),
+                "path_options": lead_dossier_path_options(thread),
+                "business_logic_tests": lead_dossier_business_tests(business_logic_map, thread.get("id")),
+                "current_blocker": thread.get("current_blocker"),
+                "required_evidence": thread.get("required_evidence", []),
+                "missing_requirements": closure.get("missing_requirements", []) if closure else [],
+                "artifact_statuses": closure.get("artifact_statuses", {}) if closure else {},
+                "next_offline_command": next_command,
+                "next_safe_commands": closure.get("next_safe_commands", [])[:6] if closure else [],
+                "minimal_poc_plan": thread.get("minimal_poc_plan"),
+            }
+        )
+    status = "ready-for-finding-gate-review" if gate_ready else "needs-evidence"
+    if not leads:
+        status = "no-high-value-leads"
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": str(artifact_dir),
+        "summary": {
+            "leads": len(leads),
+            "gate_ready_leads": gate_ready,
+            "priority_counts": dict(sorted(priority_counts.items())),
+            "closure_status_counts": dict(sorted(status_counts.items())),
+            "methodology_status": methodology.get("status"),
+        },
+        "research_alignment": {
+            "source_note": (
+                "Lead dossier applies the observed Codex bug-bounty harness pattern: read code, use scope/docs "
+                "as constraints, create candidate paths, and keep leads tied to evidence and validation gates."
+            ),
+            "methodology_components": [
+                "discovery/recon",
+                "lead generation",
+                "finding identification",
+                "issue validation",
+                "PoC/reporting",
+            ],
+            "research_sources": methodology.get("research_sources", []),
+        },
+        "leads": leads,
+        "artifact_refs": {
+            "methodology_review": METHODOLOGY_REVIEW_ARTIFACT,
+            "validation_plan": VALIDATION_PLAN_ARTIFACT,
+            "hypothesis_matrix": HYPOTHESIS_MATRIX_ARTIFACT,
+            "rewrite_response_review": REWRITE_RESPONSE_REVIEW_ARTIFACT,
+            "transaction_sidecar_review": TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
+            "operator_evidence_review": OPERATOR_EVIDENCE_REVIEW_ARTIFACT,
+        },
+        "safety": (
+            "Offline lead dossier only. It reads local profile, source-derived reviews, and artifacts; it sends no "
+            "requests, invokes no Burp tools, reads no raw Burp history, runs no scanners, signs no wallets, and "
+            "submits no transactions."
         ),
     }
 
@@ -34599,6 +34829,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("websocket-candidate-review", "run_websocket_candidate_review", min_refreshes=2, min_prints=2),
         refresh_expectation("lead-portfolio", "run_lead_portfolio"),
         refresh_expectation("methodology-review", "run_methodology_review"),
+        refresh_expectation("lead-dossier", "run_lead_dossier"),
         refresh_expectation("harness-loop", "run_harness_loop"),
         refresh_expectation("hypothesis-matrix", "run_hypothesis_matrix"),
         refresh_expectation("rewrite-review", "run_rewrite_review"),
@@ -34855,6 +35086,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         discovery_coverage_output_dir = root / "discovery-coverage-output"
         report_output_dir = root / "report-output"
         methodology_review_output_dir = root / "methodology-review-output"
+        lead_dossier_output_dir = root / "lead-dossier-output"
         transaction_sidecar_review_output_dir = root / "transaction-sidecar-review-output"
         transaction_corpus_checklist_output_dir = root / "transaction-corpus-checklist-output"
         credential_impact_checklist_output_dir = root / "credential-impact-checklist-output"
@@ -35141,6 +35373,23 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--skip-current-resource-check",
                 ]
             )
+            lead_dossier_return_code, lead_dossier_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(lead_dossier_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "lead-dossier",
+                    "--no-write",
+                    "--show-commands",
+                    "--show-evidence",
+                    "--skip-current-resource-check",
+                ]
+            )
             transaction_sidecar_review_return_code, transaction_sidecar_review_stdout = run_cli(
                 [
                     "--profile",
@@ -35410,6 +35659,12 @@ def build_no_write_selftest() -> dict[str, Any]:
             ).exists(),
             "methodology_review_json": (methodology_review_output_dir / METHODOLOGY_REVIEW_ARTIFACT).exists(),
             "methodology_review_manifest": (methodology_review_output_dir / MANIFEST_NAME).exists(),
+            "lead_dossier_dir": lead_dossier_output_dir.exists(),
+            "lead_dossier_target_profile_json": (
+                lead_dossier_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "lead_dossier_json": (lead_dossier_output_dir / LEAD_DOSSIER_ARTIFACT).exists(),
+            "lead_dossier_manifest": (lead_dossier_output_dir / MANIFEST_NAME).exists(),
             "transaction_sidecar_review_dir": transaction_sidecar_review_output_dir.exists(),
             "transaction_sidecar_review_target_profile_json": (
                 transaction_sidecar_review_output_dir / TARGET_PROFILE_ARTIFACT
@@ -35513,6 +35768,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     discovery_coverage_stdout_text = "\n".join(discovery_coverage_stdout)
     report_stdout_text = "\n".join(report_stdout)
     methodology_review_stdout_text = "\n".join(methodology_review_stdout)
+    lead_dossier_stdout_text = "\n".join(lead_dossier_stdout)
     transaction_sidecar_review_stdout_text = "\n".join(transaction_sidecar_review_stdout)
     transaction_corpus_checklist_stdout_text = "\n".join(transaction_corpus_checklist_stdout)
     credential_impact_checklist_stdout_text = "\n".join(credential_impact_checklist_stdout)
@@ -36225,6 +36481,31 @@ def build_no_write_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "lead-dossier-no-write-skips-artifacts",
+            "passed": (
+                lead_dossier_return_code == 0
+                and "Lead dossier:" in lead_dossier_stdout_text
+                and "Leads:" in lead_dossier_stdout_text
+                and "No files written (--no-write)." in lead_dossier_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "lead_dossier_dir",
+                        "lead_dossier_target_profile_json",
+                        "lead_dossier_json",
+                        "lead_dossier_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in lead_dossier_stdout)
+            ),
+            "expected": "lead-dossier --no-write prints scope-constrained lead dossiers without writing artifacts or manifests",
+            "actual": {
+                "return_code": lead_dossier_return_code,
+                "stdout": lead_dossier_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
             "id": "transaction-sidecar-review-no-write-skips-artifacts",
             "passed": (
                 transaction_sidecar_review_return_code == 0
@@ -36747,6 +37028,10 @@ def build_no_write_selftest() -> dict[str, Any]:
             "methodology_review": {
                 "return_code": methodology_review_return_code,
                 "stdout": methodology_review_stdout,
+            },
+            "lead_dossier": {
+                "return_code": lead_dossier_return_code,
+                "stdout": lead_dossier_stdout,
             },
             "outputs_exist": output_paths,
         },
@@ -51947,6 +52232,87 @@ def run_methodology_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_lead_dossier(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    current_resource_snapshot = (
+        {"status": "not-run"}
+        if getattr(args, "skip_current_resource_check", False)
+        else build_default_resource_snapshot(max_processes=8)
+    )
+    dossier = build_lead_dossier(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+        current_resource_snapshot=current_resource_snapshot,
+        limit=max(1, int(args.limit)),
+    )
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / LEAD_DOSSIER_ARTIFACT
+    if not no_write:
+        write_json(output_path, dossier)
+
+    summary = dossier.get("summary", {}) or {}
+    print(f"Lead dossier: {dossier['status']}")
+    print(
+        "Leads: "
+        f"total={summary.get('leads', 0)} "
+        f"gate_ready={summary.get('gate_ready_leads', 0)} "
+        f"priorities={json.dumps(summary.get('priority_counts', {}), sort_keys=True)} "
+        f"closures={json.dumps(summary.get('closure_status_counts', {}), sort_keys=True)}"
+    )
+    for lead in (dossier.get("leads", []) or [])[: max(0, int(args.limit))]:
+        print(
+            f"- {lead.get('priority')} {lead.get('closure_status')} "
+            f"{lead.get('type')} path={lead.get('path') or '-'} impact={lead.get('impact') or '-'}"
+        )
+        refs = lead.get("code_refs", []) or []
+        if refs:
+            print(f"  code_refs={','.join(str(ref) for ref in refs[:4])}")
+        options = lead.get("path_options", []) or []
+        if options:
+            option_text = [
+                f"{option.get('method', 'GET')} {option.get('path')}"
+                for option in options[:3]
+                if isinstance(option, dict)
+            ]
+            print(f"  path_options={'; '.join(option_text)}")
+        missing = lead.get("missing_requirements", []) or []
+        print(f"  missing={','.join(str(item) for item in missing[:4]) if missing else 'none'}")
+        blocker = lead.get("current_blocker")
+        if blocker:
+            print(f"  blocker={inline_summary_text(blocker, max_chars=260)}")
+        if args.show_evidence:
+            for evidence in (lead.get("required_evidence", []) or [])[:3]:
+                print(f"    evidence={inline_summary_text(evidence, max_chars=260)}")
+        if args.show_commands:
+            command_ref = lead.get("next_offline_command") if isinstance(lead.get("next_offline_command"), dict) else None
+            if command_ref:
+                print(f"    - {format_command_ref_label(command_ref)} {inline_summary_text(command_ref.get('command'), max_chars=420)}")
+            for ref in (lead.get("next_safe_commands", []) or [])[:2]:
+                if isinstance(ref, dict):
+                    print(f"    - safe {format_command_ref_label(ref)} {inline_summary_text(ref.get('command'), max_chars=420)}")
+    if args.show_json:
+        print("Lead dossier JSON:")
+        print(json.dumps(dossier, indent=2, sort_keys=True))
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="lead-dossier",
+                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+            )
+        )
+    return 0
+
+
 def run_harness_loop(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -55789,6 +56155,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print methodology review only; do not write methodology-review.json or refreshed manifests.",
     )
     methodology_review.set_defaults(func=run_methodology_review)
+
+    lead_dossier = sub.add_parser(
+        "lead-dossier",
+        help="Print scope-constrained high-value lead dossiers with evidence gates and next commands",
+    )
+    lead_dossier.add_argument(
+        "--output",
+        help=f"Where to write {LEAD_DOSSIER_ARTIFACT}. Defaults to --artifact-dir/{LEAD_DOSSIER_ARTIFACT}.",
+    )
+    lead_dossier.add_argument(
+        "--limit",
+        type=positive_int,
+        default=8,
+        help="Number of high-value lead dossiers to print.",
+    )
+    lead_dossier.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print safe offline command previews for each lead.",
+    )
+    lead_dossier.add_argument(
+        "--show-evidence",
+        action="store_true",
+        help="Print compact required evidence lines for each lead.",
+    )
+    lead_dossier.add_argument(
+        "--show-json",
+        action="store_true",
+        help="Print the complete lead dossier JSON to stdout.",
+    )
+    lead_dossier.add_argument(
+        "--skip-current-resource-check",
+        action="store_true",
+        help="Do not read current /proc resource state while building the dossier.",
+    )
+    lead_dossier.add_argument(
+        "--no-write",
+        action="store_true",
+        help=f"Print lead dossier only; do not write {LEAD_DOSSIER_ARTIFACT} or refreshed manifests.",
+    )
+    lead_dossier.set_defaults(func=run_lead_dossier)
 
     harness_loop = sub.add_parser(
         "harness-loop",

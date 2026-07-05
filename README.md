@@ -298,6 +298,21 @@ With `--skip-current-resource-check`, `methodology-review` stays fully offline
 and reports resource status as `not-run` instead of reading current `/proc`
 resource state.
 
+Use `lead-dossier` when you want the same evidence closure in a tighter
+bug-bounty style lead file. It applies the “read code, constrain by
+scope/docs, create candidate paths, and write down leads worth checking”
+workflow to the current artifacts, then prints source refs, path/method
+options, missing evidence, blockers, and safe offline commands for each
+Medium/High/Critical thread:
+
+```bash
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  lead-dossier --no-write --show-commands --show-evidence --skip-current-resource-check
+```
+
+The dossier is also offline-only. It does not invoke Burp, read raw Burp
+history, send requests, run scanners, sign wallets, or submit transactions.
+
 When the loop is ready but no reportable evidence exists, use
 `hypothesis-matrix` to rank the next research questions from current local
 artifacts:
@@ -978,6 +993,7 @@ python3 scripts/inferforge.py regression-suite --include-external --ws-resource-
 python3 scripts/inferforge.py adjudicate
 python3 scripts/inferforge.py audit --no-ws
 python3 scripts/inferforge.py audit --ws-resource-probes
+python3 scripts/inferforge.py lead-dossier --no-write --show-commands --show-evidence --skip-current-resource-check
 python3 scripts/inferforge.py rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract --show-sidecar-template-json
 python3 scripts/inferforge.py transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract
 python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-commands --show-steps --show-payload-template-json --skip-current-resource-check
