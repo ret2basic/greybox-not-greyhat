@@ -172,6 +172,7 @@ BOUNTY_SOURCE_INVARIANTS_ARTIFACT = "bounty-source-invariants.json"
 BOUNTY_LANE_PRIORITIES_ARTIFACT = "bounty-lane-priorities.json"
 BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT = "bounty-evidence-authorization.json"
 BOUNTY_EVIDENCE_INTAKE_ARTIFACT = "bounty-evidence-intake.json"
+BOUNTY_EVIDENCE_INTAKE_SELFTEST_ARTIFACT = "bounty-evidence-intake-selftest.json"
 BOUNTY_ACTION_QUEUE_ARTIFACT = "bounty-action-queue.json"
 BOUNTY_PREP_SYNC_ARTIFACT = "bounty-prep-sync.json"
 BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT = "bounty-evidence-request.md"
@@ -301,6 +302,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     BOUNTY_LANE_PRIORITIES_ARTIFACT,
     BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT,
     BOUNTY_EVIDENCE_INTAKE_ARTIFACT,
+    BOUNTY_EVIDENCE_INTAKE_SELFTEST_ARTIFACT,
     BOUNTY_ACTION_QUEUE_ARTIFACT,
     BOUNTY_PREP_SYNC_ARTIFACT,
     BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT,
@@ -25215,7 +25217,19 @@ def bounty_authorization_handoff_fields(lane: str) -> list[str]:
 def bounty_authorization_question(workorder: dict[str, Any], priority: dict[str, Any]) -> str:
     lane = str(workorder.get("lane") or priority.get("lane") or "unknown")
     action = str(workorder.get("first_human_action") or "Provide approved redacted official evidence for this lane.")
-    evidence = ", ".join(normalize_string_list(workorder.get("required_official_evidence_labels"))[:4])
+    evidence_items = bounty_prep_order_required_artifacts(
+        lane,
+        normalize_string_list(workorder.get("required_official_evidence_labels")),
+    )
+    if lane == "transaction-integrity" and {
+        "transaction-payloads.jsonl",
+        "transaction-intent-policy.json",
+    }.issubset(set(evidence_items)):
+        return (
+            "Can the operator approve and provide transaction-payloads.jsonl first, then "
+            f"transaction-intent-policy.json for {lane}? {action}"
+        )
+    evidence = ", ".join(evidence_items[:4])
     if evidence:
         return f"Can the operator approve and provide {evidence} for {lane}? {action}"
     return f"Can the operator approve and provide official redacted evidence for {lane}? {action}"
@@ -25253,8 +25267,14 @@ def bounty_authorization_request_for_workorder(
             else "ready-for-local-validation"
         ),
         "question": bounty_authorization_question(workorder, priority),
-        "requested_official_evidence": normalize_string_list(workorder.get("required_official_evidence")),
-        "requested_official_evidence_labels": normalize_string_list(workorder.get("required_official_evidence_labels")),
+        "requested_official_evidence": bounty_prep_order_required_artifacts(
+            lane,
+            normalize_string_list(workorder.get("required_official_evidence")),
+        ),
+        "requested_official_evidence_labels": bounty_prep_order_required_artifacts(
+            lane,
+            normalize_string_list(workorder.get("required_official_evidence_labels")),
+        ),
         "handoff_fields": bounty_authorization_handoff_fields(lane),
         "allowed_actions": bounty_authorization_allowed_actions(lane),
         "forbidden_actions": ordered_unique_strings(
@@ -25546,6 +25566,48 @@ def bounty_intake_forbidden_key_paths(value: Any, *, limit: int = 16) -> list[st
     return paths[:limit]
 
 
+def bounty_intake_approval_risks(value: Any, *, limit: int = 16) -> list[str]:
+    risks: list[str] = []
+
+    def add(risk: str) -> None:
+        if risk not in risks and len(risks) < limit:
+            risks.append(risk)
+
+    def walk(node: Any) -> None:
+        if len(risks) >= limit:
+            return
+        if isinstance(node, dict):
+            for key, child in node.items():
+                key_text = str(key)
+                key_norm = re.sub(r"[^a-z0-9]+", "_", key_text.lower()).strip("_")
+                if key_norm == "draft_only" and child is True:
+                    add("draft-only-marker")
+                if key_norm == "approved" and child is False:
+                    add("explicit-approved-false")
+                if key_norm == "status" and str(child).strip().lower() in {
+                    "draft",
+                    "template",
+                    "placeholder",
+                    "pending",
+                    "unreviewed",
+                }:
+                    add("pending-or-template-status")
+                walk(child)
+                if len(risks) >= limit:
+                    return
+        elif isinstance(node, list):
+            for child in node[:16]:
+                walk(child)
+                if len(risks) >= limit:
+                    return
+        elif isinstance(node, str):
+            if "REPLACE_WITH_" in node or COMMAND_PLACEHOLDER_RE.search(node):
+                add("placeholder-marker")
+
+    walk(value)
+    return risks[:limit]
+
+
 def bounty_intake_scan_file(path: Path, *, max_file_bytes: int) -> dict[str, Any]:
     rel = repo_relative_or_absolute(path)
     if not path.exists():
@@ -25556,6 +25618,7 @@ def bounty_intake_scan_file(path: Path, *, max_file_bytes: int) -> dict[str, Any
             "size_bytes": None,
             "format": path.suffix.lower().lstrip(".") or "unknown",
             "redaction_risks": [],
+            "approval_risks": [],
             "parse_errors": [],
             "row_count": 0,
         }
@@ -25567,6 +25630,7 @@ def bounty_intake_scan_file(path: Path, *, max_file_bytes: int) -> dict[str, Any
             "size_bytes": None,
             "format": "unknown",
             "redaction_risks": ["evidence-path-is-not-a-file"],
+            "approval_risks": [],
             "parse_errors": [],
             "row_count": 0,
         }
@@ -25580,6 +25644,7 @@ def bounty_intake_scan_file(path: Path, *, max_file_bytes: int) -> dict[str, Any
             "size_bytes": size,
             "format": suffix.lstrip(".") or "unknown",
             "redaction_risks": [],
+            "approval_risks": [],
             "parse_errors": [],
             "row_count": 0,
         }
@@ -25591,6 +25656,7 @@ def bounty_intake_scan_file(path: Path, *, max_file_bytes: int) -> dict[str, Any
             "size_bytes": size,
             "format": suffix.lstrip(".") or "unknown",
             "redaction_risks": ["file-exceeds-intake-size-limit"],
+            "approval_risks": [],
             "parse_errors": [],
             "row_count": 0,
             "max_file_bytes": max_file_bytes,
@@ -25605,6 +25671,7 @@ def bounty_intake_scan_file(path: Path, *, max_file_bytes: int) -> dict[str, Any
             "size_bytes": size,
             "format": suffix.lstrip(".") or "unknown",
             "redaction_risks": ["file-unreadable"],
+            "approval_risks": [],
             "parse_errors": [redacted_error_summary(error)],
             "row_count": 0,
         }
@@ -25630,12 +25697,16 @@ def bounty_intake_scan_file(path: Path, *, max_file_bytes: int) -> dict[str, Any
         forbidden_paths = bounty_intake_forbidden_key_paths(parsed)
         if forbidden_paths:
             redaction_risks.append("forbidden-field-name")
+        approval_risks = bounty_intake_approval_risks(parsed)
     else:
         forbidden_paths = []
+        approval_risks = []
     if parse_errors:
         status = "invalid-format"
     elif redaction_risks:
         status = "needs-redaction-review"
+    elif approval_risks:
+        status = "blocked-template-or-unapproved-evidence"
     else:
         status = "present-clean"
     return {
@@ -25645,6 +25716,7 @@ def bounty_intake_scan_file(path: Path, *, max_file_bytes: int) -> dict[str, Any
         "size_bytes": size,
         "format": suffix.lstrip(".") or "unknown",
         "redaction_risks": redaction_risks,
+        "approval_risks": approval_risks,
         "parse_errors": parse_errors,
         "row_count": row_count,
         "forbidden_field_paths": forbidden_paths[:8],
@@ -25675,6 +25747,11 @@ def bounty_intake_request_review(
     files = [bounty_intake_scan_file(path, max_file_bytes=max_file_bytes) for path in path_refs]
     missing = [row for row in files if row.get("status") in {"missing", "empty", "not-a-file"}]
     invalid = [row for row in files if row.get("status") == "invalid-format"]
+    unapproved = [
+        row
+        for row in files
+        if row.get("approval_risks") or row.get("status") == "blocked-template-or-unapproved-evidence"
+    ]
     redaction = [
         row
         for row in files
@@ -25685,6 +25762,8 @@ def bounty_intake_request_review(
         status = "waiting-evidence-files"
     elif invalid:
         status = "blocked-invalid-evidence-format"
+    elif unapproved:
+        status = "blocked-template-or-unapproved-evidence"
     elif redaction:
         status = "blocked-redaction-review"
     elif path_refs and len(clean) == len(path_refs):
@@ -25710,6 +25789,7 @@ def bounty_intake_request_review(
         "present_clean_files": len(clean),
         "missing_or_empty_files": len(missing),
         "invalid_format_files": len(invalid),
+        "unapproved_or_template_files": len(unapproved),
         "redaction_review_files": len(redaction),
         "redaction_risks": ordered_unique_strings(
             [
@@ -25718,11 +25798,20 @@ def bounty_intake_request_review(
                 for risk in normalize_string_list(row.get("redaction_risks"))
             ]
         ),
+        "approval_risks": ordered_unique_strings(
+            [
+                risk
+                for row in files
+                for risk in normalize_string_list(row.get("approval_risks"))
+            ]
+        ),
         "next_step": (
             "Provide the missing approved redacted evidence file(s)."
             if missing
             else "Fix evidence JSON/JSONL formatting before lane validation."
             if invalid
+            else "Replace draft, placeholder, pending, or explicitly unapproved evidence with approved redacted evidence."
+            if unapproved
             else "Remove raw secret-like data or forbidden fields before lane validation."
             if redaction
             else "Run the after-evidence validation commands for this lane."
@@ -25781,8 +25870,15 @@ def build_bounty_evidence_intake(
             for risk in normalize_string_list(row.get("redaction_risks"))
         ]
     )
+    approval_risks = ordered_unique_strings(
+        [
+            risk
+            for row in reviews
+            for risk in normalize_string_list(row.get("approval_risks"))
+        ]
+    )
     if blocked:
-        status = "blocked-evidence-intake-redaction-or-format"
+        status = "blocked-evidence-intake"
     elif ready:
         status = "ready-for-lane-validation"
     elif reviews:
@@ -25810,6 +25906,7 @@ def build_bounty_evidence_intake(
             "blocked": len(blocked),
             "waiting": len(waiting),
             "redaction_risks": len(redaction_risks),
+            "approval_risks": len(approval_risks),
             "top_request": top.get("id"),
             "top_lane": top.get("lane"),
             "top_status": top.get("status"),
@@ -25823,10 +25920,11 @@ def build_bounty_evidence_intake(
         "blocked_requests": blocked[:8],
         "waiting_requests": waiting[:8],
         "redaction_risk_kinds": redaction_risks,
+        "approval_risk_kinds": approval_risks,
         "commands": commands[:12],
         "reportability_rule": (
-            "Intake only checks file presence, shape, and redaction risk. It is not evidence validation and cannot promote a finding. "
-            "Medium+ still requires lane readiness, finding-gate acceptance, and adjudication."
+            "Intake only checks file presence, shape, approval/template markers, and redaction risk. It is not evidence validation "
+            "and cannot promote a finding. Medium+ still requires lane readiness, finding-gate acceptance, and adjudication."
         ),
         "next_step": (
             top.get("next_step")
@@ -25836,6 +25934,178 @@ def build_bounty_evidence_intake(
         "safety": (
             "Offline intake only. It reads bounded local evidence files, prints no sensitive excerpts, sends no requests, calls no Burp tool, "
             "starts no browser, signs no wallet, submits no transaction, and changes no infrastructure."
+        ),
+    }
+
+
+def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
+    target = "http://127.0.0.1:9997"
+
+    def authorization_for(path: Path, *, request_id: str) -> dict[str, Any]:
+        return {
+            "generated_at": utc_now(),
+            "schema": "inferforge-bounty-evidence-authorization-v1",
+            "status": "authorization-required-before-evidence-collection",
+            "target": target,
+            "authorization_requests": [
+                {
+                    "id": request_id,
+                    "lane": "transaction-integrity",
+                    "entrypoint": "POST /api/quote",
+                    "expected_severity": "high-candidate",
+                    "priority_decision": "pursue-high-value",
+                    "requested_official_evidence": [str(path)],
+                    "requested_official_evidence_labels": [path.name],
+                    "after_evidence_validation_commands": ["transaction-sidecar-review --no-write --show-files"],
+                    "recommended_after_evidence_command": "transaction-sidecar-review --no-write --show-files",
+                    "reportability_boundary": "Synthetic intake self-test request only.",
+                }
+            ],
+        }
+
+    def run_case(case_name: str, content: Any | None) -> dict[str, Any]:
+        case_root = root / case_name
+        case_root.mkdir(parents=True, exist_ok=True)
+        sidecar = case_root / "transaction-payloads.jsonl"
+        if content is not None:
+            rows = content if isinstance(content, list) else [content]
+            sidecar.write_text(
+                "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+        return build_bounty_evidence_intake(
+            target=target,
+            profile=None,
+            artifact_dir=case_root,
+            bounty_evidence_authorization=authorization_for(sidecar, request_id=f"AUTHZ-{case_name}"),
+            max_file_bytes=262144,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="inferforge-bounty-evidence-intake-selftest-") as temp_dir:
+        root = Path(temp_dir)
+        missing_case = run_case("missing", None)
+        clean_case = run_case(
+            "clean",
+            {
+                "approval_reference": "self-test-approved-redacted-fixture",
+                "payloads": [
+                    {
+                        "data": {
+                            "type": "svm",
+                            "transaction": "QUJDREVGRw==",
+                        }
+                    }
+                ],
+            },
+        )
+        draft_case = run_case(
+            "draft",
+            {
+                "draft_only": True,
+                "approved": False,
+                "payloads": [
+                    {
+                        "data": {
+                            "type": "svm",
+                            "transaction": "REPLACE_WITH_APPROVED_BASE64_UNSIGNED_TRANSACTION",
+                        }
+                    }
+                ],
+            },
+        )
+        approved_false_case = run_case(
+            "approved_false",
+            {
+                "approved": False,
+                "approval_reference": "self-test-not-approved",
+                "payloads": [
+                    {
+                        "data": {
+                            "type": "svm",
+                            "transaction": "QUJDREVGRw==",
+                        }
+                    }
+                ],
+            },
+        )
+
+    def first_review(case: dict[str, Any]) -> dict[str, Any]:
+        rows = case.get("intake_reviews") if isinstance(case.get("intake_reviews"), list) else []
+        return rows[0] if rows and isinstance(rows[0], dict) else {}
+
+    draft_review = first_review(draft_case)
+    approved_false_review = first_review(approved_false_case)
+    assertions = [
+        {
+            "id": "missing-sidecar-waits-for-evidence",
+            "passed": first_review(missing_case).get("status") == "waiting-evidence-files",
+            "expected": "waiting-evidence-files",
+            "actual": first_review(missing_case).get("status"),
+        },
+        {
+            "id": "clean-sidecar-ready-for-lane-validation",
+            "passed": clean_case.get("status") == "ready-for-lane-validation"
+            and first_review(clean_case).get("status") == "ready-for-lane-validation",
+            "expected": "ready-for-lane-validation",
+            "actual": {
+                "artifact": clean_case.get("status"),
+                "request": first_review(clean_case).get("status"),
+            },
+        },
+        {
+            "id": "draft-template-sidecar-blocked",
+            "passed": draft_case.get("status") == "blocked-evidence-intake"
+            and draft_review.get("status") == "blocked-template-or-unapproved-evidence"
+            and "draft-only-marker" in normalize_string_list(draft_review.get("approval_risks"))
+            and "placeholder-marker" in normalize_string_list(draft_review.get("approval_risks")),
+            "expected": ["blocked-template-or-unapproved-evidence", "draft-only-marker", "placeholder-marker"],
+            "actual": {
+                "artifact": draft_case.get("status"),
+                "request": draft_review.get("status"),
+                "approval_risks": draft_review.get("approval_risks"),
+            },
+        },
+        {
+            "id": "approved-false-sidecar-blocked",
+            "passed": approved_false_case.get("status") == "blocked-evidence-intake"
+            and approved_false_review.get("status") == "blocked-template-or-unapproved-evidence"
+            and "explicit-approved-false" in normalize_string_list(approved_false_review.get("approval_risks")),
+            "expected": ["blocked-template-or-unapproved-evidence", "explicit-approved-false"],
+            "actual": {
+                "artifact": approved_false_case.get("status"),
+                "request": approved_false_review.get("status"),
+                "approval_risks": approved_false_review.get("approval_risks"),
+            },
+        },
+    ]
+    failed = [item for item in assertions if not item.get("passed")]
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-evidence-intake-selftest-v1",
+        "status": "failed" if failed else "passed",
+        "target": target,
+        "summary": {
+            "cases": 4,
+            "assertions": len(assertions),
+            "failed": len(failed),
+            "case_statuses": {
+                "missing": missing_case.get("status"),
+                "clean": clean_case.get("status"),
+                "draft": draft_case.get("status"),
+                "approved_false": approved_false_case.get("status"),
+            },
+        },
+        "cases": {
+            "missing": missing_case,
+            "clean": clean_case,
+            "draft": draft_case,
+            "approved_false": approved_false_case,
+        },
+        "assertions": assertions,
+        "safety": (
+            "Synthetic local fixture only. It writes temporary files under tempfile, sends no requests, calls no Burp tool, "
+            "starts no browser, creates no workspace evidence sidecars, signs no wallet, submits no transaction, "
+            "and changes no infrastructure."
         ),
     }
 
@@ -25892,6 +26162,12 @@ def bounty_action_next_step(
             str(authorization.get("priority_reason") or "")
             or str(intake.get("next_step") or "")
             or "Keep this lane parked until provider/operator evidence exists."
+        )
+    if kind == "collect-approved-evidence" and str(authorization.get("lane") or "") == "transaction-integrity":
+        return (
+            "Can the operator approve and provide transaction-payloads.jsonl first, then the matching "
+            "transaction-intent-policy.json for transaction-integrity? Provide one approved quote transaction "
+            "payload and one matching explicit intent policy."
         )
     return (
         str(authorization.get("question") or "")
@@ -25978,7 +26254,10 @@ def bounty_action_for_authorization_request(
         "blocked_by_official_evidence": kind in {"collect-approved-evidence", "park-until-official-evidence"},
         "safe_offline_command": safe_command,
         "next_step": bounty_action_next_step(kind, authorization, intake),
-        "requested_evidence": normalize_string_list(authorization.get("requested_official_evidence_labels")),
+        "requested_evidence": bounty_prep_order_required_artifacts(
+            str(authorization.get("lane") or ""),
+            normalize_string_list(authorization.get("requested_official_evidence_labels")),
+        ),
         "file_refs": normalize_string_list(intake.get("file_refs")),
         "redaction_risks": normalize_string_list(intake.get("redaction_risks")),
         "reportability_boundary": authorization.get("reportability_boundary") or rollup.get("reportability_boundary"),
@@ -26209,11 +26488,15 @@ def bounty_prep_order_required_artifacts(lane: str, artifacts: list[str]) -> lis
     ordered = ordered_unique_strings([item for item in artifacts if item])
     preferred = BOUNTY_PREP_REQUIRED_ARTIFACT_ORDER_BY_LANE.get(str(lane or ""), [])
     preferred_index = {name: index for index, name in enumerate(preferred)}
+    original_index = {name: index for index, name in enumerate(ordered)}
     return sorted(
         ordered,
         key=lambda name: (
-            preferred_index.get(name, len(preferred) + ordered.index(name)),
-            ordered.index(name),
+            preferred_index.get(
+                name,
+                preferred_index.get(Path(name).name, len(preferred) + original_index[name]),
+            ),
+            original_index[name],
         ),
     )
 
@@ -54423,6 +54706,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("self-test-transactions", "run_transaction_decoder_selftest"),
         refresh_expectation("self-test-bounty-template-safety", "run_bounty_template_safety_selftest"),
         refresh_expectation("self-test-bounty-prep-package", "run_bounty_prep_package_selftest"),
+        refresh_expectation("self-test-bounty-evidence-intake", "run_bounty_evidence_intake_selftest"),
         refresh_expectation("collect-quote", "run_collect_quote", min_refreshes=2, min_prints=2),
         refresh_expectation("collect-orca-baseline", "run_collect_orca_baseline", min_refreshes=2, min_prints=2),
     ]
@@ -73052,6 +73336,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             ("self-test-transactions", "self-test-transactions"),
             ("self-test-bounty-template-safety", "self-test-bounty-template-safety"),
             ("self-test-bounty-prep-package", "self-test-bounty-prep-package"),
+            ("self-test-bounty-evidence-intake", "self-test-bounty-evidence-intake"),
         ]:
             command = inferforge_cli_command(
                 args,
@@ -79602,6 +79887,7 @@ def run_bounty_evidence_intake(args: argparse.Namespace) -> int:
         f"blocked={summary.get('blocked', 0)} "
         f"waiting={summary.get('waiting', 0)} "
         f"redaction_risks={summary.get('redaction_risks', 0)} "
+        f"approval_risks={summary.get('approval_risks', 0)} "
         f"top={summary.get('top_lane') or '-'} "
         f"top_status={summary.get('top_status') or '-'}"
     )
@@ -79620,7 +79906,8 @@ def run_bounty_evidence_intake(args: argparse.Namespace) -> int:
             print(
                 f"- {row.get('id')}: {row.get('expected_severity')} lane={row.get('lane')} "
                 f"status={row.get('status')} files={len(row.get('files') or [])} "
-                f"redaction={row.get('redaction_review_files')}"
+                f"redaction={row.get('redaction_review_files')} "
+                f"approval={row.get('unapproved_or_template_files')}"
             )
             labels = ", ".join(normalize_string_list(row.get("requested_labels"))[:4])
             if labels:
@@ -79633,7 +79920,7 @@ def run_bounty_evidence_intake(args: argparse.Namespace) -> int:
                     print(
                         f"  file={file_row.get('path')} status={file_row.get('status')} "
                         f"format={file_row.get('format')} rows={file_row.get('row_count')} "
-                        f"risks={','.join(normalize_string_list(file_row.get('redaction_risks'))[:3]) or '-'}"
+                        f"risks={','.join(ordered_unique_strings([*normalize_string_list(file_row.get('redaction_risks')), *normalize_string_list(file_row.get('approval_risks'))])[:4]) or '-'}"
                     )
                 for ref in normalize_string_list(row.get("descriptive_refs"))[:2]:
                     print(f"  descriptive={inline_summary_text(ref, max_chars=240)}")
@@ -79655,6 +79942,13 @@ def run_bounty_evidence_intake(args: argparse.Namespace) -> int:
                 print(f"- {risk}")
         else:
             print("- none")
+        approval_risks = normalize_string_list(intake.get("approval_risk_kinds"))
+        print("Approval/template risks:")
+        if approval_risks:
+            for risk in approval_risks[:display_limit]:
+                print(f"- {risk}")
+        else:
+            print("- none")
     if getattr(args, "show_commands", False) and not getattr(args, "show_requests", False):
         print("Commands:")
         for command_text in normalize_string_list(intake.get("commands"))[:display_limit]:
@@ -79669,6 +79963,37 @@ def run_bounty_evidence_intake(args: argparse.Namespace) -> int:
     if getattr(args, "strict", False) and summary.get("blocked", 0) > 0:
         return 1
     return 0
+
+
+def run_bounty_evidence_intake_selftest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result = build_bounty_evidence_intake_selftest()
+    result["current_profile_context"] = profile_summary(profile)
+    output_path = artifact_dir / BOUNTY_EVIDENCE_INTAKE_SELFTEST_ARTIFACT
+    write_json(output_path, sanitize_artifact_samples(result))
+    summary = result.get("summary", {}) if isinstance(result.get("summary"), dict) else {}
+    print(f"Bounty evidence intake self-test: {result['status']}")
+    print(
+        "Cases: "
+        f"cases={summary.get('cases', 0)} "
+        f"assertions={summary.get('assertions', 0)} "
+        f"failed={summary.get('failed', 0)} "
+        f"statuses={json.dumps(summary.get('case_statuses', {}), sort_keys=True)}"
+    )
+    failed = [item for item in result.get("assertions", []) if not item.get("passed")]
+    if failed:
+        print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="self-test-bounty-evidence-intake",
+            output_paths=[output_path],
+        )
+    )
+    return 0 if result["status"] == "passed" else 1
 
 
 def build_or_load_bounty_evidence_intake_for_run(
@@ -85027,6 +85352,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a synthetic self-test for bounty prep package ordering and sync",
     )
     bounty_prep_package_selftest.set_defaults(func=run_bounty_prep_package_selftest)
+
+    bounty_evidence_intake_selftest = sub.add_parser(
+        "self-test-bounty-evidence-intake",
+        help="Run a synthetic self-test for bounty evidence intake approval/template blockers",
+    )
+    bounty_evidence_intake_selftest.set_defaults(func=run_bounty_evidence_intake_selftest)
 
     collect_quote = sub.add_parser(
         "collect-quote",
