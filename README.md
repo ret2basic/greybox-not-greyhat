@@ -326,10 +326,14 @@ also prints the evidence contract id, required operator decisions, and the first
 reportability gates so the next step is an evidence closure rather than a broad
 audit. The lead order follows `assessment_mode`: greybox keeps coverage-first
 ordering, while blackbox ranks gate-ready and high-payoff reportable leads ahead
-of broad coverage gaps. Each lead also prints a strict validation checklist
-status for scope, attacker control, concrete impact, minimal evidence, safe
-reproduction, counter-evidence, and severity/report path; the lead stays blocked
-before finding gate until all seven questions are satisfied:
+of broad coverage gaps. Each lead carries an `assessment_rank` scorecard with
+`coverage_pressure`, `bounty_pressure`, `validity_pressure`, a composite score,
+and a pursue/park decision. In greybox mode, missing dangerous-surface evidence
+raises coverage pressure; in blackbox mode, gate-ready validity and expected
+payoff dominate. Each lead also prints a strict validation checklist status for
+scope, attacker control, concrete impact, minimal evidence, safe reproduction,
+counter-evidence, and severity/report path; the lead stays blocked before
+finding gate until all seven questions are satisfied:
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \

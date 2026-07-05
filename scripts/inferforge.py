@@ -11045,11 +11045,204 @@ LEAD_DOSSIER_BLACKBOX_PAYOFF_RANK = {
     "resource-exhaustion": 5,
 }
 
+LEAD_DOSSIER_COVERAGE_SURFACE_RANK = {
+    "transaction-integrity": 0,
+    "credentialed-upstream-cost-abuse": 1,
+    "resource-exhaustion": 2,
+    "rpc-proxy-abuse": 3,
+    "unauthorized-state-change": 4,
+    "fixed-upstream-proxy-confusion": 5,
+}
+
+LEAD_DOSSIER_PRIORITY_SCORE = {
+    "critical": 40,
+    "high": 32,
+    "medium": 22,
+    "low": 8,
+    "info": 0,
+}
+
+LEAD_DOSSIER_COVERAGE_SURFACE_SCORE = {
+    "transaction-integrity": 34,
+    "credentialed-upstream-cost-abuse": 31,
+    "resource-exhaustion": 29,
+    "rpc-proxy-abuse": 27,
+    "unauthorized-state-change": 25,
+    "fixed-upstream-proxy-confusion": 23,
+}
+
+LEAD_DOSSIER_BLACKBOX_PAYOFF_SCORE = {
+    "transaction-integrity": 36,
+    "unauthorized-state-change": 34,
+    "fixed-upstream-proxy-confusion": 32,
+    "rpc-proxy-abuse": 28,
+    "credentialed-upstream-cost-abuse": 22,
+    "resource-exhaustion": 18,
+}
+
 
 def lead_dossier_ranking_strategy(assessment_policy: dict[str, Any]) -> str:
     if str(assessment_policy.get("mode") or "") == "blackbox":
         return "blackbox-bounty-first"
     return "greybox-coverage-first"
+
+
+def bounded_assessment_score(value: int) -> int:
+    return max(0, min(100, int(value)))
+
+
+def lead_dossier_score_level(score: int) -> str:
+    if score >= 75:
+        return "high"
+    if score >= 45:
+        return "medium"
+    if score > 0:
+        return "low"
+    return "none"
+
+
+def lead_dossier_missing_requirement_count(lead: dict[str, Any]) -> int:
+    missing_requirements = lead.get("missing_requirements")
+    return len(missing_requirements) if isinstance(missing_requirements, list) else 0
+
+
+def lead_dossier_blocking_question_count(lead: dict[str, Any]) -> int:
+    strict_validation = (
+        lead.get("strict_validation")
+        if isinstance(lead.get("strict_validation"), dict)
+        else {}
+    )
+    blocking_questions = (
+        strict_validation.get("blocking_questions")
+        if isinstance(strict_validation.get("blocking_questions"), list)
+        else []
+    )
+    return len(blocking_questions)
+
+
+def lead_dossier_closure_blocked(lead: dict[str, Any]) -> bool:
+    return str(lead.get("closure_status") or "").startswith("blocked")
+
+
+def lead_dossier_assessment_scorecard(
+    lead: dict[str, Any],
+    *,
+    assessment_policy: dict[str, Any],
+) -> dict[str, Any]:
+    strategy = lead_dossier_ranking_strategy(assessment_policy)
+    priority = str(lead.get("priority") or "info")
+    impact = str(lead.get("impact") or "")
+    gate_ready = bool(lead.get("gate_ready"))
+    missing_count = lead_dossier_missing_requirement_count(lead)
+    blocking_count = lead_dossier_blocking_question_count(lead)
+    blocked = lead_dossier_closure_blocked(lead)
+
+    priority_score = LEAD_DOSSIER_PRIORITY_SCORE.get(priority, 0)
+    coverage_surface_score = LEAD_DOSSIER_COVERAGE_SURFACE_SCORE.get(impact, 12)
+    coverage_gap_score = min(24, missing_count * 4) + min(12, blocking_count * 3)
+    coverage_pressure = bounded_assessment_score(
+        priority_score
+        + coverage_surface_score
+        + coverage_gap_score
+        + (6 if not gate_ready else 3)
+        - (20 if blocked else 0)
+    )
+
+    payoff_score = LEAD_DOSSIER_BLACKBOX_PAYOFF_SCORE.get(impact, 10)
+    validity_gap_penalty = min(35, missing_count * 5 + blocking_count * 4)
+    validity_pressure = bounded_assessment_score(
+        (70 if gate_ready else 42)
+        + (priority_score // 2)
+        - validity_gap_penalty
+        - (20 if blocked else 0)
+    )
+    bounty_pressure = bounded_assessment_score(
+        priority_score
+        + payoff_score
+        + (25 if gate_ready else 0)
+        + max(0, validity_pressure // 4)
+        - min(30, missing_count * 5 + blocking_count * 3)
+        - (20 if blocked else 0)
+    )
+
+    if strategy == "blackbox-bounty-first":
+        composite_score = bounty_pressure
+        if blocked:
+            decision = "park-until-resource-or-scope-gate-clears"
+            parking = "park-blocked"
+        elif gate_ready and priority in {"critical", "high", "medium"}:
+            decision = "pursue-now"
+            parking = "do-not-park"
+        elif bounty_pressure >= 65 and missing_count <= 2 and blocking_count <= 2:
+            decision = "pursue-minimal-evidence"
+            parking = "do-not-park"
+        elif bounty_pressure < 45 or missing_count >= 5 or blocking_count >= 4:
+            decision = "park-unless-better-evidence-arrives"
+            parking = "park-low-validity-or-payoff"
+        else:
+            decision = "secondary-bounty-lead"
+            parking = "park-behind-stronger-lead"
+    else:
+        composite_score = coverage_pressure
+        if blocked:
+            decision = "keep-open-but-blocked"
+            parking = "blocked-do-not-close"
+        elif gate_ready:
+            decision = "finish-gate-review"
+            parking = "do-not-park"
+        elif missing_count:
+            decision = "pursue-coverage-closure"
+            parking = "do-not-park"
+        else:
+            decision = "covered-review-if-needed"
+            parking = "candidate-for-closure"
+
+    drivers = []
+    if priority:
+        drivers.append(f"priority:{priority}")
+    drivers.append(f"impact:{impact or 'unknown'}")
+    if gate_ready:
+        drivers.append("gate-ready")
+    if missing_count:
+        drivers.append(f"missing-requirements:{missing_count}")
+    if blocking_count:
+        drivers.append(f"blocking-questions:{blocking_count}")
+    if blocked:
+        drivers.append("blocked")
+
+    return {
+        "strategy": strategy,
+        "mode": assessment_policy.get("mode"),
+        "coverage_surface_rank": LEAD_DOSSIER_COVERAGE_SURFACE_RANK.get(impact, 9),
+        "priority_rank": LEAD_DOSSIER_PRIORITY_RANK.get(priority, 9),
+        "impact_payoff_rank": (
+            LEAD_DOSSIER_BLACKBOX_PAYOFF_RANK.get(impact, 9)
+            if strategy == "blackbox-bounty-first"
+            else None
+        ),
+        "missing_requirements": missing_count,
+        "blocking_questions": blocking_count,
+        "gate_ready": gate_ready,
+        "coverage_pressure": {
+            "score": coverage_pressure,
+            "level": lead_dossier_score_level(coverage_pressure),
+            "meaning": "Audit pressure to keep this dangerous surface open until coverage or evidence closure is complete.",
+        },
+        "bounty_pressure": {
+            "score": bounty_pressure,
+            "level": lead_dossier_score_level(bounty_pressure),
+            "meaning": "Bounty pressure to pursue this as a valid, high-impact, high-payoff report path.",
+        },
+        "validity_pressure": {
+            "score": validity_pressure,
+            "level": lead_dossier_score_level(validity_pressure),
+            "meaning": "How close the lead is to concrete, reproducible finding-gate evidence.",
+        },
+        "composite_score": composite_score,
+        "decision": decision,
+        "parking_recommendation": parking,
+        "drivers": drivers,
+    }
 
 
 def lead_dossier_assessment_rank_key(
@@ -11062,25 +11255,15 @@ def lead_dossier_assessment_rank_key(
     if strategy != "blackbox-bounty-first":
         return (original_index, 0, 0, 0, 0, 0)
 
-    strict_validation = (
-        lead.get("strict_validation")
-        if isinstance(lead.get("strict_validation"), dict)
-        else {}
-    )
-    missing_requirements = lead.get("missing_requirements") if isinstance(lead.get("missing_requirements"), list) else []
-    blocking_questions = (
-        strict_validation.get("blocking_questions")
-        if isinstance(strict_validation.get("blocking_questions"), list)
-        else []
-    )
-    closure_status = str(lead.get("closure_status") or "")
-    blocked_rank = 1 if closure_status.startswith("blocked") else 0
+    missing_count = lead_dossier_missing_requirement_count(lead)
+    blocking_count = lead_dossier_blocking_question_count(lead)
+    blocked_rank = 1 if lead_dossier_closure_blocked(lead) else 0
     return (
         0 if lead.get("gate_ready") else 1,
         LEAD_DOSSIER_PRIORITY_RANK.get(str(lead.get("priority") or ""), 9),
         LEAD_DOSSIER_BLACKBOX_PAYOFF_RANK.get(str(lead.get("impact") or ""), 9),
-        len(missing_requirements),
-        len(blocking_questions),
+        missing_count,
+        blocking_count,
         blocked_rank,
     )
 
@@ -11098,17 +11281,12 @@ def apply_lead_dossier_assessment_ranking(
             assessment_policy=assessment_policy,
             original_index=original_index,
         )
-        missing_requirements = lead.get("missing_requirements") if isinstance(lead.get("missing_requirements"), list) else []
+        scorecard = lead_dossier_assessment_scorecard(
+            lead,
+            assessment_policy=assessment_policy,
+        )
         lead["original_rank"] = original_rank
-        lead["assessment_rank"] = {
-            "strategy": strategy,
-            "gate_ready": bool(lead.get("gate_ready")),
-            "priority_rank": LEAD_DOSSIER_PRIORITY_RANK.get(str(lead.get("priority") or ""), 9),
-            "impact_payoff_rank": LEAD_DOSSIER_BLACKBOX_PAYOFF_RANK.get(str(lead.get("impact") or ""), 9)
-            if strategy == "blackbox-bounty-first"
-            else None,
-            "missing_requirements": len(missing_requirements),
-        }
+        lead["assessment_rank"] = scorecard
         ranked.append((key, original_index, lead))
     ranked.sort(key=lambda row: (row[0], row[1]))
     ranked_leads = [lead for _key, _original_index, lead in ranked]
@@ -39541,13 +39719,27 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "high-payoff-transaction-integrity",
                     "coverage-resource-exhaustion",
                 ]
+                and greybox_ranked_sample[0].get("assessment_rank", {}).get("decision")
+                == "pursue-coverage-closure"
+                and greybox_ranked_sample[0].get("assessment_rank", {}).get("parking_recommendation")
+                == "do-not-park"
+                and blackbox_ranked_sample[0].get("assessment_rank", {}).get("decision")
+                == "pursue-now"
+                and blackbox_ranked_sample[0].get("assessment_rank", {}).get("parking_recommendation")
+                == "do-not-park"
+                and (
+                    blackbox_ranked_sample[0].get("assessment_rank", {}).get("bounty_pressure", {}).get("score", 0)
+                    >= blackbox_ranked_sample[0].get("assessment_rank", {}).get("coverage_pressure", {}).get("score", 0)
+                )
             ),
-            "expected": "greybox keeps coverage order while blackbox prioritizes valid high-payoff findings",
+            "expected": "greybox keeps coverage order while blackbox prioritizes valid high-payoff findings with explicit scorecards",
             "actual": {
                 "greybox_strategy": greybox_ranking_strategy,
                 "greybox_order": [lead.get("id") for lead in greybox_ranked_sample],
+                "greybox_top_scorecard": greybox_ranked_sample[0].get("assessment_rank", {}),
                 "blackbox_strategy": blackbox_ranking_strategy,
                 "blackbox_order": [lead.get("id") for lead in blackbox_ranked_sample],
+                "blackbox_top_scorecard": blackbox_ranked_sample[0].get("assessment_rank", {}),
             },
         },
         {
@@ -56575,6 +56767,36 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
             print(f"  path_options={'; '.join(option_text)}")
         missing = lead.get("missing_requirements", []) or []
         print(f"  missing={','.join(str(item) for item in missing[:4]) if missing else 'none'}")
+        assessment_rank = (
+            lead.get("assessment_rank")
+            if isinstance(lead.get("assessment_rank"), dict)
+            else {}
+        )
+        if assessment_rank:
+            coverage_pressure = (
+                assessment_rank.get("coverage_pressure")
+                if isinstance(assessment_rank.get("coverage_pressure"), dict)
+                else {}
+            )
+            bounty_pressure = (
+                assessment_rank.get("bounty_pressure")
+                if isinstance(assessment_rank.get("bounty_pressure"), dict)
+                else {}
+            )
+            validity_pressure = (
+                assessment_rank.get("validity_pressure")
+                if isinstance(assessment_rank.get("validity_pressure"), dict)
+                else {}
+            )
+            print(
+                "  assessment="
+                f"score={assessment_rank.get('composite_score')} "
+                f"decision={assessment_rank.get('decision')} "
+                f"park={assessment_rank.get('parking_recommendation')} "
+                f"coverage={coverage_pressure.get('score')} "
+                f"bounty={bounty_pressure.get('score')} "
+                f"validity={validity_pressure.get('score')}"
+            )
         blocker = lead.get("current_blocker")
         if blocker:
             print(f"  blocker={inline_summary_text(blocker, max_chars=260)}")
