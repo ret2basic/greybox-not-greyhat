@@ -10180,6 +10180,235 @@ def build_methodology_supporting_reviews(
     return reviews
 
 
+def transaction_approval_sequence_step(approval_packet: dict[str, Any], step_id: str) -> dict[str, Any]:
+    for step in approval_packet.get("approval_sequence", []) or []:
+        if isinstance(step, dict) and step.get("id") == step_id:
+            return step
+    return {}
+
+
+def transaction_evidence_closure_plan(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    requirements: list[dict[str, Any]],
+    sidecar_review: dict[str, Any],
+    corpus_checklist: dict[str, Any],
+    approval_packet: dict[str, Any],
+) -> dict[str, Any]:
+    requirement_by_id = {
+        str(requirement.get("id") or ""): requirement
+        for requirement in requirements
+        if isinstance(requirement, dict)
+    }
+    sidecar_summary = sidecar_review.get("summary", {}) if isinstance(sidecar_review.get("summary"), dict) else {}
+    corpus_summary = corpus_checklist.get("summary", {}) if isinstance(corpus_checklist.get("summary"), dict) else {}
+    recommended_quote = (
+        approval_packet.get("recommended_quote")
+        if isinstance(approval_packet.get("recommended_quote"), dict)
+        else {}
+    )
+    resource_capture_gate = (
+        approval_packet.get("resource_capture_gate")
+        if isinstance(approval_packet.get("resource_capture_gate"), dict)
+        else {}
+    )
+    required_fields = normalize_string_list(approval_packet.get("redacted_sidecar_required_fields"))
+    finding_gate_blockers = normalize_string_list(approval_packet.get("finding_gate_blockers"))
+    expected_payload_type = recommended_quote.get("expectedPayloadType") or sidecar_summary.get("expected_payload_type")
+    payload_sidecar = (
+        approval_packet.get("payload_sidecar")
+        or repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl")
+    )
+    intent_policy_sidecar = (
+        approval_packet.get("intent_policy_sidecar")
+        or repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json")
+    )
+
+    def requirement_status(requirement_id: str) -> str:
+        requirement = requirement_by_id.get(requirement_id, {})
+        return str(requirement.get("status") or "waiting")
+
+    def requirement_next(requirement_id: str, fallback: str) -> str:
+        requirement = requirement_by_id.get(requirement_id, {})
+        return str(requirement.get("next_step") or fallback)
+
+    def offline_command(subcommand: str, source: str) -> dict[str, Any] | None:
+        return methodology_command_ref(artifact_dir, profile, subcommand, source=source)
+
+    def packet_step_summary(step_id: str) -> dict[str, Any]:
+        step = transaction_approval_sequence_step(approval_packet, step_id)
+        if not step:
+            return {}
+        return {
+            key: step.get(key)
+            for key in ["id", "status", "risk", "action", "command", "command_safety_ref"]
+            if step.get(key) is not None
+        }
+
+    payload_required_fields = [
+        field
+        for field in required_fields
+        if "payload" in field.lower()
+        or "quote" in field.lower()
+        or "transaction" in field.lower()
+        or "raw burp" in field.lower()
+    ]
+    policy_required_fields = [
+        field
+        for field in required_fields
+        if "intent policy" in field.lower()
+        or "allowedprogram" in field.lower()
+        or "wallet" in field.lower()
+        or "amountin" in field.lower()
+    ]
+    steps = [
+        {
+            "id": "approved-payload-sidecar",
+            "requirement": "approved-transaction-payload-sidecar",
+            "status": requirement_status("approved-transaction-payload-sidecar"),
+            "artifact": payload_sidecar,
+            "recommended_quote": recommended_quote,
+            "required_fields": payload_required_fields[:4],
+            "packet_steps": [
+                packet_step_summary("payload-template-preview"),
+                packet_step_summary("single-approved-quote-capture"),
+            ],
+            "next_step": requirement_next(
+                "approved-transaction-payload-sidecar",
+                "Add one approved quote response or extracted transaction payload sidecar.",
+            ),
+        },
+        {
+            "id": "candidate-extraction",
+            "requirement": "transaction-payload-candidates",
+            "status": requirement_status("transaction-payload-candidates"),
+            "artifact": payload_sidecar,
+            "evidence": {
+                "candidate_count": sidecar_summary.get("candidate_count", 0),
+                "payload_files_present": sidecar_summary.get("payload_files_present", 0),
+                "placeholder_payload_files": sidecar_summary.get("placeholder_payload_files", 0),
+            },
+            "packet_steps": [packet_step_summary("sidecar-review")],
+            "offline_command": offline_command(
+                TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND,
+                "transaction-closure-plan:candidate-extraction",
+            ),
+            "next_step": requirement_next(
+                "transaction-payload-candidates",
+                "Fix payload extraction or sidecar shape until transaction candidates are present.",
+            ),
+        },
+        {
+            "id": "payload-contract",
+            "requirement": "payload-contract-compatible",
+            "status": requirement_status("payload-contract-compatible"),
+            "artifact": payload_sidecar,
+            "evidence": {
+                "expected_payload_type": expected_payload_type,
+                "payload_contract_status": sidecar_summary.get("payload_contract_status"),
+                "payload_contract_allows_decode": sidecar_summary.get("payload_contract_allows_decode"),
+            },
+            "next_step": requirement_next(
+                "payload-contract-compatible",
+                "Use an SVM payload source matching the configured quote_response.expected_payload_type.",
+            ),
+        },
+        {
+            "id": "intent-policy-sidecar",
+            "requirement": "intent-policy-sidecar-valid",
+            "status": requirement_status("intent-policy-sidecar-valid"),
+            "artifact": intent_policy_sidecar,
+            "required_fields": policy_required_fields[:4],
+            "evidence": {
+                "intent_policy_status": corpus_summary.get("intent_policy_status"),
+                "program_allowlist_status": corpus_summary.get("program_allowlist_status"),
+                "recommended_direction": recommended_quote.get("direction"),
+            },
+            "packet_steps": [
+                packet_step_summary("intent-policy-preview"),
+                packet_step_summary("intent-policy-write"),
+            ],
+            "next_step": requirement_next(
+                "intent-policy-sidecar-valid",
+                "Prepare a matching transaction-intent-policy.json with wallet, amount, mints, and allowed programs.",
+            ),
+        },
+        {
+            "id": "decoded-intent-review",
+            "requirement": "decoded-intent-reviewed",
+            "status": requirement_status("decoded-intent-reviewed"),
+            "artifact": "transaction-intent.json",
+            "evidence": {
+                "decoded_transactions": corpus_summary.get("decoded_transactions", 0),
+                "reportability_status": corpus_summary.get("reportability_status"),
+                "candidate_severity": corpus_summary.get("candidate_severity"),
+            },
+            "packet_steps": [packet_step_summary("decode-preview")],
+            "offline_command": offline_command(
+                "decode-transactions --no-write",
+                "transaction-closure-plan:decoded-intent-review",
+            ),
+            "next_step": requirement_next(
+                "decoded-intent-reviewed",
+                "Run decode-transactions with the approved corpus and review signer/account/mint/amount/program mismatches.",
+            ),
+        },
+        {
+            "id": "finding-gate-entry",
+            "requirement": "finding-gate-impact",
+            "status": "passed" if not finding_gate_blockers else "waiting",
+            "artifact": "finding-gate.json",
+            "evidence": {
+                "finding_gate_blockers": finding_gate_blockers[:5],
+                "ready_for_finding_gate": bool(corpus_summary.get("ready_for_finding_gate")),
+            },
+            "packet_steps": [packet_step_summary("finding-gate-preview")],
+            "offline_command": offline_command(
+                "gate --no-write --show-items",
+                "transaction-closure-plan:finding-gate-entry",
+            ),
+            "next_step": (
+                "Run finding-gate only after decoded transaction evidence proves concrete user-funds impact."
+            ),
+        },
+    ]
+    incomplete_steps = [
+        step
+        for step in steps
+        if step.get("status") not in {"passed", "ready-offline", "ready-after-resource-check"}
+    ]
+    active_step = incomplete_steps[0] if incomplete_steps else {}
+    if not incomplete_steps:
+        status = "ready-for-finding-gate-review"
+    elif (
+        resource_capture_gate.get("status") == "blocked-resource"
+        and active_step.get("id") == "approved-payload-sidecar"
+    ):
+        status = "blocked-resource-needs-approved-corpus"
+    elif active_step.get("id") == "decoded-intent-review":
+        status = "needs-decoded-intent-review"
+    else:
+        status = "needs-closure-evidence"
+
+    return {
+        "id": "transaction-evidence-closure",
+        "status": status,
+        "active_step": active_step.get("id"),
+        "resource_capture_gate": resource_capture_gate,
+        "steps": steps,
+        "finding_gate_blockers": finding_gate_blockers,
+        "reportability_gate": (
+            "A transaction-integrity lead is reportable only after decoded intent evidence proves concrete "
+            "signer/account/mint/amount/program impact; source-flow evidence and sidecar readiness are not enough."
+        ),
+        "safety": (
+            "Offline closure plan only. It emits redacted artifacts, commands, and field requirements; it does not "
+            "read raw Burp history, send target traffic, invoke wallets, sign transactions, or submit transactions."
+        ),
+    }
+
+
 def build_transaction_evidence_closure(
     *,
     artifact_dir: Path,
@@ -10233,6 +10462,14 @@ def build_transaction_evidence_closure(
             "Run decode-transactions with the approved corpus and review signer/account/mint/amount/program mismatches.",
         ),
     ]
+    closure_plan = transaction_evidence_closure_plan(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        requirements=requirements,
+        sidecar_review=sidecar_review,
+        corpus_checklist=corpus_checklist,
+        approval_packet=approval_packet,
+    )
     commands = []
     if sidecar_review.get("status") == "ready-for-decode":
         for command in sidecar_review.get("decode_commands", []) or []:
@@ -10268,6 +10505,7 @@ def build_transaction_evidence_closure(
         ],
         "next_safe_commands": commands[:6],
         "transaction_corpus_approval_packet": approval_packet,
+        "closure_plan": closure_plan,
         "finding_gate_entry_condition": (
             "Only enter finding-gate after decoded transaction evidence shows a signer, wallet, account, mint, amount, "
             "or program mismatch with concrete user-funds impact."
@@ -12913,6 +13151,7 @@ def build_lead_dossier(
                 "required_evidence": thread.get("required_evidence", []),
                 "missing_requirements": closure.get("missing_requirements", []) if closure else [],
                 "artifact_statuses": closure.get("artifact_statuses", {}) if closure else {},
+                "closure_plan": closure.get("closure_plan", {}) if closure else {},
                 "approval_packet": (
                     closure.get("transaction_corpus_approval_packet")
                     or closure.get("credential_impact_approval_packet")
@@ -45137,6 +45376,7 @@ def build_transaction_decoder_selftest(
     sidecar_missing_policy_review: dict[str, Any] = {}
     sidecar_mismatch_review: dict[str, Any] = {}
     sidecar_empty_review: dict[str, Any] = {}
+    sidecar_empty_transaction_closure: dict[str, Any] = {}
     with tempfile.TemporaryDirectory() as temp_dir:
         guard_artifact_dir = Path(temp_dir) / "transaction-sidecar-guard"
         guard_artifact_dir.mkdir()
@@ -45253,6 +45493,15 @@ def build_transaction_decoder_selftest(
             target=DEFAULT_TARGET,
             profile=profile,
             artifact_dir=empty_artifact_dir,
+        )
+        sidecar_empty_transaction_closure = build_transaction_evidence_closure(
+            artifact_dir=empty_artifact_dir,
+            profile=profile,
+            item={"impact": "transaction-integrity"},
+            supporting_reviews={
+                "transaction_sidecar_review": sidecar_empty_review,
+                "transaction_corpus_checklist": sidecar_empty_corpus_checklist,
+            },
         )
         evm_artifact_dir = Path(temp_dir) / "transaction-sidecar-evm"
         evm_artifact_dir.mkdir()
@@ -45481,6 +45730,36 @@ def build_transaction_decoder_selftest(
         and "maximize-dangerous-surface-coverage" in sidecar_empty_approval_text
         and payload["base64"] not in sidecar_empty_approval_text
     )
+    sidecar_empty_closure_plan = (
+        sidecar_empty_transaction_closure.get("closure_plan")
+        if isinstance(sidecar_empty_transaction_closure.get("closure_plan"), dict)
+        else {}
+    )
+    sidecar_empty_closure_plan_steps = [
+        item
+        for item in (sidecar_empty_closure_plan.get("steps", []) or [])
+        if isinstance(item, dict)
+    ]
+    sidecar_empty_closure_plan_text = json.dumps(sidecar_empty_closure_plan, sort_keys=True)
+    sidecar_empty_closure_plan_passed = (
+        sidecar_empty_closure_plan.get("id") == "transaction-evidence-closure"
+        and sidecar_empty_closure_plan.get("status") in {
+            "needs-closure-evidence",
+            "blocked-resource-needs-approved-corpus",
+        }
+        and sidecar_empty_closure_plan.get("active_step") == "approved-payload-sidecar"
+        and [item.get("id") for item in sidecar_empty_closure_plan_steps[:4]]
+        == [
+            "approved-payload-sidecar",
+            "candidate-extraction",
+            "payload-contract",
+            "intent-policy-sidecar",
+        ]
+        and str(sidecar_empty_closure_plan_steps[0].get("artifact") or "").endswith("transaction-payloads.jsonl")
+        and "transaction-intent-policy.json" in sidecar_empty_closure_plan_text
+        and "finding-gate" in sidecar_empty_closure_plan_text
+        and payload["base64"] not in sidecar_empty_closure_plan_text
+    )
     status = (
         "passed"
         if decoded_count == 1
@@ -45498,6 +45777,7 @@ def build_transaction_decoder_selftest(
         and sidecar_evm_passed
         and sidecar_contract_passed
         and sidecar_empty_approval_packet_passed
+        and sidecar_empty_closure_plan_passed
         else "failed"
     )
     return {
@@ -45589,6 +45869,10 @@ def build_transaction_decoder_selftest(
         "transaction_corpus_approval_packet": {
             "status": "passed" if sidecar_empty_approval_packet_passed else "failed",
             "packet": sidecar_empty_approval_packet,
+        },
+        "transaction_evidence_closure_plan": {
+            "status": "passed" if sidecar_empty_closure_plan_passed else "failed",
+            "plan": sidecar_empty_closure_plan,
         },
         "transactions": transactions,
         "note": "This self-test proves decoder mechanics only; it does not satisfy GAP-quote-transaction-corpus.",
@@ -58412,6 +58696,33 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
         if approval_packet:
             print(f"  approval_packet={format_approval_packet_inline(approval_packet)}")
         if args.show_evidence:
+            closure_plan = (
+                lead.get("closure_plan")
+                if isinstance(lead.get("closure_plan"), dict)
+                else {}
+            )
+            if closure_plan:
+                resource_gate = (
+                    closure_plan.get("resource_capture_gate")
+                    if isinstance(closure_plan.get("resource_capture_gate"), dict)
+                    else {}
+                )
+                print(
+                    "    closure_plan="
+                    f"{closure_plan.get('id')} "
+                    f"status={closure_plan.get('status')} "
+                    f"active={closure_plan.get('active_step') or '-'} "
+                    f"resource={resource_gate.get('status') or '-'}"
+                )
+                for step in (closure_plan.get("steps", []) or [])[:3]:
+                    if not isinstance(step, dict):
+                        continue
+                    print(
+                        "    plan_step="
+                        f"{step.get('status')} {step.get('id')} "
+                        f"artifact={step.get('artifact') or '-'} "
+                        f"next={inline_summary_text(step.get('next_step'), max_chars=220)}"
+                    )
             for evidence in (lead.get("required_evidence", []) or [])[:3]:
                 print(f"    evidence={inline_summary_text(evidence, max_chars=260)}")
             evidence_contract = (
