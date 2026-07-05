@@ -9493,15 +9493,8 @@ def line_number_for_offset(source: str, offset: int) -> int:
     return source.count("\n", 0, max(0, offset)) + 1
 
 
-CLIENT_HTTP_LITERAL_RE = re.compile(
-    r"\b(?P<receiver>[A-Za-z_$][\w$]*)\s*\.\s*"
-    r"(?P<method>get|head|post|put|patch|delete)\s*"
-    r"(?:<[^>\n]+>)?\s*\(\s*"
-    r"(?P<quote>['\"`])(?P<path>/[^'\"`?#\n)]*)",
-    re.IGNORECASE,
-)
-CLIENT_HTTP_SOURCE_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
-CLIENT_HTTP_SOURCE_SKIP_DIRS = {
+SOURCE_SCAN_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
+SOURCE_SCAN_SKIP_DIRS = {
     ".git",
     ".greybox",
     ".next",
@@ -9515,6 +9508,15 @@ CLIENT_HTTP_SOURCE_SKIP_DIRS = {
     "node_modules",
     "out",
 }
+CLIENT_HTTP_LITERAL_RE = re.compile(
+    r"\b(?P<receiver>[A-Za-z_$][\w$]*)\s*\.\s*"
+    r"(?P<method>get|head|post|put|patch|delete)\s*"
+    r"(?:<[^>\n]+>)?\s*\(\s*"
+    r"(?P<quote>['\"`])(?P<path>/[^'\"`?#\n)]*)",
+    re.IGNORECASE,
+)
+CLIENT_HTTP_SOURCE_SUFFIXES = SOURCE_SCAN_SUFFIXES
+CLIENT_HTTP_SOURCE_SKIP_DIRS = SOURCE_SCAN_SKIP_DIRS
 
 
 def sorted_client_http_path_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -9524,7 +9526,12 @@ def sorted_client_http_path_candidates(candidates: list[dict[str, Any]]) -> list
     )
 
 
-def collect_client_http_path_candidates(source_root: Path, *, limit: int = 200) -> list[dict[str, Any]]:
+def collect_client_http_path_candidates(
+    source_root: Path,
+    *,
+    limit: int = 200,
+    max_file_bytes: int = DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES,
+) -> list[dict[str, Any]]:
     if not source_root.is_dir():
         return []
     roots = [source_root / "src"] if (source_root / "src").is_dir() else [source_root]
@@ -9542,6 +9549,12 @@ def collect_client_http_path_candidates(source_root: Path, *, limit: int = 200) 
                     return sorted_client_http_path_candidates(candidates)
                 path = Path(dirpath) / filename
                 if path.suffix not in CLIENT_HTTP_SOURCE_SUFFIXES:
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                if stat.st_size > max_file_bytes:
                     continue
                 try:
                     source = read_text(path)
@@ -16342,34 +16355,64 @@ def build_rpc_transaction_method_exposure_review(
 def grouped_source_references(
     source_root: Path,
     pattern_groups: dict[str, list[str]],
+    *,
+    max_file_bytes: int = DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES,
+    max_files: int = 256,
 ) -> dict[str, list[dict[str, Any]]]:
     refs_by_group: dict[str, list[dict[str, Any]]] = {key: [] for key in pattern_groups}
-    extensions = {".js", ".jsx", ".ts", ".tsx"}
     source_dir = source_root / "src"
     if not source_dir.exists():
         return refs_by_group
-    for path in sorted((source_root / "src").rglob("*")):
-        if path.suffix not in extensions or not path.is_file():
-            continue
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except UnicodeDecodeError:
-            continue
-        for index, line in enumerate(lines, start=1):
-            for group, patterns in pattern_groups.items():
-                if any(pattern in line for pattern in patterns):
-                    refs_by_group[group].append(
-                        {
-                            "file": source_root_relative_or_repo(path, source_root),
-                            "line": index,
-                            "sample": line.strip()[:180],
-                        }
-                    )
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(source_dir):
+        dirnames[:] = sorted(
+            dirname
+            for dirname in dirnames
+            if dirname not in SOURCE_SCAN_SKIP_DIRS and not dirname.startswith(".")
+        )
+        for filename in sorted(filenames):
+            path = Path(dirpath) / filename
+            if path.suffix not in SOURCE_SCAN_SUFFIXES or path.name.endswith(".d.ts"):
+                continue
+            if scanned >= max(1, max_files):
+                return refs_by_group
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_size > max_file_bytes:
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except (UnicodeDecodeError, OSError):
+                continue
+            scanned += 1
+            for index, line in enumerate(lines, start=1):
+                for group, patterns in pattern_groups.items():
+                    if any(pattern in line for pattern in patterns):
+                        refs_by_group[group].append(
+                            {
+                                "file": source_root_relative_or_repo(path, source_root),
+                                "line": index,
+                                "sample": redact_text(line.strip(), max_chars=180) or "",
+                            }
+                        )
     return refs_by_group
 
 
-def source_references(source_root: Path, patterns: list[str]) -> list[dict[str, Any]]:
-    return grouped_source_references(source_root, {"matches": patterns}).get("matches", [])
+def source_references(
+    source_root: Path,
+    patterns: list[str],
+    *,
+    max_file_bytes: int = DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES,
+    max_files: int = 256,
+) -> list[dict[str, Any]]:
+    return grouped_source_references(
+        source_root,
+        {"matches": patterns},
+        max_file_bytes=max_file_bytes,
+        max_files=max_files,
+    ).get("matches", [])
 
 
 def build_transaction_flow_static_review(
@@ -36383,6 +36426,37 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and pages_api_method_samples.get("commented_req_method_ignored") == []
         and pages_api_method_samples.get("string_fixture_ignored") == []
     )
+    with tempfile.TemporaryDirectory(prefix="inferforge-bounded-source-scan-selftest-") as bounded_scan_temp_dir:
+        bounded_scan_root = Path(bounded_scan_temp_dir)
+        (bounded_scan_root / "src/app/api/safe").mkdir(parents=True)
+        (bounded_scan_root / "src/app/api/safe/route.ts").write_text(
+            "export async function GET() { return Response.json({ ok: true }) }\n"
+            "const client = { get: (_path: string) => null }\n"
+            "client.get('/api/visible')\n",
+            encoding="utf-8",
+        )
+        (bounded_scan_root / "src/components/generated").mkdir(parents=True)
+        oversized_scan_file = bounded_scan_root / "src/components/generated/world-land.ts"
+        oversized_scan_file.write_text(
+            "const client = { get: (_path: string) => null }\n"
+            "client.get('/api/hidden-generated')\n"
+            "walletProvider.sendTransaction(tx, connection)\n"
+            + ("x" * 2048),
+            encoding="utf-8",
+        )
+        bounded_source_refs = grouped_source_references(
+            bounded_scan_root,
+            {"transaction_sinks": ["walletProvider.sendTransaction"]},
+            max_file_bytes=512,
+        )
+        bounded_client_candidates = collect_client_http_path_candidates(
+            bounded_scan_root,
+            max_file_bytes=512,
+        )
+        bounded_source_scan_passed = (
+            bounded_source_refs.get("transaction_sinks") == []
+            and {candidate.get("path") for candidate in bounded_client_candidates} == {"/api/visible"}
+        )
     blackbox_history_samples = [
         {
             "method": "GET",
@@ -39633,6 +39707,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and unsafe_observation_validation_passed
         and route_method_export_list_passed
         and pages_api_method_samples_passed
+        and bounded_source_scan_passed
         and blackbox_mode_samples_passed
         and any_method_match_reason_passed
         and rewrite_discovery_passed
@@ -39705,6 +39780,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         "pages_api_method_detection": {
             "status": "passed" if pages_api_method_samples_passed else "failed",
             "samples": pages_api_method_samples,
+        },
+        "bounded_source_scan": {
+            "status": "passed" if bounded_source_scan_passed else "failed",
+            "grouped_refs": bounded_source_refs,
+            "client_candidates": bounded_client_candidates,
         },
         "blackbox_mode": {
             "status": "passed" if blackbox_mode_samples_passed else "failed",
