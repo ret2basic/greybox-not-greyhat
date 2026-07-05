@@ -12846,6 +12846,12 @@ def rewrite_validation_checklist_item(
         status = "needs-approved-read-only-path"
     else:
         status = "needs-manual-concrete-path"
+    recommended_candidate = read_only[0] if read_only else None
+    recommended_sensitivity = (
+        recommended_candidate.get("sensitivity")
+        if isinstance(recommended_candidate, dict) and isinstance(recommended_candidate.get("sensitivity"), dict)
+        else {}
+    )
     return {
         "id": f"REWRITE-CHECKLIST-{safe_probe_id(rewrite_review_item.get('id') or rewrite_review_item.get('path'))}",
         "status": status,
@@ -12858,6 +12864,19 @@ def rewrite_validation_checklist_item(
         "fixed_upstreams": rewrite_review_item.get("fixed_upstreams", []) or [],
         "catch_all": bool(rewrite_review_item.get("catch_all")),
         "source_guard_status": source_guard.get("status") or "missing",
+        "source_guard_summary": source_guard.get("summary") if isinstance(source_guard.get("summary"), dict) else {},
+        "recommended_path_candidate": recommended_candidate,
+        "candidate_selection_rationale": [
+            "Read-only candidates are sorted by path sensitivity score, then method and local_path.",
+            "Use the top candidate only as a prioritization hint; scope and data-sensitivity approval are still required before any request.",
+            (
+                "Top candidate matched sensitivity keywords: "
+                + ", ".join(normalize_string_list(recommended_sensitivity.get("matched_keywords")))
+            )
+            if recommended_sensitivity.get("matched_keywords")
+            else "Top candidate did not match high-sensitivity keywords.",
+            str(recommended_sensitivity.get("review_note") or ""),
+        ],
         "read_only_path_candidates": read_only[:10],
         "blocked_path_candidates": blocked[:10],
         "promotion_preview_commands": promotion_commands,
@@ -43705,6 +43724,30 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             ),
             None,
         )
+        rewrite_checklist_sample = build_rewrite_validation_checklist(
+            target="http://127.0.0.1:9998",
+            profile=rewrite_normalized,
+            artifact_dir=rewrite_review_dir,
+        )
+        rewrite_checklist_proxy_item = next(
+            (
+                item
+                for item in rewrite_checklist_sample.get("items", [])
+                if item.get("cluster_id") == "route-api-proxy-path"
+            ),
+            None,
+        )
+        rewrite_checklist_recommended = (
+            rewrite_checklist_proxy_item.get("recommended_path_candidate")
+            if isinstance(rewrite_checklist_proxy_item, dict)
+            and isinstance(rewrite_checklist_proxy_item.get("recommended_path_candidate"), dict)
+            else {}
+        )
+        rewrite_checklist_recommended_sensitivity = (
+            rewrite_checklist_recommended.get("sensitivity")
+            if isinstance(rewrite_checklist_recommended.get("sensitivity"), dict)
+            else {}
+        )
         fixed_source_guard_review = build_rewrite_source_guard_review(
             rewrite_source_root,
             ["src/lib/fixed-upstream-selftest.ts"],
@@ -44554,6 +44597,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rewrite_review_proxy_item.get("status") == "needs-approved-read-only-path"
             and rewrite_review_proxy_item.get("priority") == "high"
             and rewrite_review_proxy_item.get("catch_all") is True
+            and rewrite_checklist_proxy_item is not None
+            and rewrite_checklist_proxy_item.get("status") == "ready-for-single-path-promotion-preview"
+            and rewrite_checklist_proxy_item.get("source_guard_summary", {}).get("fixed_upstream_fetch_refs") == 0
+            and rewrite_checklist_recommended.get("local_path") == "/api/proxy/users/42"
+            and isinstance(rewrite_checklist_recommended_sensitivity.get("matched_keywords"), list)
+            and any(
+                "Read-only candidates are sorted by path sensitivity score"
+                in str(reason)
+                for reason in rewrite_checklist_proxy_item.get("candidate_selection_rationale", [])
+            )
             and "fixed-upstream" in rewrite_review_proxy_item.get("risk_factors", [])
             and "client-read-only-path-candidate" in rewrite_review_proxy_item.get("risk_factors", [])
             and "client-non-read-only-path-blocked" in rewrite_review_proxy_item.get("risk_factors", [])
@@ -50263,21 +50316,44 @@ def run_rewrite_validation_checklist(args: argparse.Namespace) -> int:
             f"path={item.get('path') or '-'} candidate_id={item.get('candidate_id') or '-'}"
         )
         if args.show_candidates:
+            source_guard_summary = item.get("source_guard_summary") if isinstance(item.get("source_guard_summary"), dict) else {}
+            if source_guard_summary:
+                print(
+                    "  source_guard="
+                    f"{item.get('source_guard_status')} "
+                    f"fixed={source_guard_summary.get('fixed_upstream_fetch_refs', 0)} "
+                    f"guards={source_guard_summary.get('positive_guard_refs', 0)} "
+                    f"query={source_guard_summary.get('query_forwarding_refs', 0)} "
+                    f"credentials={source_guard_summary.get('credential_forwarding_refs', 0)}"
+                )
+            recommended = item.get("recommended_path_candidate") if isinstance(item.get("recommended_path_candidate"), dict) else {}
+            if recommended:
+                print(
+                    "  recommended="
+                    f"{recommended.get('method')} {recommended.get('local_path')} "
+                    f"source={recommended.get('source_ref')}"
+                )
+                for reason in normalize_string_list(item.get("candidate_selection_rationale"))[:3]:
+                    print(f"    reason={inline_summary_text(reason, max_chars=220)}")
             for candidate in (item.get("read_only_path_candidates", []) or [])[:3]:
                 sensitivity = candidate.get("sensitivity") if isinstance(candidate.get("sensitivity"), dict) else {}
                 print(
                     "  candidate="
                     f"{candidate.get('method')} {candidate.get('local_path')} "
                     f"source={candidate.get('source_ref')} "
-                    f"sensitivity={sensitivity.get('priority') or 'unknown'}:{sensitivity.get('score', 0)}"
+                    f"sensitivity={sensitivity.get('priority') or 'unknown'}:{sensitivity.get('score', 0)} "
+                    f"keywords={','.join(normalize_string_list(sensitivity.get('matched_keywords'))) or '-'}"
                 )
+                if sensitivity.get("review_note"):
+                    print(f"    note={inline_summary_text(sensitivity.get('review_note'), max_chars=220)}")
             for candidate in (item.get("blocked_path_candidates", []) or [])[:3]:
                 sensitivity = candidate.get("sensitivity") if isinstance(candidate.get("sensitivity"), dict) else {}
                 print(
                     "  blocked_candidate="
                     f"{candidate.get('method')} {candidate.get('local_path')} "
                     f"status={candidate.get('status')} "
-                    f"sensitivity={sensitivity.get('priority') or 'unknown'}:{sensitivity.get('score', 0)}"
+                    f"sensitivity={sensitivity.get('priority') or 'unknown'}:{sensitivity.get('score', 0)} "
+                    f"keywords={','.join(normalize_string_list(sensitivity.get('matched_keywords'))) or '-'}"
                 )
         if args.show_commands:
             for command_text in (item.get("promotion_preview_commands", []) or [])[:3]:
