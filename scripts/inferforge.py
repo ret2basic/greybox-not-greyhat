@@ -1072,8 +1072,11 @@ ASSESSMENT_MODE_POLICIES: dict[str, dict[str, Any]] = {
         "objective_model": {
             "primary_objective": "dangerous-surface-coverage",
             "completion_unit": "all-dangerous-source-derived-surfaces",
+            "success_definition": "Maximize coverage and evidence closure for every dangerous audit surface; a single finding does not complete the review.",
             "valid_completion_signal": "Every dangerous source-derived surface is covered, evidence-closed, accepted as residual risk, or blocked by scope/resource gates.",
             "minimum_report_threshold": "evidence-closed-dangerous-surface",
+            "coverage_requirement": "exhaustive-dangerous-surface-coverage",
+            "bounty_validity_policy": "report valid findings, but keep auditing uncovered dangerous surfaces",
             "coverage_policy": "continue-after-single-finding",
             "lead_parking_policy": "do-not-park-dangerous-surfaces-for-payoff-alone",
         },
@@ -1092,8 +1095,11 @@ ASSESSMENT_MODE_POLICIES: dict[str, dict[str, Any]] = {
         "objective_model": {
             "primary_objective": "valid-high-impact-bounty-report",
             "completion_unit": "one-valid-medium-high-critical-report",
+            "success_definition": "Find the strongest valid bounty-worthy Medium+ issue; one high-impact reproducible report can satisfy the objective.",
             "valid_completion_signal": "One in-scope gate-ready Medium, High, or Critical report path has concrete reproducible impact evidence.",
             "minimum_report_threshold": "finding-gate-ready-medium-plus",
+            "coverage_requirement": "non-exhaustive-coverage-secondary",
+            "bounty_validity_policy": "validity-impact-and-program-fit-before-breadth",
             "coverage_policy": "coverage-secondary-after-dominant-bounty-path",
             "lead_parking_policy": "park-broad-or-low-validity-work-behind-dominant-bounty-lead",
         },
@@ -12416,8 +12422,11 @@ def lead_dossier_assessment_scorecard(
         "objective_alignment": {
             "primary_objective": objective_model.get("primary_objective"),
             "completion_unit": objective_model.get("completion_unit"),
+            "success_definition": objective_model.get("success_definition"),
             "valid_completion_signal": objective_model.get("valid_completion_signal"),
             "minimum_report_threshold": objective_model.get("minimum_report_threshold"),
+            "coverage_requirement": objective_model.get("coverage_requirement"),
+            "bounty_validity_policy": objective_model.get("bounty_validity_policy"),
             "coverage_policy": objective_model.get("coverage_policy"),
             "lead_parking_policy": objective_model.get("lead_parking_policy"),
             "role": objective_role,
@@ -12515,6 +12524,9 @@ def apply_assessment_relative_focus_policy(
 def assessment_objective_satisfaction_summary(
     items: list[dict[str, Any]],
     assessment_policy: dict[str, Any],
+    *,
+    artifact_dir: Path | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     objective_model = assessment_policy_objective_model(assessment_policy)
     strategy = lead_dossier_ranking_strategy(assessment_policy)
@@ -12561,7 +12573,7 @@ def assessment_objective_satisfaction_summary(
     else:
         status = "needs-dangerous-surface-coverage-closure"
         next_step = "Close or explicitly accept every remaining dangerous-surface evidence gap before declaring greybox coverage complete."
-    unblocker_rollup = objective_unblocker_rollup(open_items)
+    unblocker_rollup = objective_unblocker_rollup(open_items, artifact_dir=artifact_dir, profile=profile)
 
     return {
         "status": status,
@@ -12569,6 +12581,11 @@ def assessment_objective_satisfaction_summary(
         "strategy": strategy,
         "primary_objective": objective_model.get("primary_objective"),
         "completion_unit": objective_model.get("completion_unit"),
+        "success_definition": objective_model.get("success_definition"),
+        "valid_completion_signal": objective_model.get("valid_completion_signal"),
+        "minimum_report_threshold": objective_model.get("minimum_report_threshold"),
+        "coverage_requirement": objective_model.get("coverage_requirement"),
+        "bounty_validity_policy": objective_model.get("bounty_validity_policy"),
         "coverage_policy": objective_model.get("coverage_policy"),
         "lead_parking_policy": objective_model.get("lead_parking_policy"),
         "candidate_items": len(scored_items),
@@ -12581,6 +12598,8 @@ def assessment_objective_satisfaction_summary(
         "unblocker_actionability_counts": unblocker_rollup.get("actionability_counts", {}),
         "top_unblocker": unblocker_rollup.get("top_unblocker"),
         "unblockers": unblocker_rollup.get("items", []),
+        "safe_offline_commands": unblocker_rollup.get("safe_offline_commands", []),
+        "command_safety": unblocker_rollup.get("command_safety", {"commands": 0}),
         "next_step": next_step,
     }
 
@@ -12815,7 +12834,39 @@ def objective_unblocker_evidence_package(lane: str) -> dict[str, Any]:
     }
 
 
-def assessment_item_objective_unblocker(item: dict[str, Any]) -> dict[str, Any]:
+def objective_unblocker_command_refs(
+    unblocker: dict[str, Any],
+    *,
+    artifact_dir: Path | None,
+    profile: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if artifact_dir is None:
+        return []
+    package = unblocker.get("evidence_package") if isinstance(unblocker.get("evidence_package"), dict) else {}
+    lane = str(unblocker.get("lane") or "unclassified-evidence")
+    item_id = safe_probe_id(str(unblocker.get("item_id") or "objective-unblocker"))[:80]
+    command_refs = []
+    for index, subcommand in enumerate(package.get("safe_offline_reviews", []) or [], start=1):
+        subcommand_text = str(subcommand or "").strip()
+        if not subcommand_text:
+            continue
+        ref = methodology_command_ref(
+            artifact_dir,
+            profile,
+            subcommand_text,
+            source=f"objective-unblocker:{lane}:{item_id}:{index}",
+        )
+        if isinstance(ref, dict):
+            command_refs.append(ref)
+    return command_refs
+
+
+def assessment_item_objective_unblocker(
+    item: dict[str, Any],
+    *,
+    artifact_dir: Path | None = None,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     closure_plan = item.get("closure_plan") if isinstance(item.get("closure_plan"), dict) else {}
     active_step = str(closure_plan.get("active_step") or "").strip()
     active_step_row: dict[str, Any] = {}
@@ -12851,7 +12902,7 @@ def assessment_item_objective_unblocker(item: dict[str, Any]) -> dict[str, Any]:
         else {}
     )
     evidence_package = objective_unblocker_evidence_package(lane)
-    return {
+    unblocker = {
         "item_id": assessment_item_identity(item),
         "priority": item.get("priority") or item.get("validation_item_priority"),
         "impact": impact or None,
@@ -12868,20 +12919,40 @@ def assessment_item_objective_unblocker(item: dict[str, Any]) -> dict[str, Any]:
         "approval_packet_types": approval_packet_types,
         "objective_blocker": alignment.get("objective_blocker"),
     }
+    command_refs = objective_unblocker_command_refs(unblocker, artifact_dir=artifact_dir, profile=profile)
+    if command_refs:
+        unblocker["safe_offline_command_refs"] = command_refs[:4]
+        unblocker["command_safety"] = command_safety_summary(command_refs)
+    return unblocker
 
 
-def objective_unblocker_rollup(open_items: list[dict[str, Any]]) -> dict[str, Any]:
-    unblockers = [assessment_item_objective_unblocker(item) for item in open_items if isinstance(item, dict)]
+def objective_unblocker_rollup(
+    open_items: list[dict[str, Any]],
+    *,
+    artifact_dir: Path | None = None,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    unblockers = [
+        assessment_item_objective_unblocker(item, artifact_dir=artifact_dir, profile=profile)
+        for item in open_items
+        if isinstance(item, dict)
+    ]
     lane_counts: dict[str, int] = {}
     actionability_counts: dict[str, int] = {}
+    command_refs = []
     for unblocker in unblockers:
         increment_count(lane_counts, str(unblocker.get("lane") or "unknown"))
         increment_count(actionability_counts, str(unblocker.get("actionability") or "unknown"))
+        for ref in unblocker.get("safe_offline_command_refs", []) or []:
+            if isinstance(ref, dict):
+                command_refs.append(ref)
     return {
         "items": unblockers[:8],
         "top_unblocker": unblockers[0] if unblockers else None,
         "lane_counts": dict(sorted(lane_counts.items())),
         "actionability_counts": dict(sorted(actionability_counts.items())),
+        "safe_offline_commands": command_refs[:8],
+        "command_safety": command_safety_summary(command_refs) if command_refs else {"commands": 0},
     }
 
 
@@ -13115,7 +13186,12 @@ def build_bounty_harness_alignment(
         )
     )
     apply_assessment_relative_focus_policy(candidate_leads, assessment_policy)
-    objective_satisfaction = assessment_objective_satisfaction_summary(candidate_leads, assessment_policy)
+    objective_satisfaction = assessment_objective_satisfaction_summary(
+        candidate_leads,
+        assessment_policy,
+        artifact_dir=artifact_dir,
+        profile=profile,
+    )
     top_candidate = candidate_leads[0] if candidate_leads else {}
 
     def command(subcommand: str, *, source: str) -> dict[str, Any] | None:
@@ -14442,7 +14518,12 @@ def build_lead_dossier(
         assessment_policy,
     )
     leads = ranked_candidates[:requested_limit]
-    objective_satisfaction = assessment_objective_satisfaction_summary(ranked_candidates, assessment_policy)
+    objective_satisfaction = assessment_objective_satisfaction_summary(
+        ranked_candidates,
+        assessment_policy,
+        artifact_dir=artifact_dir,
+        profile=profile,
+    )
     priority_counts: dict[str, int] = {}
     status_counts: dict[str, int] = {}
     gate_ready = 0
@@ -19334,7 +19415,12 @@ def build_iteration_decision_from_plan(
     artifact_health_needs_review = artifact_health_status == "needs-human-review"
     resource_blocks_active = bool(active_after_gate and resource_status not in {"healthy", "not-run"})
     iteration_focus = build_iteration_assessment_focus(validation_plan, assessment_policy)
-    objective_satisfaction = assessment_objective_satisfaction_summary(iteration_focus, assessment_policy)
+    objective_satisfaction = assessment_objective_satisfaction_summary(
+        iteration_focus,
+        assessment_policy,
+        artifact_dir=artifact_dir,
+        profile=profile,
+    )
     assessment_by_item_id = {
         str(item.get("validation_item_id")): item.get("assessment_rank")
         for item in iteration_focus
@@ -19360,6 +19446,22 @@ def build_iteration_decision_from_plan(
             )
 
     actions: list[dict[str, Any]] = []
+    objective_package_commands = [
+        ref
+        for ref in (objective_satisfaction.get("safe_offline_commands", []) or [])
+        if isinstance(ref, dict)
+    ]
+    if objective_package_commands:
+        actions.append(
+            iteration_action(
+                action_id="objective-evidence-package",
+                status="ready",
+                kind="offline",
+                reason="Run the no-write evidence-package commands for the current objective blocker first.",
+                commands=objective_package_commands,
+                limit=offline_preview_limit,
+            )
+        )
     if offline:
         offline_reason = "Read-only planning commands can run under current resource pressure."
         if resource_status not in {"healthy", "not-run"}:
@@ -19489,6 +19591,7 @@ def build_iteration_decision_from_plan(
             "artifact_health_review_gated_active_commands": len(active_after_gate) if artifact_health_needs_review else 0,
             "resource_blocked_active_commands": len(active_after_gate) if resource_blocks_active else 0,
             "approval_packets": len(approval_packets),
+            "objective_package_commands": len(objective_package_commands),
             "blocked_commands": len(blocked),
             "command_safety": allowed_command_summary,
             "blocked_command_safety": blocked_command_summary,
@@ -42928,6 +43031,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "objective=" in methodology_review_stdout_text
                 and "lane=" in methodology_review_stdout_text
                 and "package=" in methodology_review_stdout_text
+                and "commands=" in methodology_review_stdout_text
                 and "- bounty system-context-threat-model:" in methodology_review_stdout_text
                 and "High-value threads:" in methodology_review_stdout
                 and "poc_plan=" in methodology_review_stdout_text
@@ -42961,6 +43065,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "lane=" in lead_dossier_stdout_text
                 and "action=" in lead_dossier_stdout_text
                 and "package=" in lead_dossier_stdout_text
+                and "commands=" in lead_dossier_stdout_text
                 and "strict_validation=blocked-before-finding-gate" in lead_dossier_stdout_text
                 and "question=waiting concrete-impact-evidence" in lead_dossier_stdout_text
                 and "No files written (--no-write)." in lead_dossier_stdout
@@ -52559,6 +52664,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_iteration_top_focus_scorecard.get("strategy") == "blackbox-bounty-first"
         and blackbox_iteration_top_focus_scorecard.get("bounty_pressure", {}).get("score") is not None
         and all(isinstance(scorecard, dict) for scorecard in blackbox_iteration_packet_scorecards)
+        and (
+            int(blackbox_iteration_decision_sample.get("summary", {}).get("objective_package_commands", 0) or 0) == 0
+            or any(
+                action.get("id") == "objective-evidence-package" and action.get("kind") == "offline"
+                for action in blackbox_iteration_decision_sample.get("actions", [])
+            )
+        )
         and blackbox_iteration_decision_sample.get("summary", {}).get("offline_commands", 0) > 0
         and blackbox_iteration_decision_sample.get("summary", {}).get("active_after_resource_gate_commands", 0) > 0
         and blackbox_iteration_decision_sample.get("summary", {}).get("resource_blocked_active_commands", 0) > 0
@@ -60279,6 +60391,7 @@ def run_methodology_review(args: argparse.Namespace) -> int:
             f"objective={bounty_summary.get('objective_status') or '-'} "
             f"lane={bounty_top_unblocker.get('lane') or '-'} "
             f"package={bounty_top_unblocker.get('evidence_package_id') or '-'} "
+            f"commands={len(bounty_objective.get('safe_offline_commands', []) or [])} "
             f"top={bounty_summary.get('top_candidate_id') or '-'} "
             f"gate_ready={bounty_summary.get('gate_ready_threads', 0)} "
             f"resource={bounty_summary.get('resource_status') or '-'} "
@@ -60425,7 +60538,8 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
             f"top_open={objective_satisfaction.get('top_open_id') or '-'} "
             f"lane={top_unblocker.get('lane') or '-'} "
             f"action={top_unblocker.get('actionability') or '-'} "
-            f"package={top_unblocker.get('evidence_package_id') or '-'}"
+            f"package={top_unblocker.get('evidence_package_id') or '-'} "
+            f"commands={len(objective_satisfaction.get('safe_offline_commands', []) or [])}"
         )
     if assessment_policy:
         objective_model = (
@@ -62640,7 +62754,8 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
             f"top_open={objective_satisfaction.get('top_open_id') or '-'} "
             f"lane={top_unblocker.get('lane') or '-'} "
             f"action={top_unblocker.get('actionability') or '-'} "
-            f"package={top_unblocker.get('evidence_package_id') or '-'}"
+            f"package={top_unblocker.get('evidence_package_id') or '-'} "
+            f"commands={len(objective_satisfaction.get('safe_offline_commands', []) or [])}"
         )
     if resource_preflight and resource_preflight.get("status") != "not-run":
         warnings = resource_preflight.get("warnings", []) or []
@@ -62662,6 +62777,7 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
         f"artifact_review_gated_active={summary.get('artifact_health_review_gated_active_commands', 0)} "
         f"resource_blocked_active={summary.get('resource_blocked_active_commands', 0)} "
         f"approval_packets={summary.get('approval_packets', 0)} "
+        f"objective_package={summary.get('objective_package_commands', 0)} "
         f"blocked={summary.get('blocked_commands', 0)}"
     )
     if command_safety:

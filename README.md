@@ -47,7 +47,9 @@ data-source switch:
 
 The active policy also carries a machine-readable `objective_model`: greybox's
 completion unit is `all-dangerous-source-derived-surfaces`, while blackbox's
-completion unit is `one-valid-medium-high-critical-report`.
+completion unit is `one-valid-medium-high-critical-report`. The same model also
+records `coverage_requirement` and `bounty_validity_policy`, so unattended runs
+can distinguish exhaustive audit closure from non-exhaustive bounty pursuit.
 
 Target-specific routing, source references, Burp observation requests, enabled
 strategy sets, and cluster metadata are described by a target profile. The
@@ -365,7 +367,9 @@ can distinguish approved payload capture, provider/operator evidence,
 deployment resource evidence, read-only response observation, resource gates,
 and finding-gate review. Each unblocker also carries an `evidence_package` with
 required artifacts, safe no-write review commands, active-validation gates, and
-forbidden validation steps for that lane.
+forbidden validation steps for that lane. When an artifact directory is known,
+the package's safe reviews are expanded into command-safety-classified
+`safe_offline_command_refs`.
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
@@ -646,7 +650,9 @@ scorecard for the validation item that produced them. The iteration summary also
 includes `objective_satisfaction`, so unattended runs can tell whether the
 active mode still needs coverage closure or a valid Medium+ bounty report path,
 which evidence lane is currently blocking it, and which evidence package should
-be completed before any active validation.
+be completed before any active validation. Package commands also appear as an
+`objective-evidence-package` offline action so the loop can prioritize the
+current blocker before generic planning commands.
 
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:
