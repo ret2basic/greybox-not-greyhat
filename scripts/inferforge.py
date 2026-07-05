@@ -168,6 +168,7 @@ BOUNTY_VALIDATION_GATES_ARTIFACT = "bounty-validation-gates.json"
 BOUNTY_INVALIDITY_REVIEW_ARTIFACT = "bounty-invalidity-review.json"
 BOUNTY_READINESS_ROLLUP_ARTIFACT = "bounty-readiness-rollup.json"
 BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT = "bounty-evidence-workorders.json"
+BOUNTY_SOURCE_INVARIANTS_ARTIFACT = "bounty-source-invariants.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -286,6 +287,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     BOUNTY_INVALIDITY_REVIEW_ARTIFACT,
     BOUNTY_READINESS_ROLLUP_ARTIFACT,
     BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT,
+    BOUNTY_SOURCE_INVARIANTS_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -24457,6 +24459,374 @@ def build_bounty_evidence_workorders(
     }
 
 
+def bounded_source_refs_from_rows(rows: Any, *, limit: int = 10) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str]] = set()
+
+    def add_ref(ref: dict[str, Any]) -> None:
+        file_name = str(ref.get("file") or "")
+        line = int(ref.get("line") or 0)
+        sample = str(ref.get("sample") or ref.get("token") or "")
+        key = (file_name, line, sample)
+        if not file_name or key in seen:
+            return
+        seen.add(key)
+        refs.append(
+            {
+                "file": file_name,
+                "line": line,
+                "token": ref.get("token"),
+                "sample": ref.get("sample"),
+            }
+        )
+
+    def walk(value: Any) -> None:
+        if len(refs) >= limit:
+            return
+        if isinstance(value, dict):
+            if value.get("file") and ("line" in value or "sample" in value or "token" in value):
+                add_ref(value)
+                return
+            for child in value.values():
+                walk(child)
+                if len(refs) >= limit:
+                    return
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+                if len(refs) >= limit:
+                    return
+
+    walk(rows)
+    return refs[:limit]
+
+
+def first_row_by_id(rows: Any, row_id: str) -> dict[str, Any]:
+    if not isinstance(rows, list):
+        return {}
+    for row in rows:
+        if isinstance(row, dict) and row.get("id") == row_id:
+            return row
+    return {}
+
+
+def source_refs_for_path_tokens(
+    source_root: Path,
+    relpath: str,
+    tokens: list[str],
+    *,
+    limit: int = 6,
+) -> list[dict[str, Any]]:
+    path = source_root / relpath
+    try:
+        source = read_text_file_limited(
+            path,
+            max_input_bytes=DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES,
+            limit_name="source-invariant-max-file-bytes",
+        )
+    except (FileNotFoundError, OSError, UnicodeDecodeError, ValueError):
+        return []
+    refs = []
+    seen: set[tuple[str, int, str]] = set()
+    for token in tokens:
+        offset = source.find(token)
+        if offset < 0:
+            continue
+        line = line_number_for_offset(source, offset)
+        lines = source.splitlines()
+        sample = lines[line - 1].strip() if 0 < line <= len(lines) else token
+        key = (relpath, line, token)
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append(
+            {
+                "file": source_root_relative_or_repo(path, source_root),
+                "line": line,
+                "token": token,
+                "sample": sample,
+            }
+        )
+        if len(refs) >= limit:
+            break
+    return refs
+
+
+def source_invariant_row_for_workorder(
+    workorder: dict[str, Any],
+    *,
+    source_root: Path,
+    transaction_flow_review: dict[str, Any] | None,
+    rpc_proxy_parity_review: dict[str, Any] | None,
+    rewrite_review: dict[str, Any] | None,
+    route_inventory: dict[str, Any] | None,
+    secret_exposure_review: dict[str, Any] | None,
+    websocket_candidate_review: dict[str, Any] | None,
+) -> dict[str, Any]:
+    lane = str(workorder.get("lane") or "unknown")
+    refs: list[dict[str, Any]] = []
+    source_invariants: list[str] = []
+    negative_controls: list[str] = [
+        "Source invariants are not official evidence and cannot promote a Medium+ finding by themselves.",
+        "Finding-gate/adjudication must still accept mechanism, reachability, impact, and terminal state.",
+    ]
+    source_status = "operator-evidence-required"
+    source_signal = "source-context-indexed"
+
+    if lane == "transaction-integrity":
+        dataflows = (
+            transaction_flow_review.get("dataflows", [])
+            if isinstance(transaction_flow_review, dict)
+            else []
+        )
+        remote_flow = first_row_by_id(dataflows, "remote-payload-to-wallet-signing")
+        blockhash_flow = first_row_by_id(dataflows, "client-recent-blockhash-rewrite")
+        refs = bounded_source_refs_from_rows([remote_flow, blockhash_flow], limit=10)
+        source_status = "source-positive-official-payload-required"
+        source_signal = "remote-payload-wallet-signing-path-indexed"
+        source_invariants = [
+            "A remote orchestration payload is deserialized into a Solana VersionedTransaction.",
+            "The deserialized transaction reaches walletProvider.sendTransaction.",
+            "The client refreshes recentBlockhash before sending, so the post-rewrite transaction must be decoded for intent.",
+        ]
+        negative_controls.extend(
+            [
+                "The source path proves a high-value transaction-integrity oracle, but not a mismatch.",
+                "A synthetic payload, placeholder payload, or source-only argument remains invalid.",
+            ]
+        )
+    elif lane == "build-secret-exposure":
+        actionable = (
+            secret_exposure_review.get("actionable_review_items", [])
+            if isinstance(secret_exposure_review, dict)
+            else []
+        )
+        refs = bounded_source_refs_from_rows(actionable, limit=10)
+        source_status = "static-build-secret-signal-provenance-required"
+        source_signal = "docker-build-secret-static-risk-indexed"
+        source_invariants = [
+            "Dockerfile uses NODE_AUTH_TOKEN as a build argument.",
+            "Dockerfile promotes the build secret into ENV during the builder stage.",
+            "Dockerfile writes npm auth material to .npmrc during build.",
+        ]
+        negative_controls.extend(
+            [
+                "Static Dockerfile source does not prove a real secret was supplied.",
+                "Static Dockerfile source does not prove layer, cache, log, or registry retention.",
+            ]
+        )
+    elif lane == "sensitive-response-impact":
+        route_rewrites = (
+            route_inventory.get("rewrites", [])
+            if isinstance(route_inventory, dict) and isinstance(route_inventory.get("rewrites"), list)
+            else []
+        )
+        infrafi_rewrites = [
+            rewrite
+            for rewrite in route_rewrites
+            if isinstance(rewrite, dict) and str(rewrite.get("path") or "").startswith("/api/infrafi/")
+        ]
+        refs = [
+            *source_refs_for_path_tokens(
+                source_root,
+                "next.config.ts",
+                [
+                    "const INFRAFI_API_PROXY_TARGET",
+                    "source: '/api/infrafi/:path*'",
+                    "destination: `${INFRAFI_API_PROXY_TARGET}/:path*`",
+                ],
+                limit=4,
+            ),
+            *source_refs_for_path_tokens(
+                source_root,
+                "src/store/vault.ts",
+                ["/vault/solana/dry-powder"],
+                limit=2,
+            ),
+            *bounded_source_refs_from_rows(infrafi_rewrites, limit=4),
+        ][:10]
+        source_status = "rewrite-boundary-response-sidecar-required"
+        source_signal = "fixed-upstream-or-rewrite-boundary-indexed"
+        source_invariants = [
+            "A same-origin /api/infrafi rewrite forwards browser-visible paths to a fixed upstream API target.",
+            "The client requests /vault/solana/dry-powder through that upstream-facing API surface.",
+            "No approved single-response impact evidence is present in the current artifacts.",
+        ]
+        negative_controls.extend(
+            [
+                "A reachable upstream or rewrite boundary is not sensitive-response impact by itself.",
+                "Status code, route existence, and source guard presence do not prove data exposure.",
+            ]
+        )
+    elif lane == "websocket-header-trust":
+        source_review = (
+            websocket_candidate_review.get("source_review")
+            if isinstance(websocket_candidate_review, dict)
+            else {}
+        )
+        refs = bounded_source_refs_from_rows(source_review, limit=10)
+        source_status = "source-header-forwarding-operator-trust-required"
+        source_signal = "websocket-header-forwarding-indexed"
+        source_invariants = [
+            "WebSocket proxy iterates inbound request headers and forwards non-hop-by-hop headers upstream.",
+            "Origin is filtered, but authorization/cookie trust impact remains an operator/provider question.",
+            "Current source auth context shows no sensitive browser credential context proof.",
+        ]
+        negative_controls.extend(
+            [
+                "Header forwarding source code is not impact unless the upstream trusts, logs, bills, authorizes, or rate-limits from it.",
+                "Non-sensitive cookie context or server-side authorization references are not browser-controlled trust-boundary proof.",
+            ]
+        )
+    elif lane in {"credentialed-provider-impact", "resource-control"}:
+        checks = (
+            rpc_proxy_parity_review.get("checks", [])
+            if isinstance(rpc_proxy_parity_review, dict)
+            else []
+        )
+        review_checks = [
+            row
+            for row in checks
+            if isinstance(row, dict) and row.get("status") in {"review", "blocked", "waiting"}
+        ]
+        refs = bounded_source_refs_from_rows(review_checks or checks, limit=10)
+        if lane == "resource-control":
+            source_status = "source-controls-indexed-resource-impact-required"
+            source_signal = "rpc-resource-control-boundary-indexed"
+            source_invariants = [
+                "HTTP and WebSocket RPC paths gate cluster and method choices before upstream proxying.",
+                "RPC host-derived origin and rate/connection behavior remain deployment/operator-dependent.",
+            ]
+        else:
+            source_status = "credentialed-proxy-operator-impact-required"
+            source_signal = "server-credentialed-upstream-path-indexed"
+            source_invariants = [
+                "Server-side API/RPC credentials or upstream dependencies are used behind public app routes.",
+                "Provider quota, billing, rate-limit, monitoring, or account impact is not visible from source alone.",
+            ]
+        negative_controls.extend(
+            [
+                "Method allowlists, origin gates, and rate limits reduce static exploitability and require deployment/operator evidence to override.",
+                "Provider cost or quota impact cannot be inferred from source-only route reachability.",
+            ]
+        )
+    else:
+        source_status = "source-context-insufficient"
+        source_signal = "unmapped-lane"
+        source_invariants = ["No lane-specific source invariant mapper exists yet."]
+
+    return {
+        "id": f"SOURCE-INVARIANT-{safe_probe_id(str(workorder.get('id') or lane))}",
+        "workorder_id": workorder.get("id"),
+        "gate_id": workorder.get("gate_id"),
+        "lane": lane,
+        "expected_severity": workorder.get("expected_severity"),
+        "status": source_status,
+        "source_signal": source_signal,
+        "can_promote_without_official_evidence": False,
+        "official_evidence_missing": bool(workorder.get("official_evidence_missing")),
+        "operator_input_required": bool(workorder.get("operator_input_required")),
+        "source_invariants": source_invariants,
+        "negative_controls": negative_controls,
+        "source_refs": refs,
+        "required_official_evidence": normalize_string_list(workorder.get("required_official_evidence")),
+        "next_step": workorder.get("first_human_action") or workorder.get("recommended_preview_command"),
+    }
+
+
+def build_bounty_source_invariants(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    source_root: Path,
+    bounty_evidence_workorders: dict[str, Any] | None,
+    transaction_flow_review: dict[str, Any] | None,
+    rpc_proxy_parity_review: dict[str, Any] | None,
+    rewrite_review: dict[str, Any] | None,
+    route_inventory: dict[str, Any] | None,
+    secret_exposure_review: dict[str, Any] | None,
+    websocket_candidate_review: dict[str, Any] | None,
+) -> dict[str, Any]:
+    workorders = (
+        bounty_evidence_workorders.get("workorders", [])
+        if isinstance(bounty_evidence_workorders, dict)
+        and isinstance(bounty_evidence_workorders.get("workorders"), list)
+        else []
+    )
+    rows = [
+        source_invariant_row_for_workorder(
+            workorder,
+            source_root=source_root,
+            transaction_flow_review=transaction_flow_review,
+            rpc_proxy_parity_review=rpc_proxy_parity_review,
+            rewrite_review=rewrite_review,
+            route_inventory=route_inventory,
+            secret_exposure_review=secret_exposure_review,
+            websocket_candidate_review=websocket_candidate_review,
+        )
+        for workorder in workorders
+        if isinstance(workorder, dict)
+    ]
+    rows.sort(
+        key=lambda row: (
+            0 if row.get("operator_input_required") else 1,
+            BOUNTY_FRONTIER_SEVERITY_RANK.get(str(row.get("expected_severity") or "info"), 9),
+            str(row.get("lane") or ""),
+            str(row.get("id") or ""),
+        )
+    )
+    status_counts: dict[str, int] = {}
+    lane_counts: dict[str, int] = {}
+    for row in rows:
+        increment_count(status_counts, str(row.get("status") or "unknown"))
+        increment_count(lane_counts, str(row.get("lane") or "unknown"))
+    promotable = sum(1 for row in rows if row.get("can_promote_without_official_evidence"))
+    operator_required = sum(1 for row in rows if row.get("operator_input_required"))
+    if promotable:
+        status = "source-invariant-promotable-review-required"
+    elif rows:
+        status = "source-invariants-indexed-official-evidence-required"
+    else:
+        status = "no-bounty-source-invariants"
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-source-invariants-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "rows": len(rows),
+            "can_promote_without_official_evidence": promotable,
+            "operator_input_required": operator_required,
+            "status_counts": dict(sorted(status_counts.items())),
+            "lane_counts": dict(sorted(lane_counts.items())),
+            "bounty_evidence_workorders_status": artifact_summary_status(bounty_evidence_workorders),
+            "transaction_flow_review_status": artifact_summary_status(transaction_flow_review),
+            "rpc_proxy_parity_review_status": artifact_summary_status(rpc_proxy_parity_review),
+            "rewrite_review_status": artifact_summary_status(rewrite_review),
+            "route_inventory_status": artifact_summary_status(route_inventory),
+            "secret_exposure_review_status": artifact_summary_status(secret_exposure_review),
+            "websocket_candidate_review_status": artifact_summary_status(websocket_candidate_review),
+        },
+        "source_invariant_rows": rows,
+        "reportability_rule": (
+            "Source invariants can focus or prune evidence work, but they are not bounty evidence. "
+            "Medium+ promotion still requires official evidence, lane validation, finding-gate acceptance, and adjudication."
+        ),
+        "next_step": (
+            rows[0].get("next_step")
+            if rows
+            else "Build bounty-evidence-workorders first."
+        ),
+        "safety": (
+            "Offline source-invariant synthesis only. It reads local source-derived artifacts, sends no requests, "
+            "calls no Burp tool, starts no browser, creates no evidence sidecars, signs no wallet, and submits no transaction."
+        ),
+    }
+
+
 def build_provenance_invalidity_row(invalidity_review: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(invalidity_review, dict):
         return {}
@@ -25779,6 +26149,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     BOUNTY_INVALIDITY_REVIEW_ARTIFACT: "bounty-invalidity-review",
     BOUNTY_READINESS_ROLLUP_ARTIFACT: "bounty-readiness-rollup",
     BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT: "bounty-evidence-workorders",
+    BOUNTY_SOURCE_INVARIANTS_ARTIFACT: "bounty-source-invariants",
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
     TRANSACTION_EVIDENCE_READINESS_ARTIFACT: "transaction-evidence-readiness",
     OPERATOR_IMPACT_READINESS_ARTIFACT: "operator-impact-readiness",
@@ -25829,6 +26200,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "bounty-invalidity-review",
     "bounty-readiness-rollup",
     "bounty-evidence-workorders",
+    "bounty-source-invariants",
     "transaction-intent-boundary",
     "transaction-evidence-readiness",
     "operator-impact-readiness",
@@ -25864,6 +26236,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "bounty-invalidity-review": "bounty-invalidity-review --no-write",
     "bounty-readiness-rollup": "bounty-readiness-rollup --no-write",
     "bounty-evidence-workorders": "bounty-evidence-workorders --no-write",
+    "bounty-source-invariants": "bounty-source-invariants --no-write",
     "transaction-intent-boundary": "transaction-intent-boundary --no-write",
     "transaction-evidence-readiness": "transaction-evidence-readiness --no-write",
     "operator-impact-readiness": "operator-impact-readiness --no-write",
@@ -50946,6 +51319,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("bounty-invalidity-review", "run_bounty_invalidity_review"),
         refresh_expectation("bounty-readiness-rollup", "run_bounty_readiness_rollup"),
         refresh_expectation("bounty-evidence-workorders", "run_bounty_evidence_workorders"),
+        refresh_expectation("bounty-source-invariants", "run_bounty_source_invariants"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-intent-boundary", "run_transaction_intent_boundary"),
         refresh_expectation("transaction-evidence-readiness", "run_transaction_evidence_readiness"),
@@ -75684,6 +76058,130 @@ def run_bounty_evidence_workorders(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_or_load_bounty_evidence_workorders_for_run(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    source_root: Path,
+) -> dict[str, Any]:
+    workorders = load_optional_json(artifact_dir / BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT)
+    if isinstance(workorders, dict):
+        return workorders
+    rollup = build_or_load_bounty_readiness_rollup_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    return build_bounty_evidence_workorders(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_readiness_rollup=rollup,
+    )
+
+
+def run_bounty_source_invariants(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    workorders = build_or_load_bounty_evidence_workorders_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    invariants = build_bounty_source_invariants(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+        bounty_evidence_workorders=workorders,
+        transaction_flow_review=load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT),
+        rpc_proxy_parity_review=load_optional_json(artifact_dir / RPC_PROXY_PARITY_REVIEW_ARTIFACT),
+        rewrite_review=load_optional_json(artifact_dir / REWRITE_REVIEW_ARTIFACT),
+        route_inventory=load_optional_json(artifact_dir / ROUTE_INVENTORY_ARTIFACT),
+        secret_exposure_review=load_optional_json(artifact_dir / SECRET_EXPOSURE_REVIEW_ARTIFACT),
+        websocket_candidate_review=load_optional_json(artifact_dir / WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT),
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / BOUNTY_SOURCE_INVARIANTS_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(invariants))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-source-invariants",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = invariants.get("summary", {}) if isinstance(invariants.get("summary"), dict) else {}
+    print(f"Bounty source invariants: {invariants.get('status')}")
+    print(
+        "Invariants: "
+        f"rows={summary.get('rows', 0)} "
+        f"promotable={summary.get('can_promote_without_official_evidence', 0)} "
+        f"operator_required={summary.get('operator_input_required', 0)}"
+    )
+    print(
+        "Inputs: "
+        f"workorders={summary.get('bounty_evidence_workorders_status') or '-'} "
+        f"transaction={summary.get('transaction_flow_review_status') or '-'} "
+        f"rpc={summary.get('rpc_proxy_parity_review_status') or '-'} "
+        f"rewrite={summary.get('rewrite_review_status') or '-'} "
+        f"routes={summary.get('route_inventory_status') or '-'} "
+        f"secret={summary.get('secret_exposure_review_status') or '-'} "
+        f"ws={summary.get('websocket_candidate_review_status') or '-'}"
+    )
+    print(f"Statuses: {json.dumps(summary.get('status_counts', {}), sort_keys=True)}")
+    display_limit = max(0, int(args.top))
+    if getattr(args, "show_rows", False):
+        print("Rows:")
+        for row in (invariants.get("source_invariant_rows", []) or [])[:display_limit]:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('id')}: {row.get('expected_severity')} lane={row.get('lane')} "
+                f"status={row.get('status')} promotable={row.get('can_promote_without_official_evidence')}"
+            )
+            for invariant in normalize_string_list(row.get("source_invariants"))[: max(1, min(3, int(args.invariants_per_row)))]:
+                print(f"  invariant={inline_summary_text(invariant, max_chars=260)}")
+            if getattr(args, "show_controls", False):
+                for control in normalize_string_list(row.get("negative_controls"))[: max(1, min(3, int(args.controls_per_row)))]:
+                    print(f"  control={inline_summary_text(control, max_chars=260)}")
+            if getattr(args, "show_refs", False):
+                for ref in (row.get("source_refs", []) or [])[:2]:
+                    if isinstance(ref, dict):
+                        print(
+                            f"  ref={ref.get('file')}:{ref.get('line') or '-'} "
+                            f"{inline_summary_text(ref.get('sample') or ref.get('token'), max_chars=180)}"
+                        )
+        remaining = len(invariants.get("source_invariant_rows", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more invariant row(s); rerun without --no-write to write the full artifact")
+            else:
+                print(f"- {remaining} more invariant row(s) in {output_path}")
+    print(f"Rule: {inline_summary_text(invariants.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(invariants.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and invariants.get("status") != "source-invariant-promotable-review-required":
+        return 1
+    return 0
+
+
 def run_rpc_proxy_parity_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -78939,6 +79437,65 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless no workorders need official evidence and finding-gate review can proceed.",
     )
     bounty_evidence_workorders.set_defaults(func=run_bounty_evidence_workorders)
+
+    bounty_source_invariants = sub.add_parser(
+        "bounty-source-invariants",
+        help="Summarize what local source proves or cannot prove for current bounty evidence workorders",
+    )
+    bounty_source_invariants.add_argument(
+        "--output",
+        help=(
+            f"Where to write {BOUNTY_SOURCE_INVARIANTS_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{BOUNTY_SOURCE_INVARIANTS_ARTIFACT}."
+        ),
+    )
+    bounty_source_invariants.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of source invariant rows to print.",
+    )
+    bounty_source_invariants.add_argument(
+        "--invariants-per-row",
+        type=positive_int,
+        default=3,
+        help="Number of source invariants to print per row.",
+    )
+    bounty_source_invariants.add_argument(
+        "--controls-per-row",
+        type=positive_int,
+        default=3,
+        help="Number of negative controls to print per row.",
+    )
+    bounty_source_invariants.add_argument(
+        "--show-rows",
+        action="store_true",
+        help="Print lane-specific source invariant rows.",
+    )
+    bounty_source_invariants.add_argument(
+        "--show-controls",
+        action="store_true",
+        help="Print negative controls that keep source-only evidence out of findings.",
+    )
+    bounty_source_invariants.add_argument(
+        "--show-refs",
+        action="store_true",
+        help="Print source references backing each invariant row.",
+    )
+    bounty_source_invariants.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print bounty source invariants only; do not write {BOUNTY_SOURCE_INVARIANTS_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    bounty_source_invariants.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless source invariants are sufficient for a promotable review path.",
+    )
+    bounty_source_invariants.set_defaults(func=run_bounty_source_invariants)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
