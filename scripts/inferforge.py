@@ -34286,6 +34286,7 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                 target,
                 "gate",
                 "--no-write",
+                "--show-items",
             ]
         )
         with contextlib.redirect_stdout(gate_stdout_buffer):
@@ -34394,8 +34395,10 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             "passed": (
                 gate_return_code == 0
                 and "Gated 1 item(s)" in gate_stdout
+                and any("candidate-fixed-upstream-proxy-confusion-impact" in line for line in gate_stdout)
                 and "No files written (--no-write)." in gate_stdout
                 and not gate_output_path_exists
+                and "response_sample" not in "\n".join(gate_stdout)
             ),
             "expected": "gate --no-write imports rewrite-response-review candidate gates without writing finding-gate.json",
             "actual": {
@@ -45315,6 +45318,21 @@ def run_gate(args: argparse.Namespace) -> int:
     gate = build_finding_gate(suspicions, burp_history, transaction_intent, rewrite_response_review)
     output_path = artifact_dir / "finding-gate.json"
     print(f"Gated {len(gate['gates'])} item(s)")
+    if args.show_items:
+        gate_items = gate.get("gates", []) or []
+        print("Gate items:" if gate_items else "Gate items: none")
+        for item in gate_items[: max(0, int(args.top))]:
+            checks = [check for check in item.get("checks", []) or [] if isinstance(check, dict)]
+            passed_checks = sum(1 for check in checks if check.get("passed") is True)
+            print(
+                f"- {item.get('gate_status')} {item.get('classification')} "
+                f"severity={item.get('severity') or '-'} "
+                f"entrypoint={item.get('entrypoint') or '-'} "
+                f"checks={passed_checks}/{len(checks)} "
+                f"id={item.get('suspicion_id') or '-'}"
+            )
+            for check in checks[:3]:
+                print(f"  check={check.get('id')} passed={check.get('passed')}")
     if not suspicions_path.exists():
         print("No suspicions.json found; built gate from other eligible artifacts.")
     if no_write:
@@ -51176,6 +51194,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-write",
         action="store_true",
         help="Print finding gate summary only; do not write finding-gate.json or refreshed manifests.",
+    )
+    gate.add_argument(
+        "--show-items",
+        action="store_true",
+        help="Print compact gate item statuses without evidence bodies or response samples.",
+    )
+    gate.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of gate items to print when --show-items is set.",
     )
     gate.set_defaults(func=run_gate)
 
