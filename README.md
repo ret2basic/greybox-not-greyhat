@@ -652,7 +652,8 @@ active mode still needs coverage closure or a valid Medium+ bounty report path,
 which evidence lane is currently blocking it, and which evidence package should
 be completed before any active validation. Package commands also appear as an
 `objective-evidence-package` offline action so the loop can prioritize the
-current blocker before generic planning commands.
+current blocker before generic planning commands. Those package commands are
+deduped out of the generic offline action preview.
 
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:

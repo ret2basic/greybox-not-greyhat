@@ -19409,7 +19409,6 @@ def build_iteration_decision_from_plan(
         fallback_artifact_dir=artifact_dir,
         no_write_preview=repair_no_write_preview,
     )
-    allowed_command_summary = command_safety_summary([*artifact_repair, *offline, *resource_checks, *active_after_gate])
     blocked_command_summary = command_safety_summary(blocked)
     artifact_health_blocks_active = artifact_health_status == "failed"
     artifact_health_needs_review = artifact_health_status == "needs-human-review"
@@ -19451,6 +19450,25 @@ def build_iteration_decision_from_plan(
         for ref in (objective_satisfaction.get("safe_offline_commands", []) or [])
         if isinstance(ref, dict)
     ]
+    objective_package_command_keys = {
+        str(ref.get("command") or "").strip()
+        for ref in objective_package_commands
+        if str(ref.get("command") or "").strip()
+    }
+    offline_after_objective_package = [
+        ref
+        for ref in offline
+        if str(ref.get("command") or "").strip() not in objective_package_command_keys
+    ]
+    allowed_command_summary = command_safety_summary(
+        [
+            *artifact_repair,
+            *objective_package_commands,
+            *offline_after_objective_package,
+            *resource_checks,
+            *active_after_gate,
+        ]
+    )
     if objective_package_commands:
         actions.append(
             iteration_action(
@@ -19462,7 +19480,7 @@ def build_iteration_decision_from_plan(
                 limit=offline_preview_limit,
             )
         )
-    if offline:
+    if offline_after_objective_package:
         offline_reason = "Read-only planning commands can run under current resource pressure."
         if resource_status not in {"healthy", "not-run"}:
             offline_reason = (
@@ -19474,7 +19492,7 @@ def build_iteration_decision_from_plan(
                 status="ready",
                 kind="offline",
                 reason=offline_reason,
-                commands=offline,
+                commands=offline_after_objective_package,
                 limit=offline_preview_limit,
             )
         )
@@ -19543,7 +19561,7 @@ def build_iteration_decision_from_plan(
             )
         )
 
-    if offline or artifact_repair:
+    if objective_package_commands or offline_after_objective_package or artifact_repair:
         status = "ready-offline"
     elif artifact_health_blocks_active:
         status = "blocked-artifact-health"
@@ -19584,7 +19602,7 @@ def build_iteration_decision_from_plan(
             "burp_history_count_limit": resource_budget.get("burp_history_count_limit"),
             "validation_items": len(validation_plan.get("items", []) or []),
             "artifact_repair_commands": len(artifact_repair),
-            "offline_commands": len(offline),
+            "offline_commands": len(offline_after_objective_package),
             "resource_check_commands": len(resource_checks),
             "active_after_resource_gate_commands": len(active_after_gate),
             "artifact_health_blocked_active_commands": len(active_after_gate) if artifact_health_blocks_active else 0,
@@ -51538,6 +51556,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for ref in action.get("commands", []) or []
             if isinstance(ref, dict)
         ]
+        focused_iteration_objective_preview_commands = [
+            str(ref.get("command") or "")
+            for action in focused_iteration_decision_sample.get("actions", [])
+            if action.get("id") == "objective-evidence-package"
+            for ref in action.get("commands", []) or []
+            if isinstance(ref, dict)
+        ]
         artifact_repair_iteration_decision_sample = build_iteration_decision_from_plan(
             target="https://blackbox.test",
             profile=blackbox_normalized_profile,
@@ -52698,14 +52723,18 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for item in focused_iteration_decision_sample.get("approval_packets", [])
             if isinstance(item, dict)
         )
-        and focused_iteration_preview_commands[:2]
+        and focused_iteration_objective_preview_commands[:2]
         == [
             focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
-            focused_iteration_command("operator-evidence-review --no-write --show-missing --show-template"),
+            focused_iteration_command(TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND),
         ]
         and not any(
+            command in focused_iteration_preview_commands
+            for command in focused_iteration_objective_preview_commands
+        )
+        and not any(
             any(token in {"harness-loop", "hypothesis-matrix"} for token in validation_command_tokens(command))
-            for command in focused_iteration_preview_commands[:2]
+            for command in [*focused_iteration_objective_preview_commands[:2], *focused_iteration_preview_commands[:2]]
         )
         and artifact_repair_iteration_decision_sample.get("status") == "ready-offline"
         and artifact_repair_iteration_decision_sample.get("summary", {}).get("artifact_repair_commands") == 2
@@ -55809,16 +55838,23 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "status": "passed"
                 if (
                     focused_iteration_decision_sample.get("summary", {}).get("offline_command_preview_limit") == 2
-                    and focused_iteration_preview_commands[:2]
+                    and focused_iteration_objective_preview_commands[:2]
                     == [
                         focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
                         focused_iteration_command(
-                            "operator-evidence-review --no-write --show-missing --show-template"
+                            TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND
                         ),
                     ]
                     and not any(
+                        command in focused_iteration_preview_commands
+                        for command in focused_iteration_objective_preview_commands
+                    )
+                    and not any(
                         any(token in {"harness-loop", "hypothesis-matrix"} for token in validation_command_tokens(command))
-                        for command in focused_iteration_preview_commands[:2]
+                        for command in [
+                            *focused_iteration_objective_preview_commands[:2],
+                            *focused_iteration_preview_commands[:2],
+                        ]
                     )
                 )
                 else "failed",
@@ -55826,9 +55862,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     "offline_command_preview_limit"
                 ),
                 "preview_commands": focused_iteration_preview_commands,
+                "objective_preview_commands": focused_iteration_objective_preview_commands,
                 "expected_commands": [
                     focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
-                    focused_iteration_command("operator-evidence-review --no-write --show-missing --show-template"),
+                    focused_iteration_command(TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND),
                 ],
             },
         },
