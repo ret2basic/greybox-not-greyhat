@@ -1563,11 +1563,14 @@ stores an `unblock_plan` with the nearest evidence artifacts, the first concrete
 evidence item to collect, and no-write command templates for the matching
 contract: rewrite-response sidecars for fixed-upstream impact, transaction
 sidecars and corpus checklists for quote integrity, and operator-evidence
-templates for credential/resource impact. Rewrite-response unblock plans also
-carry the selected read-only request, source reference, fixed upstreams,
-path-sensitivity score, sidecar path, and redacted required fields, so reviewers
-can understand why the path is high-value without re-running the lower-level
-rewrite review first. `audit` and
+templates for credential/resource impact. The same group summary carries
+`oracle_types` plus validation-oracle acceptance and rejection checks, so
+`review-blockers --no-write` can show the exact proof model that must pass before
+finding-gate or adjudication can accept a Medium+ claim. Rewrite-response unblock
+plans also carry the selected read-only request, source reference, fixed
+upstreams, path-sensitivity score, sidecar path, and redacted required fields, so
+reviewers can understand why the path is high-value without re-running the
+lower-level rewrite review first. `audit` and
 `verification-queue` refresh it automatically.
 The Markdown playbook is useful as the first artifact to inspect after a
 regression run because it keeps the approved-path, source-only review, missing

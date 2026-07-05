@@ -36479,6 +36479,10 @@ def format_review_blocker_group_summary(group: dict[str, Any]) -> str:
         parts.append(f"priority={group.get('priority')}")
     if group.get("cluster_id"):
         parts.append(f"cluster={group.get('cluster_id')}")
+    oracle_types = sorted_unique_strings(group.get("oracle_types", []) or [])
+    if oracle_types:
+        suffix = "" if len(oracle_types) <= 3 else f",+{len(oracle_types) - 3}"
+        parts.append(f"oracle={','.join(oracle_types[:3])}{suffix}")
     candidate_ids = [str(item) for item in group.get("review_candidate_ids", []) or []]
     if candidate_ids:
         suffix = "" if len(candidate_ids) <= 3 else f",+{len(candidate_ids) - 3}"
@@ -36537,6 +36541,24 @@ def review_blocker_group_followup_preview_lines(group: dict[str, Any], *, limit:
         ]
         suffix = "" if len(source_counts) <= 4 else f",+{len(source_counts) - 4}"
         lines.append(f"  source_counts={','.join(rendered_counts)}{suffix}")
+    validation_oracles = [
+        oracle
+        for oracle in group.get("validation_oracles", []) or []
+        if isinstance(oracle, dict)
+    ]
+    for oracle in validation_oracles[:2]:
+        lines.append(
+            "  oracle="
+            f"{oracle.get('type') or oracle.get('id') or 'unknown'} "
+            f"status={oracle.get('status') or 'unknown'} "
+            f"next={inline_summary_text(oracle.get('next_step'), max_chars=220)}"
+        )
+        for check in normalize_string_list(oracle.get("acceptance_checks"))[:2]:
+            lines.append(f"  oracle_accept={inline_summary_text(check, max_chars=220)}")
+        for reject in normalize_string_list(oracle.get("reject_if"))[:2]:
+            lines.append(f"  oracle_reject={inline_summary_text(reject, max_chars=220)}")
+    if len(validation_oracles) > 2:
+        lines.append(f"  oracle=... +{len(validation_oracles) - 2} more")
     return lines
 
 
@@ -36978,6 +37000,9 @@ def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str
                 "review_candidates": [],
                 "commands": [],
                 "source_counts": {},
+                "oracle_types": [],
+                "oracle_status_counts": {},
+                "validation_oracles": [],
             }
             grouped[key] = group
             review_candidate_maps[key] = {}
@@ -37000,6 +37025,20 @@ def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str
         if blocker.get("source"):
             group["sources"].append(blocker.get("source"))
             increment_count(group["source_counts"], str(blocker.get("source")))
+        blocker_evidence = blocker.get("evidence") if isinstance(blocker.get("evidence"), dict) else {}
+        oracle_type = str(blocker_evidence.get("oracle_type") or "").strip()
+        if oracle_type:
+            group["oracle_types"].append(oracle_type)
+        oracle_status = str(blocker_evidence.get("oracle_status") or "").strip()
+        if oracle_status:
+            increment_count(group["oracle_status_counts"], oracle_status)
+        validation_oracle = (
+            blocker_evidence.get("validation_oracle")
+            if isinstance(blocker_evidence.get("validation_oracle"), dict)
+            else {}
+        )
+        if validation_oracle:
+            group["validation_oracles"].append(validation_oracle)
         if blocker.get("source_review_blockers"):
             group["source_review_blockers"].append(blocker.get("source_review_blockers"))
         group["artifact_refs"].extend(blocker.get("artifact_refs", []) or [])
@@ -37040,6 +37079,18 @@ def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str
             "commands": command_refs,
         }
         group["blocker_ids"] = sorted_unique_strings(group["blocker_ids"])
+        group["oracle_types"] = sorted_unique_strings(group.get("oracle_types", []) or [])
+        deduped_oracles = []
+        seen_oracles: set[str] = set()
+        for oracle in group.get("validation_oracles", []) or []:
+            if not isinstance(oracle, dict):
+                continue
+            oracle_key = str(oracle.get("id") or oracle.get("type") or json.dumps(oracle, sort_keys=True))
+            if oracle_key in seen_oracles:
+                continue
+            seen_oracles.add(oracle_key)
+            deduped_oracles.append(oracle)
+        group["validation_oracles"] = deduped_oracles
         groups.append(group)
 
     groups.sort(
@@ -37091,6 +37142,14 @@ def finding_gate_preview_unblock_plan(
     packet_context = preview.get("packet_context") if isinstance(preview.get("packet_context"), dict) else {}
     assessment_rank = preview.get("assessment_rank") if isinstance(preview.get("assessment_rank"), dict) else {}
     relative_focus = preview.get("relative_focus") if isinstance(preview.get("relative_focus"), dict) else {}
+    validation_oracle = (
+        preview.get("validation_oracle")
+        if isinstance(preview.get("validation_oracle"), dict)
+        else finding_gate_preview_validation_oracle(
+            packet_type=packet_type,
+            impact=str(preview.get("impact") or preview.get("severity") or ""),
+        )
+    )
     common_subcommands = [
         "gate --no-write --show-items",
         "adjudicate --no-write",
@@ -37235,6 +37294,9 @@ def finding_gate_preview_unblock_plan(
         "first_unblocker": spec.get("first_unblocker") or "Clear the listed finding-gate blockers with concrete evidence.",
         "evidence_artifacts": ordered_unique_strings(spec.get("evidence_artifacts", [])),
         "offline_commands": commands,
+        "validation_oracle": validation_oracle,
+        "oracle_type": validation_oracle.get("type"),
+        "oracle_status": validation_oracle.get("status"),
         "assessment_context": {
             "mode": assessment_policy.get("mode"),
             "optimization_goal": assessment_policy.get("optimization_goal"),
@@ -37488,6 +37550,9 @@ def build_review_blockers(
                 "packet_type": preview.get("packet_type"),
                 "packet_status": preview.get("packet_status"),
                 "packet_context": preview.get("packet_context", {}),
+                "validation_oracle": preview.get("validation_oracle") or unblock_plan.get("validation_oracle"),
+                "oracle_type": preview.get("oracle_type") or unblock_plan.get("oracle_type"),
+                "oracle_status": preview.get("oracle_status") or unblock_plan.get("oracle_status"),
                 "assessment_rank": preview.get("assessment_rank", {}),
                 "relative_focus": preview.get("relative_focus", {}),
                 "validation_item_id": preview.get("validation_item_id"),
@@ -38341,7 +38406,15 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 and gate_blockers.get("summary", {}).get("optimization_goal")
                 == "maximize-dangerous-surface-coverage"
                 and gate_blocker_group.get("priority") == "high"
+                and gate_blocker_group.get("oracle_types") == ["transaction-intent"]
+                and (gate_blocker_group.get("validation_oracles") or [{}])[0].get("type")
+                == "transaction-intent"
+                and any(
+                    "Offline decode" in str(check)
+                    for check in ((gate_blocker_group.get("validation_oracles") or [{}])[0].get("acceptance_checks") or [])
+                )
                 and "POST /api/quote" in str(gate_blocker_group.get("title") or "")
+                and "oracle=transaction-intent" in format_review_blocker_group_summary(gate_blocker_group)
                 and "approved quote transaction payload sidecar" in str(gate_blocker_group.get("next_action") or "")
                 and any(
                     TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND in command
@@ -38509,6 +38582,28 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
     ][:8]
 
     def append_group_context(item: dict[str, Any]) -> None:
+        validation_oracles = [
+            oracle
+            for oracle in item.get("validation_oracles", []) or []
+            if isinstance(oracle, dict)
+        ]
+        if validation_oracles:
+            lines.append("  - Validation oracles:")
+            for oracle in validation_oracles[:3]:
+                lines.append(
+                    f"    - `{oracle.get('type') or oracle.get('id') or 'unknown'}` "
+                    f"status=`{oracle.get('status') or 'unknown'}`"
+                )
+                if oracle.get("next_step"):
+                    lines.append(f"      - Next: {markdown_text(oracle.get('next_step'))}")
+                acceptance_checks = normalize_string_list(oracle.get("acceptance_checks"))
+                for check in acceptance_checks[:2]:
+                    lines.append(f"      - Accept: {markdown_text(check)}")
+                reject_if = normalize_string_list(oracle.get("reject_if"))
+                for reject in reject_if[:2]:
+                    lines.append(f"      - Reject: {markdown_text(reject)}")
+            if len(validation_oracles) > 3:
+                lines.append(f"    - ... +{len(validation_oracles) - 3} more oracles")
         candidates = item.get("review_candidates", []) or []
         if candidates:
             lines.append("  - Candidate details:")
@@ -38631,6 +38726,20 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
         )
         if item.get("next_action"):
             lines.append(f"- Next action: {markdown_text(item.get('next_action'))}")
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
+        validation_oracle = (
+            evidence.get("validation_oracle")
+            if isinstance(evidence.get("validation_oracle"), dict)
+            else {}
+        )
+        if validation_oracle:
+            lines.append(f"- Oracle: `{validation_oracle.get('type') or validation_oracle.get('id') or 'unknown'}`")
+            if validation_oracle.get("next_step"):
+                lines.append(f"  - Oracle next: {markdown_text(validation_oracle.get('next_step'))}")
+            for check in normalize_string_list(validation_oracle.get("acceptance_checks"))[:3]:
+                lines.append(f"  - Oracle accept: {markdown_text(check)}")
+            for reject in normalize_string_list(validation_oracle.get("reject_if"))[:3]:
+                lines.append(f"  - Oracle reject: {markdown_text(reject)}")
         refs = item.get("artifact_refs", []) or []
         if refs:
             lines.append("- Artifact refs: " + ", ".join(f"`{ref}`" for ref in refs))
@@ -58492,6 +58601,8 @@ def run_review_blockers(args: argparse.Namespace) -> int:
         for group in groups[:display_limit]:
             print(f"- {format_review_blocker_group_summary(group)}")
             if no_write:
+                for line in review_blocker_group_followup_preview_lines(group):
+                    print(line)
                 command_refs = review_blocker_group_command_refs(group)
                 if command_refs:
                     command_safety = (group.get("command_safety", {}) or {}).get("summary", {}) or {}
@@ -58504,9 +58615,6 @@ def run_review_blockers(args: argparse.Namespace) -> int:
                         print(f"    - {label} {command}")
                     if len(command_refs) > 4:
                         print(f"    - ... +{len(command_refs) - 4} more commands")
-                else:
-                    for line in review_blocker_group_followup_preview_lines(group):
-                        print(line)
         if len(groups) > display_limit:
             if no_write:
                 print(
