@@ -21159,6 +21159,11 @@ def transaction_corpus_policy_templates(profile: dict[str, Any] | None, artifact
                 "programAllowlistStatus": "configured" if allowed_programs else "manual-review-required",
                 "missing_runtime_fields": row.get("missing_runtime_fields", []),
                 "intent_policy_sidecar_template": row.get("sidecar_template", {}),
+                "prepare_policy_preview_command": validation_command_for_artifact_dir(
+                    artifact_dir,
+                    " ".join(shlex.quote(str(part)) for part in [*prepare_parts, "--no-write"]),
+                    profile=profile,
+                ),
                 "prepare_policy_command": validation_command_for_artifact_dir(
                     artifact_dir,
                     " ".join(shlex.quote(str(part)) for part in prepare_parts),
@@ -21612,6 +21617,7 @@ def build_transaction_corpus_checklist(
             "status": row.get("status"),
             "path": intent_policy_sidecar_path,
             "policy": row.get("intent_policy_sidecar_template", {}),
+            "prepare_preview_command": row.get("prepare_policy_preview_command"),
             "prepare_command": row.get("prepare_policy_command"),
             "notes": [
                 "Copy exactly one policy object to transaction-intent-policy.json for the approved quote direction.",
@@ -43791,6 +43797,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         for template in transaction_policy_sidecar_templates
         if isinstance(template, dict)
     )
+    transaction_policy_prepare_preview_commands = "\n".join(
+        str(template.get("prepare_preview_command") or "")
+        for template in transaction_policy_sidecar_templates
+        if isinstance(template, dict)
+    )
     transaction_prepare_policy_sample = build_transaction_intent_policy_sidecar(
         test_profile,
         direction="buy",
@@ -43805,8 +43816,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and {"direction", "wallet", "amountIn", "sourceMint", "destinationMint"}.issubset(
             transaction_policy_template_fields
         )
+        and "prepare-transaction-intent-policy --direction buy" in transaction_policy_prepare_preview_commands
+        and "prepare-transaction-intent-policy --direction sell" in transaction_policy_prepare_preview_commands
+        and "--no-write" in transaction_policy_prepare_preview_commands
         and "prepare-transaction-intent-policy --direction buy" in transaction_policy_prepare_commands
         and "prepare-transaction-intent-policy --direction sell" in transaction_policy_prepare_commands
+        and "--no-write" not in transaction_policy_prepare_commands
         and transaction_prepare_policy_sample.get("direction") == "buy"
         and transaction_prepare_policy_sample.get("amountIn") == "1000000"
         and transaction_prepare_policy_sample.get("wallet") == "EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR"
@@ -49678,6 +49693,8 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
             f"allowed_programs={len(row.get('allowedPrograms', []) or [])} "
             f"program_policy={row.get('programAllowlistStatus') or 'unknown'}"
         )
+        if args.show_commands and row.get("prepare_policy_preview_command"):
+            print(f"  prepare_preview={inline_summary_text(row.get('prepare_policy_preview_command'), max_chars=420)}")
         if args.show_commands and row.get("prepare_policy_command"):
             print(f"  prepare={inline_summary_text(row.get('prepare_policy_command'), max_chars=420)}")
         if args.show_commands and row.get("decode_command"):
