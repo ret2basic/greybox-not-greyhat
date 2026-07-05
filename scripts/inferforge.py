@@ -41769,6 +41769,11 @@ def run_resource_snapshot(args: argparse.Namespace) -> int:
             f"browser_automation={budget.get('browser_automation')} "
             f"release_candidate_rss={budget.get('release_candidate_rss_mib')}MiB"
         )
+        recommendations = budget.get("recommendations", []) if isinstance(budget.get("recommendations"), list) else []
+        if recommendations:
+            print("Recommendations:")
+            for recommendation in recommendations[:3]:
+                print(f"- {inline_summary_text(recommendation, max_chars=180)}")
     port_text = ", ".join(
         f"{port}={'listening' if status.get('listening') else 'closed'}"
         for port, status in snapshot.get("watched_ports", {}).items()
