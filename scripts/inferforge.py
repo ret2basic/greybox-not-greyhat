@@ -46127,19 +46127,36 @@ def run_review_candidates(args: argparse.Namespace) -> int:
     if not no_write:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         write_target_profile_artifact(artifact_dir, profile, target, source_root)
-    candidates = collect_review_observation_candidates(profile)
+    profile_candidates = collect_review_observation_candidates(profile)
+    artifact_candidates = collect_artifact_review_observation_candidates(profile, artifact_dir)
+    candidates = merged_review_observation_candidates(profile, artifact_candidates)
+    display_clusters, display_clusters_source = endpoint_clusters_for_hypothesis_matrix(
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
     artifact = {
         "generated_at": utc_now(),
         "status": "listed",
         "profile": profile_summary(profile),
         "target": target,
         "candidate_count": len(candidates),
+        "source_counts": {
+            "profile_candidates": len(profile_candidates),
+            "artifact_or_source_candidates": len(artifact_candidates),
+            "endpoint_clusters_source": display_clusters_source,
+        },
         "candidates": candidates,
         "safety": "Review candidates are inert templates. Listing them does not send HTTP traffic or modify the profile.",
     }
     output_path = artifact_dir / "review-observation-candidates.json"
-    display_candidates = contextualize_review_candidates(candidates, build_clusters(profile, source_root), artifact_dir)
+    display_candidates = contextualize_review_candidates(candidates, display_clusters, artifact_dir)
     print(f"Review observation candidates: {len(candidates)}")
+    print(
+        "Sources: "
+        f"profile={len(profile_candidates)} "
+        f"artifact_or_source={len(artifact_candidates)} "
+        f"endpoint_clusters={display_clusters_source}"
+    )
     for candidate in display_candidates:
         for line in format_review_candidate_cli_lines(candidate):
             print(line)
