@@ -17121,11 +17121,23 @@ def transaction_intent_review_summary(transaction_intent: dict[str, Any] | None)
         else {}
     )
     checks = policy_checks.get("checks", []) if isinstance(policy_checks.get("checks"), list) else []
+    reportability_review = (
+        transaction_intent.get("reportability_review")
+        if isinstance(transaction_intent.get("reportability_review"), dict)
+        else {}
+    )
+    if not reportability_review and policy_checks:
+        policy = transaction_intent.get("intent_policy") if isinstance(transaction_intent.get("intent_policy"), dict) else {}
+        transactions = transaction_intent.get("transactions") if isinstance(transaction_intent.get("transactions"), list) else []
+        reportability_review = build_transaction_intent_reportability_review(transactions, policy, policy_checks)
     return {
         "status": artifact_summary_status(transaction_intent),
         "candidates_seen": transaction_intent.get("candidates_seen", 0),
         "decoded_transactions": transaction_intent.get("decoded_transactions", 0),
         "intent_policy_status": policy_checks.get("status") or "unknown",
+        "reportability_status": reportability_review.get("status") or "missing",
+        "candidate_severity": reportability_review.get("candidate_severity") or "none",
+        "ready_for_finding_gate": bool(reportability_review.get("ready_for_finding_gate")),
         "checks": len(checks),
         "warnings": transaction_intent.get("warnings", [])[:6],
     }
@@ -17973,11 +17985,21 @@ def build_transaction_corpus_checklist(
         else {}
     )
     policy_status = str(policy_checks.get("status") or "not-configured")
+    reportability_review = (
+        transaction_intent.get("reportability_review")
+        if isinstance(transaction_intent.get("reportability_review"), dict)
+        else {}
+    )
+    if not reportability_review and policy_checks:
+        policy = transaction_intent.get("intent_policy") if isinstance(transaction_intent.get("intent_policy"), dict) else {}
+        transactions = transaction_intent.get("transactions") if isinstance(transaction_intent.get("transactions"), list) else []
+        reportability_review = build_transaction_intent_reportability_review(transactions, policy, policy_checks)
+    reportability_status = str(reportability_review.get("status") or "missing")
     burp_candidate_count = int(burp_transaction_candidates.get("candidate_count") or 0)
     quote_success = bool(quote_collection.get("success"))
     quote_diagnosis = quote_collection.get("diagnosis") if isinstance(quote_collection.get("diagnosis"), dict) else {}
 
-    if decoded_transactions > 0 and policy_status == "failed":
+    if decoded_transactions > 0 and reportability_review.get("ready_for_finding_gate"):
         status = "decoded-intent-mismatch-review"
     elif decoded_transactions > 0 and policy_status in {"passed", "review-required"}:
         status = "decoded-corpus-ready-for-review"
@@ -18063,6 +18085,15 @@ def build_transaction_corpus_checklist(
             "status": policy_status,
             "evidence": policy_checks.get("summary") or transaction_intent.get("warnings", [])[:3],
         },
+        {
+            "id": "intent-reportability-gate",
+            "status": reportability_status,
+            "evidence": {
+                "candidate_severity": reportability_review.get("candidate_severity") or "none",
+                "ready_for_finding_gate": bool(reportability_review.get("ready_for_finding_gate")),
+                "high_impact_failures": reportability_review.get("high_impact_failure_count", 0),
+            },
+        },
     ]
 
     return {
@@ -18086,6 +18117,9 @@ def build_transaction_corpus_checklist(
             "transaction_intent_candidates": candidates_seen,
             "decoded_transactions": decoded_transactions,
             "intent_policy_status": policy_status,
+            "reportability_status": reportability_status,
+            "candidate_severity": reportability_review.get("candidate_severity") or "none",
+            "ready_for_finding_gate": bool(reportability_review.get("ready_for_finding_gate")),
         },
         "policy_templates": policy_templates,
         "capture_steps": capture_steps,
@@ -31312,6 +31346,122 @@ def build_transaction_intent_checks(
     }
 
 
+def transaction_intent_check_suffix(check: dict[str, Any]) -> str:
+    check_id = str(check.get("id") or "")
+    return check_id.rsplit(":", 1)[-1] if ":" in check_id else check_id
+
+
+def compact_intent_check_evidence(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": check.get("id"),
+            "label": check.get("label"),
+            "status": check.get("status"),
+            "severity": check.get("severity"),
+            "evidence": check.get("evidence"),
+        }
+        for check in checks[:12]
+    ]
+
+
+def build_transaction_intent_reportability_review(
+    transactions: list[dict[str, Any]],
+    policy: dict[str, Any],
+    policy_checks: dict[str, Any],
+) -> dict[str, Any]:
+    checks = policy_checks.get("checks", []) if isinstance(policy_checks.get("checks"), list) else []
+    decoded_count = sum(1 for item in transactions if isinstance(item, dict) and item.get("decoded"))
+    required_failures = [
+        check
+        for check in checks
+        if isinstance(check, dict)
+        and check.get("status") == "failed"
+        and check.get("severity", "required") == "required"
+    ]
+    review_items = [check for check in checks if isinstance(check, dict) and check.get("status") == "review"]
+    high_impact_suffixes = {
+        "wallet-account",
+        "wallet-signer",
+        "source-mint",
+        "destination-mint",
+        "program-allowlist",
+    }
+    high_impact_failures = [
+        check for check in required_failures if transaction_intent_check_suffix(check) in high_impact_suffixes
+    ]
+    decode_failures = [
+        check for check in required_failures if transaction_intent_check_suffix(check) == "decoded"
+    ]
+    structural_failures = [
+        check for check in required_failures if transaction_intent_check_suffix(check) == "instructions-present"
+    ]
+
+    if not policy.get("configured"):
+        status = "needs-intent-policy"
+        candidate_severity = "none"
+        ready_for_finding_gate = False
+        next_step = "Configure an intent policy with direction, wallet, amountIn, expected mints, and optional allowed programs."
+    elif not policy.get("valid"):
+        status = "invalid-intent-policy"
+        candidate_severity = "none"
+        ready_for_finding_gate = False
+        next_step = "Fix the intent policy before interpreting decoded transaction checks."
+    elif not transactions:
+        status = "needs-transaction-corpus"
+        candidate_severity = "none"
+        ready_for_finding_gate = False
+        next_step = "Collect one approved quote transaction corpus and rerun decode-transactions."
+    elif decoded_count == 0 or decode_failures:
+        status = "needs-decodable-transaction"
+        candidate_severity = "none"
+        ready_for_finding_gate = False
+        next_step = "Use a valid Solana transaction payload sidecar before making any transaction-integrity claim."
+    elif high_impact_failures:
+        status = "candidate-transaction-integrity-impact"
+        candidate_severity = "high"
+        ready_for_finding_gate = True
+        next_step = "Open a finding-gate review with the failed signer, wallet, mint, or program evidence."
+    elif structural_failures:
+        status = "required-transaction-structure-failure"
+        candidate_severity = "medium"
+        ready_for_finding_gate = True
+        next_step = "Review decoded instruction structure and decide whether the failure proves concrete user-funds impact."
+    elif review_items:
+        status = "manual-address-table-review-required"
+        candidate_severity = "medium"
+        ready_for_finding_gate = False
+        next_step = "Resolve address table lookup coverage or manually compare loaded accounts before escalation."
+    elif policy_checks.get("status") == "passed":
+        status = "intent-checks-passed"
+        candidate_severity = "none"
+        ready_for_finding_gate = False
+        next_step = "Do not escalate the transaction-integrity thread from this corpus unless another concrete mismatch is found."
+    else:
+        status = "needs-manual-intent-review"
+        candidate_severity = "info"
+        ready_for_finding_gate = False
+        next_step = "Review the decoded checks manually before making any reportability decision."
+
+    return {
+        "status": status,
+        "candidate_severity": candidate_severity,
+        "ready_for_finding_gate": ready_for_finding_gate,
+        "reportable_now": False,
+        "decoded_transactions": decoded_count,
+        "required_failure_count": len(required_failures),
+        "high_impact_failure_count": len(high_impact_failures),
+        "review_item_count": len(review_items),
+        "high_impact_failures": compact_intent_check_evidence(high_impact_failures),
+        "required_failures": compact_intent_check_evidence(required_failures),
+        "review_items": compact_intent_check_evidence(review_items),
+        "next_step": next_step,
+        "reportability_gate": (
+            "Decoded intent mismatch is only a candidate impact signal. A reportable finding still requires a finding-gate "
+            "decision tying the mismatch to concrete user-funds or transaction-integrity impact, with no wallet signing or submission."
+        ),
+    }
+
+
 def build_transaction_intent(
     artifact_dir: Path,
     results: list[dict[str, Any]],
@@ -31361,6 +31511,7 @@ def build_transaction_intent(
         allowed_programs=intent_allowed_programs,
     )
     policy_checks = build_transaction_intent_checks(transactions, policy)
+    reportability_review = build_transaction_intent_reportability_review(transactions, policy, policy_checks)
     return {
         "generated_at": utc_now(),
         "purpose": "Decode Solana transaction payloads for intent review only. This artifact never signs or submits transactions.",
@@ -31380,6 +31531,7 @@ def build_transaction_intent(
         "decoder": decoded.get("decoder", {}),
         "intent_policy": policy,
         "intent_policy_checks": policy_checks,
+        "reportability_review": reportability_review,
         "transactions": transactions,
         "warnings": warnings,
     }
@@ -31523,6 +31675,7 @@ def build_transaction_decoder_selftest(
         profile,
     )
     policy_checks = build_transaction_intent_checks(transactions, policy)
+    reportability_review = build_transaction_intent_reportability_review(transactions, policy, policy_checks)
     decoded_count = sum(1 for item in transactions if item.get("decoded"))
     with tempfile.TemporaryDirectory() as temp_dir:
         guard_artifact_dir = Path(temp_dir) / "transaction-sidecar-guard"
@@ -31545,7 +31698,10 @@ def build_transaction_decoder_selftest(
     )
     status = (
         "passed"
-        if decoded_count == 1 and policy_checks.get("status") == "passed" and sidecar_guard_passed
+        if decoded_count == 1
+        and policy_checks.get("status") == "passed"
+        and reportability_review.get("status") == "intent-checks-passed"
+        and sidecar_guard_passed
         else "failed"
     )
     return {
@@ -31565,6 +31721,7 @@ def build_transaction_decoder_selftest(
         "decoded_transactions": decoded_count,
         "decoder": decoded.get("decoder", {}),
         "intent_policy_checks": policy_checks,
+        "reportability_review": reportability_review,
         "sidecar_input_guard": {
             "status": "passed" if sidecar_guard_passed else "failed",
             "resource_limits": sidecar_guard_intent.get("resource_limits", {}),
@@ -31800,6 +31957,12 @@ def build_report_transaction_intent_placeholder() -> dict[str, Any]:
         "decoded_transactions": 0,
         "decoder": {"mode": "not-run"},
         "intent_policy_checks": {"status": "not-run"},
+        "reportability_review": {
+            "status": "not-run",
+            "candidate_severity": "none",
+            "ready_for_finding_gate": False,
+            "reportable_now": False,
+        },
         "warnings": ["transaction-intent.json was not available when report was refreshed."],
         "safety": "Placeholder used by report refresh only. No wallet signing or transaction submission was performed.",
     }
@@ -32229,6 +32392,8 @@ def generate_report(
         f"- Decoded transactions: `{transaction_intent.get('decoded_transactions', 0)}`",
         f"- Decoder mode: `{transaction_intent.get('decoder', {}).get('mode', 'unknown')}`",
         f"- Intent policy status: `{transaction_intent.get('intent_policy_checks', {}).get('status', 'unknown')}`",
+        f"- Intent gate: `{transaction_intent.get('reportability_review', {}).get('status', 'unknown')}`",
+        f"- Candidate severity: `{transaction_intent.get('reportability_review', {}).get('candidate_severity', 'none')}`",
         f"- Decoder self-test: `{(transaction_decoder_selftest or {}).get('status', 'not-run')}`",
         "- Safety: decode only; no wallet signing or transaction submission.",
     ]
@@ -32887,6 +33052,7 @@ def generate_index_html(
       <div class="metric"><span>Tx Candidates</span><strong>{e(transaction_intent.get('candidates_seen', 0))}</strong></div>
       <div class="metric"><span>Decoded Tx</span><strong>{e(transaction_intent.get('decoded_transactions', 0))}</strong></div>
       <div class="metric"><span>Intent Policy</span><strong>{e(transaction_intent.get('intent_policy_checks', {}).get('status', 'unknown'))}</strong></div>
+      <div class="metric"><span>Tx Gate</span><strong>{e(transaction_intent.get('reportability_review', {}).get('status', 'unknown'))}</strong></div>
       <div class="metric"><span>Tx Self-Test</span><strong>{e(decoder_selftest_status)}</strong></div>
     </section>
 
@@ -33325,6 +33491,12 @@ def run_audit(args: argparse.Namespace) -> int:
         "Transactions: "
         f"{transaction_intent['candidates_seen']} candidates, "
         f"{transaction_intent['decoded_transactions']} decoded"
+    )
+    tx_reportability = transaction_intent.get("reportability_review", {}) or {}
+    print(
+        "Intent gate: "
+        f"status={tx_reportability.get('status') or 'unknown'} "
+        f"severity={tx_reportability.get('candidate_severity') or 'none'}"
     )
     print(f"Evidence gaps: {len(evidence_gaps['gaps'])}")
     print(f"Evidence chain: {evidence_chain['status']}")
@@ -42044,7 +42216,9 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
         f"status={intent.get('status')}, "
         f"candidates={intent.get('candidates_seen', 0)}, "
         f"decoded={intent.get('decoded_transactions', 0)}, "
-        f"policy={intent.get('intent_policy_status')}"
+        f"policy={intent.get('intent_policy_status')}, "
+        f"gate={intent.get('reportability_status')}, "
+        f"severity={intent.get('candidate_severity')}"
     )
     print(
         "Policy scaffold: "
@@ -42144,7 +42318,9 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
         f"burp_candidates={summary.get('burp_transaction_candidates', 0)} "
         f"candidates={summary.get('transaction_intent_candidates', 0)} "
         f"decoded={summary.get('decoded_transactions', 0)} "
-        f"policy={summary.get('intent_policy_status')}"
+        f"policy={summary.get('intent_policy_status')} "
+        f"gate={summary.get('reportability_status') or 'missing'} "
+        f"severity={summary.get('candidate_severity') or 'none'}"
     )
     print(
         "Capture gate: "
@@ -42577,6 +42753,13 @@ def run_decode_transactions(args: argparse.Namespace) -> int:
         f"{transaction_intent['candidates_seen']} candidates, "
         f"{transaction_intent['decoded_transactions']} decoded"
     )
+    reportability_review = transaction_intent.get("reportability_review", {}) or {}
+    print(
+        "Intent gate: "
+        f"status={reportability_review.get('status') or 'unknown'} "
+        f"severity={reportability_review.get('candidate_severity') or 'none'} "
+        f"ready_for_finding_gate={reportability_review.get('ready_for_finding_gate')}"
+    )
     print_refreshed_manifests(
         refresh_current_artifact_manifest(
             artifact_dir=artifact_dir,
@@ -42985,7 +43168,8 @@ def run_collect_quote(args: argparse.Namespace) -> int:
         "Transactions: "
         f"{transaction_intent['candidates_seen']} candidates, "
         f"{transaction_intent['decoded_transactions']} decoded, "
-        f"policy={transaction_intent['intent_policy_checks']['status']}"
+        f"policy={transaction_intent['intent_policy_checks']['status']}, "
+        f"gate={(transaction_intent.get('reportability_review', {}) or {}).get('status') or 'unknown'}"
     )
     print(f"Decoder self-test: {transaction_decoder_selftest['status']}")
     print(f"Readiness: {environment_readiness['status']}")

@@ -945,6 +945,11 @@ compiled instructions are present, and all compiled instruction program IDs are
 in `allowedPrograms` when that allowlist is configured. Address table lookups
 can require manual review because loaded accounts are not expanded from chain
 state.
+`transaction-intent.json.reportability_review` summarizes whether decoded
+checks are merely waiting for corpus/policy, passed for the current corpus, or
+contain signer, wallet, mint, or program mismatches that are ready for a
+separate finding-gate review. It is still a candidate impact signal, not a
+reportable finding by itself.
 
 `collect-quote` is the safe quote-corpus helper. It requests the active
 profile's quote path, saves a successful quote response to
