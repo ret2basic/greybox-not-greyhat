@@ -10689,6 +10689,89 @@ def methodology_thread_rank(thread: dict[str, Any]) -> tuple[int, int, int, str]
     return (status_rank, impact_rank.get(impact, 9), priority_rank, str(thread.get("id") or thread.get("path") or ""))
 
 
+LEAD_DOSSIER_PRIORITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 4, "info": 5}
+
+LEAD_DOSSIER_BLACKBOX_PAYOFF_RANK = {
+    "transaction-integrity": 0,
+    "unauthorized-state-change": 1,
+    "fixed-upstream-proxy-confusion": 2,
+    "rpc-proxy-abuse": 3,
+    "credentialed-upstream-cost-abuse": 4,
+    "resource-exhaustion": 5,
+}
+
+
+def lead_dossier_ranking_strategy(assessment_policy: dict[str, Any]) -> str:
+    if str(assessment_policy.get("mode") or "") == "blackbox":
+        return "blackbox-bounty-first"
+    return "greybox-coverage-first"
+
+
+def lead_dossier_assessment_rank_key(
+    lead: dict[str, Any],
+    *,
+    assessment_policy: dict[str, Any],
+    original_index: int,
+) -> tuple[int, int, int, int, int, int]:
+    strategy = lead_dossier_ranking_strategy(assessment_policy)
+    if strategy != "blackbox-bounty-first":
+        return (original_index, 0, 0, 0, 0, 0)
+
+    strict_validation = (
+        lead.get("strict_validation")
+        if isinstance(lead.get("strict_validation"), dict)
+        else {}
+    )
+    missing_requirements = lead.get("missing_requirements") if isinstance(lead.get("missing_requirements"), list) else []
+    blocking_questions = (
+        strict_validation.get("blocking_questions")
+        if isinstance(strict_validation.get("blocking_questions"), list)
+        else []
+    )
+    closure_status = str(lead.get("closure_status") or "")
+    blocked_rank = 1 if closure_status.startswith("blocked") else 0
+    return (
+        0 if lead.get("gate_ready") else 1,
+        LEAD_DOSSIER_PRIORITY_RANK.get(str(lead.get("priority") or ""), 9),
+        LEAD_DOSSIER_BLACKBOX_PAYOFF_RANK.get(str(lead.get("impact") or ""), 9),
+        len(missing_requirements),
+        len(blocking_questions),
+        blocked_rank,
+    )
+
+
+def apply_lead_dossier_assessment_ranking(
+    leads: list[dict[str, Any]],
+    assessment_policy: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]]]:
+    strategy = lead_dossier_ranking_strategy(assessment_policy)
+    ranked: list[tuple[tuple[int, int, int, int, int, int], int, dict[str, Any]]] = []
+    for original_index, lead in enumerate(leads, start=1):
+        original_rank = int(lead.get("rank") or original_index)
+        key = lead_dossier_assessment_rank_key(
+            lead,
+            assessment_policy=assessment_policy,
+            original_index=original_index,
+        )
+        missing_requirements = lead.get("missing_requirements") if isinstance(lead.get("missing_requirements"), list) else []
+        lead["original_rank"] = original_rank
+        lead["assessment_rank"] = {
+            "strategy": strategy,
+            "gate_ready": bool(lead.get("gate_ready")),
+            "priority_rank": LEAD_DOSSIER_PRIORITY_RANK.get(str(lead.get("priority") or ""), 9),
+            "impact_payoff_rank": LEAD_DOSSIER_BLACKBOX_PAYOFF_RANK.get(str(lead.get("impact") or ""), 9)
+            if strategy == "blackbox-bounty-first"
+            else None,
+            "missing_requirements": len(missing_requirements),
+        }
+        ranked.append((key, original_index, lead))
+    ranked.sort(key=lambda row: (row[0], row[1]))
+    ranked_leads = [lead for _key, _original_index, lead in ranked]
+    for rank, lead in enumerate(ranked_leads, start=1):
+        lead["rank"] = rank
+    return strategy, ranked_leads
+
+
 BUSINESS_LOGIC_TEST_LIBRARY: dict[str, dict[str, Any]] = {
     "data-validation": {
         "title": "Business logic data validation",
@@ -11583,13 +11666,18 @@ def build_lead_dossier(
     current_resource_snapshot: dict[str, Any] | None = None,
     limit: int = 8,
 ) -> dict[str, Any]:
+    requested_limit = max(1, int(limit))
+    initial_assessment_policy = assessment_mode_policy(profile)
+    methodology_limit = requested_limit
+    if lead_dossier_ranking_strategy(initial_assessment_policy) == "blackbox-bounty-first":
+        methodology_limit = max(requested_limit, min(24, requested_limit * 3))
     methodology = build_methodology_review(
         target=target,
         profile=profile,
         artifact_dir=artifact_dir,
         source_root=source_root,
         current_resource_snapshot=current_resource_snapshot,
-        limit=max(1, int(limit)),
+        limit=methodology_limit,
     )
     business_logic_map = (
         methodology.get("business_logic_map")
@@ -11601,22 +11689,15 @@ def build_lead_dossier(
         if isinstance(methodology.get("assessment_policy"), dict)
         else assessment_mode_policy(profile)
     )
-    leads = []
-    priority_counts: dict[str, int] = {}
-    status_counts: dict[str, int] = {}
-    gate_ready = 0
+    lead_candidates = []
     for index, thread in enumerate(methodology.get("high_value_threads", []) or [], start=1):
         if not isinstance(thread, dict):
             continue
         closure = thread.get("evidence_closure") if isinstance(thread.get("evidence_closure"), dict) else {}
         priority = str(thread.get("priority") or "info")
         closure_status = str(closure.get("status") or "unknown")
-        increment_count(priority_counts, priority)
-        increment_count(status_counts, closure_status)
-        if closure.get("gate_ready"):
-            gate_ready += 1
         next_command = thread.get("next_offline_command") if isinstance(thread.get("next_offline_command"), dict) else None
-        leads.append(
+        lead_candidates.append(
             {
                 "id": thread.get("id") or f"lead-{index}",
                 "rank": index,
@@ -11659,6 +11740,19 @@ def build_lead_dossier(
                 "minimal_poc_plan": thread.get("minimal_poc_plan"),
             }
         )
+    ranking_strategy, ranked_candidates = apply_lead_dossier_assessment_ranking(
+        lead_candidates,
+        assessment_policy,
+    )
+    leads = ranked_candidates[:requested_limit]
+    priority_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    gate_ready = 0
+    for lead in leads:
+        increment_count(priority_counts, str(lead.get("priority") or "info"))
+        increment_count(status_counts, str(lead.get("closure_status") or "unknown"))
+        if lead.get("gate_ready"):
+            gate_ready += 1
     status = "ready-for-finding-gate-review" if gate_ready else "needs-evidence"
     if not leads:
         status = "no-high-value-leads"
@@ -11670,6 +11764,8 @@ def build_lead_dossier(
         "artifact_dir": str(artifact_dir),
         "summary": {
             "leads": len(leads),
+            "selection_pool_leads": len(ranked_candidates),
+            "lead_selection_strategy": ranking_strategy,
             "gate_ready_leads": gate_ready,
             "priority_counts": dict(sorted(priority_counts.items())),
             "closure_status_counts": dict(sorted(status_counts.items())),
@@ -36229,6 +36325,46 @@ def build_no_write_selftest() -> dict[str, Any]:
                 "strategy_sets": ["blackbox-http-observed"],
             }
         )
+        ranking_sample_leads = [
+            {
+                "id": "coverage-resource-exhaustion",
+                "rank": 1,
+                "priority": "high",
+                "impact": "resource-exhaustion",
+                "closure_status": "needs-evidence",
+                "gate_ready": False,
+                "missing_requirements": ["operator-evidence", "resource-bound"],
+                "strict_validation": {"blocking_questions": ["concrete-impact-evidence", "fresh-minimal-evidence-package"]},
+            },
+            {
+                "id": "high-payoff-transaction-integrity",
+                "rank": 2,
+                "priority": "high",
+                "impact": "transaction-integrity",
+                "closure_status": "needs-evidence",
+                "gate_ready": False,
+                "missing_requirements": ["transaction-corpus"],
+                "strict_validation": {"blocking_questions": ["concrete-impact-evidence"]},
+            },
+            {
+                "id": "gate-ready-sensitive-data",
+                "rank": 3,
+                "priority": "medium",
+                "impact": "fixed-upstream-proxy-confusion",
+                "closure_status": "ready-for-finding-gate-review",
+                "gate_ready": True,
+                "missing_requirements": [],
+                "strict_validation": {"blocking_questions": []},
+            },
+        ]
+        greybox_ranking_strategy, greybox_ranked_sample = apply_lead_dossier_assessment_ranking(
+            json_clone(ranking_sample_leads),
+            greybox_assessment_policy,
+        )
+        blackbox_ranking_strategy, blackbox_ranked_sample = apply_lead_dossier_assessment_ranking(
+            json_clone(ranking_sample_leads),
+            blackbox_assessment_policy,
+        )
         provider_context_docs_review = build_quote_provider_public_docs_review(default_target_profile())
         review_candidates_output_dir = root / "review-candidates-output"
         plan_output_dir = root / "plan-output"
@@ -37377,6 +37513,32 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "greybox_policy": greybox_assessment_policy,
                 "blackbox_policy": blackbox_assessment_policy,
+            },
+        },
+        {
+            "id": "lead-ranking-follows-assessment-mode",
+            "passed": (
+                greybox_ranking_strategy == "greybox-coverage-first"
+                and [lead.get("id") for lead in greybox_ranked_sample[:3]]
+                == [
+                    "coverage-resource-exhaustion",
+                    "high-payoff-transaction-integrity",
+                    "gate-ready-sensitive-data",
+                ]
+                and blackbox_ranking_strategy == "blackbox-bounty-first"
+                and [lead.get("id") for lead in blackbox_ranked_sample[:3]]
+                == [
+                    "gate-ready-sensitive-data",
+                    "high-payoff-transaction-integrity",
+                    "coverage-resource-exhaustion",
+                ]
+            ),
+            "expected": "greybox keeps coverage order while blackbox prioritizes valid high-payoff findings",
+            "actual": {
+                "greybox_strategy": greybox_ranking_strategy,
+                "greybox_order": [lead.get("id") for lead in greybox_ranked_sample],
+                "blackbox_strategy": blackbox_ranking_strategy,
+                "blackbox_order": [lead.get("id") for lead in blackbox_ranked_sample],
             },
         },
         {
@@ -53908,6 +54070,8 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
     print(
         "Leads: "
         f"total={summary.get('leads', 0)} "
+        f"pool={summary.get('selection_pool_leads', summary.get('leads', 0))} "
+        f"selection={summary.get('lead_selection_strategy') or '-'} "
         f"gate_ready={summary.get('gate_ready_leads', 0)} "
         f"priorities={json.dumps(summary.get('priority_counts', {}), sort_keys=True)} "
         f"closures={json.dumps(summary.get('closure_status_counts', {}), sort_keys=True)}"
