@@ -173,6 +173,7 @@ BOUNTY_LANE_PRIORITIES_ARTIFACT = "bounty-lane-priorities.json"
 BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT = "bounty-evidence-authorization.json"
 BOUNTY_EVIDENCE_INTAKE_ARTIFACT = "bounty-evidence-intake.json"
 BOUNTY_ACTION_QUEUE_ARTIFACT = "bounty-action-queue.json"
+BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT = "bounty-evidence-request.md"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -296,6 +297,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT,
     BOUNTY_EVIDENCE_INTAKE_ARTIFACT,
     BOUNTY_ACTION_QUEUE_ARTIFACT,
+    BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -26137,6 +26139,200 @@ def build_bounty_action_queue(
     }
 
 
+def bounty_brief_line(value: Any, *, max_chars: int = 360) -> str:
+    text = inline_summary_text(value, max_chars=max_chars)
+    return text.replace("\n", " ").strip()
+
+
+def bounty_brief_bullet_lines(values: Any, *, max_items: int, max_chars: int = 220) -> list[str]:
+    rows = []
+    for value in normalize_string_list(values)[:max_items]:
+        rows.append(f"- {bounty_brief_line(value, max_chars=max_chars)}")
+    return rows
+
+
+def bounty_evidence_request_markdown(
+    *,
+    target: str,
+    action_queue: dict[str, Any],
+    bounty_evidence_authorization: dict[str, Any] | None,
+    top: int,
+) -> str:
+    summary = action_queue.get("summary", {}) if isinstance(action_queue.get("summary"), dict) else {}
+    actions = [
+        row
+        for row in (action_queue.get("actions", []) or [])
+        if isinstance(row, dict)
+    ]
+    auth_requests = (
+        bounty_evidence_authorization.get("authorization_requests", [])
+        if isinstance(bounty_evidence_authorization, dict)
+        and isinstance(bounty_evidence_authorization.get("authorization_requests"), list)
+        else []
+    )
+    auth_by_id = {
+        str(row.get("id")): row
+        for row in auth_requests
+        if isinstance(row, dict) and row.get("id")
+    }
+    active_actions = [
+        row
+        for row in actions
+        if str(row.get("kind") or "") in {"collect-approved-evidence", "fix-evidence-intake", "validate-ready-evidence"}
+    ][:top]
+    parked_actions = [
+        row
+        for row in actions
+        if str(row.get("kind") or "") == "park-until-official-evidence"
+    ][:top]
+    lines = [
+        "# Bounty Evidence Request Brief",
+        "",
+        f"- Generated: `{utc_now()}`",
+        f"- Target: `{bounty_brief_line(target, max_chars=160)}`",
+        f"- Queue status: `{bounty_brief_line(action_queue.get('status'), max_chars=120)}`",
+        f"- Actions: `{summary.get('actions', 0)}`",
+        f"- Agent-ready actions: `{summary.get('agent_ready', 0)}`",
+        f"- Human-required actions: `{summary.get('human_required', 0)}`",
+        f"- Blocked actions: `{summary.get('blocked', 0)}`",
+        "",
+        "This brief is not evidence and is not a vulnerability report. It is a request packet for approved, redacted evidence. Do not submit a bounty report until official evidence exists, lane readiness passes, finding-gate accepts concrete impact, and adjudication agrees.",
+        "",
+        "## Current Decision",
+        "",
+        f"- Top lane: `{bounty_brief_line(summary.get('top_lane') or '-', max_chars=120)}`",
+        f"- Top action kind: `{bounty_brief_line(summary.get('top_kind') or '-', max_chars=120)}`",
+        f"- Top actor: `{bounty_brief_line(summary.get('top_actor') or '-', max_chars=120)}`",
+        f"- Next: {bounty_brief_line(action_queue.get('next_step'), max_chars=420)}",
+        "",
+        "## Active Requests",
+        "",
+    ]
+    if not active_actions:
+        lines.append("- No active evidence requests are queued. Refresh the bounty action queue.")
+    for index, action in enumerate(active_actions, start=1):
+        auth = auth_by_id.get(str(action.get("authorization_request_id") or ""), {})
+        lines.extend(
+            [
+                f"### {index}. {bounty_brief_line(action.get('lane') or 'unknown-lane', max_chars=120)}",
+                "",
+                f"- Severity: `{bounty_brief_line(action.get('expected_severity') or '-', max_chars=80)}`",
+                f"- Action: `{bounty_brief_line(action.get('kind') or '-', max_chars=120)}`",
+                f"- Actor: `{bounty_brief_line(action.get('actor') or '-', max_chars=120)}`",
+                f"- Entrypoint: `{bounty_brief_line(action.get('entrypoint') or '-', max_chars=180)}`",
+                f"- Request: {bounty_brief_line(action.get('next_step'), max_chars=520)}",
+                "",
+                "Required evidence:",
+            ]
+        )
+        evidence_lines = bounty_brief_bullet_lines(
+            action.get("requested_evidence") or auth.get("requested_official_evidence_labels"),
+            max_items=8,
+            max_chars=260,
+        )
+        lines.extend(evidence_lines or ["- Approved, redacted official evidence for this lane."])
+        handoff = bounty_brief_bullet_lines(auth.get("handoff_fields"), max_items=10, max_chars=160)
+        if handoff:
+            lines.extend(["", "Handoff fields:", *handoff])
+        allowed = bounty_brief_bullet_lines(auth.get("allowed_actions"), max_items=5, max_chars=260)
+        if allowed:
+            lines.extend(["", "Allowed actions:", *allowed])
+        forbidden = bounty_brief_bullet_lines(auth.get("forbidden_actions"), max_items=8, max_chars=280)
+        if forbidden:
+            lines.extend(["", "Forbidden actions:", *forbidden])
+        command_text = action.get("safe_offline_command") or auth.get("recommended_preview_command")
+        if command_text:
+            lines.extend(["", "Safe local command:", "", "```bash", str(command_text), "```"])
+        after_commands = normalize_string_list(auth.get("after_evidence_validation_commands"))[:4]
+        if after_commands:
+            lines.extend(["", "After evidence exists:", ""])
+            for command in after_commands:
+                lines.extend(["```bash", command, "```"])
+        lines.append("")
+    if parked_actions:
+        lines.extend(["## Parked Lanes", ""])
+        for action in parked_actions:
+            lines.append(
+                f"- `{bounty_brief_line(action.get('lane') or '-', max_chars=120)}` "
+                f"({bounty_brief_line(action.get('expected_severity') or '-', max_chars=80)}): "
+                f"{bounty_brief_line(action.get('next_step'), max_chars=300)}"
+            )
+        lines.append("")
+    lines.extend(
+        [
+            "## Global Redaction Rules",
+            "",
+            "- Do not include raw secrets, bearer tokens, cookies, private keys, seed phrases, wallet signatures, signed transactions, full raw response bodies, raw Burp history, or unredacted CI/build logs.",
+            "- Use short redacted summaries, field paths, source references, hashes, timestamps, and approval references instead of raw sensitive content.",
+            "- Keep each artifact scoped to the requested lane and the approved evidence item.",
+            "- Run `bounty-evidence-intake --no-write --show-requests --show-files --show-risks` before lane validation.",
+            "",
+            "## Validation Path",
+            "",
+            "```bash",
+            "python3 scripts/inferforge.py --artifact-dir .greybox/discover-check bounty-evidence-intake --no-write --show-requests --show-files --show-risks --top 8",
+            "python3 scripts/inferforge.py --artifact-dir .greybox/discover-check bounty-action-queue --no-write --show-actions --show-blockers --show-commands --top 8",
+            "python3 scripts/inferforge.py --artifact-dir .greybox/discover-check gate --no-write --show-items",
+            "python3 scripts/inferforge.py --artifact-dir .greybox/discover-check adjudicate --no-write",
+            "```",
+            "",
+        ]
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def build_bounty_evidence_request_brief(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    bounty_action_queue: dict[str, Any] | None,
+    bounty_evidence_authorization: dict[str, Any] | None,
+    top: int,
+) -> dict[str, Any]:
+    queue = bounty_action_queue if isinstance(bounty_action_queue, dict) else {}
+    summary = queue.get("summary", {}) if isinstance(queue.get("summary"), dict) else {}
+    markdown = bounty_evidence_request_markdown(
+        target=target,
+        action_queue=queue,
+        bounty_evidence_authorization=bounty_evidence_authorization,
+        top=top,
+    )
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-evidence-request-brief-v1",
+        "status": (
+            "evidence-request-brief-ready"
+            if queue.get("actions")
+            else "no-evidence-request-actions"
+        ),
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "actions": summary.get("actions", 0),
+            "agent_ready": summary.get("agent_ready", 0),
+            "human_required": summary.get("human_required", 0),
+            "blocked": summary.get("blocked", 0),
+            "parked": summary.get("parked", 0),
+            "top_lane": summary.get("top_lane"),
+            "top_kind": summary.get("top_kind"),
+            "bounty_action_queue_status": artifact_summary_status(bounty_action_queue),
+            "bounty_evidence_authorization_status": artifact_summary_status(bounty_evidence_authorization),
+            "markdown_lines": len(markdown.splitlines()),
+        },
+        "markdown": markdown,
+        "reportability_rule": (
+            "This brief is a request packet only. It is not evidence, not validation, and not a reportable finding."
+        ),
+        "next_step": queue.get("next_step") or "Refresh bounty-action-queue first.",
+        "safety": (
+            "Offline brief rendering only. It reads local JSON artifacts, writes Markdown, sends no requests, calls no Burp tool, "
+            "starts no browser, creates no evidence sidecars, signs no wallet, submits no transaction, and changes no infrastructure."
+        ),
+    }
+
+
 def build_provenance_invalidity_row(invalidity_review: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(invalidity_review, dict):
         return {}
@@ -27464,6 +27660,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT: "bounty-evidence-authorization",
     BOUNTY_EVIDENCE_INTAKE_ARTIFACT: "bounty-evidence-intake",
     BOUNTY_ACTION_QUEUE_ARTIFACT: "bounty-action-queue",
+    BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT: "bounty-evidence-request",
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
     TRANSACTION_EVIDENCE_READINESS_ARTIFACT: "transaction-evidence-readiness",
     OPERATOR_IMPACT_READINESS_ARTIFACT: "operator-impact-readiness",
@@ -27519,6 +27716,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "bounty-evidence-authorization",
     "bounty-evidence-intake",
     "bounty-action-queue",
+    "bounty-evidence-request",
     "transaction-intent-boundary",
     "transaction-evidence-readiness",
     "operator-impact-readiness",
@@ -27559,6 +27757,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "bounty-evidence-authorization": "bounty-evidence-authorization --no-write",
     "bounty-evidence-intake": "bounty-evidence-intake --no-write",
     "bounty-action-queue": "bounty-action-queue --no-write",
+    "bounty-evidence-request": "bounty-evidence-request --no-write",
     "transaction-intent-boundary": "transaction-intent-boundary --no-write",
     "transaction-evidence-readiness": "transaction-evidence-readiness --no-write",
     "operator-impact-readiness": "operator-impact-readiness --no-write",
@@ -52646,6 +52845,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("bounty-evidence-authorization", "run_bounty_evidence_authorization"),
         refresh_expectation("bounty-evidence-intake", "run_bounty_evidence_intake"),
         refresh_expectation("bounty-action-queue", "run_bounty_action_queue"),
+        refresh_expectation("bounty-evidence-request", "run_bounty_evidence_request"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-intent-boundary", "run_transaction_intent_boundary"),
         refresh_expectation("transaction-evidence-readiness", "run_transaction_evidence_readiness"),
@@ -78091,6 +78291,124 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_or_load_bounty_action_queue_for_run(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    source_root: Path,
+    max_file_bytes: int,
+) -> dict[str, Any]:
+    queue = load_optional_json(artifact_dir / BOUNTY_ACTION_QUEUE_ARTIFACT)
+    if isinstance(queue, dict):
+        return queue
+    rollup = build_or_load_bounty_readiness_rollup_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    authorization = build_or_load_bounty_evidence_authorization_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    intake = build_or_load_bounty_evidence_intake_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+        max_file_bytes=max_file_bytes,
+    )
+    return build_bounty_action_queue(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_readiness_rollup=rollup,
+        bounty_evidence_authorization=authorization,
+        bounty_evidence_intake=intake,
+        adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+    )
+
+
+def run_bounty_evidence_request(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    authorization = build_or_load_bounty_evidence_authorization_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    queue = build_or_load_bounty_action_queue_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+        max_file_bytes=int(args.max_file_bytes),
+    )
+    brief = build_bounty_evidence_request_brief(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_action_queue=queue,
+        bounty_evidence_authorization=authorization,
+        top=int(args.top),
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(str(brief.get("markdown") or ""), encoding="utf-8")
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-evidence-request",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = brief.get("summary", {}) if isinstance(brief.get("summary"), dict) else {}
+    print(f"Bounty evidence request: {brief.get('status')}")
+    print(
+        "Brief: "
+        f"actions={summary.get('actions', 0)} "
+        f"agent_ready={summary.get('agent_ready', 0)} "
+        f"human_required={summary.get('human_required', 0)} "
+        f"blocked={summary.get('blocked', 0)} "
+        f"parked={summary.get('parked', 0)} "
+        f"top={summary.get('top_lane') or '-'} "
+        f"kind={summary.get('top_kind') or '-'} "
+        f"lines={summary.get('markdown_lines', 0)}"
+    )
+    print(
+        "Inputs: "
+        f"queue={summary.get('bounty_action_queue_status') or '-'} "
+        f"authorization={summary.get('bounty_evidence_authorization_status') or '-'}"
+    )
+    print(f"Rule: {inline_summary_text(brief.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(brief.get('next_step'), max_chars=360)}")
+    if getattr(args, "show_brief", False):
+        print("Markdown brief:")
+        print(str(brief.get("markdown") or "").rstrip())
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and summary.get("human_required", 0) <= 0 and summary.get("agent_ready", 0) <= 0:
+        return 1
+    return 0
+
+
 def run_rpc_proxy_parity_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -81627,6 +81945,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero when evidence intake redaction or format blockers must be fixed first.",
     )
     bounty_action_queue.set_defaults(func=run_bounty_action_queue)
+
+    bounty_evidence_request = sub.add_parser(
+        "bounty-evidence-request",
+        help="Render a human-facing Markdown brief for the current prioritized bounty evidence requests",
+    )
+    bounty_evidence_request.add_argument(
+        "--output",
+        help=(
+            f"Where to write {BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT}."
+        ),
+    )
+    bounty_evidence_request.add_argument(
+        "--top",
+        type=positive_int,
+        default=5,
+        help="Number of active and parked actions to include in the brief.",
+    )
+    bounty_evidence_request.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=262144,
+        help="Maximum bytes to read if evidence intake or action queue must be built. Defaults to 262144.",
+    )
+    bounty_evidence_request.add_argument(
+        "--show-brief",
+        action="store_true",
+        help="Print the rendered Markdown brief.",
+    )
+    bounty_evidence_request.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print bounty evidence request summary only; do not write {BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    bounty_evidence_request.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless the brief contains at least one human or agent action.",
+    )
+    bounty_evidence_request.set_defaults(func=run_bounty_evidence_request)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
