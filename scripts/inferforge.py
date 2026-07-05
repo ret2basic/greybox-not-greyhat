@@ -171,6 +171,7 @@ BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT = "bounty-evidence-workorders.json"
 BOUNTY_SOURCE_INVARIANTS_ARTIFACT = "bounty-source-invariants.json"
 BOUNTY_LANE_PRIORITIES_ARTIFACT = "bounty-lane-priorities.json"
 BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT = "bounty-evidence-authorization.json"
+BOUNTY_EVIDENCE_INTAKE_ARTIFACT = "bounty-evidence-intake.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -292,6 +293,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     BOUNTY_SOURCE_INVARIANTS_ARTIFACT,
     BOUNTY_LANE_PRIORITIES_ARTIFACT,
     BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT,
+    BOUNTY_EVIDENCE_INTAKE_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -25418,6 +25420,411 @@ def build_bounty_evidence_authorization(
     }
 
 
+BOUNTY_INTAKE_FILE_SUFFIXES = {".json", ".jsonl", ".txt", ".log", ".md"}
+BOUNTY_INTAKE_SECRET_TEXT_RE = re.compile(
+    r"(?i)(authorization\s*[:=]\s*bearer\s+)[^,\s\"']+|"
+    r"((?:api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token|secret|password|cookie|set-cookie)\s*[:=]\s*)[^,\s\"';&]+"
+)
+BOUNTY_INTAKE_FORBIDDEN_KEYWORDS = {
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "set_cookie",
+    "proxy-authorization",
+    "proxy_authorization",
+    "bearer",
+    "access_token",
+    "auth_token",
+    "api_key",
+    "apikey",
+    "x-api-key",
+    "x_api_key",
+    "x-m0-api-key",
+    "x_m0_api_key",
+    "password",
+    "secret",
+    "private_key",
+    "privatekey",
+    "seed_phrase",
+    "seedphrase",
+    "mnemonic",
+    "signature",
+    "signed_transaction",
+    "signedtransaction",
+    "raw_body",
+    "body",
+    "body_sample",
+    "response_body",
+    "raw_response",
+    "raw_burp_history",
+    "burp_history",
+    "headers",
+}
+
+
+def bounty_intake_contains_unredacted_secret_text(value: str) -> bool:
+    for match in BOUNTY_INTAKE_SECRET_TEXT_RE.finditer(value):
+        prefix = match.group(1) or match.group(2) or ""
+        secret = match.group(0)[len(prefix) :].strip()
+        if secret and secret.lower() not in {"[redacted]", "redacted"}:
+            return True
+    return False
+
+
+def bounty_intake_evidence_path(raw: str, *, artifact_dir: Path) -> Path | None:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    if any(token and token in value for token in MANUAL_PLACEHOLDER_TOKENS):
+        return None
+    if ":" in value and not re.match(r"^[A-Za-z]:[\\/]", value):
+        return None
+    candidate = Path(value)
+    suffix = candidate.suffix.lower()
+    if suffix not in BOUNTY_INTAKE_FILE_SUFFIXES:
+        return None
+    if candidate.is_absolute() or "/" in value or value.startswith("."):
+        return resolve_repo_path(value)
+    return (artifact_dir / value).resolve()
+
+
+def bounty_intake_parse_jsonl(text: str) -> tuple[list[Any], list[str]]:
+    rows = []
+    errors = []
+    for index, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            errors.append(f"line-{index}:invalid-json")
+            if len(errors) >= 5:
+                break
+    return rows, errors
+
+
+def bounty_intake_forbidden_key_paths(value: Any, *, limit: int = 16) -> list[str]:
+    paths: list[str] = []
+
+    def walk(node: Any, prefix: str) -> None:
+        if len(paths) >= limit:
+            return
+        if isinstance(node, dict):
+            for key, child in node.items():
+                key_text = str(key)
+                key_norm = re.sub(r"[^a-z0-9]+", "_", key_text.lower()).strip("_")
+                if key_text.lower() in BOUNTY_INTAKE_FORBIDDEN_KEYWORDS or key_norm in BOUNTY_INTAKE_FORBIDDEN_KEYWORDS:
+                    paths.append(f"{prefix}.{key_text}" if prefix else key_text)
+                    if len(paths) >= limit:
+                        return
+                child_prefix = f"{prefix}.{key_text}" if prefix else key_text
+                walk(child, child_prefix)
+                if len(paths) >= limit:
+                    return
+        elif isinstance(node, list):
+            for child in node[:8]:
+                walk(child, f"{prefix}[]" if prefix else "[]")
+                if len(paths) >= limit:
+                    return
+
+    walk(value, "$")
+    return paths[:limit]
+
+
+def bounty_intake_scan_file(path: Path, *, max_file_bytes: int) -> dict[str, Any]:
+    rel = repo_relative_or_absolute(path)
+    if not path.exists():
+        return {
+            "path": rel,
+            "status": "missing",
+            "exists": False,
+            "size_bytes": None,
+            "format": path.suffix.lower().lstrip(".") or "unknown",
+            "redaction_risks": [],
+            "parse_errors": [],
+            "row_count": 0,
+        }
+    if not path.is_file():
+        return {
+            "path": rel,
+            "status": "not-a-file",
+            "exists": True,
+            "size_bytes": None,
+            "format": "unknown",
+            "redaction_risks": ["evidence-path-is-not-a-file"],
+            "parse_errors": [],
+            "row_count": 0,
+        }
+    size = path.stat().st_size
+    suffix = path.suffix.lower()
+    if size == 0:
+        return {
+            "path": rel,
+            "status": "empty",
+            "exists": True,
+            "size_bytes": size,
+            "format": suffix.lstrip(".") or "unknown",
+            "redaction_risks": [],
+            "parse_errors": [],
+            "row_count": 0,
+        }
+    if size > max_file_bytes:
+        return {
+            "path": rel,
+            "status": "too-large-for-intake",
+            "exists": True,
+            "size_bytes": size,
+            "format": suffix.lstrip(".") or "unknown",
+            "redaction_risks": ["file-exceeds-intake-size-limit"],
+            "parse_errors": [],
+            "row_count": 0,
+            "max_file_bytes": max_file_bytes,
+        }
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        return {
+            "path": rel,
+            "status": "unreadable",
+            "exists": True,
+            "size_bytes": size,
+            "format": suffix.lstrip(".") or "unknown",
+            "redaction_risks": ["file-unreadable"],
+            "parse_errors": [redacted_error_summary(error)],
+            "row_count": 0,
+        }
+    redaction_risks = []
+    if bounty_intake_contains_unredacted_secret_text(text):
+        redaction_risks.append("secret-like-text-pattern")
+    parse_errors: list[str] = []
+    row_count = 0
+    parsed: Any = None
+    if suffix == ".json":
+        try:
+            parsed = json.loads(text)
+            row_count = 1
+        except json.JSONDecodeError:
+            parse_errors.append("invalid-json")
+    elif suffix == ".jsonl":
+        rows, parse_errors = bounty_intake_parse_jsonl(text)
+        parsed = rows
+        row_count = len(rows)
+    elif suffix in {".txt", ".log", ".md"}:
+        row_count = len([line for line in text.splitlines() if line.strip()])
+    if parsed is not None:
+        forbidden_paths = bounty_intake_forbidden_key_paths(parsed)
+        if forbidden_paths:
+            redaction_risks.append("forbidden-field-name")
+    else:
+        forbidden_paths = []
+    if parse_errors:
+        status = "invalid-format"
+    elif redaction_risks:
+        status = "needs-redaction-review"
+    else:
+        status = "present-clean"
+    return {
+        "path": rel,
+        "status": status,
+        "exists": True,
+        "size_bytes": size,
+        "format": suffix.lstrip(".") or "unknown",
+        "redaction_risks": redaction_risks,
+        "parse_errors": parse_errors,
+        "row_count": row_count,
+        "forbidden_field_paths": forbidden_paths[:8],
+        "max_file_bytes": max_file_bytes,
+    }
+
+
+def bounty_intake_request_review(
+    request: dict[str, Any],
+    *,
+    artifact_dir: Path,
+    max_file_bytes: int,
+) -> dict[str, Any]:
+    raw_evidence = normalize_string_list(request.get("requested_official_evidence"))
+    path_refs: list[Path] = []
+    descriptive_refs = []
+    seen_paths: set[str] = set()
+    for item in raw_evidence:
+        path = bounty_intake_evidence_path(item, artifact_dir=artifact_dir)
+        if path is None:
+            descriptive_refs.append(item)
+            continue
+        key = str(path)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        path_refs.append(path)
+    files = [bounty_intake_scan_file(path, max_file_bytes=max_file_bytes) for path in path_refs]
+    missing = [row for row in files if row.get("status") in {"missing", "empty", "not-a-file"}]
+    invalid = [row for row in files if row.get("status") == "invalid-format"]
+    redaction = [
+        row
+        for row in files
+        if row.get("redaction_risks") or row.get("status") in {"too-large-for-intake", "unreadable"}
+    ]
+    clean = [row for row in files if row.get("status") == "present-clean"]
+    if missing:
+        status = "waiting-evidence-files"
+    elif invalid:
+        status = "blocked-invalid-evidence-format"
+    elif redaction:
+        status = "blocked-redaction-review"
+    elif path_refs and len(clean) == len(path_refs):
+        status = "ready-for-lane-validation"
+    elif descriptive_refs and not path_refs:
+        status = "waiting-manual-nonfile-evidence"
+    else:
+        status = "waiting-evidence"
+    return {
+        "id": f"INTAKE-{safe_probe_id(str(request.get('id') or request.get('lane') or 'request'))}",
+        "authorization_request_id": request.get("id"),
+        "workorder_id": request.get("workorder_id"),
+        "gate_id": request.get("gate_id"),
+        "lane": request.get("lane"),
+        "entrypoint": request.get("entrypoint"),
+        "expected_severity": request.get("expected_severity"),
+        "priority_decision": request.get("priority_decision"),
+        "status": status,
+        "requested_labels": normalize_string_list(request.get("requested_official_evidence_labels")),
+        "file_refs": [repo_relative_or_absolute(path) for path in path_refs],
+        "descriptive_refs": descriptive_refs,
+        "files": files,
+        "present_clean_files": len(clean),
+        "missing_or_empty_files": len(missing),
+        "invalid_format_files": len(invalid),
+        "redaction_review_files": len(redaction),
+        "redaction_risks": ordered_unique_strings(
+            [
+                risk
+                for row in files
+                for risk in normalize_string_list(row.get("redaction_risks"))
+            ]
+        ),
+        "next_step": (
+            "Provide the missing approved redacted evidence file(s)."
+            if missing
+            else "Fix evidence JSON/JSONL formatting before lane validation."
+            if invalid
+            else "Remove raw secret-like data or forbidden fields before lane validation."
+            if redaction
+            else "Run the after-evidence validation commands for this lane."
+            if path_refs and len(clean) == len(path_refs)
+            else "Attach a redacted operator/build provenance summary and approval reference."
+        ),
+        "after_evidence_validation_commands": normalize_string_list(request.get("after_evidence_validation_commands")),
+        "recommended_after_evidence_command": request.get("recommended_after_evidence_command"),
+        "reportability_boundary": request.get("reportability_boundary"),
+    }
+
+
+def build_bounty_evidence_intake(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    bounty_evidence_authorization: dict[str, Any] | None,
+    max_file_bytes: int,
+) -> dict[str, Any]:
+    requests = (
+        bounty_evidence_authorization.get("authorization_requests", [])
+        if isinstance(bounty_evidence_authorization, dict)
+        and isinstance(bounty_evidence_authorization.get("authorization_requests"), list)
+        else []
+    )
+    reviews = [
+        bounty_intake_request_review(
+            request,
+            artifact_dir=artifact_dir,
+            max_file_bytes=max_file_bytes,
+        )
+        for request in requests
+        if isinstance(request, dict)
+    ]
+    status_counts: dict[str, int] = {}
+    lane_counts: dict[str, int] = {}
+    for row in reviews:
+        increment_count(status_counts, str(row.get("status") or "unknown"))
+        increment_count(lane_counts, str(row.get("lane") or "unknown"))
+    ready = [row for row in reviews if row.get("status") == "ready-for-lane-validation"]
+    blocked = [
+        row
+        for row in reviews
+        if str(row.get("status") or "").startswith("blocked")
+    ]
+    waiting = [
+        row
+        for row in reviews
+        if str(row.get("status") or "").startswith("waiting")
+    ]
+    redaction_risks = ordered_unique_strings(
+        [
+            risk
+            for row in reviews
+            for risk in normalize_string_list(row.get("redaction_risks"))
+        ]
+    )
+    if blocked:
+        status = "blocked-evidence-intake-redaction-or-format"
+    elif ready:
+        status = "ready-for-lane-validation"
+    elif reviews:
+        status = "waiting-approved-evidence-files"
+    else:
+        status = "no-evidence-intake-requests"
+    top = reviews[0] if reviews else {}
+    commands = ordered_unique_strings(
+        [
+            str(row.get("recommended_after_evidence_command") or "")
+            for row in ready
+            if row.get("recommended_after_evidence_command")
+        ]
+    )
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-evidence-intake-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "requests": len(reviews),
+            "ready_for_lane_validation": len(ready),
+            "blocked": len(blocked),
+            "waiting": len(waiting),
+            "redaction_risks": len(redaction_risks),
+            "top_request": top.get("id"),
+            "top_lane": top.get("lane"),
+            "top_status": top.get("status"),
+            "status_counts": dict(sorted(status_counts.items())),
+            "lane_counts": dict(sorted(lane_counts.items())),
+            "bounty_evidence_authorization_status": artifact_summary_status(bounty_evidence_authorization),
+            "max_file_bytes": max_file_bytes,
+        },
+        "intake_reviews": reviews,
+        "ready_requests": ready[:8],
+        "blocked_requests": blocked[:8],
+        "waiting_requests": waiting[:8],
+        "redaction_risk_kinds": redaction_risks,
+        "commands": commands[:12],
+        "reportability_rule": (
+            "Intake only checks file presence, shape, and redaction risk. It is not evidence validation and cannot promote a finding. "
+            "Medium+ still requires lane readiness, finding-gate acceptance, and adjudication."
+        ),
+        "next_step": (
+            top.get("next_step")
+            if top
+            else "Build bounty-evidence-authorization first."
+        ),
+        "safety": (
+            "Offline intake only. It reads bounded local evidence files, prints no sensitive excerpts, sends no requests, calls no Burp tool, "
+            "starts no browser, signs no wallet, submits no transaction, and changes no infrastructure."
+        ),
+    }
+
+
 def build_provenance_invalidity_row(invalidity_review: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(invalidity_review, dict):
         return {}
@@ -26743,6 +27150,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     BOUNTY_SOURCE_INVARIANTS_ARTIFACT: "bounty-source-invariants",
     BOUNTY_LANE_PRIORITIES_ARTIFACT: "bounty-lane-priorities",
     BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT: "bounty-evidence-authorization",
+    BOUNTY_EVIDENCE_INTAKE_ARTIFACT: "bounty-evidence-intake",
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
     TRANSACTION_EVIDENCE_READINESS_ARTIFACT: "transaction-evidence-readiness",
     OPERATOR_IMPACT_READINESS_ARTIFACT: "operator-impact-readiness",
@@ -26796,6 +27204,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "bounty-source-invariants",
     "bounty-lane-priorities",
     "bounty-evidence-authorization",
+    "bounty-evidence-intake",
     "transaction-intent-boundary",
     "transaction-evidence-readiness",
     "operator-impact-readiness",
@@ -26834,6 +27243,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "bounty-source-invariants": "bounty-source-invariants --no-write",
     "bounty-lane-priorities": "bounty-lane-priorities --no-write",
     "bounty-evidence-authorization": "bounty-evidence-authorization --no-write",
+    "bounty-evidence-intake": "bounty-evidence-intake --no-write",
     "transaction-intent-boundary": "transaction-intent-boundary --no-write",
     "transaction-evidence-readiness": "transaction-evidence-readiness --no-write",
     "operator-impact-readiness": "operator-impact-readiness --no-write",
@@ -51919,6 +52329,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("bounty-source-invariants", "run_bounty_source_invariants"),
         refresh_expectation("bounty-lane-priorities", "run_bounty_lane_priorities"),
         refresh_expectation("bounty-evidence-authorization", "run_bounty_evidence_authorization"),
+        refresh_expectation("bounty-evidence-intake", "run_bounty_evidence_intake"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-intent-boundary", "run_transaction_intent_boundary"),
         refresh_expectation("transaction-evidence-readiness", "run_transaction_evidence_readiness"),
@@ -77076,6 +77487,150 @@ def run_bounty_evidence_authorization(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_or_load_bounty_evidence_authorization_for_run(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    source_root: Path,
+) -> dict[str, Any]:
+    authorization = load_optional_json(artifact_dir / BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT)
+    if isinstance(authorization, dict):
+        return authorization
+    workorders = build_or_load_bounty_evidence_workorders_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    priorities = build_or_load_bounty_lane_priorities_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    return build_bounty_evidence_authorization(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_evidence_workorders=workorders,
+        bounty_lane_priorities=priorities,
+    )
+
+
+def run_bounty_evidence_intake(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    authorization = build_or_load_bounty_evidence_authorization_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    intake = build_bounty_evidence_intake(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_evidence_authorization=authorization,
+        max_file_bytes=int(args.max_file_bytes),
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / BOUNTY_EVIDENCE_INTAKE_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(intake))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-evidence-intake",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = intake.get("summary", {}) if isinstance(intake.get("summary"), dict) else {}
+    print(f"Bounty evidence intake: {intake.get('status')}")
+    print(
+        "Intake: "
+        f"requests={summary.get('requests', 0)} "
+        f"ready={summary.get('ready_for_lane_validation', 0)} "
+        f"blocked={summary.get('blocked', 0)} "
+        f"waiting={summary.get('waiting', 0)} "
+        f"redaction_risks={summary.get('redaction_risks', 0)} "
+        f"top={summary.get('top_lane') or '-'} "
+        f"top_status={summary.get('top_status') or '-'}"
+    )
+    print(
+        "Inputs: "
+        f"authorization={summary.get('bounty_evidence_authorization_status') or '-'} "
+        f"max_file_bytes={summary.get('max_file_bytes') or '-'}"
+    )
+    print(f"Statuses: {json.dumps(summary.get('status_counts', {}), sort_keys=True)}")
+    display_limit = max(0, int(args.top))
+    if getattr(args, "show_requests", False):
+        print("Intake requests:")
+        for row in (intake.get("intake_reviews", []) or [])[:display_limit]:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('id')}: {row.get('expected_severity')} lane={row.get('lane')} "
+                f"status={row.get('status')} files={len(row.get('files') or [])} "
+                f"redaction={row.get('redaction_review_files')}"
+            )
+            labels = ", ".join(normalize_string_list(row.get("requested_labels"))[:4])
+            if labels:
+                print(f"  needs={inline_summary_text(labels, max_chars=300)}")
+            print(f"  next={inline_summary_text(row.get('next_step'), max_chars=320)}")
+            if getattr(args, "show_files", False):
+                for file_row in (row.get("files", []) or [])[: max(1, min(4, int(args.files_per_request)))]:
+                    if not isinstance(file_row, dict):
+                        continue
+                    print(
+                        f"  file={file_row.get('path')} status={file_row.get('status')} "
+                        f"format={file_row.get('format')} rows={file_row.get('row_count')} "
+                        f"risks={','.join(normalize_string_list(file_row.get('redaction_risks'))[:3]) or '-'}"
+                    )
+                for ref in normalize_string_list(row.get("descriptive_refs"))[:2]:
+                    print(f"  descriptive={inline_summary_text(ref, max_chars=240)}")
+            if getattr(args, "show_commands", False):
+                command_text = row.get("recommended_after_evidence_command")
+                if command_text:
+                    print(f"  after={inline_summary_text(command_text, max_chars=420)}")
+        remaining = len(intake.get("intake_reviews", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more intake request(s); rerun without --no-write to write the full artifact")
+            else:
+                print(f"- {remaining} more intake request(s) in {output_path}")
+    if getattr(args, "show_risks", False):
+        risks = normalize_string_list(intake.get("redaction_risk_kinds"))
+        print("Redaction risks:")
+        if risks:
+            for risk in risks[:display_limit]:
+                print(f"- {risk}")
+        else:
+            print("- none")
+    if getattr(args, "show_commands", False) and not getattr(args, "show_requests", False):
+        print("Commands:")
+        for command_text in normalize_string_list(intake.get("commands"))[:display_limit]:
+            print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    print(f"Rule: {inline_summary_text(intake.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(intake.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and summary.get("blocked", 0) > 0:
+        return 1
+    return 0
+
+
 def run_rpc_proxy_parity_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -80495,6 +81050,70 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless at least one actionable authorization request exists.",
     )
     bounty_evidence_authorization.set_defaults(func=run_bounty_evidence_authorization)
+
+    bounty_evidence_intake = sub.add_parser(
+        "bounty-evidence-intake",
+        help="Check authorized bounty evidence files for presence, parse shape, and redaction risk before lane validation",
+    )
+    bounty_evidence_intake.add_argument(
+        "--output",
+        help=(
+            f"Where to write {BOUNTY_EVIDENCE_INTAKE_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{BOUNTY_EVIDENCE_INTAKE_ARTIFACT}."
+        ),
+    )
+    bounty_evidence_intake.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of intake requests, risks, or commands to print.",
+    )
+    bounty_evidence_intake.add_argument(
+        "--files-per-request",
+        type=positive_int,
+        default=3,
+        help="Number of evidence file rows to print per intake request.",
+    )
+    bounty_evidence_intake.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=262144,
+        help="Maximum bytes to read from any local evidence file during intake. Defaults to 262144.",
+    )
+    bounty_evidence_intake.add_argument(
+        "--show-requests",
+        action="store_true",
+        help="Print per-authorization evidence intake reviews.",
+    )
+    bounty_evidence_intake.add_argument(
+        "--show-files",
+        action="store_true",
+        help="Print file-level presence, parse, and redaction-risk status for each shown request.",
+    )
+    bounty_evidence_intake.add_argument(
+        "--show-risks",
+        action="store_true",
+        help="Print redaction risk categories found in currently present evidence files.",
+    )
+    bounty_evidence_intake.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print after-evidence validation commands for requests that passed intake.",
+    )
+    bounty_evidence_intake.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print bounty evidence intake only; do not write {BOUNTY_EVIDENCE_INTAKE_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    bounty_evidence_intake.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero when any present evidence file is blocked by format or redaction-risk intake.",
+    )
+    bounty_evidence_intake.set_defaults(func=run_bounty_evidence_intake)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
