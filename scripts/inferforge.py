@@ -37924,6 +37924,22 @@ def build_transaction_intent_checks(
                     },
                 )
             )
+        else:
+            checks.append(
+                make_intent_check(
+                    f"{tx_id}:program-allowlist",
+                    "Compiled instruction programs require manual allowlist review",
+                    "review",
+                    {
+                        "programIds": sorted(program_ids),
+                        "review_required": (
+                            "No allowedPrograms policy is configured; manually review every decoded instruction "
+                            "program ID before treating program behavior as passed."
+                        ),
+                    },
+                    severity="review",
+                )
+            )
 
     required_failures = [
         check for check in checks if check["status"] == "failed" and check["severity"] == "required"
@@ -37993,6 +38009,12 @@ def build_transaction_intent_reportability_review(
     structural_failures = [
         check for check in required_failures if transaction_intent_check_suffix(check) == "instructions-present"
     ]
+    program_review_items = [
+        check for check in review_items if transaction_intent_check_suffix(check) == "program-allowlist"
+    ]
+    non_program_review_items = [
+        check for check in review_items if transaction_intent_check_suffix(check) != "program-allowlist"
+    ]
 
     if not policy.get("configured"):
         status = "needs-intent-policy"
@@ -38024,6 +38046,11 @@ def build_transaction_intent_reportability_review(
         candidate_severity = "medium"
         ready_for_finding_gate = True
         next_step = "Review decoded instruction structure and decide whether the failure proves concrete user-funds impact."
+    elif program_review_items and not non_program_review_items:
+        status = "manual-program-allowlist-review-required"
+        candidate_severity = "medium"
+        ready_for_finding_gate = False
+        next_step = "Review decoded instruction program IDs against an approved allowlist before escalation."
     elif review_items:
         status = "manual-address-table-review-required"
         candidate_severity = "medium"
@@ -38307,6 +38334,23 @@ def build_transaction_decoder_selftest(
     )
     policy_checks = build_transaction_intent_checks(transactions, policy)
     reportability_review = build_transaction_intent_reportability_review(transactions, policy, policy_checks)
+    no_allowlist_policy = normalize_transaction_intent_policy(
+        {
+            "direction": direction,
+            "wallet": payload["wallet"],
+            "amountIn": amount_in,
+            "sourceMint": payload["sourceMint"],
+            "destinationMint": payload["destinationMint"],
+        },
+        profile,
+    )
+    no_allowlist_policy["allowedPrograms"] = []
+    no_allowlist_policy_checks = build_transaction_intent_checks(transactions, no_allowlist_policy)
+    no_allowlist_reportability_review = build_transaction_intent_reportability_review(
+        transactions,
+        no_allowlist_policy,
+        no_allowlist_policy_checks,
+    )
     mismatch_policy = normalize_transaction_intent_policy(
         {
             "direction": direction,
@@ -38360,6 +38404,17 @@ def build_transaction_decoder_selftest(
         and amount_mismatch_reportability_review.get("candidate_severity") == "high"
         and amount_mismatch_reportability_review.get("ready_for_finding_gate") is True
         and any(check.get("status") == "failed" for check in amount_mismatch_failures)
+    )
+    no_allowlist_program_reviews = [
+        check
+        for check in no_allowlist_policy_checks.get("checks", []) or []
+        if isinstance(check, dict) and transaction_intent_check_suffix(check) == "program-allowlist"
+    ]
+    no_allowlist_gate_passed = (
+        no_allowlist_policy_checks.get("status") == "review-required"
+        and no_allowlist_reportability_review.get("status") == "manual-program-allowlist-review-required"
+        and no_allowlist_reportability_review.get("ready_for_finding_gate") is False
+        and any(check.get("status") == "review" for check in no_allowlist_program_reviews)
     )
     decoded_count = sum(1 for item in transactions if item.get("decoded"))
     sidecar_ready_review: dict[str, Any] = {}
@@ -38662,6 +38717,7 @@ def build_transaction_decoder_selftest(
         and reportability_review.get("status") == "intent-checks-passed"
         and mismatch_gate_passed
         and amount_mismatch_gate_passed
+        and no_allowlist_gate_passed
         and sidecar_guard_passed
         and sidecar_ready_passed
         and sidecar_missing_policy_passed
@@ -38698,6 +38754,11 @@ def build_transaction_decoder_selftest(
             "status": "passed" if amount_mismatch_gate_passed else "failed",
             "intent_policy_checks": amount_mismatch_policy_checks,
             "reportability_review": amount_mismatch_reportability_review,
+        },
+        "missing_program_allowlist_selftest": {
+            "status": "passed" if no_allowlist_gate_passed else "failed",
+            "intent_policy_checks": no_allowlist_policy_checks,
+            "reportability_review": no_allowlist_reportability_review,
         },
         "sidecar_input_guard": {
             "status": "passed" if sidecar_guard_passed else "failed",
