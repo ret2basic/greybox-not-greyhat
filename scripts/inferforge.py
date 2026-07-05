@@ -36,7 +36,7 @@ import urllib.request
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -6975,6 +6975,24 @@ def protected_control_plane_port_for_process(process: dict[str, Any]) -> int | N
     return None
 
 
+def protected_control_plane_watch_ports(watch_ports: Iterable[int]) -> list[int]:
+    return sorted(
+        {
+            int(port)
+            for port in watch_ports
+            if int(port) in PROTECTED_CONTROL_PLANE_PORTS
+        }
+    )
+
+
+def resource_snapshot_visible_processes(processes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        process
+        for process in processes
+        if protected_control_plane_port_for_process(process) is None
+    ]
+
+
 def top_rss_processes(limit: int) -> list[dict[str, Any]]:
     proc_root = Path("/proc")
     processes: list[dict[str, Any]] = []
@@ -7117,7 +7135,9 @@ def build_resource_snapshot(
         str(port): {"listening": port in listening_ports}
         for port in sorted(set(watch_ports))
     }
-    top_processes = top_rss_processes(max(max_processes, 8))
+    top_processes = resource_snapshot_visible_processes(
+        top_rss_processes(max(max_processes, 8))
+    )
     release_candidates = resource_release_candidates(top_processes)
     resource_budget = build_resource_budget(status, warnings, memory, release_candidates=release_candidates)
     return {
@@ -17254,6 +17274,69 @@ def source_references(
     ).get("matches", [])
 
 
+def build_preview_execution_quote_review(
+    preview_wallet_refs: list[dict[str, Any]],
+    execution_wallet_refs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    preview_fetch_refs = [
+        ref
+        for ref in preview_wallet_refs
+        if "fetchQuote(" in str(ref.get("sample") or "") and "previewWallet" in str(ref.get("sample") or "")
+    ]
+    execution_fresh_refs = [
+        ref
+        for ref in execution_wallet_refs
+        if "fetchQuote(" in str(ref.get("sample") or "")
+        and any(token in str(ref.get("sample") or "") for token in ["solanaAddress", "walletAddress"])
+    ]
+    sender_recipient_binding_refs = [
+        ref
+        for ref in execution_wallet_refs
+        if any(token in str(ref.get("sample") or "") for token in ["sender: walletAddress", "recipient: walletAddress"])
+    ]
+    if preview_fetch_refs and execution_fresh_refs:
+        status = "fresh-execution-quote-indexed"
+        priority = "info"
+        conclusion = (
+            "Preview quote uses a preview wallet, but execution fetches a fresh quote with the connected execution wallet."
+        )
+    elif preview_wallet_refs and execution_wallet_refs:
+        status = "needs-flow-confirmation"
+        priority = "medium"
+        conclusion = "Preview and execution wallet inputs both exist, but fresh execution quote behavior is not proven."
+    elif preview_wallet_refs:
+        status = "preview-wallet-only"
+        priority = "low"
+        conclusion = "Preview wallet references exist without an execution-wallet quote reference in the bounded scan."
+    elif execution_wallet_refs:
+        status = "execution-wallet-only"
+        priority = "info"
+        conclusion = "Execution wallet quote references exist without preview-wallet refs in the bounded scan."
+    else:
+        status = "no-preview-execution-wallet-context"
+        priority = "info"
+        conclusion = "No preview/execution wallet quote split was found in the bounded scan."
+    return {
+        "status": status,
+        "priority": priority,
+        "summary": {
+            "preview_wallet_refs": len(preview_wallet_refs),
+            "execution_wallet_refs": len(execution_wallet_refs),
+            "preview_fetch_refs": len(preview_fetch_refs),
+            "execution_fresh_quote_refs": len(execution_fresh_refs),
+            "sender_recipient_binding_refs": len(sender_recipient_binding_refs),
+        },
+        "preview_fetch_refs": preview_fetch_refs[:6],
+        "execution_fresh_quote_refs": execution_fresh_refs[:6],
+        "sender_recipient_binding_refs": sender_recipient_binding_refs[:6],
+        "conclusion": conclusion,
+        "reportability_gate": (
+            "Preview/execution wallet context is not reportable by itself. Escalate only if decoded executable "
+            "transactions prove a signer, wallet, mint, amount, or program mismatch."
+        ),
+    }
+
+
 def build_transaction_flow_static_review(
     *,
     frontend_transaction_refs: list[dict[str, Any]],
@@ -17284,9 +17367,13 @@ def build_transaction_flow_static_review(
             "Do decoded signer, writable account, mint, amount, and program IDs match the user's intended swap?",
         )
     if preview_wallet_refs and execution_wallet_refs:
+        preview_execution_review = build_preview_execution_quote_review(preview_wallet_refs, execution_wallet_refs)
         add_signal(
-            "preview-wallet-execution-wallet-review",
-            "Quote preview and execution paths can use different wallet inputs.",
+            str(preview_execution_review.get("status") or "preview-wallet-execution-wallet-review"),
+            str(
+                preview_execution_review.get("conclusion")
+                or "Quote preview and execution paths can use different wallet inputs."
+            ),
             [*preview_wallet_refs[:3], *execution_wallet_refs[:3]],
             "Does a preview quote ever get reused for execution, or does execution fetch a fresh quote for the connected wallet?",
         )
@@ -17309,6 +17396,10 @@ def build_transaction_flow_static_review(
         "status": "needs-decoded-intent-review" if signals else "no-static-intent-signals",
         "signal_count": len(signals),
         "signals": signals,
+        "preview_execution_quote_review": build_preview_execution_quote_review(
+            preview_wallet_refs,
+            execution_wallet_refs,
+        ),
         "required_comparisons": [
             "Compare the executing wallet with decoded signer accounts.",
             "Compare requested source/destination mints with decoded static account keys and loaded account review notes.",
@@ -19081,6 +19172,7 @@ def build_transaction_flow_review(
     recent_blockhash_refs = refs_by_group["recent_blockhash_refresh"]
     preview_refs = refs_by_group["preview_wallet_inputs"]
     execution_refs = refs_by_group["execution_wallet_inputs"]
+    preview_execution_quote_review = build_preview_execution_quote_review(preview_refs, execution_refs)
 
     remote_files = transaction_flow_files_for_refs([*remote_refs, *deserializer_refs])
     local_files = transaction_flow_files_for_refs(local_construction_refs)
@@ -19148,9 +19240,12 @@ def build_transaction_flow_review(
     if preview_refs and execution_refs:
         add_dataflow(
             "preview-wallet-vs-execution-wallet",
-            "needs-flow-confirmation",
-            "medium",
-            "Quote preview and execution paths reference different wallet inputs.",
+            str(preview_execution_quote_review.get("status") or "needs-flow-confirmation"),
+            str(preview_execution_quote_review.get("priority") or "medium"),
+            str(
+                preview_execution_quote_review.get("conclusion")
+                or "Quote preview and execution paths reference different wallet inputs."
+            ),
             [*preview_refs[:5], *execution_refs[:5]],
             "Does execution fetch a fresh quote for the connected wallet rather than reusing preview wallet transaction material?",
         )
@@ -19284,6 +19379,7 @@ def build_transaction_flow_review(
             "local_signing_sink_refs": len(local_signing_refs),
             "quote_request_field_refs": len(refs_by_group.get("quote_request_fields", []) or []),
             "server_quote_validation_refs": len(refs_by_group.get("server_quote_validation", []) or []),
+            "preview_execution_quote_status": preview_execution_quote_review.get("status"),
             "quote_source_contract_status": quote_contract_review.get("status"),
             "server_credential_proxy_status": credential_proxy_review.get("status"),
             "provider_public_docs_status": provider_public_docs_review.get("status"),
@@ -19310,6 +19406,7 @@ def build_transaction_flow_review(
         "dataflows": dataflows,
         "transaction_intent": intent_summary,
         "intent_policy_scaffold": policy_scaffold,
+        "preview_execution_quote_review": preview_execution_quote_review,
         "provider_public_docs_review": provider_public_docs_review,
         "quote_source_contract_review": quote_contract_review,
         "server_credential_proxy_review": credential_proxy_review,
@@ -30704,6 +30801,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         plan_output_dir = root / "plan-output"
         capabilities_output_dir = root / "capabilities-output"
         readiness_output_dir = root / "readiness-output"
+        protected_resource_snapshot_output_dir = root / "protected-resource-snapshot-output"
         attack_strategy_output_dir = root / "attack-strategy-output"
         verification_queue_output_dir = root / "verification-queue-output"
         source_peek_output_dir = root / "source-peek-output"
@@ -30779,6 +30877,16 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--source-root",
                     str(root),
                     "readiness",
+                    "--no-write",
+                ]
+            )
+            protected_resource_snapshot_return_code, protected_resource_snapshot_stdout = run_cli(
+                [
+                    "--artifact-dir",
+                    str(protected_resource_snapshot_output_dir),
+                    "resource-snapshot",
+                    "--watch-port",
+                    "2455",
                     "--no-write",
                 ]
             )
@@ -31050,6 +31158,13 @@ def build_no_write_selftest() -> dict[str, Any]:
             "readiness_capabilities_json": (readiness_output_dir / "burp-capabilities.json").exists(),
             "readiness_json": (readiness_output_dir / "environment-readiness.json").exists(),
             "readiness_manifest": (readiness_output_dir / MANIFEST_NAME).exists(),
+            "protected_resource_snapshot_dir": protected_resource_snapshot_output_dir.exists(),
+            "protected_resource_snapshot_json": (
+                protected_resource_snapshot_output_dir / RESOURCE_SNAPSHOT_ARTIFACT
+            ).exists(),
+            "protected_resource_snapshot_manifest": (
+                protected_resource_snapshot_output_dir / MANIFEST_NAME
+            ).exists(),
             "attack_strategy_dir": attack_strategy_output_dir.exists(),
             "attack_strategy_target_profile_json": (attack_strategy_output_dir / TARGET_PROFILE_ARTIFACT).exists(),
             "attack_strategy_json": (attack_strategy_output_dir / "attack-strategy.json").exists(),
@@ -31187,6 +31302,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     plan_stdout_text = "\n".join(plan_stdout)
     capabilities_stdout_text = "\n".join(capabilities_stdout)
     readiness_stdout_text = "\n".join(readiness_stdout)
+    protected_resource_snapshot_stdout_text = "\n".join(protected_resource_snapshot_stdout)
     attack_strategy_stdout_text = "\n".join(attack_strategy_stdout)
     verification_queue_stdout_text = "\n".join(verification_queue_stdout)
     source_peek_stdout_text = "\n".join(source_peek_stdout)
@@ -31548,6 +31664,33 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": invalid_promote_return_code,
                 "stdout": invalid_promote_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "resource-snapshot-protected-watch-port-blocked",
+            "passed": (
+                protected_resource_snapshot_return_code == 2
+                and "Resource snapshot blocked: protected-control-plane-watch-port"
+                in protected_resource_snapshot_stdout
+                and "Protected ports: 2455" in protected_resource_snapshot_stdout
+                and "No local process or port snapshot collected." in protected_resource_snapshot_stdout
+                and "No files written (--no-write)." in protected_resource_snapshot_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "protected_resource_snapshot_dir",
+                        "protected_resource_snapshot_json",
+                        "protected_resource_snapshot_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in protected_resource_snapshot_stdout)
+            ),
+            "expected": "resource-snapshot blocks protected control-plane watch ports before collecting local resource data",
+            "actual": {
+                "return_code": protected_resource_snapshot_return_code,
+                "stdout": protected_resource_snapshot_stdout,
+                "stdout_text": protected_resource_snapshot_stdout_text,
                 "outputs_exist": output_paths,
             },
         },
@@ -38062,48 +38205,49 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             if isinstance(ref, dict)
         )
         selftest_uid = os.geteuid()
-        resource_release_candidate_sample = resource_release_candidates(
-            [
-                {
-                    "pid": 101,
-                    "name": "java",
-                    "rss_mib": 900.0,
-                    "command_preview": "/opt/BurpSuite/jre/bin/java burpsuite.jar",
-                    "uid": selftest_uid,
+        resource_process_sample = [
+            {
+                "pid": 101,
+                "name": "java",
+                "rss_mib": 900.0,
+                "command_preview": "/opt/BurpSuite/jre/bin/java burpsuite.jar",
+                "uid": selftest_uid,
+            },
+            {
+                "pid": 102,
+                "name": "firefox-bin",
+                "rss_mib": 420.0,
+                "command_preview": "firefox",
+                "uid": selftest_uid,
+            },
+            {
+                "pid": 103,
+                "name": "python",
+                "rss_mib": 640.0,
+                "command_preview": "python -m app.cli --host 0.0.0.0 --port 2455",
+                "uid": selftest_uid,
+                "cgroup_context": {
+                    "scope": "container",
+                    "runtime": "docker",
+                    "container_id_short": "8c59a6d0c9ef",
+                    "label": "docker:8c59a6d0c9ef",
                 },
-                {
-                    "pid": 102,
-                    "name": "firefox-bin",
-                    "rss_mib": 420.0,
-                    "command_preview": "firefox",
-                    "uid": selftest_uid,
-                },
-                {
-                    "pid": 103,
-                    "name": "python",
-                    "rss_mib": 640.0,
-                    "command_preview": "python -m app.cli --host 0.0.0.0 --port 2455",
-                    "uid": selftest_uid,
-                    "cgroup_context": {
-                        "scope": "container",
-                        "runtime": "docker",
-                        "container_id_short": "8c59a6d0c9ef",
-                        "label": "docker:8c59a6d0c9ef",
-                    },
-                },
-                {
-                    "pid": 104,
-                    "name": "codex",
-                    "rss_mib": 500.0,
-                    "command_preview": "/path/to/codex",
-                },
-            ]
-        )
+            },
+            {
+                "pid": 104,
+                "name": "codex",
+                "rss_mib": 500.0,
+                "command_preview": "/path/to/codex",
+            },
+        ]
+        resource_visible_process_sample = resource_snapshot_visible_processes(resource_process_sample)
+        resource_release_candidate_sample = resource_release_candidates(resource_visible_process_sample)
         resource_release_candidate_types = {
             item.get("type") for item in resource_release_candidate_sample
         }
         resource_release_candidates_passed = (
             resource_release_candidate_types == {"burp-gui", "browser"}
+            and {item.get("pid") for item in resource_visible_process_sample} == {101, 102, 104}
             and {item.get("pid") for item in resource_release_candidate_sample} == {101, 102}
             and all(item.get("pid") != 103 for item in resource_release_candidate_sample)
             and protected_control_plane_port_for_process(
@@ -39888,6 +40032,22 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for item in rewrite_transaction_flow_review.get("dataflows", [])
             if isinstance(item, dict)
         }
+        transaction_flow_review_dataflows = {
+            item.get("id"): item
+            for item in rewrite_transaction_flow_review.get("dataflows", [])
+            if isinstance(item, dict)
+        }
+        preview_execution_static_review = (
+            transaction_static_review.get("preview_execution_quote_review", {})
+            if isinstance(transaction_static_review.get("preview_execution_quote_review"), dict)
+            else {}
+        )
+        preview_execution_flow_review = (
+            rewrite_transaction_flow_review.get("preview_execution_quote_review", {})
+            if isinstance(rewrite_transaction_flow_review.get("preview_execution_quote_review"), dict)
+            else {}
+        )
+        preview_execution_dataflow = transaction_flow_review_dataflows.get("preview-wallet-vs-execution-wallet", {})
         transaction_flow_hypothesis_passed = (
             rewrite_transaction_policy.get("remote_transaction_signing_review", {}).get("status")
             == "needs-transaction-intent-corpus"
@@ -39897,10 +40057,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and transaction_static_review.get("status") == "needs-decoded-intent-review"
             and {
                 "remote-payload-to-wallet-signing",
-                "preview-wallet-execution-wallet-review",
+                "fresh-execution-quote-indexed",
                 "client-recent-blockhash-rewrite",
             }.issubset(transaction_static_signal_ids)
+            and preview_execution_static_review.get("status") == "fresh-execution-quote-indexed"
+            and preview_execution_static_review.get("priority") == "info"
             and rewrite_transaction_flow_review.get("status") == "needs-transaction-intent-corpus"
+            and preview_execution_flow_review.get("status") == "fresh-execution-quote-indexed"
+            and preview_execution_flow_review.get("priority") == "info"
+            and preview_execution_dataflow.get("status") == "fresh-execution-quote-indexed"
+            and preview_execution_dataflow.get("priority") == "info"
             and rewrite_transaction_flow_review.get("intent_policy_scaffold", {}).get("status")
             == "profile-quote-intent-indexed"
             and rewrite_transaction_flow_review.get("intent_policy_scaffold", {}).get("configured_direction_count", 0) >= 2
@@ -41417,6 +41583,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "status": "passed"
             if resource_release_candidates_passed and resource_budget_swap_pressure_passed
             else "failed",
+            "visible_processes": resource_visible_process_sample,
             "candidates": resource_release_candidate_sample,
             "swap_pressure_budget": resource_budget_swap_pressure_sample,
         },
@@ -44631,7 +44798,17 @@ def run_resource_snapshot(args: argparse.Namespace) -> int:
     artifact_dir = Path(args.artifact_dir).resolve()
     target = args.target or DEFAULT_TARGET
     no_write = bool(args.no_write)
-    watch_ports = args.watch_port if args.watch_port else [3100]
+    watch_ports = args.watch_port if args.watch_port else DEFAULT_RESOURCE_WATCH_PORTS
+    blocked_watch_ports = protected_control_plane_watch_ports(watch_ports)
+    if blocked_watch_ports:
+        print("Resource snapshot blocked: protected-control-plane-watch-port")
+        print(f"Protected ports: {', '.join(str(port) for port in blocked_watch_ports)}")
+        print("No local process or port snapshot collected.")
+        if no_write:
+            print("No files written (--no-write).")
+        else:
+            print("No files written.")
+        return 2
     snapshot = build_resource_snapshot(
         max_processes=args.max_processes,
         watch_ports=watch_ports,
@@ -45705,6 +45882,16 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
         if isinstance(provider_docs.get("summary"), dict)
         else {}
     )
+    preview_execution_quote = (
+        review.get("preview_execution_quote_review")
+        if isinstance(review.get("preview_execution_quote_review"), dict)
+        else {}
+    )
+    preview_execution_summary = (
+        preview_execution_quote.get("summary")
+        if isinstance(preview_execution_quote.get("summary"), dict)
+        else {}
+    )
     source_contract = review.get("quote_source_contract_review") if isinstance(review.get("quote_source_contract_review"), dict) else {}
     source_contract_summary = source_contract.get("summary", {}) if isinstance(source_contract.get("summary"), dict) else {}
     credential_proxy = (
@@ -45736,6 +45923,13 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
         f"status={scaffold.get('status')}, "
         f"directions={scaffold.get('configured_direction_count', 0)}/{scaffold.get('direction_count', 0)}"
     )
+    if preview_execution_quote:
+        print(
+            "Preview/execution quote: "
+            f"status={preview_execution_quote.get('status')} "
+            f"fresh_refs={preview_execution_summary.get('execution_fresh_quote_refs', 0)} "
+            f"priority={preview_execution_quote.get('priority')}"
+        )
     if provider_docs:
         print(
             "Provider docs: "

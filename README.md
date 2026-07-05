@@ -500,10 +500,12 @@ default local target application port for the checked-in profile, not Burp's
 proxy or Burp's built-in browser. Keep it closed unless a local app regression
 actually needs the dev server.
 
-Do not add control-plane ports such as `2455` to resource-snapshot watch lists
-or memory-reclaim candidates. In the Codex VPS environment, `2455` is reserved
-for the AI API load balancer and must not be signaled, stopped, restarted, or
-probed by unattended tooling.
+Do not add control-plane ports such as `2455` to resource-snapshot watch lists,
+readiness checks, health checks, resource checks, probes, or memory-reclaim
+candidates. In the Codex VPS environment, `2455` is reserved for the AI API load
+balancer and must not be observed, signaled, stopped, restarted, or probed by
+unattended tooling. `resource-snapshot --watch-port 2455` is blocked before
+collecting local process or port data.
 
 `burp-sync`, `audit`, `blackbox-asset-map`, `websocket-candidate-review`
 handshake baselines, `host-takeover-baseline`, `collect-quote`,

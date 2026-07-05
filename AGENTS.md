@@ -9,7 +9,8 @@ Hard rule:
 - Do not kill, stop, restart, signal, or otherwise manage the process,
   container, service, or port behind `2455`.
 - Do not use `2455` as a memory-reclaim candidate.
-- Do not run active probes against `2455`.
+- Do not add `2455` to watch-port lists, health checks, readiness checks,
+  resource checks, or active probes.
 - If `2455` appears unhealthy, report it to the user and wait for explicit
   authorization before taking any action.
 
