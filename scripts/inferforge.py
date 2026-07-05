@@ -31715,6 +31715,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Operator evidence review:" in operator_evidence_review_stdout_text
                 and "Coverage:" in operator_evidence_review_stdout_text
                 and "Sidecar template:" in operator_evidence_review_stdout_text
+                and "- template " in operator_evidence_review_stdout_text
                 and "No files written (--no-write)." in operator_evidence_review_stdout
                 and not any(
                     output_paths[key]
@@ -45498,12 +45499,24 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
                     print(f"  needed={inline_summary_text(needed, max_chars=180)}")
     if args.show_template:
         template = review.get("sidecar_template") if isinstance(review.get("sidecar_template"), dict) else {}
+        template_items = template.get("evidence_items", []) if isinstance(template.get("evidence_items"), list) else []
         print(
             "Sidecar template: "
             f"path={review.get('sidecar_path')} "
-            f"items={len(template.get('evidence_items', []) or [])} "
+            f"items={len(template_items)} "
             f"accepted_statuses={','.join(review.get('accepted_present_statuses', []) or [])}"
         )
+        for item in template_items[:top_count]:
+            if not isinstance(item, dict):
+                continue
+            print(
+                f"- template {item.get('id')} "
+                f"status={item.get('status')} type={item.get('evidence_type')}"
+            )
+            for needed in (item.get("operator_evidence_needed", []) or [])[:2]:
+                print(f"  needed={inline_summary_text(needed, max_chars=180)}")
+            for redaction in (item.get("redaction_required", []) or [])[:1]:
+                print(f"  redaction={inline_summary_text(redaction, max_chars=180)}")
     if no_write:
         print("No files written (--no-write).")
     else:

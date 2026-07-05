@@ -367,7 +367,10 @@ values and file hashes are not written to the artifact. The output
 configuration, proxy/header trust evidence, key/TTL bounds, fallback monitoring,
 and deployment env injection. Missing categories remain operator-evidence
 requirements; this artifact is triage, not a reportable resource-exhaustion
-finding.
+finding. `operator-evidence-review --no-write --show-missing --show-template`
+prints the redacted `operator-evidence.json` sidecar path plus template item
+IDs, evidence questions, accepted present statuses, and redaction reminders for
+the missing decisions.
 
 Use `rewrite-review` for the dedicated fixed-upstream rewrite/proxy review:
 
