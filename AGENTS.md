@@ -11,6 +11,8 @@ Hard rule:
 - Do not manage the AI API load balancer by process name, container name,
   service name, supervisor unit, or any other identifier, even if the port is
   not mentioned directly.
+- Do not inspect, probe, curl, `ss`, `lsof`, `pgrep`, health-check, or
+  supervisor-query `2455` or the AI API load balancer as an operational target.
 - Do not use `2455` as a memory-reclaim candidate.
 - Do not add `2455` to watch-port lists, health checks, readiness checks,
   resource checks, or active probes.
