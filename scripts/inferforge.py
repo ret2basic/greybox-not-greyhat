@@ -16978,6 +16978,128 @@ def iteration_action(
     }
 
 
+VALIDATION_APPROVAL_PACKET_KEYS = [
+    ("transaction_corpus_approval_packet", "transaction-corpus"),
+    ("credential_impact_approval_packet", "credential-impact"),
+    ("resource_control_approval_packet", "resource-control"),
+    ("rpc_proxy_abuse_approval_packet", "rpc-proxy-abuse"),
+    ("rewrite_response_approval_packet", "rewrite-response"),
+    ("websocket_header_forwarding_approval_packet", "websocket-header-forwarding"),
+]
+
+
+def validation_item_approval_packets(item: dict[str, Any]) -> list[tuple[str, str, dict[str, Any]]]:
+    packets: list[tuple[str, str, dict[str, Any]]] = []
+    for packet_key, packet_type in VALIDATION_APPROVAL_PACKET_KEYS:
+        packet = item.get(packet_key) if isinstance(item.get(packet_key), dict) else {}
+        if packet:
+            packets.append((packet_key, packet_type, packet))
+    return packets
+
+
+def iteration_focus_missing_requirements(
+    item: dict[str, Any],
+    packets: list[tuple[str, str, dict[str, Any]]],
+) -> list[str]:
+    candidates: list[str] = []
+    for key in ["missing_requirements", "missing_evidence"]:
+        raw = item.get(key)
+        if isinstance(raw, list):
+            candidates.extend(str(value) for value in raw if str(value or "").strip())
+    for _packet_key, _packet_type, packet in packets:
+        recommended = packet.get("recommended_evidence") if isinstance(packet.get("recommended_evidence"), dict) else {}
+        for key in ["missing_decision_ids", "missing_requirements"]:
+            raw = recommended.get(key)
+            if isinstance(raw, list):
+                candidates.extend(str(value) for value in raw if str(value or "").strip())
+        blockers = packet.get("finding_gate_blockers")
+        if isinstance(blockers, list):
+            candidates.extend(str(value) for value in blockers if str(value or "").strip())
+    if not candidates and isinstance(item.get("required_evidence"), list):
+        candidates.extend(str(value) for value in item.get("required_evidence", []) if str(value or "").strip())
+    return ordered_unique_strings(candidates)[:12]
+
+
+def iteration_focus_gate_ready(
+    item: dict[str, Any],
+    packets: list[tuple[str, str, dict[str, Any]]],
+) -> bool:
+    if item.get("gate_ready") is True:
+        return True
+    status = str(item.get("status") or "")
+    if status in {"ready-for-finding-gate-review", "ready-for-gate-review"}:
+        return True
+    return any(
+        str(packet.get("status") or "") in {"ready-for-finding-gate-review", "ready-for-gate-review"}
+        for _packet_key, _packet_type, packet in packets
+    )
+
+
+def iteration_focus_lead_from_validation_item(item: dict[str, Any]) -> dict[str, Any]:
+    packets = validation_item_approval_packets(item)
+    missing_requirements = iteration_focus_missing_requirements(item, packets)
+    gate_ready = iteration_focus_gate_ready(item, packets)
+    status = str(item.get("status") or "")
+    closure_status = "needs-evidence"
+    if status.startswith("blocked"):
+        closure_status = status
+    elif gate_ready:
+        closure_status = "ready-for-finding-gate-review"
+    return {
+        "id": item.get("id") or item.get("hypothesis_id") or "validation-item",
+        "rank": item.get("rank") or 0,
+        "priority": item.get("priority") or "info",
+        "impact": item.get("impact"),
+        "closure_status": closure_status,
+        "gate_ready": gate_ready,
+        "missing_requirements": missing_requirements,
+        "strict_validation": {
+            "blocking_questions": [] if gate_ready else missing_requirements,
+        },
+    }
+
+
+def build_iteration_assessment_focus(
+    validation_plan: dict[str, Any],
+    assessment_policy: dict[str, Any],
+) -> list[dict[str, Any]]:
+    ranked: list[tuple[tuple[int, int, int, int, int, int], int, dict[str, Any]]] = []
+    for original_index, item in enumerate(validation_plan.get("items", []) or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        focus_lead = iteration_focus_lead_from_validation_item(item)
+        focus_lead["rank"] = original_index
+        scorecard = lead_dossier_assessment_scorecard(
+            focus_lead,
+            assessment_policy=assessment_policy,
+        )
+        key = lead_dossier_assessment_rank_key(
+            focus_lead,
+            assessment_policy=assessment_policy,
+            original_index=original_index,
+        )
+        packets = validation_item_approval_packets(item)
+        row = {
+            "rank": original_index,
+            "validation_item_id": item.get("id") or item.get("hypothesis_id"),
+            "validation_item_status": item.get("status"),
+            "validation_item_priority": item.get("priority"),
+            "validation_item_type": item.get("hypothesis_type") or item.get("type"),
+            "impact": item.get("impact"),
+            "path": item.get("path"),
+            "host": item.get("host"),
+            "approval_packet_types": [packet_type for _key, packet_type, _packet in packets],
+            "missing_requirements": focus_lead.get("missing_requirements", []),
+            "assessment_rank": scorecard,
+        }
+        ranked.append((key, original_index, row))
+    ranked.sort(key=lambda row: (row[0], row[1]))
+    focus_rows = [row for _key, _original_index, row in ranked]
+    for rank, row in enumerate(focus_rows, start=1):
+        row["rank"] = rank
+    return focus_rows
+
+
 OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     TARGET_PROFILE_ARTIFACT: "profile",
     STRATEGY_REGISTRY_ARTIFACT: "profile",
@@ -17189,30 +17311,28 @@ def build_iteration_decision_from_plan(
     artifact_health_blocks_active = artifact_health_status == "failed"
     artifact_health_needs_review = artifact_health_status == "needs-human-review"
     resource_blocks_active = bool(active_after_gate and resource_status not in {"healthy", "not-run"})
+    iteration_focus = build_iteration_assessment_focus(validation_plan, assessment_policy)
+    assessment_by_item_id = {
+        str(item.get("validation_item_id")): item.get("assessment_rank")
+        for item in iteration_focus
+        if item.get("validation_item_id") is not None and isinstance(item.get("assessment_rank"), dict)
+    }
     approval_packets = []
     for item in validation_plan.get("items", []) or []:
         if not isinstance(item, dict):
             continue
-        for packet_key, packet_type in [
-            ("transaction_corpus_approval_packet", "transaction-corpus"),
-            ("credential_impact_approval_packet", "credential-impact"),
-            ("resource_control_approval_packet", "resource-control"),
-            ("rpc_proxy_abuse_approval_packet", "rpc-proxy-abuse"),
-            ("rewrite_response_approval_packet", "rewrite-response"),
-            ("websocket_header_forwarding_approval_packet", "websocket-header-forwarding"),
-        ]:
-            packet = item.get(packet_key) if isinstance(item.get(packet_key), dict) else {}
-            if not packet:
-                continue
+        item_id = item.get("id")
+        for packet_key, packet_type, packet in validation_item_approval_packets(item):
             approval_packets.append(
                 {
-                    "validation_item_id": item.get("id"),
+                    "validation_item_id": item_id,
                     "validation_item_status": item.get("status"),
                     "validation_item_priority": item.get("priority"),
                     "validation_item_type": item.get("hypothesis_type"),
                     "packet_key": packet_key,
                     "packet_type": packet_type,
                     "packet": packet,
+                    "assessment_rank": assessment_by_item_id.get(str(item_id)),
                 }
             )
 
@@ -17345,12 +17465,30 @@ def build_iteration_decision_from_plan(
             "blocked_commands": len(blocked),
             "command_safety": allowed_command_summary,
             "blocked_command_safety": blocked_command_summary,
+            "focus_items": len(iteration_focus),
+            "focus_pursue_now": sum(
+                1
+                for item in iteration_focus
+                if (item.get("assessment_rank") or {}).get("decision")
+                in {"pursue-now", "pursue-minimal-evidence", "pursue-coverage-closure", "finish-gate-review"}
+            ),
+            "focus_parked": sum(
+                1
+                for item in iteration_focus
+                if str((item.get("assessment_rank") or {}).get("parking_recommendation") or "").startswith("park")
+            ),
+            "top_focus_decision": (
+                (iteration_focus[0].get("assessment_rank") or {}).get("decision")
+                if iteration_focus
+                else None
+            ),
         },
         "resource_preflight": resource_preflight,
         "artifact_health": {
             "status": artifact_health_status,
             "summary": artifact_health.get("summary", {}) if isinstance(artifact_health, dict) else {},
         },
+        "iteration_focus": iteration_focus[:limit],
         "approval_packets": approval_packets[:limit],
         "actions": actions,
         "artifact_refs": {
@@ -48061,6 +48199,22 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for ref in action.get("commands", []) or []
             if isinstance(ref, dict)
         )
+        blackbox_iteration_focus_sample = [
+            item
+            for item in blackbox_iteration_decision_sample.get("iteration_focus", []) or []
+            if isinstance(item, dict)
+        ]
+        blackbox_iteration_top_focus_scorecard = (
+            blackbox_iteration_focus_sample[0].get("assessment_rank", {})
+            if blackbox_iteration_focus_sample
+            and isinstance(blackbox_iteration_focus_sample[0].get("assessment_rank"), dict)
+            else {}
+        )
+        blackbox_iteration_packet_scorecards = [
+            item.get("assessment_rank")
+            for item in blackbox_iteration_decision_sample.get("approval_packets", []) or []
+            if isinstance(item, dict) and item.get("validation_item_id") is not None
+        ]
 
         def focused_iteration_command(subcommand: str) -> str:
             return validation_command_for_artifact_dir(
@@ -49047,6 +49201,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         == "maximize-valid-high-bounty-finding"
         and blackbox_iteration_decision_sample.get("summary", {}).get("lead_selection_strategy")
         == "blackbox-bounty-first"
+        and blackbox_iteration_decision_sample.get("summary", {}).get("focus_items", 0) > 0
+        and blackbox_iteration_top_focus_scorecard.get("strategy") == "blackbox-bounty-first"
+        and blackbox_iteration_top_focus_scorecard.get("bounty_pressure", {}).get("score") is not None
+        and all(isinstance(scorecard, dict) for scorecard in blackbox_iteration_packet_scorecards)
         and blackbox_iteration_decision_sample.get("summary", {}).get("offline_commands", 0) > 0
         and blackbox_iteration_decision_sample.get("summary", {}).get("active_after_resource_gate_commands", 0) > 0
         and blackbox_iteration_decision_sample.get("summary", {}).get("resource_blocked_active_commands", 0) > 0
@@ -58913,6 +59071,43 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
         print(f"Command safety: {format_command_safety_summary(command_safety)}")
     if blocked_command_safety and blocked_command_safety.get("commands"):
         print(f"Blocked command safety: {format_command_safety_summary(blocked_command_safety)}")
+    focus_items = [
+        item
+        for item in decision.get("iteration_focus", []) or []
+        if isinstance(item, dict)
+    ]
+    if focus_items:
+        top_focus = focus_items[0]
+        focus_assessment = (
+            top_focus.get("assessment_rank")
+            if isinstance(top_focus.get("assessment_rank"), dict)
+            else {}
+        )
+        coverage_pressure = (
+            focus_assessment.get("coverage_pressure")
+            if isinstance(focus_assessment.get("coverage_pressure"), dict)
+            else {}
+        )
+        bounty_pressure = (
+            focus_assessment.get("bounty_pressure")
+            if isinstance(focus_assessment.get("bounty_pressure"), dict)
+            else {}
+        )
+        validity_pressure = (
+            focus_assessment.get("validity_pressure")
+            if isinstance(focus_assessment.get("validity_pressure"), dict)
+            else {}
+        )
+        print(
+            "Top focus: "
+            f"item={top_focus.get('validation_item_id') or '-'} "
+            f"decision={focus_assessment.get('decision') or '-'} "
+            f"park={focus_assessment.get('parking_recommendation') or '-'} "
+            f"score={focus_assessment.get('composite_score')} "
+            f"coverage={coverage_pressure.get('score')} "
+            f"bounty={bounty_pressure.get('score')} "
+            f"validity={validity_pressure.get('score')}"
+        )
     approval_packets = [
         item
         for item in decision.get("approval_packets", []) or []

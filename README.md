@@ -587,7 +587,11 @@ guessing from free-form text. It also embeds and prints the active
 `assessment_mode` optimization policy: `greybox` keeps the loop
 coverage-first until dangerous source-derived surfaces are closed, while
 `blackbox` keeps the loop bounty-first and parks broad coverage work once a
-stronger valid high-impact report path exists.
+stronger valid high-impact report path exists. The artifact includes
+`iteration_focus`, a ranked validation-item scorecard using the same
+`coverage_pressure`, `bounty_pressure`, `validity_pressure`, and pursue/park
+decision fields as `lead-dossier`; approval packets also carry the matching
+assessment scorecard for the validation item that produced them.
 
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:
