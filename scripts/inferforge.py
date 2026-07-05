@@ -46997,6 +46997,22 @@ def run_decode_transactions(args: argparse.Namespace) -> int:
         f"severity={reportability_review.get('candidate_severity') or 'none'} "
         f"ready_for_finding_gate={reportability_review.get('ready_for_finding_gate')}"
     )
+    for label, key in [
+        ("High-impact failures", "high_impact_failures"),
+        ("Required failures", "required_failures"),
+        ("Review items", "review_items"),
+    ]:
+        rows = reportability_review.get(key, []) if isinstance(reportability_review.get(key), list) else []
+        if not rows:
+            continue
+        print(f"{label}:")
+        for row in rows[:6]:
+            print(
+                f"- {row.get('id')} "
+                f"status={row.get('status')} "
+                f"severity={row.get('severity')} "
+                f"evidence={inline_summary_text(row.get('evidence'), max_chars=260)}"
+            )
     if no_write:
         print("No files written (--no-write).")
     else:
