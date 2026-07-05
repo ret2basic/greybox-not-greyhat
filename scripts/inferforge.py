@@ -616,6 +616,7 @@ def default_target_profile() -> dict[str, Any]:
         },
         "quote_response": {
             "transaction_candidate_paths": json_clone(DEFAULT_QUOTE_RESPONSE_CANDIDATE_PATHS),
+            "expected_payload_type": "svm",
         },
         "quote_provider": {
             "name": "M0",
@@ -1491,6 +1492,14 @@ def quote_response_candidate_paths(profile: dict[str, Any] | None) -> list[str]:
     return normalize_string_list(raw_paths)
 
 
+def quote_response_expected_payload_type(profile: dict[str, Any] | None) -> str:
+    config = quote_response_config(profile)
+    raw_type = config.get("expected_payload_type") or config.get("expectedPayloadType")
+    if not isinstance(raw_type, str):
+        return ""
+    return raw_type.strip().lower()
+
+
 def parse_simple_json_path(path: str) -> list[tuple[str, str | int]] | None:
     if not isinstance(path, str) or not path.startswith("$"):
         return None
@@ -2038,6 +2047,18 @@ def build_profile_validation_artifact(
                         ),
                     }
                 )
+        raw_expected_payload_type = (
+            raw_quote_response.get("expected_payload_type")
+            or raw_quote_response.get("expectedPayloadType")
+        )
+        if raw_expected_payload_type is not None and not isinstance(raw_expected_payload_type, str):
+            warnings.append(
+                {
+                    "id": "quote-response:expected-payload-type-invalid",
+                    "severity": "warning",
+                    "message": "`quote_response.expected_payload_type` should be a string such as `svm` or omitted.",
+                }
+            )
 
     raw_quote_provider = profile.get("quote_provider")
     quote_provider = quote_provider_config(profile)
@@ -19670,6 +19691,7 @@ def build_transaction_payload_shape_guidance(
     max_input_bytes: int = DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
 ) -> dict[str, Any]:
     candidate_paths = quote_response_candidate_paths(profile)
+    expected_payload_type = quote_response_expected_payload_type(profile)
     quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
     accepted_sidecars = [
         repo_relative_or_absolute(path)
@@ -19690,8 +19712,10 @@ def build_transaction_payload_shape_guidance(
         "accepted_sidecars": accepted_sidecars,
         "max_input_bytes": max_input_bytes,
         "configured_candidate_paths": candidate_paths,
+        "expected_payload_type": expected_payload_type or None,
         "auto_detection": [
             "Configured quote_response.transaction_candidate_paths are tried first when the sidecar is JSON.",
+            "When quote_response.expected_payload_type is configured, JSON payload data.type must match before decode.",
             "JSON string values whose path contains `transaction` are scanned recursively.",
             "Plain-text base64-like transaction payloads are accepted from transaction-payloads.txt.",
         ],
@@ -19813,6 +19837,11 @@ def build_transaction_sidecar_review(
         profile,
         max_input_bytes=max_input_bytes,
     )
+    payload_contract_review = build_payload_contract_review(
+        payload_shape_review,
+        expected_payload_type=quote_response_expected_payload_type(profile),
+        candidate_count=len(candidates),
+    )
     present_payload_files = [row for row in payload_files if row.get("status") == "present"]
     oversized_payload_files = [row for row in payload_files if row.get("status") == "too-large"]
 
@@ -19831,9 +19860,12 @@ def build_transaction_sidecar_review(
         policy_error = redacted_error_summary(error)
 
     policy_summary = transaction_policy_review_summary(policy)
-    ready_for_decode = bool(candidates) and bool(policy.get("valid"))
+    payload_contract_allows_decode = bool(payload_contract_review.get("allows_decode"))
+    ready_for_decode = bool(candidates) and bool(policy.get("valid")) and payload_contract_allows_decode
     if ready_for_decode:
         status = "ready-for-decode"
+    elif candidates and not payload_contract_allows_decode:
+        status = "payload-contract-not-ready"
     elif policy_error is not None:
         status = "invalid-intent-policy-sidecar"
     elif candidates and not policy.get("configured"):
@@ -19858,7 +19890,7 @@ def build_transaction_sidecar_review(
                 profile=profile,
             )
         )
-    elif candidates:
+    elif candidates and payload_contract_allows_decode:
         decode_commands.extend(
             row.get("decode_command")
             for row in transaction_corpus_policy_templates(profile, artifact_dir)
@@ -19877,6 +19909,15 @@ def build_transaction_sidecar_review(
             "evidence": len(candidates),
         },
         {
+            "id": "payload-contract-compatible",
+            "status": "passed"
+            if payload_contract_allows_decode
+            else "failed"
+            if candidates
+            else "waiting",
+            "evidence": payload_contract_review,
+        },
+        {
             "id": "intent-policy-sidecar-valid",
             "status": "passed" if policy.get("valid") else "failed" if policy.get("configured") else "waiting",
             "evidence": policy_summary,
@@ -19887,11 +19928,19 @@ def build_transaction_sidecar_review(
             "evidence": {
                 "candidate_count": len(candidates),
                 "policy_valid": bool(policy.get("valid")),
+                "payload_contract_status": payload_contract_review.get("status"),
+                "payload_contract_allows_decode": payload_contract_allows_decode,
             },
         },
     ]
     if ready_for_decode:
         next_step = "Run decode-transactions --no-write and review signer, account, mint, amount, and program checks."
+    elif candidates and not payload_contract_allows_decode:
+        next_step = (
+            "Replace the payload sidecar with the approved quote response whose payload data.type matches "
+            f"{payload_contract_review.get('expected_payload_type')}, or use an extracted base64 sidecar only after "
+            "manual payload-type review."
+        )
     elif candidates and not policy.get("configured"):
         next_step = "Write transaction-intent-policy.json for the approved direction, wallet, amountIn, mints, and reviewed allowedPrograms."
     elif candidates:
@@ -19928,10 +19977,14 @@ def build_transaction_sidecar_review(
             "intent_policy_valid": bool(policy.get("valid")),
             "ready_for_decode": ready_for_decode,
             "payload_shape_status": payload_shape_review.get("status"),
+            "payload_contract_status": payload_contract_review.get("status"),
+            "expected_payload_type": payload_contract_review.get("expected_payload_type"),
+            "payload_contract_allows_decode": payload_contract_allows_decode,
             "warnings": len(warnings),
         },
         "payload_shape_guidance": payload_shape_guidance,
         "payload_shape_review": payload_shape_review,
+        "payload_contract_review": payload_contract_review,
         "payload_sidecars": payload_files,
         "intent_policy_sidecar": {
             "path": repo_relative_or_absolute(policy_path),
@@ -33577,6 +33630,98 @@ def payload_shape_status(records: list[dict[str, Any]], *, parsed_json: bool, ba
     return "non-json-without-base64-candidates"
 
 
+def build_payload_contract_review(
+    payload_shape_review: dict[str, Any],
+    *,
+    expected_payload_type: str,
+    candidate_count: int,
+) -> dict[str, Any]:
+    expected = str(expected_payload_type or "").strip().lower()
+    if not expected:
+        return {
+            "status": "not-configured",
+            "expected_payload_type": None,
+            "allows_decode": True,
+            "summary": {
+                "json_transaction_payloads": 0,
+                "matching_payload_type": 0,
+                "missing_payload_type": 0,
+                "mismatched_payload_type": 0,
+            },
+            "records": [],
+            "review_note": (
+                "No quote_response.expected_payload_type is configured, so payload type is not used as a decode gate."
+            ),
+        }
+
+    records: list[dict[str, Any]] = []
+    for file_row in payload_shape_review.get("files", []) or []:
+        if not isinstance(file_row, dict):
+            continue
+        source = str(file_row.get("source") or "")
+        for record in file_row.get("records", []) or []:
+            if not isinstance(record, dict) or record.get("kind") != "solana-transaction-payload":
+                continue
+            actual = str(record.get("payload_type") or "").strip().lower()
+            if not actual:
+                status = "missing-payload-type"
+            elif actual == expected:
+                status = "matching-payload-type"
+            else:
+                status = "mismatched-payload-type"
+            records.append(
+                {
+                    "source": source,
+                    "status": status,
+                    "json_path": record.get("json_path"),
+                    "payload_type": record.get("payload_type"),
+                    "expected_payload_type": expected,
+                    "chain": record.get("chain"),
+                }
+            )
+
+    matching = [record for record in records if record.get("status") == "matching-payload-type"]
+    missing = [record for record in records if record.get("status") == "missing-payload-type"]
+    mismatched = [record for record in records if record.get("status") == "mismatched-payload-type"]
+    if mismatched:
+        status = "payload-type-mismatch"
+        allows_decode = False
+        review_note = f"At least one JSON transaction payload type does not match expected `{expected}`."
+    elif missing:
+        status = "payload-type-missing"
+        allows_decode = False
+        review_note = f"At least one JSON transaction payload has no data.type, but expected `{expected}`."
+    elif matching:
+        status = "payload-type-matched"
+        allows_decode = True
+        review_note = f"JSON transaction payloads match expected `{expected}`."
+    elif candidate_count > 0:
+        status = "no-json-payload-type-context"
+        allows_decode = True
+        review_note = (
+            "Transaction candidates are present but no JSON payload type context was indexed; this is allowed for "
+            "extracted base64/text sidecars after manual approval."
+        )
+    else:
+        status = "waiting-for-payload"
+        allows_decode = False
+        review_note = "No transaction candidates are available to evaluate against the expected payload type."
+
+    return {
+        "status": status,
+        "expected_payload_type": expected,
+        "allows_decode": allows_decode,
+        "summary": {
+            "json_transaction_payloads": len(records),
+            "matching_payload_type": len(matching),
+            "missing_payload_type": len(missing),
+            "mismatched_payload_type": len(mismatched),
+        },
+        "records": records[:12],
+        "review_note": review_note,
+    }
+
+
 def inspect_transaction_payload_shape_text(text: str, *, source: str, candidate_paths: list[str]) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     configured_hits = 0
@@ -34969,6 +35114,7 @@ def build_transaction_decoder_selftest(
     )
     decoded_count = sum(1 for item in transactions if item.get("decoded"))
     sidecar_ready_review: dict[str, Any] = {}
+    sidecar_mismatch_review: dict[str, Any] = {}
     sidecar_empty_review: dict[str, Any] = {}
     with tempfile.TemporaryDirectory() as temp_dir:
         guard_artifact_dir = Path(temp_dir) / "transaction-sidecar-guard"
@@ -34992,6 +35138,7 @@ def build_transaction_decoder_selftest(
                 "payloads": [
                     {
                         "data": {
+                            "type": "svm",
                             "transaction": payload["base64"],
                         }
                     }
@@ -35013,6 +35160,37 @@ def build_transaction_decoder_selftest(
             target=DEFAULT_TARGET,
             profile=profile,
             artifact_dir=ready_artifact_dir,
+        )
+        mismatch_artifact_dir = Path(temp_dir) / "transaction-sidecar-type-mismatch"
+        mismatch_artifact_dir.mkdir()
+        write_json(
+            mismatch_artifact_dir / "transaction-payloads.json",
+            {
+                "payloads": [
+                    {
+                        "data": {
+                            "type": "evm",
+                            "transaction": payload["base64"],
+                        }
+                    }
+                ]
+            },
+        )
+        write_json(
+            mismatch_artifact_dir / "transaction-intent-policy.json",
+            {
+                "direction": direction,
+                "wallet": payload["wallet"],
+                "amountIn": amount_in,
+                "sourceMint": payload["sourceMint"],
+                "destinationMint": payload["destinationMint"],
+                "allowedPrograms": [payload["allowedProgram"]],
+            },
+        )
+        sidecar_mismatch_review = build_transaction_sidecar_review(
+            target=DEFAULT_TARGET,
+            profile=profile,
+            artifact_dir=mismatch_artifact_dir,
         )
         empty_artifact_dir = Path(temp_dir) / "transaction-sidecar-empty"
         empty_artifact_dir.mkdir()
@@ -35074,8 +35252,19 @@ def build_transaction_decoder_selftest(
         and sidecar_ready_review.get("summary", {}).get("candidate_count") == 1
         and sidecar_ready_review.get("summary", {}).get("intent_policy_valid") is True
         and sidecar_ready_review.get("summary", {}).get("ready_for_decode") is True
+        and sidecar_ready_review.get("payload_contract_review", {}).get("status") == "payload-type-matched"
+        and sidecar_ready_review.get("payload_contract_review", {}).get("allows_decode") is True
         and payload["base64"] not in sidecar_ready_text
         and sidecar_ready_review.get("decode_commands")
+    )
+    sidecar_mismatch_passed = (
+        sidecar_mismatch_review.get("status") == "payload-contract-not-ready"
+        and sidecar_mismatch_review.get("summary", {}).get("candidate_count") == 1
+        and sidecar_mismatch_review.get("summary", {}).get("ready_for_decode") is False
+        and sidecar_mismatch_review.get("summary", {}).get("payload_contract_status") == "payload-type-mismatch"
+        and sidecar_mismatch_review.get("payload_contract_review", {}).get("allows_decode") is False
+        and not sidecar_mismatch_review.get("decode_commands")
+        and "payload data.type matches" in str(sidecar_mismatch_review.get("next_step") or "")
     )
     sidecar_empty_guidance = (
         sidecar_empty_review.get("payload_shape_guidance")
@@ -35109,6 +35298,7 @@ def build_transaction_decoder_selftest(
         and amount_mismatch_gate_passed
         and sidecar_guard_passed
         and sidecar_ready_passed
+        and sidecar_mismatch_passed
         and sidecar_empty_passed
         and sidecar_evm_passed
         else "failed"
@@ -35150,8 +35340,17 @@ def build_transaction_decoder_selftest(
             "status": "passed" if sidecar_ready_passed else "failed",
             "review_status": sidecar_ready_review.get("status"),
             "summary": sidecar_ready_review.get("summary", {}),
+            "payload_contract_review": sidecar_ready_review.get("payload_contract_review", {}),
             "candidate_summaries": sidecar_ready_review.get("candidate_summaries", []),
             "decode_commands": sidecar_ready_review.get("decode_commands", []),
+        },
+        "sidecar_payload_type_mismatch": {
+            "status": "passed" if sidecar_mismatch_passed else "failed",
+            "review_status": sidecar_mismatch_review.get("status"),
+            "summary": sidecar_mismatch_review.get("summary", {}),
+            "payload_contract_review": sidecar_mismatch_review.get("payload_contract_review", {}),
+            "decode_commands": sidecar_mismatch_review.get("decode_commands", []),
+            "next_step": sidecar_mismatch_review.get("next_step"),
         },
         "sidecar_empty_guidance": {
             "status": "passed" if sidecar_empty_passed else "failed",
@@ -46945,6 +47144,7 @@ def print_transaction_payload_shape_guidance(guidance: dict[str, Any], *, top: i
         return
     accepted_sidecars = normalize_string_list(guidance.get("accepted_sidecars"))
     candidate_paths = normalize_string_list(guidance.get("configured_candidate_paths"))
+    expected_payload_type = str(guidance.get("expected_payload_type") or "")
     print("Payload shape guidance:")
     print(
         "- accepted_sidecars="
@@ -46954,6 +47154,8 @@ def print_transaction_payload_shape_guidance(guidance: dict[str, Any], *, top: i
         "- candidate_paths="
         f"{','.join(candidate_paths) if candidate_paths else '(recursive/base64 fallback only)'}"
     )
+    if expected_payload_type:
+        print(f"- expected_payload_type={expected_payload_type}")
     for example in (guidance.get("examples", []) or [])[: max(0, int(top))]:
         if not isinstance(example, dict):
             continue
@@ -47011,6 +47213,8 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
         f"oversized={summary.get('payload_files_oversized', 0)} "
         f"candidates={summary.get('candidate_count', 0)} "
         f"shape={summary.get('payload_shape_status') or 'unknown'} "
+        f"contract={summary.get('payload_contract_status') or 'unknown'} "
+        f"expected_type={summary.get('expected_payload_type') or '-'} "
         f"policy_configured={summary.get('intent_policy_configured')} "
         f"policy_valid={summary.get('intent_policy_valid')} "
         f"ready_for_decode={summary.get('ready_for_decode')}"
@@ -47075,6 +47279,26 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
                     f"{record.get('kind')} path={record.get('json_path')} "
                     f"type={record.get('payload_type') or '-'} chain={record.get('chain') or '-'}"
                 )
+    contract_review = review.get("payload_contract_review") if isinstance(review.get("payload_contract_review"), dict) else {}
+    if args.show_commands and contract_review:
+        contract_summary = contract_review.get("summary", {}) if isinstance(contract_review.get("summary"), dict) else {}
+        print(
+            "Payload contract review: "
+            f"status={contract_review.get('status')} "
+            f"expected={contract_review.get('expected_payload_type') or '-'} "
+            f"allows_decode={contract_review.get('allows_decode')} "
+            f"matched={contract_summary.get('matching_payload_type', 0)} "
+            f"missing={contract_summary.get('missing_payload_type', 0)} "
+            f"mismatched={contract_summary.get('mismatched_payload_type', 0)}"
+        )
+        for record in (contract_review.get("records", []) or [])[: max(0, int(args.top))]:
+            if not isinstance(record, dict):
+                continue
+            print(
+                "  contract="
+                f"{record.get('status')} source={record.get('source')} "
+                f"path={record.get('json_path')} type={record.get('payload_type') or '-'}"
+            )
     print(f"Next: {inline_summary_text(review.get('next_step'), max_chars=260)}")
     if no_write:
         print("No files written (--no-write).")

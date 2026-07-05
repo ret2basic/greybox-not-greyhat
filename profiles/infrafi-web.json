@@ -102,7 +102,8 @@
     "transaction_candidate_paths": [
       "$[*].payloads[*].data.transaction",
       "$.payloads[*].data.transaction"
-    ]
+    ],
+    "expected_payload_type": "svm"
   },
   "quote_provider": {
     "name": "M0",

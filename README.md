@@ -736,10 +736,18 @@ recursive JSON and base64 scan as a fallback:
     "transaction_candidate_paths": [
       "$[*].payloads[*].data.transaction",
       "$.payloads[*].data.transaction"
-    ]
+    ],
+    "expected_payload_type": "svm"
   }
 }
 ```
+
+For JSON quote-response sidecars, `expected_payload_type` is a decode-readiness
+gate. If a configured transaction path resolves to `payloads[*].data.transaction`
+but the sibling `data.type` is missing or does not match the expected value,
+`transaction-sidecar-review` keeps the corpus out of `ready-for-decode`.
+Text-only extracted base64 sidecars remain allowed after manual approval because
+they intentionally do not preserve full provider response context.
 
 Quote provider response diagnosis is profile-owned too. Use
 `quote_provider.diagnostics` to map target-specific local/upstream error shapes
@@ -938,6 +946,8 @@ approved:
 When the active profile declares `quote_response.transaction_candidate_paths`,
 those simple JSON paths are applied before the generic recursive/base64 scan so
 candidate summaries retain the provider-specific response location.
+When `quote_response.expected_payload_type` is set, JSON sidecars must also show
+that payload type before the sidecar is marked ready for decode.
 `transaction-sidecar-review --no-write --show-files --show-commands` prints the
 accepted sidecar files, configured candidate paths, and compact JSON/JSONL/TXT
 payload-shape examples when a sidecar is present but no base64 transaction
