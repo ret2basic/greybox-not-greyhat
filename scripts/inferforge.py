@@ -175,6 +175,7 @@ TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
 TRANSACTION_INTENT_BOUNDARY_ARTIFACT = "transaction-intent-boundary.json"
 TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
 TRANSACTION_SIDECAR_REVIEW_ARTIFACT = "transaction-sidecar-review.json"
+TRANSACTION_EVIDENCE_READINESS_ARTIFACT = "transaction-evidence-readiness.json"
 TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT = "transaction-intent-policy-templates.json"
 CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT = "credential-impact-checklist.json"
 OPERATOR_EVIDENCE_ARTIFACT = "operator-evidence.json"
@@ -286,6 +287,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
     TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
+    TRANSACTION_EVIDENCE_READINESS_ARTIFACT,
     TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT,
     CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT,
     OPERATOR_EVIDENCE_ARTIFACT,
@@ -24457,6 +24459,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     BOUNTY_VALIDATION_GATES_ARTIFACT: "bounty-validation-gates",
     BOUNTY_INVALIDITY_REVIEW_ARTIFACT: "bounty-invalidity-review",
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
+    TRANSACTION_EVIDENCE_READINESS_ARTIFACT: "transaction-evidence-readiness",
     ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT: "oracle-plan --write-sidecar-template",
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT: "rewrite-response-review --write-sidecar-template",
     "finding-gate.json": "gate",
@@ -24501,6 +24504,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "bounty-validation-gates",
     "bounty-invalidity-review",
     "transaction-intent-boundary",
+    "transaction-evidence-readiness",
     "rewrite-response-review --write-sidecar-template",
     "report",
     "transaction-corpus-checklist --write-policy-template --skip-current-resource-check",
@@ -24530,6 +24534,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "bounty-validation-gates": "bounty-validation-gates --no-write",
     "bounty-invalidity-review": "bounty-invalidity-review --no-write",
     "transaction-intent-boundary": "transaction-intent-boundary --no-write",
+    "transaction-evidence-readiness": "transaction-evidence-readiness --no-write",
     "rewrite-response-review --write-sidecar-template": (
         "rewrite-response-review --no-write --show-sidecar-template-json"
     ),
@@ -33471,6 +33476,283 @@ def build_transaction_intent_boundary(
         "safety": (
             "Offline source and artifact synthesis only. It sends no target traffic, calls no Burp tool, invokes no wallet, "
             "signs nothing, and submits no Solana transaction."
+        ),
+    }
+
+
+def transaction_invalidity_row(invalidity_review: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(invalidity_review, dict):
+        return {}
+    rows = invalidity_review.get("invalidity_rows")
+    if not isinstance(rows, list):
+        return {}
+    for row in rows:
+        if isinstance(row, dict) and row.get("bounty_lane") == "transaction-integrity":
+            return row
+    return {}
+
+
+def transaction_readiness_check(
+    check_id: str,
+    label: str,
+    status: str,
+    evidence: Any,
+    next_step: str,
+) -> dict[str, Any]:
+    return {
+        "id": check_id,
+        "label": label,
+        "status": status,
+        "evidence": evidence,
+        "next_step": next_step,
+    }
+
+
+def build_transaction_evidence_readiness(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    transaction_sidecar_review: dict[str, Any] | None,
+    transaction_corpus_checklist: dict[str, Any] | None,
+    transaction_intent_boundary: dict[str, Any] | None,
+    bounty_invalidity_review: dict[str, Any] | None,
+) -> dict[str, Any]:
+    sidecar = transaction_sidecar_review if isinstance(transaction_sidecar_review, dict) else {}
+    corpus = transaction_corpus_checklist if isinstance(transaction_corpus_checklist, dict) else {}
+    boundary = transaction_intent_boundary if isinstance(transaction_intent_boundary, dict) else {}
+    invalidity_row = transaction_invalidity_row(bounty_invalidity_review)
+    sidecar_summary = sidecar.get("summary") if isinstance(sidecar.get("summary"), dict) else {}
+    corpus_summary = corpus.get("summary") if isinstance(corpus.get("summary"), dict) else {}
+    boundary_summary = boundary.get("summary") if isinstance(boundary.get("summary"), dict) else {}
+    approval_packet = (
+        corpus.get("transaction_corpus_approval_packet")
+        if isinstance(corpus.get("transaction_corpus_approval_packet"), dict)
+        else {}
+    )
+    resource_gate = (
+        corpus.get("resource_capture_gate")
+        if isinstance(corpus.get("resource_capture_gate"), dict)
+        else {}
+    )
+    payload_candidate_count = int(sidecar_summary.get("candidate_count") or 0)
+    single_payload_ready = payload_candidate_count == 1
+    placeholder_count = int(
+        sidecar_summary.get("placeholder_payload_files")
+        or corpus_summary.get("payload_sidecar_placeholders")
+        or 0
+    )
+    ready_for_decode = single_payload_ready and (
+        bool(sidecar_summary.get("ready_for_decode")) or str(corpus.get("status") or "") == "ready-to-decode"
+    )
+    policy_valid = bool(sidecar_summary.get("intent_policy_valid"))
+    policy_configured = bool(sidecar_summary.get("intent_policy_configured")) or str(
+        corpus_summary.get("intent_policy_status") or ""
+    ) in {"passed", "review-required"}
+    decoded_transactions = int(
+        boundary_summary.get("decoded_transactions")
+        or corpus_summary.get("decoded_transactions")
+        or 0
+    )
+    candidate_boundaries = int(boundary_summary.get("candidate_boundaries") or 0)
+    waiting_boundaries = int(boundary_summary.get("waiting_transaction_corpus_boundaries") or 0)
+    invalid_now = bool(invalidity_row.get("invalid_if_reported_now"))
+    official_payload_status = (
+        "passed"
+        if single_payload_ready
+        else "review-required"
+        if payload_candidate_count > 1
+        else "placeholder"
+        if placeholder_count > 0
+        else "waiting"
+    )
+    official_payload_next_step = (
+        "Keep exactly one approved POST /api/quote response body or extracted transaction payload sidecar."
+        if single_payload_ready
+        else "Reduce the sidecar to exactly one approved POST /api/quote response body or extracted transaction payload."
+        if payload_candidate_count > 1
+        else "Replace placeholders with one approved POST /api/quote response body or extracted transaction payload sidecar."
+    )
+    checks = [
+        transaction_readiness_check(
+            "official-transaction-payload-sidecar",
+            "Exactly one approved quote response body or extracted base64 transaction payload is present.",
+            official_payload_status,
+            {
+                "payload_candidates": payload_candidate_count,
+                "single_payload_ready": single_payload_ready,
+                "placeholder_payload_files": placeholder_count,
+                "accepted_sidecars": approval_packet.get("accepted_payload_sidecars", []),
+            },
+            official_payload_next_step,
+        ),
+        transaction_readiness_check(
+            "intent-policy-sidecar",
+            "A matching explicit intent policy is configured for direction, wallet, amount, and mints.",
+            "passed" if policy_valid else "waiting" if not policy_configured else "invalid",
+            {
+                "configured": policy_configured,
+                "valid": policy_valid,
+                "policy_status": corpus_summary.get("intent_policy_status") or "missing",
+            },
+            "Write one transaction-intent-policy.json from the matching template after replacing wallet and amountIn placeholders.",
+        ),
+        transaction_readiness_check(
+            "program-allowlist-or-manual-review",
+            "Decoded instruction programs have an allowlist or explicit manual review gate.",
+            "passed"
+            if corpus_summary.get("program_allowlist_status") == "configured"
+            else "manual-review-required",
+            {
+                "program_allowlist_status": corpus_summary.get("program_allowlist_status") or "missing",
+                "missing_directions": corpus_summary.get("program_allowlist_missing_directions", []),
+            },
+            "Configure quote_intent.allowedPrograms or manually review every decoded instruction program before passing this gate.",
+        ),
+        transaction_readiness_check(
+            "ready-for-offline-decode",
+            "Payload and policy inputs are sufficient to run decode-transactions without signing or submitting.",
+            "passed" if ready_for_decode else "waiting",
+            {
+                "sidecar_status": sidecar.get("status") or "missing",
+                "corpus_status": corpus.get("status") or "missing",
+                "ready_for_decode": ready_for_decode,
+            },
+            "Run transaction-sidecar-review and then decode-transactions with the matching policy template.",
+        ),
+        transaction_readiness_check(
+            "decoded-intent-boundary",
+            "Decoded transaction checks have reached signer, wallet, mint, amount, and program boundaries.",
+            "passed" if decoded_transactions > 0 else "waiting",
+            {
+                "decoded_transactions": decoded_transactions,
+                "waiting_transaction_corpus_boundaries": waiting_boundaries,
+            },
+            "Decode one approved transaction payload and review every high-impact intent boundary.",
+        ),
+        transaction_readiness_check(
+            "finding-gate-transaction-integrity",
+            "Finding-gate/adjudication has accepted concrete transaction-integrity impact.",
+            "passed" if candidate_boundaries > 0 and not invalid_now else "blocked",
+            {
+                "candidate_boundaries": candidate_boundaries,
+                "invalid_if_reported_now": invalid_now,
+                "primary_invalidity_category": invalidity_row.get("primary_invalidity_category"),
+            },
+            invalidity_row.get("minimum_fix")
+            or "Rerun gate --no-write --show-items and adjudicate --no-write after decoded mismatch evidence exists.",
+        ),
+    ]
+    failed_or_waiting = [check for check in checks if check.get("status") != "passed"]
+    if candidate_boundaries > 0 and not invalid_now:
+        status = "ready-for-finding-gate-review"
+    elif ready_for_decode:
+        status = "ready-for-offline-decode"
+    elif payload_candidate_count > 1:
+        status = "waiting-single-official-transaction-payload"
+    elif policy_configured and payload_candidate_count <= 0:
+        status = "waiting-official-transaction-payload"
+    elif payload_candidate_count > 0 and not policy_valid:
+        status = "waiting-intent-policy"
+    else:
+        status = "waiting-minimal-transaction-evidence"
+    recommended_quote = (
+        approval_packet.get("recommended_quote")
+        if isinstance(approval_packet.get("recommended_quote"), dict)
+        else {}
+    )
+    minimum_package = {
+        "payload_sidecar": approval_packet.get("payload_sidecar")
+        or repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl"),
+        "intent_policy_sidecar": approval_packet.get("intent_policy_sidecar")
+        or repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json"),
+        "approved_request": {
+            "method": recommended_quote.get("method") or "POST",
+            "path": recommended_quote.get("path") or probe_target_path(profile, "quote", "path", "/api/quote"),
+            "direction": recommended_quote.get("direction") or "buy",
+            "expectedPayloadType": recommended_quote.get("expectedPayloadType") or quote_response_expected_payload_type(profile),
+        },
+        "manual_fields": [
+            "approved public wallet",
+            "approved raw amountIn",
+            "exact approved quote response transaction payload",
+            "reviewed allowedPrograms or manual decoded-program review note",
+        ],
+        "forbidden_fields": [
+            "private keys",
+            "seed phrases",
+            "wallet signatures",
+            "signed transactions",
+            "cookies",
+            "bearer tokens",
+            "raw Burp history",
+        ],
+    }
+    commands = [
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "transaction-sidecar-review --no-write --show-files --show-candidates --show-commands --show-evidence-contract",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "transaction-corpus-checklist --no-write --show-commands --show-steps --show-policy-template-json --skip-current-resource-check",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "transaction-intent-boundary --no-write --show-boundaries",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(artifact_dir, "decode-transactions --no-write", profile=profile),
+        validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+        validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+    ]
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-transaction-evidence-readiness-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "checks": len(checks),
+            "passed": sum(1 for check in checks if check.get("status") == "passed"),
+            "waiting_or_blocked": len(failed_or_waiting),
+            "payload_candidates": payload_candidate_count,
+            "placeholder_payload_files": placeholder_count,
+            "policy_configured": policy_configured,
+            "policy_valid": policy_valid,
+            "ready_for_decode": ready_for_decode,
+            "decoded_transactions": decoded_transactions,
+            "candidate_boundaries": candidate_boundaries,
+            "invalid_if_reported_now": invalid_now,
+            "transaction_sidecar_status": sidecar.get("status") or "missing",
+            "transaction_corpus_status": corpus.get("status") or "missing",
+            "transaction_boundary_status": boundary.get("status") or "missing",
+            "invalidity_status": (
+                bounty_invalidity_review.get("status")
+                if isinstance(bounty_invalidity_review, dict)
+                else "missing"
+            ),
+            "resource_capture_gate_status": resource_gate.get("status") or "missing",
+        },
+        "minimum_official_evidence_package": minimum_package,
+        "checks": checks,
+        "first_blocker": failed_or_waiting[0] if failed_or_waiting else None,
+        "commands": commands,
+        "reportability_rule": (
+            "This readiness artifact is not evidence. It only becomes a Medium+ proof path after an approved payload, "
+            "matching intent policy, offline decode mismatch, finding-gate acceptance, and adjudication all agree."
+        ),
+        "next_step": (
+            failed_or_waiting[0].get("next_step")
+            if failed_or_waiting
+            else "Run finding-gate and adjudication with the decoded transaction-integrity evidence."
+        ),
+        "safety": (
+            "Offline transaction evidence readiness only. It sends no requests, reads no raw Burp history, invokes no wallet, "
+            "signs nothing, and submits no transaction."
         ),
     }
 
@@ -48903,6 +49185,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("bounty-invalidity-review", "run_bounty_invalidity_review"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-intent-boundary", "run_transaction_intent_boundary"),
+        refresh_expectation("transaction-evidence-readiness", "run_transaction_evidence_readiness"),
         refresh_expectation("transaction-sidecar-review", "run_transaction_sidecar_review"),
         refresh_expectation("transaction-corpus-checklist", "run_transaction_corpus_checklist"),
         refresh_expectation("prepare-transaction-intent-policy", "run_prepare_transaction_intent_policy"),
@@ -70858,6 +71141,177 @@ def run_transaction_intent_boundary(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_transaction_evidence_readiness(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {}
+    sidecar_review = load_optional_json(artifact_dir / TRANSACTION_SIDECAR_REVIEW_ARTIFACT)
+    if not isinstance(sidecar_review, dict):
+        sidecar_review = build_transaction_sidecar_review(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            max_input_bytes=args.max_input_bytes,
+        )
+    corpus_checklist = load_optional_json(artifact_dir / TRANSACTION_CORPUS_CHECKLIST_ARTIFACT)
+    if not isinstance(corpus_checklist, dict):
+        corpus_checklist = build_transaction_corpus_checklist(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            quote_collection=load_optional_json(artifact_dir / "quote-collection.json"),
+            transaction_intent=transaction_intent,
+            burp_transaction_candidates=load_optional_json(artifact_dir / "burp-transaction-candidates.json"),
+            current_resource_snapshot=None,
+        )
+    boundary = load_optional_json(artifact_dir / TRANSACTION_INTENT_BOUNDARY_ARTIFACT)
+    if not isinstance(boundary, dict):
+        transaction_flow_review = load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT)
+        if not isinstance(transaction_flow_review, dict):
+            transaction_flow_review = build_transaction_flow_review(
+                source_root,
+                profile,
+                transaction_intent=transaction_intent,
+                rpc_method_policy=load_optional_json(artifact_dir / "rpc-method-policy.json") or {},
+                operator_evidence=load_optional_json(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+                max_file_bytes=args.max_file_bytes,
+                max_files=args.max_files,
+            )
+        boundary = build_transaction_intent_boundary(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            transaction_flow_review=transaction_flow_review,
+            transaction_intent=transaction_intent,
+            transaction_sidecar_review=sidecar_review,
+        )
+    invalidity_review = load_optional_json(artifact_dir / BOUNTY_INVALIDITY_REVIEW_ARTIFACT)
+    if not isinstance(invalidity_review, dict):
+        gates = build_or_load_bounty_validation_gates_for_run(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            source_root=source_root,
+        )
+        invalidity_review = build_bounty_invalidity_review(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            bounty_validation_gates=gates,
+            adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+        )
+    readiness = build_transaction_evidence_readiness(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        transaction_sidecar_review=sidecar_review,
+        transaction_corpus_checklist=corpus_checklist,
+        transaction_intent_boundary=boundary,
+        bounty_invalidity_review=invalidity_review,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / TRANSACTION_EVIDENCE_READINESS_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(readiness))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="transaction-evidence-readiness",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = readiness.get("summary", {}) if isinstance(readiness.get("summary"), dict) else {}
+    print(f"Transaction evidence readiness: {readiness.get('status')}")
+    print(
+        "Readiness: "
+        f"checks={summary.get('checks', 0)} "
+        f"passed={summary.get('passed', 0)} "
+        f"waiting={summary.get('waiting_or_blocked', 0)} "
+        f"payloads={summary.get('payload_candidates', 0)} "
+        f"placeholders={summary.get('placeholder_payload_files', 0)} "
+        f"policy_valid={summary.get('policy_valid')} "
+        f"decode_ready={summary.get('ready_for_decode')} "
+        f"decoded={summary.get('decoded_transactions', 0)} "
+        f"invalid_now={summary.get('invalid_if_reported_now')}"
+    )
+    print(
+        "Inputs: "
+        f"sidecar={summary.get('transaction_sidecar_status') or '-'} "
+        f"corpus={summary.get('transaction_corpus_status') or '-'} "
+        f"boundary={summary.get('transaction_boundary_status') or '-'} "
+        f"invalidity={summary.get('invalidity_status') or '-'}"
+    )
+    package = (
+        readiness.get("minimum_official_evidence_package")
+        if isinstance(readiness.get("minimum_official_evidence_package"), dict)
+        else {}
+    )
+    approved_request = (
+        package.get("approved_request")
+        if isinstance(package.get("approved_request"), dict)
+        else {}
+    )
+    print(
+        "Minimum package: "
+        f"payload={package.get('payload_sidecar') or '-'} "
+        f"policy={package.get('intent_policy_sidecar') or '-'} "
+        f"request={approved_request.get('method') or '-'} {approved_request.get('path') or '-'} "
+        f"direction={approved_request.get('direction') or '-'} "
+        f"type={approved_request.get('expectedPayloadType') or '-'}"
+    )
+    if getattr(args, "show_checks", False):
+        display_limit = max(0, int(args.top))
+        print("Checks:")
+        for check in (readiness.get("checks", []) or [])[:display_limit]:
+            if not isinstance(check, dict):
+                continue
+            print(
+                f"- {check.get('status')} {check.get('id')}: "
+                f"{inline_summary_text(check.get('label'), max_chars=220)}"
+            )
+            if args.show_next:
+                print(f"  next={inline_summary_text(check.get('next_step'), max_chars=300)}")
+        remaining = len(readiness.get("checks", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more check(s); rerun without --no-write to write the full artifact")
+            else:
+                print(f"- {remaining} more check(s) in {output_path}")
+    if args.show_commands:
+        print("Commands:")
+        for command_text in normalize_string_list(readiness.get("commands"))[: max(0, int(args.top))]:
+            print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    first_blocker = (
+        readiness.get("first_blocker")
+        if isinstance(readiness.get("first_blocker"), dict)
+        else {}
+    )
+    if first_blocker:
+        print(
+            "First blocker: "
+            f"{first_blocker.get('id')} status={first_blocker.get('status')} "
+            f"next={inline_summary_text(first_blocker.get('next_step'), max_chars=300)}"
+        )
+    print(f"Rule: {inline_summary_text(readiness.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(readiness.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if args.strict and readiness.get("status") not in {"ready-for-offline-decode", "ready-for-finding-gate-review"}:
+        return 1
+    return 0
+
+
 def run_credential_impact_checklist(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -75796,6 +76250,77 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless a transaction intent boundary is indexed or ready for payload evidence.",
     )
     transaction_intent_boundary.set_defaults(func=run_transaction_intent_boundary)
+
+    transaction_evidence_readiness = sub.add_parser(
+        "transaction-evidence-readiness",
+        help="Summarize the minimal official transaction evidence package for offline decode and gate readiness",
+    )
+    transaction_evidence_readiness.add_argument(
+        "--output",
+        help=(
+            f"Where to write {TRANSACTION_EVIDENCE_READINESS_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{TRANSACTION_EVIDENCE_READINESS_ARTIFACT}."
+        ),
+    )
+    transaction_evidence_readiness.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=DEFAULT_TRANSACTION_FLOW_REVIEW_MAX_FILE_BYTES,
+        help=(
+            "Maximum bytes to read per source file if transaction-flow review must be rebuilt. "
+            f"Defaults to {DEFAULT_TRANSACTION_FLOW_REVIEW_MAX_FILE_BYTES}."
+        ),
+    )
+    transaction_evidence_readiness.add_argument(
+        "--max-files",
+        type=positive_int,
+        default=256,
+        help="Maximum source files if transaction-flow review must be rebuilt. Defaults to 256.",
+    )
+    transaction_evidence_readiness.add_argument(
+        "--max-input-bytes",
+        type=positive_int,
+        default=DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+        help=f"Maximum bytes to read from transaction sidecars. Defaults to {DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES}.",
+    )
+    transaction_evidence_readiness.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of readiness checks or commands to print.",
+    )
+    transaction_evidence_readiness.add_argument(
+        "--show-checks",
+        action="store_true",
+        help="Print transaction evidence readiness checks and next steps.",
+    )
+    transaction_evidence_readiness.add_argument(
+        "--show-next",
+        action="store_true",
+        help="Print next action per readiness check.",
+    )
+    transaction_evidence_readiness.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print safe offline transaction evidence verification commands.",
+    )
+    transaction_evidence_readiness.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print transaction evidence readiness only; do not write {TRANSACTION_EVIDENCE_READINESS_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    transaction_evidence_readiness.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Return non-zero unless the official transaction evidence package is ready for offline decode "
+            "or finding-gate review."
+        ),
+    )
+    transaction_evidence_readiness.set_defaults(func=run_transaction_evidence_readiness)
 
     prepare_intent_policy = sub.add_parser(
         "prepare-transaction-intent-policy",
