@@ -31727,6 +31727,31 @@ def build_transaction_decoder_selftest(
     )
     policy_checks = build_transaction_intent_checks(transactions, policy)
     reportability_review = build_transaction_intent_reportability_review(transactions, policy, policy_checks)
+    mismatch_policy = normalize_transaction_intent_policy(
+        {
+            "direction": direction,
+            "wallet": "So11111111111111111111111111111111111111112",
+            "amountIn": amount_in,
+            "sourceMint": payload["sourceMint"],
+            "destinationMint": payload["destinationMint"],
+            "allowedPrograms": ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"],
+        },
+        profile,
+    )
+    mismatch_policy_checks = build_transaction_intent_checks(transactions, mismatch_policy)
+    mismatch_reportability_review = build_transaction_intent_reportability_review(
+        transactions,
+        mismatch_policy,
+        mismatch_policy_checks,
+    )
+    mismatch_gate_passed = (
+        mismatch_policy_checks.get("status") == "failed"
+        and mismatch_reportability_review.get("status") == "candidate-transaction-integrity-impact"
+        and mismatch_reportability_review.get("candidate_severity") == "high"
+        and mismatch_reportability_review.get("ready_for_finding_gate") is True
+        and mismatch_reportability_review.get("reportable_now") is False
+        and int(mismatch_reportability_review.get("high_impact_failure_count") or 0) >= 2
+    )
     decoded_count = sum(1 for item in transactions if item.get("decoded"))
     with tempfile.TemporaryDirectory() as temp_dir:
         guard_artifact_dir = Path(temp_dir) / "transaction-sidecar-guard"
@@ -31752,6 +31777,7 @@ def build_transaction_decoder_selftest(
         if decoded_count == 1
         and policy_checks.get("status") == "passed"
         and reportability_review.get("status") == "intent-checks-passed"
+        and mismatch_gate_passed
         and sidecar_guard_passed
         else "failed"
     )
@@ -31773,6 +31799,11 @@ def build_transaction_decoder_selftest(
         "decoder": decoded.get("decoder", {}),
         "intent_policy_checks": policy_checks,
         "reportability_review": reportability_review,
+        "mismatch_gate_selftest": {
+            "status": "passed" if mismatch_gate_passed else "failed",
+            "intent_policy_checks": mismatch_policy_checks,
+            "reportability_review": mismatch_reportability_review,
+        },
         "sidecar_input_guard": {
             "status": "passed" if sidecar_guard_passed else "failed",
             "resource_limits": sidecar_guard_intent.get("resource_limits", {}),
