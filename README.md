@@ -456,7 +456,7 @@ starting unattended work:
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
-  resource-snapshot --watch-port 3100 --watch-port 2455 --strict
+  resource-snapshot --watch-port 3100 --strict
 ```
 
 `resource-snapshot` reads local `/proc` memory, swap, TCP listener, and top RSS
@@ -466,6 +466,11 @@ unattended scripts can stop before launching heavier work. Port `3100` is the
 default local target application port for the checked-in profile, not Burp's
 proxy or Burp's built-in browser. Keep it closed unless a local app regression
 actually needs the dev server.
+
+Do not add control-plane ports such as `2455` to resource-snapshot watch lists
+or memory-reclaim candidates. In the Codex VPS environment, `2455` is reserved
+for the AI API load balancer and must not be signaled, stopped, restarted, or
+probed by unattended tooling.
 
 `burp-sync`, `audit`, `blackbox-asset-map`, `websocket-candidate-review`
 handshake baselines, `host-takeover-baseline`, `collect-quote`,

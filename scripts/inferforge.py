@@ -96,7 +96,8 @@ DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES = 256 * 1024
 DEFAULT_TRANSACTION_FLOW_REVIEW_MAX_FILE_BYTES = 512 * 1024
 DEFAULT_RESOURCE_WARN_AVAILABLE_MIB = 2048
 DEFAULT_RESOURCE_WARN_SWAP_USED_MIB = 1024
-DEFAULT_RESOURCE_WATCH_PORTS = [3100, 2455]
+DEFAULT_RESOURCE_WATCH_PORTS = [3100]
+PROTECTED_CONTROL_PLANE_PORTS = {2455}
 MAX_REQUEST_CONTEXTS_PER_ENDPOINT = 6
 REDACTED_VALUE = "[redacted]"
 GENERIC_HTTP_ROUTE_STRATEGY_SETS = {"nextjs-api-routes", "blackbox-http-observed"}
@@ -6867,6 +6868,20 @@ def process_context_label(context: Any) -> str:
     return scope or "host"
 
 
+def protected_control_plane_port_for_process(process: dict[str, Any]) -> int | None:
+    text = f"{process.get('name') or ''} {process.get('command_preview') or ''}".lower()
+    for port in sorted(PROTECTED_CONTROL_PLANE_PORTS):
+        port_text = str(port)
+        patterns = [
+            rf"(?:^|\s)--port(?:=|\s+){re.escape(port_text)}(?:\s|$)",
+            rf"\bport[=:]{re.escape(port_text)}\b",
+            rf":{re.escape(port_text)}\b",
+        ]
+        if any(re.search(pattern, text) for pattern in patterns):
+            return port
+    return None
+
+
 def top_rss_processes(limit: int) -> list[dict[str, Any]]:
     proc_root = Path("/proc")
     processes: list[dict[str, Any]] = []
@@ -6897,6 +6912,9 @@ def resource_release_candidates(processes: list[dict[str, Any]]) -> list[dict[st
         lowered = f"{name} {command}".lower()
         if "codex" in lowered or ".vscode-server" in lowered:
             continue
+        protected_port = protected_control_plane_port_for_process(process)
+        if protected_port is not None:
+            continue
         process_uid = process.get("uid")
         process_user = process.get("user")
         if not process_user and isinstance(process_uid, int):
@@ -6913,7 +6931,7 @@ def resource_release_candidates(processes: list[dict[str, Any]]) -> list[dict[st
         elif any(token in lowered for token in ["firefox", "chrome", "chromium", "playwright"]):
             candidate_type = "browser"
             recommendation = "Close idle browsers or browser automation before active target work."
-        elif "--port 3100" in lowered or "--port 2455" in lowered or "next dev" in lowered:
+        elif "--port 3100" in lowered or "next dev" in lowered:
             candidate_type = "local-service"
             recommendation = "Review whether this local service is still needed before continuing memory-sensitive work."
             if cgroup_context.get("scope") == "container":
@@ -7022,6 +7040,7 @@ def build_resource_snapshot(
         "memory": memory,
         "resource_budget": resource_budget,
         "watched_ports": watched_ports,
+        "protected_control_plane_ports": sorted(PROTECTED_CONTROL_PLANE_PORTS),
         "top_rss_processes": top_processes[:max_processes],
         "release_candidates": release_candidates,
         "safety": (
@@ -10777,6 +10796,7 @@ def validation_allowed_commands(
         command("verification-queue --no-write"),
     ]
     if hypothesis.get("type") == "resource-abuse-review" or hypothesis.get("impact") == "resource-exhaustion":
+        allowed_now_commands.insert(3, command("operator-evidence-review --no-write --show-missing --show-template"))
         allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
     if hypothesis.get("type") == "transaction-flow-review" or hypothesis.get("impact") == "transaction-integrity":
         allowed_now_commands.insert(3, command("transaction-flow-review --no-write --top 8"))
@@ -10785,6 +10805,7 @@ def validation_allowed_commands(
     if hypothesis.get("type") == "credential-proxy-review" or hypothesis.get("impact") == "credentialed-upstream-cost-abuse":
         for subcommand in reversed(
             [
+                "operator-evidence-review --no-write --show-missing --show-template",
                 "credential-impact-checklist --no-write --show-commands --show-evidence",
                 "deployment-review --no-write --top 8",
                 "transaction-flow-review --no-write --top 8",
@@ -10792,7 +10813,7 @@ def validation_allowed_commands(
         ):
             allowed_now_commands.insert(3, command(subcommand))
     allowed_after_gate_commands = [
-        command("resource-snapshot --max-processes 8 --watch-port 3100 --watch-port 2455 --no-write --strict")
+        command("resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict")
     ]
     blocked_commands: list[dict[str, Any]] = []
     command_replacements: list[dict[str, Any]] = []
@@ -11293,6 +11314,31 @@ def collect_iteration_command_sets(validation_plan: dict[str, Any]) -> dict[str,
     }
 
 
+def iteration_offline_command_priority(ref: dict[str, Any]) -> tuple[int, int, str]:
+    command = str(ref.get("command") or "").lower()
+    priority = str(ref.get("validation_item_priority") or "info")
+    command_order = [
+        ("transaction-sidecar-review", 0),
+        ("operator-evidence-review", 1),
+        ("credential-impact-checklist", 2),
+        ("transaction-corpus-checklist", 3),
+        ("deployment-review", 4),
+        ("transaction-flow-review", 5),
+        ("rewrite-review", 6),
+        ("source-peek-requests", 7),
+        ("source-peek", 8),
+        ("hypothesis-matrix", 9),
+        ("harness-loop", 10),
+        ("verification-queue", 11),
+    ]
+    command_rank = next((rank for token, rank in command_order if token in command), 50)
+    return (
+        command_rank,
+        HYPOTHESIS_PRIORITY_RANK.get(priority, 9),
+        str(ref.get("command") or ""),
+    )
+
+
 def iteration_action(
     *,
     action_id: str,
@@ -11479,7 +11525,7 @@ def build_iteration_decision_from_plan(
     limit: int,
 ) -> dict[str, Any]:
     commands = collect_iteration_command_sets(validation_plan)
-    offline = commands["offline"]
+    offline = sorted(commands["offline"], key=iteration_offline_command_priority)
     resource_checks = commands["resource_checks"]
     active_after_gate = commands["active_after_gate"]
     blocked = commands["blocked"]
@@ -31233,7 +31279,7 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
                     "swap_used_mib": 0,
                     "swap_used_pct": 0.0,
                 },
-                "watched_ports": {"3100": {"listening": False}, "2455": {"listening": False}},
+                "watched_ports": {"3100": {"listening": False}},
                 "top_rss_processes": [],
             }
 
@@ -31285,7 +31331,7 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
             "status": "warning",
             "warnings": ["available-memory-below-threshold"],
             "memory": {"mem_available_mib": 1500, "swap_used_mib": 512, "swap_used_pct": 12.5},
-            "watched_ports": {"3100": {"listening": False}, "2455": {"listening": True}},
+            "watched_ports": {"3100": {"listening": False}},
             "top_rss_processes": [],
         }
         critical_resource_snapshot = {
@@ -31293,7 +31339,7 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
             "status": "warning",
             "warnings": ["swap-usage-above-threshold"],
             "memory": {"mem_available_mib": 1500, "swap_used_mib": 3500, "swap_used_pct": 82.0},
-            "watched_ports": {"3100": {"listening": False}, "2455": {"listening": True}},
+            "watched_ports": {"3100": {"listening": False}},
             "top_rss_processes": [],
         }
         cases = {
@@ -36680,7 +36726,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "status": "warning",
                 "warnings": ["swap-usage-above-threshold"],
                 "memory": {"swap_used_pct": 82.0},
-                "watched_ports": {"2455": {"listening": True}, "3100": {"listening": False}},
+                "watched_ports": {"3100": {"listening": False}},
             },
             limit=5,
         )
@@ -36690,6 +36736,79 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for ref in action.get("commands", []) or []
             if isinstance(ref, dict)
         )
+
+        def focused_iteration_command(subcommand: str) -> str:
+            return validation_command_for_artifact_dir(
+                harness_loop_run_dir,
+                subcommand,
+                profile=blackbox_normalized_profile,
+            )
+
+        def focused_iteration_ref(subcommand: str) -> dict[str, Any]:
+            return validation_command_ref(
+                focused_iteration_command(subcommand),
+                source=f"focused-iteration:{subcommand}",
+                item_status="ready",
+            )
+
+        focused_iteration_decision_sample = build_iteration_decision_from_plan(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_run_dir,
+            validation_plan={
+                "generated_at": utc_now(),
+                "status": "ready",
+                "items": [
+                    {
+                        "id": "VAL-focused-resource",
+                        "status": "ready-offline",
+                        "priority": "medium",
+                        "hypothesis_type": "resource-abuse-review",
+                        "allowed_now": [
+                            focused_iteration_ref("harness-loop --no-write"),
+                            focused_iteration_ref("hypothesis-matrix --no-write --show-next"),
+                            focused_iteration_ref("deployment-review --no-write --top 8"),
+                            focused_iteration_ref("operator-evidence-review --no-write --show-missing --show-template"),
+                        ],
+                    },
+                    {
+                        "id": "VAL-focused-transaction",
+                        "status": "ready-offline",
+                        "priority": "high",
+                        "hypothesis_type": "transaction-flow-review",
+                        "allowed_now": [
+                            focused_iteration_ref("transaction-corpus-checklist --no-write --show-commands"),
+                            focused_iteration_ref("transaction-sidecar-review --no-write --show-files --show-commands"),
+                        ],
+                    },
+                ],
+            },
+            artifact_health={
+                "generated_at": utc_now(),
+                "status": "healthy",
+                "summary": {"artifact_dirs": 1, "status_counts": {"healthy": 1}},
+            },
+            current_resource_snapshot={
+                "generated_at": utc_now(),
+                "status": "warning",
+                "warnings": ["swap-usage-above-threshold"],
+                "memory": {"mem_available_mib": 3700, "swap_used_pct": 62.0},
+                "resource_budget": build_resource_budget(
+                    "warning",
+                    ["swap-usage-above-threshold"],
+                    {"mem_available_mib": 3700, "swap_used_pct": 62.0},
+                ),
+                "watched_ports": {"3100": {"listening": False}},
+            },
+            limit=8,
+        )
+        focused_iteration_preview_commands = [
+            str(ref.get("command") or "")
+            for action in focused_iteration_decision_sample.get("actions", [])
+            if action.get("id") == "offline-planning"
+            for ref in action.get("commands", []) or []
+            if isinstance(ref, dict)
+        ]
         artifact_repair_iteration_decision_sample = build_iteration_decision_from_plan(
             target="https://blackbox.test",
             profile=blackbox_normalized_profile,
@@ -36774,15 +36893,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             item.get("type") for item in resource_release_candidate_sample
         }
         resource_release_candidates_passed = (
-            resource_release_candidate_types == {"burp-gui", "browser", "local-service"}
-            and {item.get("pid") for item in resource_release_candidate_sample} == {101, 102, 103}
-            and any(
-                item.get("pid") == 103
-                and (item.get("process_context") or {}).get("label") == "docker:8c59a6d0c9ef"
-                and "container" in str(item.get("recommendation") or "")
-                and item.get("current_user_can_signal") is True
-                for item in resource_release_candidate_sample
+            resource_release_candidate_types == {"burp-gui", "browser"}
+            and {item.get("pid") for item in resource_release_candidate_sample} == {101, 102}
+            and all(item.get("pid") != 103 for item in resource_release_candidate_sample)
+            and protected_control_plane_port_for_process(
+                {
+                    "name": "python",
+                    "command_preview": "python -m app.cli --host 0.0.0.0 --port 2455",
+                }
             )
+            == 2455
         )
         resource_budget_swap_pressure_sample = build_resource_budget(
             "warning",
@@ -36796,8 +36916,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and resource_budget_swap_pressure_sample.get("active_service_start") == "blocked"
             and resource_budget_swap_pressure_sample.get("resource_warning_override") == "blocked-critical"
             and "critical-resource-budget" in (resource_budget_swap_pressure_sample.get("hard_block_reasons") or [])
-            and resource_budget_swap_pressure_sample.get("release_candidate_count") == 3
-            and resource_budget_swap_pressure_sample.get("release_candidate_rss_mib") == 1960.0
+            and resource_budget_swap_pressure_sample.get("release_candidate_count") == 2
+            and resource_budget_swap_pressure_sample.get("release_candidate_rss_mib") == 1320.0
         )
         operator_sidecar_review: dict[str, Any] = {}
         operator_placeholder_review: dict[str, Any] = {}
@@ -37125,6 +37245,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_iteration_command_text_sample
         and "top-secret" not in blackbox_iteration_command_text_sample
         and "AbC1234567890Token" not in blackbox_iteration_command_text_sample
+        and focused_iteration_decision_sample.get("summary", {}).get("offline_command_preview_limit") == 2
+        and focused_iteration_preview_commands[:2]
+        == [
+            focused_iteration_command("transaction-sidecar-review --no-write --show-files --show-commands"),
+            focused_iteration_command("operator-evidence-review --no-write --show-missing --show-template"),
+        ]
+        and not any(
+            any(token in {"harness-loop", "hypothesis-matrix"} for token in validation_command_tokens(command))
+            for command in focused_iteration_preview_commands[:2]
+        )
         and artifact_repair_iteration_decision_sample.get("status") == "ready-offline"
         and artifact_repair_iteration_decision_sample.get("summary", {}).get("artifact_repair_commands") == 2
         and any(
@@ -39590,6 +39720,34 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "focus_stage_counts",
                 {},
             ),
+            "focused_iteration": {
+                "status": "passed"
+                if (
+                    focused_iteration_decision_sample.get("summary", {}).get("offline_command_preview_limit") == 2
+                    and focused_iteration_preview_commands[:2]
+                    == [
+                        focused_iteration_command(
+                            "transaction-sidecar-review --no-write --show-files --show-commands"
+                        ),
+                        focused_iteration_command(
+                            "operator-evidence-review --no-write --show-missing --show-template"
+                        ),
+                    ]
+                    and not any(
+                        any(token in {"harness-loop", "hypothesis-matrix"} for token in validation_command_tokens(command))
+                        for command in focused_iteration_preview_commands[:2]
+                    )
+                )
+                else "failed",
+                "offline_preview_limit": focused_iteration_decision_sample.get("summary", {}).get(
+                    "offline_command_preview_limit"
+                ),
+                "preview_commands": focused_iteration_preview_commands,
+                "expected_commands": [
+                    focused_iteration_command("transaction-sidecar-review --no-write --show-files --show-commands"),
+                    focused_iteration_command("operator-evidence-review --no-write --show-missing --show-template"),
+                ],
+            },
         },
         "any_method_match_reasons": {
             "status": "passed" if any_method_match_reason_passed else "failed",
