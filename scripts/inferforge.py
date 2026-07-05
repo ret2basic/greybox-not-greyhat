@@ -9068,6 +9068,42 @@ def current_evidence_gaps_for_artifact_dir(
     )
 
 
+def current_discovery_coverage_for_artifact_dir(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    artifact = load_optional_json(artifact_dir / DISCOVERY_COVERAGE_ARTIFACT) or {}
+    profile_doc = profile if isinstance(profile, dict) else load_optional_json(artifact_dir / TARGET_PROFILE_ARTIFACT) or {}
+    if not isinstance(profile_doc, dict) or not profile_doc or is_blackbox_profile_like(profile_doc):
+        return artifact
+    source_root = resolve_repo_path(profile_doc.get("default_source_root") or DEFAULT_SOURCE_ROOT)
+    if not source_root.exists():
+        return artifact
+    route_inventory_path = artifact_dir / ROUTE_INVENTORY_ARTIFACT
+    route_inventory = (
+        load_optional_json(route_inventory_path)
+        if route_inventory_path.exists()
+        else discover_nextjs_routes(source_root, profile_doc)
+    )
+    if not isinstance(route_inventory, dict) or not route_inventory:
+        return artifact
+    clusters = load_optional_json(artifact_dir / "endpoint-clusters.json") or build_clusters(profile_doc, source_root)
+    artifact_review_candidates = collect_artifact_review_observation_candidates(profile_doc, artifact_dir)
+    return build_discovery_coverage(
+        target,
+        profile_doc,
+        source_root,
+        route_inventory,
+        clusters,
+        route_inventory_path=route_inventory_path,
+        burp_history=load_jsonl(artifact_dir / "burp-history-observations.jsonl"),
+        probe_results=load_jsonl(artifact_dir / "probe-results.jsonl"),
+        review_candidates=artifact_review_candidates,
+    )
+
+
 def current_verification_queue_for_artifact_dir(
     *,
     target: str,
@@ -9101,7 +9137,11 @@ def build_harness_loop_run(
 ) -> dict[str, Any]:
     endpoint_clusters = load_optional_json(artifact_dir / "endpoint-clusters.json") or {}
     blackbox_coverage = load_optional_json(artifact_dir / "blackbox-coverage.json") or {}
-    discovery_coverage = load_optional_json(artifact_dir / DISCOVERY_COVERAGE_ARTIFACT) or {}
+    discovery_coverage = current_discovery_coverage_for_artifact_dir(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
     traffic_index = load_optional_json(artifact_dir / "traffic-index.json") or {}
     source_peek_requests = load_optional_json(artifact_dir / "source-peek-requests.json") or {}
     asset_candidates = load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT) or {}
@@ -9141,7 +9181,17 @@ def build_harness_loop_run(
     review_blockers_status = artifact_summary_status(review_blockers_doc)
     appendix_summary = dict_summary(evidence_appendix.get("summary"))
 
-    coverage_status = artifact_summary_status(blackbox_coverage or discovery_coverage)
+    blackbox_coverage_status = artifact_summary_status(blackbox_coverage)
+    discovery_coverage_status = artifact_summary_status(discovery_coverage)
+    if discovery_coverage_status in {"covered", "complete", "no-gaps", "needs-human-review"}:
+        coverage_status = discovery_coverage_status
+    elif blackbox_coverage_status in {"missing", "unknown", "failed"} and discovery_coverage_status not in {
+        "missing",
+        "unknown",
+    }:
+        coverage_status = discovery_coverage_status
+    else:
+        coverage_status = blackbox_coverage_status
     if list_count(clusters) == 0 and list_count(traffic_endpoints) == 0:
         discovery_status = "needs-recon"
         discovery_next = "Collect or import a bounded traffic/profile baseline before generating leads."
@@ -9151,6 +9201,9 @@ def build_harness_loop_run(
     elif coverage_status in {"covered", "complete", "no-gaps"}:
         discovery_status = "covered"
         discovery_next = "Use lead generation and finding identification to deepen from the covered baseline."
+    elif coverage_status == "needs-human-review":
+        discovery_status = "needs-review"
+        discovery_next = "Review and promote the gated discovery surface before active follow-up."
     else:
         discovery_status = "needs-coverage-review"
         discovery_next = "Review coverage artifacts and refresh passive indexes before active follow-up."
@@ -26057,6 +26110,7 @@ def build_discovery_coverage(
     route_inventory_path: Path | None = None,
     burp_history: list[dict[str, Any]] | None = None,
     probe_results: list[dict[str, Any]] | None = None,
+    review_candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     active_plan_error = None
     try:
@@ -26077,7 +26131,11 @@ def build_discovery_coverage(
             }
         )
 
-    review_candidates = collect_review_observation_candidates(profile)
+    review_candidates = (
+        merged_review_observation_candidates(profile, review_candidates)
+        if review_candidates is not None
+        else collect_review_observation_candidates(profile)
+    )
     surfaces = normalize_discovery_surfaces(route_inventory)
     rows = []
     status_counts: dict[str, int] = {}
@@ -26634,8 +26692,53 @@ def build_discovery_coverage_selftest(source_root: Path) -> dict[str, Any]:
         burp_history=burp_history,
         probe_results=probe_results,
     )
+    artifact_candidate_inventory = build_discovery_coverage_selftest_inventory(
+        include_source_only=False,
+        include_uncovered=False,
+    )
+    artifact_candidate_inventory["routes"] = []
+    artifact_candidate_inventory["summary"]["route_count"] = 0
+    artifact_candidate_inventory["summary"]["app_router_route_count"] = 0
+    artifact_candidate_inventory["summary"]["entrypoint_count"] = 1
+    artifact_candidate_inventory["summary"]["surface_count"] = 1
+    artifact_candidate_inventory["summary"]["api_route_count"] = 0
+    artifact_rewrite = artifact_candidate_inventory["rewrites"][0]
+    artifact_rewrite["cluster_id"] = "artifact-only-rewrite"
+    artifact_rewrite["path"] = "/api/artifact/{path*}"
+    artifact_rewrite["source_path"] = "/api/artifact/{path*}"
+    artifact_rewrite["match"] = {
+        "path_patterns": ["/api/artifact/{path*}"],
+        "path_prefixes": ["/api/artifact/"],
+    }
+    artifact_rewrite["rewrite"] = {
+        "source": "/api/artifact/:path*",
+        "source_pattern": "/api/artifact/{path*}",
+        "destination_resolved": "https://artifact.example.test/:path*",
+    }
+    artifact_rewrite["next_config"] = {
+        "path": "/api/artifact/{path*}",
+        "variants": ["/api/artifact/{path*}"],
+    }
+    artifact_candidate_coverage = build_discovery_coverage(
+        target,
+        profile,
+        source_root,
+        artifact_candidate_inventory,
+        clusters,
+        review_candidates=[
+            {
+                "id": "review_artifact_only_rewrite",
+                "type": "burp-http-observation",
+                "status": "review-only",
+                "method": "GET",
+                "path_template": "/api/artifact/{path*}",
+                "cluster": "artifact-only-rewrite",
+            }
+        ],
+    )
 
     full_statuses = discovery_coverage_surface_statuses(full_coverage)
+    artifact_candidate_statuses = discovery_coverage_surface_statuses(artifact_candidate_coverage)
     assertions = [
         {
             "id": "full-status-uncovered",
@@ -26654,6 +26757,12 @@ def build_discovery_coverage_selftest(source_root: Path) -> dict[str, Any]:
             "passed": covered_coverage.get("status") == "covered",
             "expected": "covered",
             "actual": covered_coverage.get("status"),
+        },
+        {
+            "id": "artifact-candidate-status-needs-human-review",
+            "passed": artifact_candidate_coverage.get("status") == "needs-human-review",
+            "expected": "needs-human-review",
+            "actual": artifact_candidate_coverage.get("status"),
         },
         {
             "id": "burp-history-precedence",
@@ -26684,6 +26793,12 @@ def build_discovery_coverage_selftest(source_root: Path) -> dict[str, Any]:
             "passed": full_statuses.get("/api/proxy/{path*}") == "review-gated",
             "expected": "review-gated",
             "actual": full_statuses.get("/api/proxy/{path*}"),
+        },
+        {
+            "id": "artifact-only-review-candidate-gates-discovery-surface",
+            "passed": artifact_candidate_statuses.get("/api/artifact/{path*}") == "review-gated",
+            "expected": "review-gated",
+            "actual": artifact_candidate_statuses.get("/api/artifact/{path*}"),
         },
         {
             "id": "uncovered-route-detected",
@@ -26717,6 +26832,11 @@ def build_discovery_coverage_selftest(source_root: Path) -> dict[str, Any]:
             "covered": {
                 "status": covered_coverage.get("status"),
                 "summary": covered_coverage.get("summary", {}),
+            },
+            "artifact_candidate": {
+                "status": artifact_candidate_coverage.get("status"),
+                "summary": artifact_candidate_coverage.get("summary", {}),
+                "surface_statuses": artifact_candidate_statuses,
             },
         },
         "safety": "Static discovery coverage self-test only. It does not read source files, send HTTP requests, call Burp, sign wallets, or submit transactions.",
@@ -48232,6 +48352,7 @@ def run_discovery_coverage(args: argparse.Namespace) -> int:
             write_json(route_inventory_path, route_inventory)
 
     clusters = build_clusters(profile, source_root)
+    artifact_review_candidates = collect_artifact_review_observation_candidates(profile, artifact_dir)
     coverage = build_discovery_coverage(
         target,
         profile,
@@ -48241,6 +48362,7 @@ def run_discovery_coverage(args: argparse.Namespace) -> int:
         route_inventory_path=route_inventory_path,
         burp_history=load_jsonl(artifact_dir / "burp-history-observations.jsonl"),
         probe_results=load_jsonl(artifact_dir / "probe-results.jsonl"),
+        review_candidates=artifact_review_candidates,
     )
     output_path = resolve_repo_path(args.output) if args.output else artifact_dir / DISCOVERY_COVERAGE_ARTIFACT
 
