@@ -37971,6 +37971,144 @@ def review_blocker_oracle_artifact_status(group: dict[str, Any], *, artifact_dir
     }
 
 
+def operator_evidence_decision_requirement_hints(decision_id: str) -> list[str]:
+    hints = {
+        "credentialed-upstream-quota-policy": [
+            "Confirm provider-side quota, usage caps, and account-level request limits for the credentialed upstream.",
+        ],
+        "credentialed-upstream-rate-limit-policy": [
+            "Confirm whether unauthenticated application requests can consume provider rate limits or trigger provider-side 429s.",
+        ],
+        "credentialed-upstream-billing-impact": [
+            "Confirm whether requests consume billable units, credits, account balance, or equivalent provider cost budget.",
+        ],
+        "credentialed-upstream-usage-monitoring": [
+            "Confirm monitoring or alerting for provider usage spikes, quota depletion, billing drift, or upstream availability impact.",
+        ],
+        "external-rate-limit-store-config": [
+            "Confirm whether the external rate-limit store is configured and healthy in production, not only local/dev.",
+            "Confirm failover behavior when the external store is unavailable.",
+        ],
+        "proxy-header-trust-model": [
+            "Confirm whether x-forwarded-for, cf-connecting-ip, or x-real-ip is overwritten by a trusted edge.",
+            "Confirm ingress or platform settings that prevent clients from spoofing the selected IP key.",
+        ],
+        "rate-limit-bounds": [
+            "Confirm burst/sustained limits, window length, TTL, and memory eviction behavior for rate-limit keys.",
+        ],
+        "fallback-monitoring-alerts": [
+            "Confirm monitoring or alerting when memory fallback is used or external store operations fail.",
+        ],
+        "rpc-client-ip-header-trust-model": [
+            "Confirm whether direct-to-app traffic can bypass the trusted edge or whether the selected client IP key can be attacker-controlled.",
+        ],
+        "sensitive-app-auth-material-presence": [
+            "Confirm whether application-origin WebSocket requests carry sensitive cookies, session tokens, Authorization material, or equivalent credentials.",
+        ],
+        "sensitive-client-header-context": [
+            "Confirm which browser-controlled headers or cookies are present on the WebSocket origin, recording names/categories only.",
+        ],
+        "sensitive-header-filter-policy": [
+            "Confirm whether sensitive client headers such as cookie and authorization are stripped before upstream WebSocket connection setup.",
+        ],
+        "upstream-header-receipt-logging-policy": [
+            "Confirm whether the upstream WebSocket provider receives or logs forwarded client headers.",
+        ],
+        "upstream-header-trust-or-billing-policy": [
+            "Confirm whether the upstream WebSocket provider trusts, bills, attributes quota, or authorizes based on forwarded client headers.",
+        ],
+        "browser-client-header-control-model": [
+            "Confirm browser versus non-browser constraints for the exact forwarded header needed to demonstrate impact.",
+        ],
+        "concrete-header-forwarding-impact": [
+            "Confirm concrete disclosure, authorization confusion, trust-boundary confusion, quota attribution, or equivalent impact.",
+        ],
+    }
+    return hints.get(
+        decision_id,
+        [f"Provide reviewed redacted operator/provider/deployment evidence for decision id {decision_id}."],
+    )
+
+
+def operator_evidence_minimal_sidecar_template(
+    *,
+    operator_context: dict[str, Any],
+    required_fields: list[str],
+) -> dict[str, Any] | None:
+    decision_ids = normalize_string_list(operator_context.get("missing_decision_ids"))
+    if not decision_ids:
+        decision_ids = normalize_string_list(operator_context.get("required_decision_ids"))
+    if not decision_ids:
+        return None
+    recommended_evidence = (
+        operator_context.get("recommended_evidence")
+        if isinstance(operator_context.get("recommended_evidence"), dict)
+        else {}
+    )
+    sidecar_path = str(operator_context.get("operator_evidence_sidecar") or OPERATOR_EVIDENCE_ARTIFACT)
+    accepted_statuses = normalize_string_list(operator_context.get("accepted_present_statuses"))
+    if not accepted_statuses:
+        accepted_statuses = sorted(OPERATOR_EVIDENCE_PRESENT_STATUSES)
+    redaction_required = [
+        "Do not include provider API keys, bearer tokens, cookies, authorization headers, private keys, seed phrases, wallet signatures, raw dashboards, raw logs, or raw Burp history.",
+        "Use short redacted summaries and references to reviewed tickets, docs, screenshots, dashboards, deployment config, or operator notes.",
+    ]
+    return {
+        "schema": "inferforge-operator-evidence-v1",
+        "status": "template",
+        "scope": "minimal-current-oracle",
+        "sidecar_path": sidecar_path,
+        "entrypoint": recommended_evidence.get("entrypoint"),
+        "provider": recommended_evidence.get("provider"),
+        "accepted_present_statuses": accepted_statuses,
+        "required_fields": required_fields[:8],
+        "instructions": [
+            "Create or update only these evidence_items[] rows for the current oracle dependency.",
+            "Keep status pending or needs-review until the evidence has been reviewed; pending rows do not satisfy reportability gates.",
+            "Use an accepted_present_statuses value only with a non-placeholder redacted summary and reviewed source_ref.",
+        ],
+        "evidence_items": [
+            {
+                "id": decision_id,
+                "status": "pending",
+                "evidence_type": "operator-statement",
+                "summary": "REPLACE_WITH_REDACTED_OPERATOR_OR_PROVIDER_EVIDENCE_SUMMARY",
+                "source_ref": "REPLACE_WITH_TICKET_DOC_SCREENSHOT_DASHBOARD_OR_CONFIG_REFERENCE",
+                "operator_evidence_needed": operator_evidence_decision_requirement_hints(decision_id),
+                "redaction_required": redaction_required,
+            }
+            for decision_id in decision_ids[:12]
+        ],
+        "safety": (
+            "Template only. It is not evidence, sends no traffic, and must not contain secrets or raw target/provider data."
+        ),
+    }
+
+
+def oracle_static_only_not_reportable_reason(oracle_type: str, evidence_contract: dict[str, Any]) -> str:
+    kind = str(evidence_contract.get("kind") or "")
+    if oracle_type == "provider-impact" or kind in {"provider-operator-cost-impact", "websocket-header-trust-impact"}:
+        return (
+            "Static source, public provider docs, or header-forwarding patterns are not reportable by themselves; "
+            "they need redacted operator/provider evidence plus finding-gate impact review."
+        )
+    if oracle_type == "resource-control" or kind == "deployment-resource-control-impact":
+        return (
+            "Static rate-limit fallback, forwarded-IP use, or configurable deployment branches are not reportable by themselves; "
+            "they need production/operator evidence and non-stress impact proof."
+        )
+    if oracle_type == "transaction-intent" or kind == "approved-quote-transaction-corpus":
+        return (
+            "Static transaction-flow source is not reportable by itself; it needs one approved quote payload and offline decoded intent mismatch evidence."
+        )
+    if oracle_type == "single-response-impact" or kind == "approved-redacted-response-impact":
+        return (
+            "Static rewrite/proxy configuration or a bare 2xx response is not reportable by itself; "
+            "it needs one approved redacted read-only response with concrete sensitive-data or trust-boundary impact."
+        )
+    return "Static suspicion is not reportable without concrete in-scope impact evidence accepted by finding-gate."
+
+
 def review_blocker_oracle_evidence_contract(group: dict[str, Any], oracle: dict[str, Any]) -> dict[str, Any]:
     oracle_type = str(oracle.get("type") or oracle.get("id") or "")
     plans = [
@@ -38041,6 +38179,14 @@ def review_blocker_oracle_evidence_contract(group: dict[str, Any], oracle: dict[
             if isinstance(operator_context.get("recommended_evidence"), dict)
             else {}
         )
+    operator_template = (
+        operator_evidence_minimal_sidecar_template(
+            operator_context=operator_context,
+            required_fields=required_fields,
+        )
+        if operator_context
+        else None
+    )
     recommended_request_keys = [
         "method",
         "path",
@@ -38096,6 +38242,12 @@ def review_blocker_oracle_evidence_contract(group: dict[str, Any], oracle: dict[
         "required_fields": required_fields[:8],
         "required_field_count": len(required_fields),
         "first_required_field": required_fields[0] if required_fields else None,
+        "operator_evidence_minimal_sidecar_template": operator_template,
+        "operator_evidence_template_item_count": (
+            len(operator_template.get("evidence_items", []) or [])
+            if isinstance(operator_template, dict)
+            else 0
+        ),
         "forbidden_validation": normalize_string_list(selected.get("forbidden_validation"))[:6],
     }
 
@@ -38111,6 +38263,7 @@ def review_blocker_oracle_work_item(
     command_safety = (group.get("command_safety", {}) or {}).get("summary", {}) or {}
     artifact_status = review_blocker_oracle_artifact_status(group, artifact_dir=artifact_dir)
     evidence_contract = review_blocker_oracle_evidence_contract(group, oracle)
+    dependency_kind = review_blocker_oracle_dependency_kind(oracle)
     return {
         "group_id": group.get("id"),
         "group_key": group.get("key"),
@@ -38122,7 +38275,7 @@ def review_blocker_oracle_work_item(
         "oracle_id": oracle.get("id"),
         "oracle_type": oracle.get("type") or oracle.get("id"),
         "oracle_status": oracle.get("status") or "unknown",
-        "dependency_kind": review_blocker_oracle_dependency_kind(oracle),
+        "dependency_kind": dependency_kind,
         "impact_claim": oracle.get("impact_claim"),
         "next_step": oracle.get("next_step"),
         "acceptance_checks": acceptance_checks[:3],
@@ -38138,6 +38291,14 @@ def review_blocker_oracle_work_item(
         "evidence_contract_kind": evidence_contract.get("kind"),
         "required_field_count": evidence_contract.get("required_field_count", 0),
         "first_required_field": evidence_contract.get("first_required_field"),
+        "operator_evidence_minimal_sidecar_template": evidence_contract.get(
+            "operator_evidence_minimal_sidecar_template"
+        ),
+        "operator_evidence_template_item_count": evidence_contract.get("operator_evidence_template_item_count", 0),
+        "static_only_not_reportable": oracle_static_only_not_reportable_reason(
+            str(oracle.get("type") or oracle.get("id") or ""),
+            evidence_contract,
+        ),
         "command_safety": command_safety,
         "command_count": int(command_safety.get("commands") or 0) if command_safety else 0,
     }
@@ -38284,6 +38445,11 @@ def oracle_plan_action_from_work_item(
         "evidence_contract_status": work_item.get("evidence_contract_status"),
         "first_required_field": work_item.get("first_required_field"),
         "required_field_count": work_item.get("required_field_count", 0),
+        "operator_evidence_minimal_sidecar_template": work_item.get(
+            "operator_evidence_minimal_sidecar_template"
+        ),
+        "operator_evidence_template_item_count": work_item.get("operator_evidence_template_item_count", 0),
+        "static_only_not_reportable": work_item.get("static_only_not_reportable"),
         "next_step": work_item.get("next_step"),
         "coverage_pressure": coverage_pressure,
         "bounty_pressure": bounty_pressure,
@@ -40023,8 +40189,37 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 == ".greybox/selftest-gate-blockers/operator-evidence.json"
                 and operator_contract.get("missing_decision_ids")
                 == ["credentialed-upstream-billing-impact"]
+                and operator_contract.get("operator_evidence_template_item_count") == 1
+                and (
+                    operator_contract.get("operator_evidence_minimal_sidecar_template", {}).get("sidecar_path")
+                    == ".greybox/selftest-gate-blockers/operator-evidence.json"
+                )
+                and (
+                    (
+                        operator_contract.get("operator_evidence_minimal_sidecar_template", {}).get("evidence_items")
+                        or [{}]
+                    )[0].get("id")
+                    == "credentialed-upstream-billing-impact"
+                )
+                and (
+                    (
+                        operator_contract.get("operator_evidence_minimal_sidecar_template", {}).get("evidence_items")
+                        or [{}]
+                    )[0].get("status")
+                    == "pending"
+                )
+                and "billable units"
+                in str(
+                    (
+                        (
+                            operator_contract.get("operator_evidence_minimal_sidecar_template", {}).get("evidence_items")
+                            or [{}]
+                        )[0].get("operator_evidence_needed")
+                        or []
+                    )
+                )
             ),
-            "expected": "operator evidence contracts preserve redacted sidecar required fields and missing decisions",
+            "expected": "operator evidence contracts preserve redacted sidecar required fields, missing decisions, and minimal sidecar template rows",
             "actual": operator_contract,
         },
         {
@@ -40035,8 +40230,32 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 == "operator evidence decision: sensitive-app-auth-material-presence"
                 and operator_decision_fallback_contract.get("missing_decision_ids")
                 == ["sensitive-app-auth-material-presence"]
+                and operator_decision_fallback_contract.get("operator_evidence_template_item_count") == 1
+                and (
+                    (
+                        operator_decision_fallback_contract.get(
+                            "operator_evidence_minimal_sidecar_template",
+                            {},
+                        ).get("evidence_items")
+                        or [{}]
+                    )[0].get("id")
+                    == "sensitive-app-auth-material-presence"
+                )
+                and "WebSocket requests carry sensitive cookies"
+                in str(
+                    (
+                        (
+                            operator_decision_fallback_contract.get(
+                                "operator_evidence_minimal_sidecar_template",
+                                {},
+                            ).get("evidence_items")
+                            or [{}]
+                        )[0].get("operator_evidence_needed")
+                        or []
+                    )
+                )
             ),
-            "expected": "operator evidence contracts expose missing decision IDs when no sidecar field contract is present",
+            "expected": "operator evidence contracts expose missing decision IDs and template rows when no sidecar field contract is present",
             "actual": operator_decision_fallback_contract,
         },
         {
@@ -40130,6 +40349,8 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 and gate_oracle_plan_top.get("active_traffic_required") is True
                 and "blocked-until-approval-and-healthy-resource-gate"
                 in str(gate_oracle_plan_top.get("active_traffic_policy") or "")
+                and "Static transaction-flow source is not reportable"
+                in str(gate_oracle_plan_top.get("static_only_not_reportable") or "")
             ),
             "expected": "oracle-plan ranks blocked validation oracles by evidence path without marking them reportable",
             "actual": {
@@ -40146,6 +40367,7 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 and "contract=approved-quote-transaction-corpus" in oracle_plan_no_write_stdout
                 and "first_required=exactly one approved POST /api/quote" in oracle_plan_no_write_stdout
                 and "active_policy=blocked-until-approval-and-healthy-resource-gate" in oracle_plan_no_write_stdout_text
+                and "static_gate=Static transaction-flow source is not reportable" in oracle_plan_no_write_stdout_text
                 and "No files written (--no-write)." in oracle_plan_no_write_stdout
                 and not any(oracle_plan_no_write_outputs_exist.values())
             ),
@@ -60634,6 +60856,11 @@ def run_oracle_plan(args: argparse.Namespace) -> int:
         if args.show_details:
             print(f"  next={inline_summary_text(action.get('next_step'), max_chars=260)}")
             print(f"  active_policy={action.get('active_traffic_policy')}")
+            if action.get("static_only_not_reportable"):
+                print(
+                    "  static_gate="
+                    f"{inline_summary_text(action.get('static_only_not_reportable'), max_chars=260)}"
+                )
             print(
                 "  pressure="
                 f"coverage:{action.get('coverage_pressure', 0)} "
@@ -60641,6 +60868,33 @@ def run_oracle_plan(args: argparse.Namespace) -> int:
                 f"validity:{action.get('validity_pressure', 0)} "
                 f"evidence:{action.get('evidence_closure_pressure', 0)}"
             )
+            operator_template = (
+                action.get("operator_evidence_minimal_sidecar_template")
+                if isinstance(action.get("operator_evidence_minimal_sidecar_template"), dict)
+                else {}
+            )
+            template_items = [
+                item
+                for item in operator_template.get("evidence_items", []) or []
+                if isinstance(item, dict)
+            ]
+            if template_items:
+                print(
+                    "  operator_sidecar_template="
+                    f"path={operator_template.get('sidecar_path') or '-'} "
+                    f"items={len(template_items)} "
+                    f"accepted={','.join(normalize_string_list(operator_template.get('accepted_present_statuses'))[:5]) or '-'}"
+                )
+                for item in template_items[:3]:
+                    needed = normalize_string_list(item.get("operator_evidence_needed"))
+                    print(
+                        "  operator_template_item="
+                        f"{item.get('id') or '-'} "
+                        f"status={item.get('status') or '-'} "
+                        f"needed={inline_summary_text(needed[0] if needed else '', max_chars=180) or '-'}"
+                    )
+                if len(template_items) > 3:
+                    print(f"  operator_template_item=... +{len(template_items) - 3} more")
             if action.get("reason"):
                 print(f"  reason={inline_summary_text(action.get('reason'), max_chars=260)}")
     remaining = len(oracle_plan.get("actions", []) or []) - display_limit
