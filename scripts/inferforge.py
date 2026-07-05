@@ -21881,18 +21881,26 @@ def transaction_sidecar_evidence_contracts(
             },
         ]
         command_refs = []
+        command_refs_by_id: dict[str, dict[str, Any]] = {}
         for command_row in commands:
             command_text = str(command_row.get("command") or "")
             if not command_text:
                 continue
             item_status = "manual-review" if command_row.get("id") == "burp-history-import" else "ready"
-            command_refs.append(
-                validation_command_ref(
-                    command_text,
-                    source=f"transaction-sidecar-evidence-contract:{command_row.get('id')}",
-                    item_status=item_status,
-                )
+            ref = validation_command_ref(
+                command_text,
+                source=f"transaction-sidecar-evidence-contract:{command_row.get('id')}",
+                item_status=item_status,
             )
+            command_refs.append(ref)
+            command_refs_by_id[str(command_row.get("id") or "")] = ref
+        commands_with_safety = []
+        for command_row in commands:
+            row = dict(command_row)
+            safety_ref = command_refs_by_id.get(str(row.get("id") or ""))
+            if safety_ref:
+                row["command_safety_ref"] = safety_ref
+            commands_with_safety.append(row)
         contracts.append(
             {
                 "method": "POST",
@@ -21904,7 +21912,7 @@ def transaction_sidecar_evidence_contracts(
                 "destinationMint": template.get("destinationMint"),
                 "programAllowlistStatus": template.get("programAllowlistStatus") or "unknown",
                 "allowedPrograms_count": len(template.get("allowedPrograms", []) or []),
-                "commands": commands,
+                "commands": commands_with_safety,
                 "command_safety": command_safety_summary(command_refs),
                 "required_order": [
                     "Review payload-template-preview and create exactly one approved payload sidecar.",
@@ -38743,6 +38751,11 @@ def build_transaction_decoder_selftest(
         if isinstance(item, dict)
     ]
     sidecar_contract_text = json.dumps(sidecar_contracts, sort_keys=True)
+    sidecar_contract_step_safety = {
+        command.get("id"): (command.get("command_safety_ref") or {}).get("classification")
+        for command in (sidecar_contracts[0].get("commands", []) if sidecar_contracts else [])
+        if isinstance(command, dict)
+    }
     sidecar_contract_passed = (
         len(sidecar_contracts) >= 1
         and sidecar_contracts[0].get("method") == "POST"
@@ -38754,6 +38767,11 @@ def build_transaction_decoder_selftest(
         and "burp-sync --replace --count" in sidecar_contract_text
         and "transaction-sidecar-review --no-write --show-files --show-candidates --show-commands" in sidecar_contract_text
         and "decode-transactions --no-write" in sidecar_contract_text
+        and sidecar_contract_step_safety.get("intent-policy-preview") == "manual-template"
+        and sidecar_contract_step_safety.get("intent-policy-write") == "manual-template"
+        and sidecar_contract_step_safety.get("decode-preview") == "manual-template"
+        and sidecar_contract_step_safety.get("payload-template-preview") == "ready"
+        and sidecar_contract_step_safety.get("resource-gate") == "ready"
         and "Do not approve wallet signing prompts." in sidecar_contract_text
         and payload["base64"] not in sidecar_contract_text
     )
@@ -51533,16 +51551,24 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
             for command_row in (contract.get("commands", []) or [])[:9]:
                 if not isinstance(command_row, dict):
                     continue
+                command_safety_ref = (
+                    command_row.get("command_safety_ref")
+                    if isinstance(command_row.get("command_safety_ref"), dict)
+                    else {}
+                )
+                safety_label = command_safety_ref.get("classification") or "-"
                 if command_row.get("command"):
                     print(
                         "  step="
                         f"{command_row.get('id')} risk={command_row.get('risk')} "
+                        f"safety={safety_label} "
                         f"command={inline_summary_text(command_row.get('command'), max_chars=420)}"
                     )
                 else:
                     print(
                         "  step="
                         f"{command_row.get('id')} risk={command_row.get('risk')} "
+                        f"safety={safety_label} "
                         f"action={inline_summary_text(command_row.get('action'), max_chars=360)}"
                     )
     shape_review = review.get("payload_shape_review") if isinstance(review.get("payload_shape_review"), dict) else {}
