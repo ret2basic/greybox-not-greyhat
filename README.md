@@ -303,7 +303,10 @@ bug-bounty style lead file. It applies the “read code, constrain by
 scope/docs, create candidate paths, and write down leads worth checking”
 workflow to the current artifacts, then prints source refs, path/method
 options, missing evidence, blockers, and safe offline commands for each
-Medium/High/Critical thread:
+Medium/High/Critical thread. For RPC resource-abuse leads, `--show-evidence`
+also prints the evidence contract id, required operator decisions, and the first
+reportability gates so the next step is an evidence closure rather than a broad
+audit:
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
@@ -410,7 +413,10 @@ the missing decisions. Add `--show-template-json` to print the redacted sidecar
 template body directly for manual review before creating `operator-evidence.json`.
 Add `--show-closure-contract` to group the same sidecar requirements into
 credentialed-upstream cost-abuse and RPC resource-exhaustion closure contracts,
-including the offline review/gate commands and stop conditions.
+including the offline review/gate commands, stop conditions, and the RPC
+resource evidence contract. The contract spells out which operator decisions
+must be proven, which header-trust/fallback conditions are reportable, and which
+safe evidence sources can support the claim without traffic volume.
 When RPC source shows rate-limit buckets keyed from
 `x-forwarded-for`, that template also includes
 `rpc-client-ip-header-trust-model`, which asks for production edge/header

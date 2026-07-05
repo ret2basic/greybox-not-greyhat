@@ -9960,6 +9960,14 @@ def build_resource_evidence_closure(
     missing_decisions = set(str(item) for item in operator_summary.get("missing_decisions", []) or [])
     critical_missing = set(str(item) for item in deployment_summary.get("critical_missing", []) or [])
     review_missing = not deployment_review or not operator_review
+    resource_review = item.get("resource_abuse_review") if isinstance(item.get("resource_abuse_review"), dict) else {}
+    evidence_contract = (
+        resource_review.get("evidence_contract")
+        if isinstance(resource_review.get("evidence_contract"), dict)
+        else operator_review.get("resource_evidence_contract")
+        if isinstance(operator_review.get("resource_evidence_contract"), dict)
+        else {}
+    )
 
     def decision_status(decision_id: str) -> str:
         if review_missing:
@@ -10034,6 +10042,7 @@ def build_resource_evidence_closure(
             if req.get("status") not in {"passed", "ready-offline", "ready-after-resource-check"}
         ],
         "next_safe_commands": commands[:6],
+        "evidence_contract": evidence_contract,
         "finding_gate_entry_condition": (
             "Only enter finding-gate after deployment/operator evidence proves attacker-controlled key growth or "
             "connection sharding plus concrete availability impact, without rate/DoS testing."
@@ -10859,6 +10868,25 @@ def lead_dossier_business_tests(
     return []
 
 
+def lead_dossier_evidence_contract(thread: dict[str, Any]) -> dict[str, Any]:
+    closure = thread.get("evidence_closure") if isinstance(thread.get("evidence_closure"), dict) else {}
+    closure_contract = (
+        closure.get("evidence_contract")
+        if isinstance(closure.get("evidence_contract"), dict)
+        else {}
+    )
+    if closure_contract:
+        return closure_contract
+    resource_review = (
+        thread.get("resource_abuse_review")
+        if isinstance(thread.get("resource_abuse_review"), dict)
+        else {}
+    )
+    if isinstance(resource_review.get("evidence_contract"), dict):
+        return resource_review.get("evidence_contract", {})
+    return {}
+
+
 def build_lead_dossier(
     *,
     target: str,
@@ -10919,6 +10947,7 @@ def build_lead_dossier(
                 "code_refs": lead_dossier_code_refs(thread),
                 "path_options": lead_dossier_path_options(thread),
                 "business_logic_tests": lead_dossier_business_tests(business_logic_map, thread.get("id")),
+                "evidence_contract": lead_dossier_evidence_contract(thread),
                 "current_blocker": thread.get("current_blocker"),
                 "required_evidence": thread.get("required_evidence", []),
                 "missing_requirements": closure.get("missing_requirements", []) if closure else [],
@@ -11835,6 +11864,7 @@ def hypothesis_from_rpc_rate_limit_resource_policy(
             "client_ip_trust_status": client_ip_trust_review.get("status") or "missing",
             "client_ip_forwarded_for_ref_count": client_ip_trust_review.get("forwarded_for_ref_count", 0),
             "client_ip_edge_header_ref_count": client_ip_trust_review.get("edge_header_ref_count", 0),
+            "evidence_contract": review.get("evidence_contract", {}),
         },
         "safety": review.get("safety") or "Offline resource-control review only. Do not run rate or DoS tests.",
     }
@@ -20310,6 +20340,56 @@ def build_rate_limit_resource_review(
             "an attacker controls the key material plus bounded-impact evidence, without flooding or rate testing."
         ),
     }
+    signal_ids = [
+        str(signal.get("id") or "")
+        for signal in signals
+        if isinstance(signal, dict) and signal.get("id")
+    ]
+    rpc_resource_evidence_contract = {
+        "id": "rpc-resource-exhaustion-evidence-contract",
+        "entrypoint": "POST /api/rpc/solana/{cluster}",
+        "static_signal_ids": signal_ids,
+        "header_trust": {
+            "status": client_ip_trust_review.get("status"),
+            "header_tokens": client_ip_trust_review.get("header_tokens", []),
+            "forwarded_for_ref_count": client_ip_trust_review.get("forwarded_for_ref_count", 0),
+            "edge_header_ref_count": client_ip_trust_review.get("edge_header_ref_count", 0),
+            "memory_fallback_ref_count": client_ip_trust_review.get("memory_fallback_ref_count", 0),
+            "websocket_connection_limit_ref_count": client_ip_trust_review.get(
+                "websocket_connection_limit_ref_count",
+                0,
+            ),
+        },
+        "required_operator_decision_ids": [
+            "external-rate-limit-store-config",
+            "proxy-header-trust-model",
+            "rpc-client-ip-header-trust-model",
+            "rate-limit-bounds",
+            "fallback-monitoring-alerts",
+        ],
+        "reportable_only_if": [
+            "Production evidence shows the selected client IP key can be attacker-controlled or direct-to-app traffic bypasses the trusted edge.",
+            "External rate-limit storage is absent, unhealthy, or can fall back to process memory without adequate production controls.",
+            "Rate-limit or WebSocket connection buckets can grow, shard, or consume upstream/provider capacity under attacker-controlled key material.",
+            "Concrete app availability, provider quota, or operator-impact evidence exists from configuration, logs, dashboards, or reviewed statements.",
+        ],
+        "not_reportable_when": [
+            "The production edge overwrites all selected client IP headers before app code receives them.",
+            "The app is not directly reachable outside the trusted edge/load-balancer path.",
+            "External rate-limit storage is enforced in production with bounded fallback, TTL/eviction, and monitoring evidence.",
+            "The only evidence is static source code without non-stress availability or quota impact.",
+        ],
+        "safe_evidence_sources": [
+            "Redacted deployment/operator sidecar entries.",
+            "Ingress, platform, or edge configuration showing header overwrite and direct reachability decisions.",
+            "Rate-limit store health/configuration evidence with secret values omitted.",
+            "Logs, metrics, dashboards, or incident notes summarized without raw identifiers.",
+        ],
+        "forbidden_validation": [
+            "No floods, stress tests, rate-limit exhaustion, Scanner, Intruder, or high-volume validation.",
+            "No wallet signing, Solana submission, provider quota depletion, or raw secret capture.",
+        ],
+    }
 
     return {
         "status": "needs-deployment-review" if signals else "no-static-resource-signal",
@@ -20317,6 +20397,7 @@ def build_rate_limit_resource_review(
         "signal_count": len(signals),
         "signals": signals,
         "client_ip_trust_review": client_ip_trust_review,
+        "evidence_contract": rpc_resource_evidence_contract,
         "reportability_gate": (
             "Static in-memory rate-limit fallback evidence is not reportable by itself. "
             "Escalate only with deployment evidence showing attacker-controlled key growth, missing external store, "
@@ -20618,6 +20699,7 @@ def operator_evidence_closure_contracts(
     sidecar_path: str,
     missing_decisions: list[dict[str, Any]],
     accepted_present_statuses: list[str],
+    resource_evidence_contract: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     missing_lookup = {
         str(item.get("id") or ""): item
@@ -20784,6 +20866,7 @@ def operator_evidence_closure_contracts(
                     "Run resource-gate before any approved single-request validation; stop unless it is healthy.",
                     "Run finding-gate-preview only with non-stress evidence tying missing controls to availability impact.",
                 ],
+                "evidence_contract": resource_evidence_contract or {},
                 "stop_conditions": [
                     "Do not run floods, stress tests, Scanner, Intruder, or rate-limit exhaustion attempts.",
                     "Do not claim spoofable IP-keyed limits unless direct-to-app reachability or untrusted header control is evidenced.",
@@ -20863,6 +20946,11 @@ def build_operator_evidence_review(
         rpc_method_policy.get("rate_limit_resource_review")
         if isinstance(rpc_method_policy, dict)
         and isinstance(rpc_method_policy.get("rate_limit_resource_review"), dict)
+        else {}
+    )
+    resource_evidence_contract = (
+        rate_limit_review.get("evidence_contract")
+        if isinstance(rate_limit_review.get("evidence_contract"), dict)
         else {}
     )
     client_ip_trust_review = (
@@ -20946,6 +21034,7 @@ def build_operator_evidence_review(
         "critical_missing": [str(item) for item in critical_missing],
         "rpc_client_ip_trust_status": client_ip_trust_review.get("status") or "missing",
         "rpc_client_ip_trust_missing": bool(rpc_client_ip_trust_missing),
+        "rpc_resource_contract": resource_evidence_contract.get("id") or "missing",
     }
     accepted_present_statuses = sorted(OPERATOR_EVIDENCE_PRESENT_STATUSES)
     sidecar_path = repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
@@ -20956,6 +21045,7 @@ def build_operator_evidence_review(
         sidecar_path=sidecar_path,
         missing_decisions=missing_sidecar_decisions,
         accepted_present_statuses=accepted_present_statuses,
+        resource_evidence_contract=resource_evidence_contract,
     )
     summary["closure_contracts"] = len(closure_contracts)
     return {
@@ -20969,6 +21059,7 @@ def build_operator_evidence_review(
         "decision_coverage": decision_coverage,
         "missing_decisions": missing_sidecar_decisions,
         "closure_contracts": closure_contracts,
+        "resource_evidence_contract": resource_evidence_contract,
         "sidecar_template": sidecar_template,
         "accepted_present_statuses": accepted_present_statuses,
         "reportability_gate": (
@@ -44495,6 +44586,39 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     ]
                 ],
             }
+            operator_rpc_method_policy = {
+                "rate_limit_resource_review": build_rate_limit_resource_review(
+                    memory_rate_limit_refs=[
+                        {
+                            "file": "server.js",
+                            "line": 70,
+                            "sample": "const memoryRateLimits = new Map()",
+                        }
+                    ],
+                    client_ip_header_refs=[
+                        {
+                            "file": "server.js",
+                            "line": 191,
+                            "token": "x-forwarded-for",
+                            "sample": "req.headers['x-forwarded-for']",
+                        }
+                    ],
+                    external_rate_limit_store_refs=[
+                        {
+                            "file": "server.js",
+                            "line": 130,
+                            "sample": "Upstash unavailable; falling back to memoryRateLimits",
+                        }
+                    ],
+                    rate_limit_guard_refs=[
+                        {
+                            "file": "server.js",
+                            "line": 447,
+                            "sample": "MAX_WS_CONNECTIONS_PER_IP",
+                        }
+                    ],
+                )
+            }
             operator_sidecar_review = build_deployment_resource_review(
                 operator_sidecar_source_root,
                 test_profile,
@@ -44505,6 +44629,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 artifact_dir=operator_sidecar_source_root,
                 operator_evidence=operator_sidecar,
                 deployment_review=operator_sidecar_review,
+                rpc_method_policy=operator_rpc_method_policy,
                 profile=test_profile,
             )
             operator_sidecar_provider = operator_sidecar_review.get("credential_provider_review", {})
@@ -44550,6 +44675,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 artifact_dir=operator_sidecar_source_root,
                 operator_evidence=operator_placeholder,
                 deployment_review=operator_placeholder_review,
+                rpc_method_policy=operator_rpc_method_policy,
                 profile=test_profile,
             )
         operator_evidence_sidecar_passed = (
@@ -44595,6 +44721,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check"
             in operator_closure_contract_text
             and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict"
+            in operator_closure_contract_text
+            and "rpc-resource-exhaustion-evidence-contract" in operator_closure_contract_text
+            and "rpc-client-ip-header-trust-model" in operator_closure_contract_text
+            and "Production evidence shows the selected client IP key can be attacker-controlled"
             in operator_closure_contract_text
             and "Do not use request floods" in operator_closure_contract_text
             and "Do not run floods" in operator_closure_contract_text
@@ -46661,6 +46791,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             if isinstance(rate_limit_resource_review.get("client_ip_trust_review"), dict)
             else {}
         )
+        rate_limit_resource_evidence_contract = (
+            rate_limit_resource_review.get("evidence_contract", {})
+            if isinstance(rate_limit_resource_review.get("evidence_contract"), dict)
+            else {}
+        )
         rate_limit_resource_review_passed = (
             rate_limit_resource_review.get("status") == "needs-deployment-review"
             and {
@@ -46672,11 +46807,24 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rate_limit_client_ip_trust_review.get("status") == "needs-proxy-trust-evidence"
             and rate_limit_client_ip_trust_review.get("forwarded_for_ref_count", 0) >= 1
             and rate_limit_client_ip_trust_review.get("memory_fallback_ref_count", 0) >= 1
+            and rate_limit_resource_evidence_contract.get("id") == "rpc-resource-exhaustion-evidence-contract"
+            and "rpc-client-ip-header-trust-model"
+            in (rate_limit_resource_evidence_contract.get("required_operator_decision_ids") or [])
+            and any(
+                "attacker-controlled" in str(gate)
+                for gate in (rate_limit_resource_evidence_contract.get("reportable_only_if") or [])
+            )
+            and any(
+                "No floods" in str(item)
+                for item in (rate_limit_resource_evidence_contract.get("forbidden_validation") or [])
+            )
             and rewrite_resource_hypothesis is not None
             and rewrite_resource_hypothesis.get("status") == "ready-for-offline-review"
             and rewrite_resource_hypothesis.get("impact") == "resource-exhaustion"
             and rewrite_resource_hypothesis.get("resource_abuse_review", {}).get("client_ip_trust_status")
             == "needs-proxy-trust-evidence"
+            and rewrite_resource_hypothesis.get("resource_abuse_review", {}).get("evidence_contract", {}).get("id")
+            == "rpc-resource-exhaustion-evidence-contract"
             and rewrite_resource_hypothesis.get("resource_abuse_review", {}).get(
                 "client_ip_forwarded_for_ref_count",
                 0,
@@ -52288,6 +52436,24 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
         if args.show_evidence:
             for evidence in (lead.get("required_evidence", []) or [])[:3]:
                 print(f"    evidence={inline_summary_text(evidence, max_chars=260)}")
+            evidence_contract = (
+                lead.get("evidence_contract")
+                if isinstance(lead.get("evidence_contract"), dict)
+                else {}
+            )
+            if evidence_contract:
+                required_decisions = ",".join(
+                    str(item)
+                    for item in (evidence_contract.get("required_operator_decision_ids", []) or [])[:5]
+                )
+                print(
+                    "    contract="
+                    f"{evidence_contract.get('id')} "
+                    f"entrypoint={evidence_contract.get('entrypoint') or '-'} "
+                    f"required_decisions={required_decisions or 'none'}"
+                )
+                for gate in (evidence_contract.get("reportable_only_if", []) or [])[:2]:
+                    print(f"    gate={inline_summary_text(gate, max_chars=260)}")
         if args.show_commands:
             command_ref = lead.get("next_offline_command") if isinstance(lead.get("next_offline_command"), dict) else None
             if command_ref:
@@ -53082,6 +53248,23 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
                 f"- contract={contract.get('id')} impact={contract.get('impact')} "
                 f"entrypoint={contract.get('entrypoint')} missing={missing}"
             )
+            evidence_contract = (
+                contract.get("evidence_contract")
+                if isinstance(contract.get("evidence_contract"), dict)
+                else {}
+            )
+            if evidence_contract:
+                decisions = ",".join(
+                    str(item)
+                    for item in (evidence_contract.get("required_operator_decision_ids", []) or [])[:5]
+                )
+                print(
+                    "  evidence_contract="
+                    f"{evidence_contract.get('id')} "
+                    f"required_decisions={decisions or 'none'}"
+                )
+                for gate in (evidence_contract.get("reportable_only_if", []) or [])[:2]:
+                    print(f"  gate={inline_summary_text(gate, max_chars=260)}")
             for command_row in (contract.get("commands", []) or [])[:6]:
                 if not isinstance(command_row, dict):
                     continue
