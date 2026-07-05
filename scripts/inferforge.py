@@ -172,6 +172,7 @@ BOUNTY_SOURCE_INVARIANTS_ARTIFACT = "bounty-source-invariants.json"
 BOUNTY_LANE_PRIORITIES_ARTIFACT = "bounty-lane-priorities.json"
 BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT = "bounty-evidence-authorization.json"
 BOUNTY_EVIDENCE_INTAKE_ARTIFACT = "bounty-evidence-intake.json"
+BOUNTY_ACTION_QUEUE_ARTIFACT = "bounty-action-queue.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -294,6 +295,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     BOUNTY_LANE_PRIORITIES_ARTIFACT,
     BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT,
     BOUNTY_EVIDENCE_INTAKE_ARTIFACT,
+    BOUNTY_ACTION_QUEUE_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -25825,6 +25827,316 @@ def build_bounty_evidence_intake(
     }
 
 
+BOUNTY_ACTION_KIND_RANK = {
+    "fix-evidence-intake": 0,
+    "validate-ready-evidence": 1,
+    "collect-approved-evidence": 2,
+    "park-until-official-evidence": 6,
+    "refresh-bounty-artifacts": 9,
+}
+
+
+def bounty_action_kind_for_request(authorization: dict[str, Any], intake: dict[str, Any]) -> str:
+    intake_status = str(intake.get("status") or "")
+    decision = str(authorization.get("priority_decision") or "")
+    if intake_status.startswith("blocked"):
+        return "fix-evidence-intake"
+    if intake_status == "ready-for-lane-validation":
+        return "validate-ready-evidence"
+    if decision.startswith("park"):
+        return "park-until-official-evidence"
+    if intake_status.startswith("waiting") or not intake_status:
+        return "collect-approved-evidence"
+    return "collect-approved-evidence"
+
+
+def bounty_action_actor(kind: str) -> str:
+    if kind == "validate-ready-evidence":
+        return "agent-offline"
+    if kind == "fix-evidence-intake":
+        return "operator-or-reviewer"
+    if kind == "collect-approved-evidence":
+        return "operator-or-user"
+    if kind == "park-until-official-evidence":
+        return "operator-if-pursued-later"
+    return "agent-offline"
+
+
+def bounty_action_next_step(
+    kind: str,
+    authorization: dict[str, Any],
+    intake: dict[str, Any],
+) -> str:
+    if kind == "validate-ready-evidence":
+        return (
+            str(intake.get("next_step") or "")
+            or "Run the lane-specific after-evidence validation command."
+        )
+    if kind == "fix-evidence-intake":
+        return str(intake.get("next_step") or "Fix evidence format or redaction blockers before validation.")
+    if kind == "park-until-official-evidence":
+        return (
+            str(authorization.get("priority_reason") or "")
+            or str(intake.get("next_step") or "")
+            or "Keep this lane parked until provider/operator evidence exists."
+        )
+    return (
+        str(authorization.get("question") or "")
+        or str(intake.get("next_step") or "")
+        or "Collect approved redacted official evidence for this lane."
+    )
+
+
+def bounty_action_safe_command(
+    kind: str,
+    authorization: dict[str, Any],
+    intake: dict[str, Any],
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> str:
+    if kind == "validate-ready-evidence":
+        return str(
+            intake.get("recommended_after_evidence_command")
+            or authorization.get("recommended_after_evidence_command")
+            or ""
+        )
+    if kind == "fix-evidence-intake":
+        return validation_command_for_artifact_dir(
+            artifact_dir,
+            "bounty-evidence-intake --no-write --show-requests --show-files --show-risks --top 8",
+            profile=profile,
+        )
+    if kind == "park-until-official-evidence":
+        return str(authorization.get("recommended_preview_command") or "")
+    return str(authorization.get("recommended_preview_command") or "")
+
+
+def bounty_action_score(action: dict[str, Any]) -> int:
+    severity_rank = BOUNTY_FRONTIER_SEVERITY_RANK.get(str(action.get("expected_severity") or "info"), 9)
+    severity_score = max(0, 48 - severity_rank * 8)
+    priority_score = int(action.get("priority_score") or 0)
+    kind = str(action.get("kind") or "")
+    kind_score = max(0, 80 - BOUNTY_ACTION_KIND_RANK.get(kind, 9) * 12)
+    pursue_bonus = 18 if str(action.get("priority_decision") or "").startswith("pursue") else 0
+    human_penalty = 10 if action.get("requires_human_evidence") else 0
+    parked_penalty = 28 if kind == "park-until-official-evidence" else 0
+    return max(0, kind_score + priority_score + severity_score + pursue_bonus - human_penalty - parked_penalty)
+
+
+def bounty_action_for_authorization_request(
+    authorization: dict[str, Any],
+    *,
+    intake: dict[str, Any],
+    rollup: dict[str, Any],
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    kind = bounty_action_kind_for_request(authorization, intake)
+    safe_command = bounty_action_safe_command(
+        kind,
+        authorization,
+        intake,
+        artifact_dir=artifact_dir,
+        profile=profile,
+    )
+    requires_human = kind in {
+        "collect-approved-evidence",
+        "fix-evidence-intake",
+        "park-until-official-evidence",
+    }
+    action = {
+        "id": f"ACTION-{safe_probe_id(str(authorization.get('id') or authorization.get('lane') or kind))}",
+        "kind": kind,
+        "actor": bounty_action_actor(kind),
+        "lane": authorization.get("lane"),
+        "entrypoint": authorization.get("entrypoint"),
+        "expected_severity": authorization.get("expected_severity"),
+        "authorization_request_id": authorization.get("id"),
+        "workorder_id": authorization.get("workorder_id"),
+        "gate_id": authorization.get("gate_id"),
+        "priority_decision": authorization.get("priority_decision"),
+        "priority_score": authorization.get("priority_score"),
+        "intake_status": intake.get("status"),
+        "readiness_status": rollup.get("readiness_status"),
+        "gate_status": rollup.get("gate_status"),
+        "requires_human_evidence": requires_human,
+        "agent_can_continue_without_new_evidence": kind == "validate-ready-evidence",
+        "blocked_by_official_evidence": kind in {"collect-approved-evidence", "park-until-official-evidence"},
+        "safe_offline_command": safe_command,
+        "next_step": bounty_action_next_step(kind, authorization, intake),
+        "requested_evidence": normalize_string_list(authorization.get("requested_official_evidence_labels")),
+        "file_refs": normalize_string_list(intake.get("file_refs")),
+        "redaction_risks": normalize_string_list(intake.get("redaction_risks")),
+        "reportability_boundary": authorization.get("reportability_boundary") or rollup.get("reportability_boundary"),
+    }
+    action["score"] = bounty_action_score(action)
+    return action
+
+
+def build_bounty_action_queue(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    bounty_readiness_rollup: dict[str, Any] | None,
+    bounty_evidence_authorization: dict[str, Any] | None,
+    bounty_evidence_intake: dict[str, Any] | None,
+    adjudication: dict[str, Any] | None,
+) -> dict[str, Any]:
+    auth_requests = (
+        bounty_evidence_authorization.get("authorization_requests", [])
+        if isinstance(bounty_evidence_authorization, dict)
+        and isinstance(bounty_evidence_authorization.get("authorization_requests"), list)
+        else []
+    )
+    intake_rows = (
+        bounty_evidence_intake.get("intake_reviews", [])
+        if isinstance(bounty_evidence_intake, dict)
+        and isinstance(bounty_evidence_intake.get("intake_reviews"), list)
+        else []
+    )
+    rollup_rows = (
+        bounty_readiness_rollup.get("lane_rollups", [])
+        if isinstance(bounty_readiness_rollup, dict)
+        and isinstance(bounty_readiness_rollup.get("lane_rollups"), list)
+        else []
+    )
+    intake_by_auth = {
+        str(row.get("authorization_request_id")): row
+        for row in intake_rows
+        if isinstance(row, dict) and row.get("authorization_request_id")
+    }
+    rollup_by_gate = {
+        str(row.get("gate_id")): row
+        for row in rollup_rows
+        if isinstance(row, dict) and row.get("gate_id")
+    }
+    actions = []
+    for request in auth_requests:
+        if not isinstance(request, dict):
+            continue
+        intake = intake_by_auth.get(str(request.get("id") or ""), {})
+        rollup = rollup_by_gate.get(str(request.get("gate_id") or ""), {})
+        actions.append(
+            bounty_action_for_authorization_request(
+                request,
+                intake=intake,
+                rollup=rollup,
+                artifact_dir=artifact_dir,
+                profile=profile,
+            )
+        )
+    if not actions:
+        refresh_command = validation_command_for_artifact_dir(
+            artifact_dir,
+            "bounty-evidence-authorization --no-write --show-questions --show-commands --top 8",
+            profile=profile,
+        )
+        actions.append(
+            {
+                "id": "ACTION-refresh-bounty-artifacts",
+                "kind": "refresh-bounty-artifacts",
+                "actor": "agent-offline",
+                "lane": None,
+                "entrypoint": None,
+                "expected_severity": "info",
+                "authorization_request_id": None,
+                "workorder_id": None,
+                "gate_id": None,
+                "priority_decision": None,
+                "priority_score": 0,
+                "intake_status": None,
+                "readiness_status": None,
+                "gate_status": None,
+                "requires_human_evidence": False,
+                "agent_can_continue_without_new_evidence": True,
+                "blocked_by_official_evidence": False,
+                "safe_offline_command": refresh_command,
+                "next_step": "Refresh bounty evidence authorization and intake artifacts.",
+                "requested_evidence": [],
+                "file_refs": [],
+                "redaction_risks": [],
+                "reportability_boundary": "This action queue is not evidence.",
+                "score": 0,
+            }
+        )
+    actions.sort(
+        key=lambda row: (
+            BOUNTY_ACTION_KIND_RANK.get(str(row.get("kind") or ""), 9),
+            -int(row.get("score") or 0),
+            BOUNTY_FRONTIER_SEVERITY_RANK.get(str(row.get("expected_severity") or "info"), 9),
+            str(row.get("lane") or ""),
+            str(row.get("id") or ""),
+        )
+    )
+    kind_counts: dict[str, int] = {}
+    actor_counts: dict[str, int] = {}
+    for row in actions:
+        increment_count(kind_counts, str(row.get("kind") or "unknown"))
+        increment_count(actor_counts, str(row.get("actor") or "unknown"))
+    ready_agent = [row for row in actions if row.get("agent_can_continue_without_new_evidence")]
+    human_required = [row for row in actions if row.get("requires_human_evidence")]
+    blocked = [row for row in actions if str(row.get("kind") or "") == "fix-evidence-intake"]
+    parked = [row for row in actions if str(row.get("kind") or "") == "park-until-official-evidence"]
+    top = actions[0] if actions else {}
+    if blocked:
+        status = "blocked-fix-evidence-intake-first"
+    elif ready_agent:
+        status = "ready-for-offline-validation-action"
+    elif human_required:
+        status = "waiting-human-evidence-action"
+    else:
+        status = "no-bounty-actions"
+    commands = ordered_unique_strings(
+        [
+            str(row.get("safe_offline_command") or "")
+            for row in actions
+            if row.get("safe_offline_command")
+        ]
+    )
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-action-queue-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "actions": len(actions),
+            "agent_ready": len(ready_agent),
+            "human_required": len(human_required),
+            "blocked": len(blocked),
+            "parked": len(parked),
+            "top_action": top.get("id"),
+            "top_kind": top.get("kind"),
+            "top_lane": top.get("lane"),
+            "top_actor": top.get("actor"),
+            "kind_counts": dict(sorted(kind_counts.items())),
+            "actor_counts": dict(sorted(actor_counts.items())),
+            "bounty_readiness_rollup_status": artifact_summary_status(bounty_readiness_rollup),
+            "bounty_evidence_authorization_status": artifact_summary_status(bounty_evidence_authorization),
+            "bounty_evidence_intake_status": artifact_summary_status(bounty_evidence_intake),
+            "adjudication_status": artifact_summary_status(adjudication),
+        },
+        "actions": actions,
+        "agent_ready_actions": ready_agent[:8],
+        "human_required_actions": human_required[:8],
+        "blocked_actions": blocked[:8],
+        "parked_actions": parked[:8],
+        "commands": commands[:12],
+        "reportability_rule": (
+            "This queue is workflow control only. It does not collect evidence, validate impact, or promote findings. "
+            "Reportability still requires official evidence, lane readiness, finding-gate acceptance, and adjudication."
+        ),
+        "next_step": top.get("next_step") if top else "Refresh bounty evidence artifacts.",
+        "safety": (
+            "Offline action queue only. It reads local JSON artifacts, sends no requests, calls no Burp tool, starts no browser, "
+            "creates no evidence sidecars, signs no wallet, submits no transaction, and changes no infrastructure."
+        ),
+    }
+
+
 def build_provenance_invalidity_row(invalidity_review: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(invalidity_review, dict):
         return {}
@@ -27151,6 +27463,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     BOUNTY_LANE_PRIORITIES_ARTIFACT: "bounty-lane-priorities",
     BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT: "bounty-evidence-authorization",
     BOUNTY_EVIDENCE_INTAKE_ARTIFACT: "bounty-evidence-intake",
+    BOUNTY_ACTION_QUEUE_ARTIFACT: "bounty-action-queue",
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
     TRANSACTION_EVIDENCE_READINESS_ARTIFACT: "transaction-evidence-readiness",
     OPERATOR_IMPACT_READINESS_ARTIFACT: "operator-impact-readiness",
@@ -27205,6 +27518,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "bounty-lane-priorities",
     "bounty-evidence-authorization",
     "bounty-evidence-intake",
+    "bounty-action-queue",
     "transaction-intent-boundary",
     "transaction-evidence-readiness",
     "operator-impact-readiness",
@@ -27244,6 +27558,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "bounty-lane-priorities": "bounty-lane-priorities --no-write",
     "bounty-evidence-authorization": "bounty-evidence-authorization --no-write",
     "bounty-evidence-intake": "bounty-evidence-intake --no-write",
+    "bounty-action-queue": "bounty-action-queue --no-write",
     "transaction-intent-boundary": "transaction-intent-boundary --no-write",
     "transaction-evidence-readiness": "transaction-evidence-readiness --no-write",
     "operator-impact-readiness": "operator-impact-readiness --no-write",
@@ -52330,6 +52645,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("bounty-lane-priorities", "run_bounty_lane_priorities"),
         refresh_expectation("bounty-evidence-authorization", "run_bounty_evidence_authorization"),
         refresh_expectation("bounty-evidence-intake", "run_bounty_evidence_intake"),
+        refresh_expectation("bounty-action-queue", "run_bounty_action_queue"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-intent-boundary", "run_transaction_intent_boundary"),
         refresh_expectation("transaction-evidence-readiness", "run_transaction_evidence_readiness"),
@@ -77631,6 +77947,150 @@ def run_bounty_evidence_intake(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_or_load_bounty_evidence_intake_for_run(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    source_root: Path,
+    max_file_bytes: int,
+) -> dict[str, Any]:
+    intake = load_optional_json(artifact_dir / BOUNTY_EVIDENCE_INTAKE_ARTIFACT)
+    if isinstance(intake, dict):
+        return intake
+    authorization = build_or_load_bounty_evidence_authorization_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    return build_bounty_evidence_intake(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_evidence_authorization=authorization,
+        max_file_bytes=max_file_bytes,
+    )
+
+
+def run_bounty_action_queue(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    rollup = build_or_load_bounty_readiness_rollup_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    authorization = build_or_load_bounty_evidence_authorization_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    intake = build_or_load_bounty_evidence_intake_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+        max_file_bytes=int(args.max_file_bytes),
+    )
+    queue = build_bounty_action_queue(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_readiness_rollup=rollup,
+        bounty_evidence_authorization=authorization,
+        bounty_evidence_intake=intake,
+        adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / BOUNTY_ACTION_QUEUE_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(queue))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-action-queue",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = queue.get("summary", {}) if isinstance(queue.get("summary"), dict) else {}
+    print(f"Bounty action queue: {queue.get('status')}")
+    print(
+        "Queue: "
+        f"actions={summary.get('actions', 0)} "
+        f"agent_ready={summary.get('agent_ready', 0)} "
+        f"human_required={summary.get('human_required', 0)} "
+        f"blocked={summary.get('blocked', 0)} "
+        f"parked={summary.get('parked', 0)} "
+        f"top={summary.get('top_lane') or '-'} "
+        f"kind={summary.get('top_kind') or '-'} "
+        f"actor={summary.get('top_actor') or '-'}"
+    )
+    print(
+        "Inputs: "
+        f"rollup={summary.get('bounty_readiness_rollup_status') or '-'} "
+        f"authorization={summary.get('bounty_evidence_authorization_status') or '-'} "
+        f"intake={summary.get('bounty_evidence_intake_status') or '-'} "
+        f"adjudication={summary.get('adjudication_status') or '-'}"
+    )
+    print(f"Kinds: {json.dumps(summary.get('kind_counts', {}), sort_keys=True)}")
+    display_limit = max(0, int(args.top))
+    if getattr(args, "show_actions", False):
+        print("Actions:")
+        for row in (queue.get("actions", []) or [])[:display_limit]:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('id')}: score={row.get('score')} {row.get('expected_severity')} "
+                f"lane={row.get('lane') or '-'} kind={row.get('kind')} actor={row.get('actor')} "
+                f"agent_ready={row.get('agent_can_continue_without_new_evidence')}"
+            )
+            print(f"  next={inline_summary_text(row.get('next_step'), max_chars=360)}")
+            evidence = ", ".join(normalize_string_list(row.get("requested_evidence"))[:4])
+            if evidence:
+                print(f"  needs={inline_summary_text(evidence, max_chars=300)}")
+            if getattr(args, "show_commands", False):
+                command_text = row.get("safe_offline_command")
+                if command_text:
+                    print(f"  command={inline_summary_text(command_text, max_chars=420)}")
+            if getattr(args, "show_blockers", False):
+                risks = ", ".join(normalize_string_list(row.get("redaction_risks"))[:4])
+                if risks:
+                    print(f"  redaction_risks={inline_summary_text(risks, max_chars=260)}")
+                if row.get("blocked_by_official_evidence"):
+                    print("  blocker=official-evidence-required")
+        remaining = len(queue.get("actions", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more action(s); rerun without --no-write to write the full artifact")
+            else:
+                print(f"- {remaining} more action(s) in {output_path}")
+    if getattr(args, "show_commands", False) and not getattr(args, "show_actions", False):
+        print("Commands:")
+        for command_text in normalize_string_list(queue.get("commands"))[:display_limit]:
+            print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    print(f"Rule: {inline_summary_text(queue.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(queue.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and summary.get("blocked", 0) > 0:
+        return 1
+    return 0
+
+
 def run_rpc_proxy_parity_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -81114,6 +81574,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero when any present evidence file is blocked by format or redaction-risk intake.",
     )
     bounty_evidence_intake.set_defaults(func=run_bounty_evidence_intake)
+
+    bounty_action_queue = sub.add_parser(
+        "bounty-action-queue",
+        help="Rank the next safe bounty workflow action from priorities, authorization, intake, and readiness state",
+    )
+    bounty_action_queue.add_argument(
+        "--output",
+        help=(
+            f"Where to write {BOUNTY_ACTION_QUEUE_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{BOUNTY_ACTION_QUEUE_ARTIFACT}."
+        ),
+    )
+    bounty_action_queue.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of queued actions or commands to print.",
+    )
+    bounty_action_queue.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=262144,
+        help="Maximum bytes to read if evidence intake must be built. Defaults to 262144.",
+    )
+    bounty_action_queue.add_argument(
+        "--show-actions",
+        action="store_true",
+        help="Print ranked bounty workflow actions.",
+    )
+    bounty_action_queue.add_argument(
+        "--show-blockers",
+        action="store_true",
+        help="Print official-evidence and redaction blockers for each shown action.",
+    )
+    bounty_action_queue.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print the safe offline command attached to each queued action.",
+    )
+    bounty_action_queue.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print bounty action queue only; do not write {BOUNTY_ACTION_QUEUE_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    bounty_action_queue.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero when evidence intake redaction or format blockers must be fixed first.",
+    )
+    bounty_action_queue.set_defaults(func=run_bounty_action_queue)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
