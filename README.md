@@ -403,6 +403,12 @@ This command is local and read-only. It flags catch-all rewrites, fixed
 upstreams, unconditional routes, and review-only observation candidates, then
 lists the evidence required before a static rewrite/proxy hypothesis can become
 a reportable issue.
+If `endpoint-clusters.json` or the target profile does not list a static
+`next.config.*` rewrite, `rewrite-review`, `hypothesis-matrix`, and
+`validation-plan` can still merge source-discovered rewrite-proxy clusters into
+their in-memory review. This catches profile omissions such as catch-all
+same-origin API proxies without changing the checked-in profile or sending
+traffic.
 For source-backed fixed-upstream API routes, it also scans the referenced route
 source for fixed upstream fetches, positive route-parameter guards, query
 forwarding, credential/header forwarding, upstream status forwarding, and cache
@@ -519,8 +525,10 @@ Do not add control-plane ports such as `2455` to resource-snapshot watch lists,
 readiness checks, health checks, resource checks, probes, or memory-reclaim
 candidates. In the Codex VPS environment, `2455` is reserved for the AI API load
 balancer and must not be observed, signaled, stopped, restarted, or probed by
-unattended tooling. `resource-snapshot --watch-port 2455` is blocked before
-collecting local process or port data.
+unattended tooling. If a watch port matches the protected control-plane list,
+`resource-snapshot` exits before collecting local process or port data. Self-tests
+must use synthetic protected ports for guard verification rather than passing
+real control-plane ports as command arguments.
 
 `burp-sync`, `audit`, `blackbox-asset-map`, `websocket-candidate-review`
 handshake baselines, `host-takeover-baseline`, `collect-quote`,

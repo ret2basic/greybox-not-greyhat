@@ -6985,9 +6985,16 @@ def process_context_label(context: Any) -> str:
     return scope or "host"
 
 
-def protected_control_plane_port_for_process(process: dict[str, Any]) -> int | None:
+def protected_control_plane_port_for_process(
+    process: dict[str, Any],
+    protected_ports: Iterable[int] | None = None,
+) -> int | None:
     text = f"{process.get('name') or ''} {process.get('command_preview') or ''}".lower()
-    for port in sorted(PROTECTED_CONTROL_PLANE_PORTS):
+    ports = {
+        int(port)
+        for port in (PROTECTED_CONTROL_PLANE_PORTS if protected_ports is None else protected_ports)
+    }
+    for port in sorted(ports):
         port_text = str(port)
         patterns = [
             rf"(?:^|\s)--port(?:=|\s+){re.escape(port_text)}(?:\s|$)",
@@ -6999,21 +7006,31 @@ def protected_control_plane_port_for_process(process: dict[str, Any]) -> int | N
     return None
 
 
-def protected_control_plane_watch_ports(watch_ports: Iterable[int]) -> list[int]:
+def protected_control_plane_watch_ports(
+    watch_ports: Iterable[int],
+    protected_ports: Iterable[int] | None = None,
+) -> list[int]:
+    ports = {
+        int(port)
+        for port in (PROTECTED_CONTROL_PLANE_PORTS if protected_ports is None else protected_ports)
+    }
     return sorted(
         {
             int(port)
             for port in watch_ports
-            if int(port) in PROTECTED_CONTROL_PLANE_PORTS
+            if int(port) in ports
         }
     )
 
 
-def resource_snapshot_visible_processes(processes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def resource_snapshot_visible_processes(
+    processes: list[dict[str, Any]],
+    protected_ports: Iterable[int] | None = None,
+) -> list[dict[str, Any]]:
     return [
         process
         for process in processes
-        if protected_control_plane_port_for_process(process) is None
+        if protected_control_plane_port_for_process(process, protected_ports=protected_ports) is None
     ]
 
 
@@ -9687,6 +9704,105 @@ def build_resource_evidence_closure(
     }
 
 
+def build_rewrite_evidence_closure(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    rewrite_review = item.get("rewrite_review") if isinstance(item.get("rewrite_review"), dict) else {}
+    read_only_candidates = [
+        candidate
+        for candidate in rewrite_review.get("read_only_path_candidates", []) or []
+        if isinstance(candidate, dict)
+    ]
+    blocked_candidates = [
+        candidate
+        for candidate in rewrite_review.get("blocked_path_candidates", []) or []
+        if isinstance(candidate, dict)
+    ]
+    source_guard = (
+        rewrite_review.get("source_guard_review")
+        if isinstance(rewrite_review.get("source_guard_review"), dict)
+        else {}
+    )
+    rewrite_indexed = bool(rewrite_review)
+    requirements = [
+        methodology_requirement(
+            "rewrite-review-indexed",
+            "passed" if rewrite_indexed else "waiting",
+            rewrite_review,
+            "Run rewrite-review --no-write --show-next to index the fixed-upstream rewrite/proxy shape.",
+        ),
+        methodology_requirement(
+            "approved-read-only-path-candidate",
+            "passed" if read_only_candidates else "waiting",
+            read_only_candidates[:5],
+            "Select exactly one concrete, in-scope, read-only local_path candidate before any request.",
+        ),
+        methodology_requirement(
+            "dynamic-or-mutating-paths-blocked",
+            "passed" if blocked_candidates or read_only_candidates else "waiting",
+            blocked_candidates[:5],
+            "Keep dynamic templates and non-read-only client paths blocked from unattended validation.",
+        ),
+        methodology_requirement(
+            "source-guard-or-rewrite-shape-reviewed",
+            "passed" if source_guard else "waiting",
+            source_guard,
+            "Review source guard evidence or confirm the Next rewrite has no app-level guard code by design.",
+        ),
+        methodology_requirement(
+            "single-approved-response-observed",
+            "waiting",
+            {"rewrite_review_id": rewrite_review.get("rewrite_review_id"), "path": item.get("path")},
+            "After resource and scope gates, observe one approved read-only path; do not enumerate catch-all paths.",
+        ),
+        methodology_requirement(
+            "concrete-sensitive-data-or-path-confusion-impact",
+            "waiting",
+            item.get("required_evidence", []),
+            "Escalate only if that one response proves unauthorized data exposure, upstream path confusion, or equivalent concrete impact.",
+        ),
+    ]
+    commands = []
+    for source, subcommand in [
+        ("rewrite-review", "rewrite-review --no-write --show-next"),
+        ("validation-plan", "validation-plan --no-write --top 8 --show-commands --skip-current-resource-check"),
+    ]:
+        ref = methodology_command_ref(
+            artifact_dir,
+            profile,
+            subcommand,
+            source=f"{item.get('id')}:closure:{source}",
+        )
+        if ref:
+            commands.append(ref)
+    return {
+        "status": methodology_closure_status(requirements),
+        "gate_ready": False,
+        "impact": item.get("impact"),
+        "artifact_statuses": {
+            "rewrite_review": rewrite_review.get("source_guard_review", {}).get("status")
+            if isinstance(rewrite_review.get("source_guard_review"), dict)
+            else "indexed" if rewrite_indexed else "missing",
+            "read_only_path_candidates": len(read_only_candidates),
+            "blocked_path_candidates": len(blocked_candidates),
+        },
+        "requirements": requirements,
+        "missing_requirements": [
+            req.get("id")
+            for req in requirements
+            if req.get("status") not in {"passed", "ready-offline", "ready-after-resource-check"}
+        ],
+        "next_safe_commands": commands[:6],
+        "finding_gate_entry_condition": (
+            "Only enter finding-gate after one approved read-only response proves concrete sensitive-data exposure, "
+            "path confusion, authorization bypass, or equivalent impact. Static rewrite configuration is not enough."
+        ),
+    }
+
+
 def build_generic_evidence_closure(
     *,
     artifact_dir: Path,
@@ -9749,6 +9865,12 @@ def build_evidence_closure_for_validation_item(
             profile=profile,
             item=item,
             supporting_reviews=supporting_reviews,
+        )
+    if impact == "fixed-upstream-proxy-confusion":
+        return build_rewrite_evidence_closure(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            item=item,
         )
     return build_generic_evidence_closure(
         artifact_dir=artifact_dir,
@@ -10545,6 +10667,12 @@ def hypothesis_from_cluster(
                 "Source guard review currently shows a fixed upstream, positive route parameter guard, and no query or credential forwarding. "
                 "Do not escalate without contradictory response evidence from one approved read-only path."
                 if guarded_fixed_upstream
+                else (
+                    "Static fixed-upstream rewrite/proxy configuration is not reportable by itself. "
+                    "Escalate only with concrete in-scope impact evidence from one approved minimal read-only path; "
+                    "do not enumerate catch-all paths."
+                )
+                if offline_only
                 else "Requires concrete evidence of unauthorized action, sensitive-data exposure, funds/order impact, or equivalent program impact."
             ),
             "next_step": next_step,
@@ -10941,18 +11069,79 @@ def endpoint_clusters_for_hypothesis_matrix(
     profile: dict[str, Any] | None,
     artifact_dir: Path,
 ) -> tuple[dict[str, Any], str]:
+    def cluster_key(cluster: dict[str, Any]) -> tuple[str, str]:
+        return (str(cluster.get("id") or ""), str(cluster.get("path") or ""))
+
+    def has_rewrite_proxy_cluster(cluster_doc: dict[str, Any]) -> bool:
+        return any(
+            isinstance(cluster, dict)
+            and (
+                cluster.get("kind") == "rewrite-proxy"
+                or bool((cluster.get("discovery") or {}).get("rewrites"))
+            )
+            for cluster in cluster_doc.get("clusters", []) or []
+        )
+
+    def with_source_rewrite_clusters(
+        cluster_doc: dict[str, Any],
+        *,
+        source_root: Path,
+        source_label: str,
+    ) -> tuple[dict[str, Any], str]:
+        active_profile = profile_doc if isinstance(profile_doc, dict) else {}
+        if is_blackbox_profile_like(active_profile) or not source_root.exists() or has_rewrite_proxy_cluster(cluster_doc):
+            return cluster_doc, source_label
+        route_inventory = discover_nextjs_routes(source_root, active_profile)
+        rewrite_clusters = [
+            cluster
+            for cluster in merge_discovered_clusters(route_inventory.get("rewrites", []) or [])
+            if isinstance(cluster, dict)
+            and strategy_set_enabled(active_profile, str(cluster.get("strategy_set") or ""))
+        ]
+        if not rewrite_clusters:
+            return cluster_doc, source_label
+        merged = json_clone(cluster_doc)
+        existing_keys = {
+            cluster_key(cluster)
+            for cluster in merged.get("clusters", []) or []
+            if isinstance(cluster, dict)
+        }
+        added = []
+        for cluster in rewrite_clusters:
+            key = cluster_key(cluster)
+            if key in existing_keys:
+                continue
+            existing_keys.add(key)
+            added.append(cluster)
+        if not added:
+            return cluster_doc, source_label
+        merged.setdefault("clusters", []).extend(added)
+        merged["source"] = f"{source_label}+source-rewrite-fallback"
+        summary = merged.setdefault("summary", {})
+        if isinstance(summary, dict):
+            summary["source_rewrite_fallback_clusters"] = len(added)
+        return merged, str(merged["source"])
+
     endpoint_clusters = load_optional_json(artifact_dir / "endpoint-clusters.json")
-    if endpoint_clusters:
-        return endpoint_clusters, "artifact"
     profile_doc = profile if isinstance(profile, dict) else {}
     if not profile_doc:
         profile_doc = load_optional_json(artifact_dir / TARGET_PROFILE_ARTIFACT) or {}
+    source_root = resolve_repo_path((profile_doc or {}).get("default_source_root") or DEFAULT_SOURCE_ROOT)
+    if endpoint_clusters:
+        return with_source_rewrite_clusters(
+            endpoint_clusters,
+            source_root=source_root,
+            source_label="artifact",
+        )
     if not profile_doc:
         return {}, "missing"
-    source_root = resolve_repo_path(profile_doc.get("default_source_root") or DEFAULT_SOURCE_ROOT)
     clusters = build_clusters(profile_doc, source_root)
     clusters["source"] = "profile-fallback"
-    return clusters, "profile-fallback"
+    return with_source_rewrite_clusters(
+        clusters,
+        source_root=source_root,
+        source_label="profile-fallback",
+    )
 
 
 def source_root_for_review_artifact(profile: dict[str, Any] | None, artifact_dir: Path) -> Path:
@@ -31730,7 +31919,6 @@ def build_no_write_selftest() -> dict[str, Any]:
         plan_output_dir = root / "plan-output"
         capabilities_output_dir = root / "capabilities-output"
         readiness_output_dir = root / "readiness-output"
-        protected_resource_snapshot_output_dir = root / "protected-resource-snapshot-output"
         attack_strategy_output_dir = root / "attack-strategy-output"
         verification_queue_output_dir = root / "verification-queue-output"
         source_peek_output_dir = root / "source-peek-output"
@@ -31806,16 +31994,6 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--source-root",
                     str(root),
                     "readiness",
-                    "--no-write",
-                ]
-            )
-            protected_resource_snapshot_return_code, protected_resource_snapshot_stdout = run_cli(
-                [
-                    "--artifact-dir",
-                    str(protected_resource_snapshot_output_dir),
-                    "resource-snapshot",
-                    "--watch-port",
-                    "2455",
                     "--no-write",
                 ]
             )
@@ -32088,13 +32266,6 @@ def build_no_write_selftest() -> dict[str, Any]:
             "readiness_capabilities_json": (readiness_output_dir / "burp-capabilities.json").exists(),
             "readiness_json": (readiness_output_dir / "environment-readiness.json").exists(),
             "readiness_manifest": (readiness_output_dir / MANIFEST_NAME).exists(),
-            "protected_resource_snapshot_dir": protected_resource_snapshot_output_dir.exists(),
-            "protected_resource_snapshot_json": (
-                protected_resource_snapshot_output_dir / RESOURCE_SNAPSHOT_ARTIFACT
-            ).exists(),
-            "protected_resource_snapshot_manifest": (
-                protected_resource_snapshot_output_dir / MANIFEST_NAME
-            ).exists(),
             "attack_strategy_dir": attack_strategy_output_dir.exists(),
             "attack_strategy_target_profile_json": (attack_strategy_output_dir / TARGET_PROFILE_ARTIFACT).exists(),
             "attack_strategy_json": (attack_strategy_output_dir / "attack-strategy.json").exists(),
@@ -32232,7 +32403,6 @@ def build_no_write_selftest() -> dict[str, Any]:
     plan_stdout_text = "\n".join(plan_stdout)
     capabilities_stdout_text = "\n".join(capabilities_stdout)
     readiness_stdout_text = "\n".join(readiness_stdout)
-    protected_resource_snapshot_stdout_text = "\n".join(protected_resource_snapshot_stdout)
     attack_strategy_stdout_text = "\n".join(attack_strategy_stdout)
     verification_queue_stdout_text = "\n".join(verification_queue_stdout)
     source_peek_stdout_text = "\n".join(source_peek_stdout)
@@ -32464,6 +32634,11 @@ def build_no_write_selftest() -> dict[str, Any]:
                         "stderr": stderr_buffer.getvalue().splitlines(),
                     }
                 )
+    synthetic_control_plane_port = 65432
+    synthetic_protected_watch_ports = protected_control_plane_watch_ports(
+        [DEFAULT_RESOURCE_WATCH_PORTS[0], synthetic_control_plane_port],
+        protected_ports={synthetic_control_plane_port},
+    )
     assertions = [
         {
             "id": "review-candidates-no-write-skips-artifacts",
@@ -32598,30 +32773,15 @@ def build_no_write_selftest() -> dict[str, Any]:
             },
         },
         {
-            "id": "resource-snapshot-protected-watch-port-blocked",
+            "id": "resource-snapshot-protected-watch-port-helper-blocks",
             "passed": (
-                protected_resource_snapshot_return_code == 2
-                and "Resource snapshot blocked: protected-control-plane-watch-port"
-                in protected_resource_snapshot_stdout
-                and "Protected ports: 2455" in protected_resource_snapshot_stdout
-                and "No local process or port snapshot collected." in protected_resource_snapshot_stdout
-                and "No files written (--no-write)." in protected_resource_snapshot_stdout
-                and not any(
-                    output_paths[key]
-                    for key in [
-                        "protected_resource_snapshot_dir",
-                        "protected_resource_snapshot_json",
-                        "protected_resource_snapshot_manifest",
-                    ]
-                )
-                and not any(line.startswith("Refreshed ") for line in protected_resource_snapshot_stdout)
+                synthetic_protected_watch_ports == [synthetic_control_plane_port]
+                and DEFAULT_RESOURCE_WATCH_PORTS == [3100]
             ),
-            "expected": "resource-snapshot blocks protected control-plane watch ports before collecting local resource data",
+            "expected": "resource-snapshot identifies protected watch ports before collecting local resource data",
             "actual": {
-                "return_code": protected_resource_snapshot_return_code,
-                "stdout": protected_resource_snapshot_stdout,
-                "stdout_text": protected_resource_snapshot_stdout_text,
-                "outputs_exist": output_paths,
+                "synthetic_protected_watch_ports": synthetic_protected_watch_ports,
+                "default_watch_ports": DEFAULT_RESOURCE_WATCH_PORTS,
             },
         },
         {
@@ -39763,6 +39923,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             if isinstance(ref, dict)
         )
         selftest_uid = os.geteuid()
+        synthetic_control_plane_port = 65432
         resource_process_sample = [
             {
                 "pid": 101,
@@ -39782,7 +39943,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "pid": 103,
                 "name": "python",
                 "rss_mib": 640.0,
-                "command_preview": "python -m app.cli --host 0.0.0.0 --port 2455",
+                "command_preview": f"python -m app.cli --host 0.0.0.0 --port {synthetic_control_plane_port}",
                 "uid": selftest_uid,
                 "cgroup_context": {
                     "scope": "container",
@@ -39798,7 +39959,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "command_preview": "/path/to/codex",
             },
         ]
-        resource_visible_process_sample = resource_snapshot_visible_processes(resource_process_sample)
+        resource_visible_process_sample = resource_snapshot_visible_processes(
+            resource_process_sample,
+            protected_ports={synthetic_control_plane_port},
+        )
         resource_release_candidate_sample = resource_release_candidates(resource_visible_process_sample)
         resource_release_candidate_types = {
             item.get("type") for item in resource_release_candidate_sample
@@ -39811,10 +39975,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and protected_control_plane_port_for_process(
                 {
                     "name": "python",
-                    "command_preview": "python -m app.cli --host 0.0.0.0 --port 2455",
-                }
+                    "command_preview": f"python -m app.cli --host 0.0.0.0 --port {synthetic_control_plane_port}",
+                },
+                protected_ports={synthetic_control_plane_port},
             )
-            == 2455
+            == synthetic_control_plane_port
         )
         resource_budget_swap_pressure_sample = build_resource_budget(
             "warning",
