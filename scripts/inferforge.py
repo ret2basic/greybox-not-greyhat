@@ -21975,7 +21975,7 @@ def build_adjudication(
                 "classification": classification,
                 "gate_status": gate_status,
                 "report_bucket": bucket,
-                "title": suspicion.get("hypothesis"),
+                "title": suspicion.get("hypothesis") or gate.get("title"),
                 "checks": gate.get("checks", []),
             }
         )
@@ -31814,9 +31814,48 @@ def build_transaction_decoder_selftest(
     }
 
 
+def transaction_intent_finding_gate_item(transaction_intent: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(transaction_intent, dict):
+        return None
+    review = (
+        transaction_intent.get("reportability_review")
+        if isinstance(transaction_intent.get("reportability_review"), dict)
+        else {}
+    )
+    if not review.get("ready_for_finding_gate"):
+        return None
+    return {
+        "suspicion_id": "TXINTENT-transaction-integrity",
+        "entrypoint": "POST /api/quote",
+        "classification": "candidate-transaction-integrity-impact",
+        "gate_status": "manual-review",
+        "severity": review.get("candidate_severity") or "needs-triage",
+        "title": "Decoded quote transaction intent mismatch requires finding-gate review",
+        "checks": [
+            {
+                "id": "decoded-transaction-corpus",
+                "passed": int(review.get("decoded_transactions") or 0) > 0,
+                "evidence": "transaction-intent.json",
+            },
+            {
+                "id": "high-impact-intent-mismatch",
+                "passed": int(review.get("high_impact_failure_count") or 0) > 0,
+                "evidence": review.get("high_impact_failures", []),
+            },
+            {
+                "id": "manual-impact-review",
+                "passed": False,
+                "evidence": review.get("reportability_gate"),
+                "note": "Manual review must tie the decoded mismatch to concrete user-funds or transaction-integrity impact.",
+            },
+        ],
+    }
+
+
 def build_finding_gate(
     suspicions: list[dict[str, Any]],
     burp_history: list[dict[str, Any]],
+    transaction_intent: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     gates = []
     burp_paths = {row.get("path") for row in burp_history}
@@ -31875,11 +31914,16 @@ def build_finding_gate(
             }
         )
 
+    tx_gate = transaction_intent_finding_gate_item(transaction_intent)
+    if tx_gate:
+        gates.append(tx_gate)
+
     return {
         "generated_at": utc_now(),
         "policy": [
             "valid-finding requires black-box reproduction, source context when needed, explicit attacker model, impact, and counter-evidence review.",
             "hardening-note may pass with controlled probe reproduction plus source context, but must not be reported as an exploitable vulnerability.",
+            "decoded transaction intent mismatches enter finding-gate as manual-review candidates and are not reportable until impact is proven.",
         ],
         "gates": gates,
     }
@@ -33388,7 +33432,7 @@ def run_audit(args: argparse.Namespace) -> int:
     quote_collection = json.loads(read_text(quote_collection_path)) if quote_collection_path.exists() else None
     suspicions = build_suspicions(results, clusters)
     write_json(artifact_dir / "suspicions.json", {"generated_at": utc_now(), "suspicions": suspicions})
-    finding_gate = build_finding_gate(suspicions, burp_history)
+    finding_gate = build_finding_gate(suspicions, burp_history, transaction_intent)
     write_json(artifact_dir / "finding-gate.json", finding_gate)
     findings = build_findings(suspicions, finding_gate)
     hardening_notes = build_hardening_notes(suspicions, finding_gate)
@@ -37487,6 +37531,43 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for item in generic_hardening_notes
         )
     )
+    transaction_gate_sample = build_finding_gate(
+        [],
+        [],
+        {
+            "reportability_review": {
+                "status": "candidate-transaction-integrity-impact",
+                "candidate_severity": "high",
+                "ready_for_finding_gate": True,
+                "reportable_now": False,
+                "decoded_transactions": 1,
+                "high_impact_failure_count": 2,
+                "high_impact_failures": [
+                    {"id": "txcand-test:wallet-signer", "status": "failed"},
+                    {"id": "txcand-test:program-allowlist", "status": "failed"},
+                ],
+                "reportability_gate": "Synthetic gate sample.",
+            }
+        },
+    )
+    transaction_gate_item = next(
+        (
+            item
+            for item in transaction_gate_sample.get("gates", [])
+            if item.get("suspicion_id") == "TXINTENT-transaction-integrity"
+        ),
+        None,
+    )
+    transaction_gate_ingestion_passed = (
+        transaction_gate_item is not None
+        and transaction_gate_item.get("classification") == "candidate-transaction-integrity-impact"
+        and transaction_gate_item.get("gate_status") == "manual-review"
+        and transaction_gate_item.get("severity") == "high"
+        and any(
+            check.get("id") == "manual-impact-review" and check.get("passed") is False
+            for check in transaction_gate_item.get("checks", [])
+        )
+    )
     quote_source_profile = json_clone(test_profile)
     for cluster in quote_source_profile.get("clusters", []):
         if cluster.get("id") == "quote":
@@ -37974,10 +38055,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_mode_samples_passed
         and any_method_match_reason_passed
         and rewrite_discovery_passed
-            and transaction_flow_hypothesis_passed
-            and rate_limit_resource_review_passed
-            and transaction_method_exposure_passed
-            and profile_custom_ws_discovery_passed
+        and transaction_flow_hypothesis_passed
+        and rate_limit_resource_review_passed
+        and transaction_method_exposure_passed
+        and profile_custom_ws_discovery_passed
         and configured_nextjs_runtime_passed
         and initial_artifacts_passed
         and target_lock_passed
@@ -37996,10 +38077,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and discover_profile_seed_cli_passed
         and readiness_profile_passed
         and approval_status_profile_neutral_passed
-            and missing_profile_fallback_passed
-            and attack_strategy_status_passed
-            and empty_replay_queue_passed
-            and resource_release_candidates_passed
+        and missing_profile_fallback_passed
+        and attack_strategy_status_passed
+        and empty_replay_queue_passed
+        and resource_release_candidates_passed
+        and transaction_gate_ingestion_passed
         )
 
     artifact = {
@@ -38023,6 +38105,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "gate_status": None if generic_gate_item is None else generic_gate_item.get("gate_status"),
             "source_refs": [] if generic_suspicion is None else generic_suspicion.get("source_refs", []),
             "hardening_note_ids": [item.get("id") for item in generic_hardening_notes],
+        },
+        "transaction_gate_ingestion": {
+            "status": "passed" if transaction_gate_ingestion_passed else "failed",
+            "gate": transaction_gate_item,
         },
         "route_method_export_list": {
             "status": "passed" if route_method_export_list_passed else "failed",
@@ -38939,31 +39025,15 @@ def run_gate(args: argparse.Namespace) -> int:
     target = resolve_target(args, profile)
     no_write = bool(args.no_write)
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {}
     suspicions_path = artifact_dir / "suspicions.json"
-    if not suspicions_path.exists():
-        output_path = artifact_dir / "finding-gate.json"
-        gate = build_finding_gate([], burp_history)
-        if no_write:
-            print("No suspicions.json found; empty finding gate preview")
-            print("No files written (--no-write).")
-        else:
-            write_json(output_path, gate)
-            print("No suspicions.json found; wrote empty finding gate")
-            print_refreshed_manifests(
-                refresh_current_artifact_manifest(
-                    artifact_dir=artifact_dir,
-                    target=target,
-                    command="gate",
-                    output_paths=[output_path],
-                )
-            )
-        return 0
-
-    suspicions_doc = json.loads(read_text(suspicions_path))
+    suspicions_doc = json.loads(read_text(suspicions_path)) if suspicions_path.exists() else {}
     suspicions = suspicions_doc.get("suspicions", [])
-    gate = build_finding_gate(suspicions, burp_history)
+    gate = build_finding_gate(suspicions, burp_history, transaction_intent)
     output_path = artifact_dir / "finding-gate.json"
-    print(f"Gated {len(gate['gates'])} suspicions")
+    print(f"Gated {len(gate['gates'])} item(s)")
+    if not suspicions_path.exists():
+        print("No suspicions.json found; built gate from other eligible artifacts.")
     if no_write:
         print("No files written (--no-write).")
     else:
@@ -39557,9 +39627,11 @@ def run_report(args: argparse.Namespace) -> int:
         suspicions,
         burp_history,
     )
+    loaded_transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json")
     finding_gate = load_optional_json(artifact_dir / "finding-gate.json") or build_finding_gate(
         suspicions,
         burp_history,
+        loaded_transaction_intent or {},
     )
     hardening_notes_doc = load_optional_json(artifact_dir / "hardening-notes.json") or {}
     hardening_notes = hardening_notes_doc.get("hardening_notes")
@@ -39570,7 +39642,7 @@ def run_report(args: argparse.Namespace) -> int:
         target,
         artifact_dir,
     )
-    transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or build_report_transaction_intent_placeholder()
+    transaction_intent = loaded_transaction_intent or build_report_transaction_intent_placeholder()
     report = generate_report(
         artifact_dir,
         target,
@@ -41155,7 +41227,8 @@ def run_adjudicate(args: argparse.Namespace) -> int:
     finding_gate = load_optional_json(artifact_dir / "finding-gate.json")
     wrote_finding_gate = False
     if finding_gate is None:
-        finding_gate = build_finding_gate(suspicions, burp_history)
+        transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {}
+        finding_gate = build_finding_gate(suspicions, burp_history, transaction_intent)
         if not no_write:
             write_json(artifact_dir / "finding-gate.json", finding_gate)
             wrote_finding_gate = True
