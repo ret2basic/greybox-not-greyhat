@@ -9893,6 +9893,7 @@ def hypothesis_from_cluster(
     *,
     target_host: str,
     resource_gated: bool,
+    rewrite_review_item: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     cluster_id = str(cluster.get("id") or safe_hypothesis_id(cluster.get("method"), cluster.get("path")))
     path = cluster.get("path")
@@ -9907,7 +9908,34 @@ def hypothesis_from_cluster(
     for impact in cluster_impact_hypotheses(cluster):
         priority = hypothesis_priority_from_values(impact.get("priority"), cluster.get("priority"))
         offline_only = (rewrite_proxy or fixed_upstream_proxy) and impact.get("impact") == "fixed-upstream-proxy-confusion"
+        rewrite_guard_review = (
+            rewrite_review_item.get("source_guard_review")
+            if isinstance(rewrite_review_item, dict)
+            and isinstance(rewrite_review_item.get("source_guard_review"), dict)
+            else {}
+        )
+        rewrite_guard_summary = (
+            rewrite_guard_review.get("summary")
+            if isinstance(rewrite_guard_review.get("summary"), dict)
+            else {}
+        )
+        guarded_fixed_upstream = (
+            offline_only
+            and isinstance(rewrite_review_item, dict)
+            and rewrite_review_item.get("status") == "source-guard-indexed"
+            and rewrite_guard_review.get("status") == "source-guard-indexed"
+            and not bool(rewrite_review_item.get("catch_all"))
+            and int(rewrite_guard_summary.get("fixed_upstream_fetch_refs") or 0) > 0
+            and int(rewrite_guard_summary.get("positive_guard_refs") or 0) > 0
+            and int(rewrite_guard_summary.get("query_forwarding_refs") or 0) == 0
+            and int(rewrite_guard_summary.get("credential_forwarding_refs") or 0) == 0
+        )
+        if guarded_fixed_upstream:
+            priority = "low"
         next_step = (
+            "Source guard is indexed for this fixed-upstream route; keep only a single approved read-only confirmation if impact remains in question."
+            if guarded_fixed_upstream
+            else
             "Review fixed-upstream source, route guards, path shape, and one approved read-only concrete path before probing."
             if offline_only
             else "Turn this into one minimal validation question; run only after resource and scope gates pass."
@@ -9942,6 +9970,18 @@ def hypothesis_from_cluster(
                     "rewrites": rewrites,
                     "inference_reasons": discovery.get("inference_reasons", []),
                     "review_observation_candidates": discovery.get("review_observation_candidates", []),
+                    **(
+                        {
+                            "status": rewrite_review_item.get("status"),
+                            "priority": rewrite_review_item.get("priority"),
+                            "source_guard_status": rewrite_guard_review.get("status"),
+                            "source_guard_summary": rewrite_guard_summary,
+                            "guarded_fixed_upstream": guarded_fixed_upstream,
+                            "risk_factors": rewrite_review_item.get("risk_factors", []),
+                        }
+                        if isinstance(rewrite_review_item, dict)
+                        else {}
+                    ),
                 }
                 if offline_only
                 else None
@@ -9949,7 +9989,12 @@ def hypothesis_from_cluster(
             "scope_decision": "in-scope-explicit-host",
             "impact_hypothesis": impact.get("question"),
             "impact": impact.get("impact"),
-            "reportability_gate": "Requires concrete evidence of unauthorized action, sensitive-data exposure, funds/order impact, or equivalent program impact.",
+            "reportability_gate": (
+                "Source guard review currently shows a fixed upstream, positive route parameter guard, and no query or credential forwarding. "
+                "Do not escalate without contradictory response evidence from one approved read-only path."
+                if guarded_fixed_upstream
+                else "Requires concrete evidence of unauthorized action, sensitive-data exposure, funds/order impact, or equivalent program impact."
+            ),
             "next_step": next_step,
             "evidence_refs": evidence_refs,
             "safety": "Cluster-derived hypothesis. Prefer offline review and existing evidence before any target request.",
@@ -11012,6 +11057,20 @@ def build_rewrite_review_rollup(
     }
 
 
+def rewrite_review_items_by_cluster_id(rewrite_review: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not isinstance(rewrite_review, dict):
+        return {}
+    items_by_cluster: dict[str, dict[str, Any]] = {}
+    for item in rewrite_review.get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        cluster_id = str(item.get("cluster_id") or "")
+        if not cluster_id or cluster_id in items_by_cluster:
+            continue
+        items_by_cluster[cluster_id] = item
+    return items_by_cluster
+
+
 def transaction_flow_review_for_hypothesis_matrix(
     *,
     profile: dict[str, Any] | None,
@@ -11065,6 +11124,9 @@ def build_hypothesis_matrix_run(
         profile=profile,
         artifact_dir=artifact_dir,
     )
+    endpoint_cluster_rows = [
+        cluster for cluster in endpoint_clusters.get("clusters", []) or [] if isinstance(cluster, dict)
+    ]
     rpc_method_policy, rpc_method_policy_source = rpc_method_policy_for_hypothesis_matrix(
         profile=profile,
         artifact_dir=artifact_dir,
@@ -11076,6 +11138,16 @@ def build_hypothesis_matrix_run(
     )
     asset_candidates = load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT) or {}
     harness_loop = build_harness_loop_run(target=target, profile=profile, artifact_dir=artifact_dir)
+    rewrite_review_needed = any(
+        any(str(impact.get("impact") or "") == "fixed-upstream-proxy-confusion" for impact in cluster_impact_hypotheses(cluster))
+        for cluster in endpoint_cluster_rows
+    )
+    rewrite_review = (
+        build_rewrite_review_run(target=target, profile=profile, artifact_dir=artifact_dir)
+        if rewrite_review_needed
+        else {}
+    )
+    rewrite_review_by_cluster = rewrite_review_items_by_cluster_id(rewrite_review)
 
     resource_gated = matrix_resource_gated(resource_snapshot)
     target_host = normalize_scope_host(urllib.parse.urlparse(target).hostname or "")
@@ -11099,10 +11171,14 @@ def build_hypothesis_matrix_run(
         if hypothesis:
             add_hypothesis(hypotheses, hypothesis)
 
-    for cluster in endpoint_clusters.get("clusters", []) or []:
-        if not isinstance(cluster, dict):
-            continue
-        for hypothesis in hypothesis_from_cluster(cluster, target_host=target_host, resource_gated=resource_gated):
+    for cluster in endpoint_cluster_rows:
+        cluster_id = str(cluster.get("id") or safe_hypothesis_id(cluster.get("method"), cluster.get("path")))
+        for hypothesis in hypothesis_from_cluster(
+            cluster,
+            target_host=target_host,
+            resource_gated=resource_gated,
+            rewrite_review_item=rewrite_review_by_cluster.get(cluster_id),
+        ):
             add_hypothesis(hypotheses, hypothesis)
 
     rpc_hypothesis = hypothesis_from_rpc_method_policy(
@@ -11217,6 +11293,7 @@ def build_hypothesis_matrix_run(
             "endpoint_clusters_source": endpoint_clusters_source,
             "rpc_method_policy_source": rpc_method_policy_source,
             "transaction_flow_review_source": transaction_flow_review_source,
+            "rewrite_review": rewrite_review.get("status") if isinstance(rewrite_review, dict) else None,
         },
         "hypotheses": deduped,
         "artifact_refs": {
@@ -11226,6 +11303,7 @@ def build_hypothesis_matrix_run(
             "endpoint_clusters": "endpoint-clusters.json",
             "rpc_method_policy": "rpc-method-policy.json",
             "transaction_flow_review": TRANSACTION_FLOW_REVIEW_ARTIFACT,
+            "rewrite_review": REWRITE_REVIEW_ARTIFACT,
             "asset_candidates": BLACKBOX_ASSET_CANDIDATES_ARTIFACT,
             "resource_snapshot": RESOURCE_SNAPSHOT_ARTIFACT,
         },
@@ -39793,6 +39871,58 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             rewrite_source_root,
             ["src/lib/fixed-upstream-selftest.ts"],
         )
+        guarded_fixed_matrix_dir = Path(temp_dir) / "guarded-fixed-matrix-artifacts"
+        guarded_fixed_matrix_dir.mkdir()
+        guarded_fixed_clusters = {
+            "generated_at": utc_now(),
+            "profile": profile_summary(rewrite_normalized),
+            "clusters": [
+                {
+                    "id": "guarded-fixed-upstream",
+                    "method": "GET",
+                    "path": "/api/fixed/pools/{address}",
+                    "kind": "fixed-upstream-proxy",
+                    "strategy_set": "fixed-upstream-proxy",
+                    "priority": "high",
+                    "source_refs": ["src/lib/fixed-upstream-selftest.ts"],
+                    "discovery": {},
+                }
+            ],
+        }
+        write_json(guarded_fixed_matrix_dir / "endpoint-clusters.json", guarded_fixed_clusters)
+        guarded_fixed_matrix = build_hypothesis_matrix_run(
+            target="http://127.0.0.1:9998",
+            profile=rewrite_normalized,
+            artifact_dir=guarded_fixed_matrix_dir,
+        )
+        guarded_fixed_hypothesis = next(
+            (
+                item
+                for item in guarded_fixed_matrix.get("hypotheses", [])
+                if item.get("cluster_id") == "guarded-fixed-upstream"
+                and item.get("impact") == "fixed-upstream-proxy-confusion"
+            ),
+            None,
+        )
+        guarded_fixed_rewrite_context = (
+            guarded_fixed_hypothesis.get("rewrite_review", {})
+            if isinstance(guarded_fixed_hypothesis, dict)
+            and isinstance(guarded_fixed_hypothesis.get("rewrite_review"), dict)
+            else {}
+        )
+        guarded_fixed_hypothesis_passed = (
+            guarded_fixed_matrix.get("summary", {}).get("rewrite_review") == "has-review-items"
+            and guarded_fixed_hypothesis is not None
+            and guarded_fixed_hypothesis.get("priority") == "low"
+            and guarded_fixed_hypothesis.get("status") == "ready-for-offline-review"
+            and guarded_fixed_rewrite_context.get("guarded_fixed_upstream") is True
+            and guarded_fixed_rewrite_context.get("source_guard_status") == "source-guard-indexed"
+            and (guarded_fixed_rewrite_context.get("source_guard_summary") or {}).get("fixed_upstream_fetch_refs") == 1
+            and (guarded_fixed_rewrite_context.get("source_guard_summary") or {}).get("positive_guard_refs", 0) >= 1
+            and (guarded_fixed_rewrite_context.get("source_guard_summary") or {}).get("query_forwarding_refs") == 0
+            and (guarded_fixed_rewrite_context.get("source_guard_summary") or {}).get("credential_forwarding_refs") == 0
+            and "Source guard is indexed" in str(guarded_fixed_hypothesis.get("next_step") or "")
+        )
         rewrite_condition_context = build_request_context(
             "GET",
             "/api/proxy/users/42",
@@ -41508,6 +41638,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_mode_samples_passed
         and any_method_match_reason_passed
         and rewrite_discovery_passed
+        and guarded_fixed_hypothesis_passed
         and transaction_flow_hypothesis_passed
         and rate_limit_resource_review_passed
         and transaction_method_exposure_passed
@@ -41926,6 +42057,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "matrix_summary": rewrite_transaction_matrix.get("summary", {}),
                 "hypothesis": rewrite_transaction_hypothesis,
                 "validation_item": rewrite_transaction_validation_item,
+            },
+            "guarded_fixed_upstream_hypothesis": {
+                "status": "passed" if guarded_fixed_hypothesis_passed else "failed",
+                "matrix_summary": guarded_fixed_matrix.get("summary", {}),
+                "hypothesis": guarded_fixed_hypothesis,
             },
             "rate_limit_resource_review": {
                 "status": "passed" if rate_limit_resource_review_passed else "failed",
