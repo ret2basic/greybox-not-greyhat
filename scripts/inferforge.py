@@ -91,7 +91,7 @@ TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND = (
 )
 REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND = (
     "rewrite-response-review --no-write --show-observations --show-commands "
-    "--show-observation-contract"
+    "--show-observation-contract --show-sidecar-template-json"
 )
 QUOTE_TRANSACTION_CORPUS_CONTRACT_NEXT_STEP = (
     "Prepare or approve one quote response or extracted transaction payload sidecar, then run "
@@ -103,6 +103,7 @@ MAX_RESPONSE_BYTES = 256 * 1024
 MAX_BODY_SAMPLE_CHARS = 1200
 DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_BURP_HISTORY_INPUT_BYTES = 4 * 1024 * 1024
+DEFAULT_REWRITE_RESPONSE_SIDECAR_INPUT_BYTES = 256 * 1024
 DEFAULT_RESOURCE_WARNING_BURP_HISTORY_INPUT_BYTES = 1 * 1024 * 1024
 DEFAULT_RESOURCE_CRITICAL_BURP_HISTORY_INPUT_BYTES = 256 * 1024
 DEFAULT_BURP_SYNC_COUNT = 20
@@ -154,6 +155,7 @@ ITERATION_DECISION_ARTIFACT = "iteration-decision.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
+REWRITE_RESPONSE_SIDECAR_ARTIFACT = "rewrite-response-sidecar.jsonl"
 DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT = "deployment-resource-review.json"
 TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
 TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
@@ -13634,6 +13636,231 @@ def rewrite_response_review_observation(
     }
 
 
+REWRITE_RESPONSE_SIDECAR_IMPACT_INDICATORS = {
+    "authorization-bypass",
+    "path-confusion",
+    "sensitive-data-exposure",
+    "tenant-data-exposure",
+    "wallet-or-account-data-exposure",
+}
+
+
+def rewrite_response_sidecar_path(artifact_dir: Path) -> Path:
+    return artifact_dir / REWRITE_RESPONSE_SIDECAR_ARTIFACT
+
+
+def rewrite_response_sidecar_template(
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    *,
+    example_path: str | None = None,
+) -> dict[str, Any]:
+    template_path = example_path if is_safe_concrete_local_path(str(example_path or "")) else PLACEHOLDER_APPROVED_CONCRETE_PATH
+    return {
+        "path": repo_relative_or_absolute(rewrite_response_sidecar_path(artifact_dir)),
+        "format": "jsonl",
+        "max_input_bytes": DEFAULT_REWRITE_RESPONSE_SIDECAR_INPUT_BYTES,
+        "line_template": {
+            "approved": True,
+            "method": "GET",
+            "path": template_path,
+            "status": 200,
+            "content_type": "application/json",
+            "impact_indicators": ["sensitive-data-exposure"],
+            "sensitive_field_markers": [
+                {"field_path": "$.vault.balance", "matched_keywords": ["vault", "balance"]},
+                {"field_path": "$.vault.wallet", "matched_keywords": ["vault", "wallet"]},
+            ],
+            "impact_summary": "Short redacted note explaining why the approved response is sensitive or path-confused.",
+            "reviewer": "REPLACE_WITH_REVIEWER_OR_TICKET",
+            "source": "manual-approved-redacted-response-review",
+        },
+        "accepted_impact_indicators": sorted(REWRITE_RESPONSE_SIDECAR_IMPACT_INDICATORS),
+        "redaction_gate": [
+            "Do not include raw Burp history, cookies, bearer tokens, API keys, private keys, seed phrases, signatures, or full response bodies.",
+            "Keep only field paths, high-level impact indicators, status/content-type, and a short redacted summary.",
+            "Set approved=true only for exactly one reviewed read-only path that is in scope.",
+            "Run rewrite-response-review --no-write --show-observations after creating or editing this sidecar.",
+        ],
+        "profile": profile_summary(profile),
+    }
+
+
+def rewrite_response_sidecar_file_status(path: Path) -> dict[str, Any]:
+    rel = repo_relative_or_absolute(path)
+    if not path.exists():
+        return {"path": rel, "name": path.name, "status": "missing"}
+    if not path.is_file():
+        return {"path": rel, "name": path.name, "status": "not-a-file"}
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        return {
+            "path": rel,
+            "name": path.name,
+            "status": "stat-failed",
+            "error": redacted_error_summary(error),
+        }
+    return {
+        "path": rel,
+        "name": path.name,
+        "status": "present" if size <= DEFAULT_REWRITE_RESPONSE_SIDECAR_INPUT_BYTES else "too-large",
+        "bytes": size,
+        "max_input_bytes": DEFAULT_REWRITE_RESPONSE_SIDECAR_INPUT_BYTES,
+    }
+
+
+def load_rewrite_response_sidecar_rows(path: Path) -> list[dict[str, Any]]:
+    status = rewrite_response_sidecar_file_status(path)
+    if status.get("status") != "present":
+        return []
+    rows = []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError as error:
+            rows.append(
+                {
+                    "_sidecar_line": line_number,
+                    "_sidecar_error": f"json-decode-error:{error.msg}",
+                }
+            )
+            continue
+        if isinstance(parsed, dict):
+            row = json_clone(parsed)
+            row["_sidecar_line"] = line_number
+            rows.append(row)
+        else:
+            rows.append(
+                {
+                    "_sidecar_line": line_number,
+                    "_sidecar_error": "line-is-not-json-object",
+                }
+            )
+    return rows
+
+
+def rewrite_response_sidecar_field_markers(row: dict[str, Any]) -> list[dict[str, Any]]:
+    markers = []
+    for marker in row.get("sensitive_field_markers", []) or []:
+        if not isinstance(marker, dict):
+            continue
+        field_path = str(marker.get("field_path") or "").strip()
+        if not field_path.startswith("$"):
+            continue
+        keywords = normalize_string_list(marker.get("matched_keywords"))
+        markers.append(
+            {
+                "field_path": field_path,
+                "matched_keywords": keywords
+                or sorted(
+                    keyword
+                    for keyword in REWRITE_RESPONSE_SENSITIVE_FIELD_KEYWORDS
+                    if keyword in field_path.lower()
+                ),
+            }
+        )
+    for field_path in normalize_string_list(row.get("json_field_paths")):
+        if not field_path.startswith("$"):
+            continue
+        lowered = field_path.lower()
+        keywords = sorted(
+            keyword
+            for keyword in REWRITE_RESPONSE_SENSITIVE_FIELD_KEYWORDS
+            if keyword in lowered
+        )
+        if keywords and not any(marker.get("field_path") == field_path for marker in markers):
+            markers.append({"field_path": field_path, "matched_keywords": keywords})
+    return markers[:20]
+
+
+def rewrite_response_sidecar_observation(
+    row: dict[str, Any],
+    *,
+    sidecar_path: Path,
+    approved_paths: set[str],
+) -> dict[str, Any]:
+    line_number = int(row.get("_sidecar_line") or 0)
+    error = str(row.get("_sidecar_error") or "")
+    path = str(row.get("path") or "")
+    method = str(row.get("method") or "GET").upper()
+    status = row.get("status")
+    status_int = status if isinstance(status, int) else None
+    successful = status_int is not None and 200 <= status_int < 300
+    approved_path = bool(row.get("approved") is True and path in approved_paths)
+    sensitivity = rewrite_path_candidate_sensitivity(path)
+    field_markers = rewrite_response_sidecar_field_markers(row)
+    raw_field_keys = [
+        key
+        for key in ["body", "body_sample", "body_text", "raw", "raw_body", "response_sample"]
+        if key in row
+    ]
+    sidecar_indicators = [
+        indicator
+        for indicator in normalize_string_list(row.get("impact_indicators"))
+        if indicator in REWRITE_RESPONSE_SIDECAR_IMPACT_INDICATORS
+    ]
+    impact_indicators = []
+    if successful:
+        impact_indicators.append("successful-response")
+    impact_indicators.extend(sidecar_indicators)
+    if field_markers:
+        impact_indicators.append("sensitive-json-field-names")
+    if raw_field_keys:
+        impact_indicators.append("raw-field-ignored")
+    candidate_impact = bool(successful and approved_path and (sidecar_indicators or field_markers))
+    if error:
+        review_status = "invalid-sidecar-row"
+    elif candidate_impact:
+        review_status = "candidate-impact-evidence"
+    elif successful and approved_path:
+        review_status = "approved-response-observed"
+    elif approved_path:
+        review_status = "approved-response-non-success"
+    else:
+        review_status = "unapproved-or-unmatched-observation"
+    return {
+        "id": f"REWRITE-SIDECAR-RESP-{line_number:03d}",
+        "status": review_status,
+        "method": method,
+        "path": path,
+        "approved_path": approved_path,
+        "source": "rewrite-response-sidecar",
+        "sidecar_error": error or None,
+        "sidecar_warnings": [f"ignored-{key}" for key in raw_field_keys],
+        "response": {
+            "status": status,
+            "content_type": row.get("content_type"),
+            "sample_present": False,
+            "response_sample": None,
+            "impact_summary": redact_text(row.get("impact_summary"), max_chars=320),
+        },
+        "path_sensitivity": sensitivity,
+        "json_field_paths": normalize_string_list(row.get("json_field_paths"))[:20],
+        "sensitive_field_markers": field_markers,
+        "impact_indicators": ordered_unique_strings(impact_indicators),
+        "impact_precheck": bool(successful and approved_path and sensitivity.get("priority") in {"critical", "high"}),
+        "impact_precheck_indicators": ["approved-high-sensitivity-path-sidecar"]
+        if successful and approved_path and sensitivity.get("priority") in {"critical", "high"}
+        else [],
+        "manual_impact_review_hint": False,
+        "precheck_gate": "sidecar-impact-reviewed" if candidate_impact else "not-triggered",
+        "candidate_impact": candidate_impact,
+        "evidence_ref": {
+            "artifact": repo_relative_or_absolute(sidecar_path),
+            "line": line_number,
+            "kind": "manual-redacted-sidecar",
+        },
+        "safety": "Manual redacted sidecar only. Raw response bodies and raw Burp history are not retained.",
+    }
+
+
 def build_rewrite_response_review(
     *,
     target: str,
@@ -13646,6 +13873,9 @@ def build_rewrite_response_review(
     )
     rewrite_review = build_rewrite_review_run(target=target, profile=profile, artifact_dir=artifact_dir)
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    sidecar_path = rewrite_response_sidecar_path(artifact_dir)
+    sidecar_status = rewrite_response_sidecar_file_status(sidecar_path)
+    sidecar_rows = load_rewrite_response_sidecar_rows(sidecar_path)
     items = []
     for rewrite_item in rewrite_review.get("items", []) or []:
         if not isinstance(rewrite_item, dict):
@@ -13669,6 +13899,21 @@ def build_rewrite_response_review(
                 rewrite_response_review_observation(
                     row,
                     index=index,
+                    approved_paths=approved_paths,
+                )
+            )
+        for row in sidecar_rows:
+            if not isinstance(row, dict):
+                continue
+            row_method = str(row.get("method") or "GET")
+            row_path = str(row.get("path") or "")
+            row_clusters = classify_endpoint(row_method, row_path, endpoint_clusters)
+            if cluster_id not in row_clusters and row_path not in approved_paths:
+                continue
+            observations.append(
+                rewrite_response_sidecar_observation(
+                    row,
+                    sidecar_path=sidecar_path,
                     approved_paths=approved_paths,
                 )
             )
@@ -13762,10 +14007,30 @@ def build_rewrite_response_review(
         status = "candidate-impact-review"
     elif approved_count:
         status = "approved-response-observed"
-    elif burp_history:
+    elif burp_history or sidecar_rows:
         status = "no-approved-rewrite-response"
     else:
         status = "no-burp-observations"
+    sidecar_template_path = next(
+        (
+            str(contract.get("path") or "")
+            for item in items
+            for contract in (item.get("observation_contracts", []) or [])
+            if isinstance(contract, dict)
+            and is_safe_concrete_local_path(str(contract.get("path") or ""))
+        ),
+        None,
+    )
+    if sidecar_template_path is None:
+        sidecar_template_path = next(
+            (
+                str(path)
+                for item in items
+                for path in (item.get("approved_path_candidates", []) or [])
+                if is_safe_concrete_local_path(str(path))
+            ),
+            None,
+        )
     return {
         "generated_at": utc_now(),
         "status": status,
@@ -13776,6 +14041,8 @@ def build_rewrite_response_review(
             "items": len(items),
             "status_counts": dict(sorted(status_counts.items())),
             "burp_observations": len(burp_history),
+            "sidecar_status": sidecar_status.get("status"),
+            "sidecar_rows": len(sidecar_rows),
             "observed_approved_responses": approved_count,
             "candidate_impact_observations": candidate_impact_count,
             "impact_precheck_observations": impact_precheck_count,
@@ -13787,8 +14054,16 @@ def build_rewrite_response_review(
         },
         "items": items,
         "followup_commands": ordered_unique_strings(followup_commands),
+        "sidecar_path": repo_relative_or_absolute(sidecar_path),
+        "sidecar_file": sidecar_status,
+        "sidecar_template": rewrite_response_sidecar_template(
+            artifact_dir,
+            profile,
+            example_path=sidecar_template_path,
+        ),
         "artifact_refs": {
             "burp_history": "burp-history-observations.jsonl",
+            "rewrite_response_sidecar": REWRITE_RESPONSE_SIDECAR_ARTIFACT,
             "rewrite_review": REWRITE_REVIEW_ARTIFACT,
             "rewrite_validation_checklist": REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
         },
@@ -24745,11 +25020,12 @@ def build_evidence_gaps(
             (
                 "Run rewrite-response-review with --show-observation-contract, promote exactly one reviewed read-only "
                 "path with --single-observation-plan, and collect at most one HTTP-only Burp observation only after "
-                "scope and resource gates are satisfied."
+                "scope and resource gates are satisfied; alternatively provide one manually approved redacted "
+                f"{REWRITE_RESPONSE_SIDECAR_ARTIFACT} sidecar row."
             ),
             (
                 "One approved HTTP request only; do not enumerate catch-all paths, do not use WebSocket upgrade "
-                "observation for this contract, and do not keep raw Burp history."
+                "observation for this contract, and do not keep raw Burp history or raw response bodies."
             ),
             review_candidates=[
                 {
@@ -25158,7 +25434,7 @@ def evidence_gap_followup_commands(
         return [
             validation_command_for_artifact_dir(
                 artifact_dir,
-                "rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract",
+                REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND,
                 profile=profile,
             ),
             validation_command_for_artifact_dir(
@@ -34870,6 +35146,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--no-write",
                     "--show-observations",
                     "--show-observation-contract",
+                    "--show-sidecar-template-json",
                 ]
             )
             decode_transactions_return_code, decode_transactions_stdout = run_cli(
@@ -36006,7 +36283,11 @@ def build_no_write_selftest() -> dict[str, Any]:
                 rewrite_response_review_return_code == 0
                 and "Rewrite response review:" in rewrite_response_review_stdout_text
                 and "Responses:" in rewrite_response_review_stdout_text
+                and "sidecar=" in rewrite_response_review_stdout_text
                 and "contracts=" in rewrite_response_review_stdout_text
+                and "Rewrite response sidecar template JSON:" in rewrite_response_review_stdout_text
+                and REWRITE_RESPONSE_SIDECAR_ARTIFACT in rewrite_response_review_stdout_text
+                and "sensitive-data-exposure" in rewrite_response_review_stdout_text
                 and "Gate:" in rewrite_response_review_stdout_text
                 and "No files written (--no-write)." in rewrite_response_review_stdout
                 and not any(
@@ -36527,6 +36808,48 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             for item in precheck_finding_gate.get("gates", []) or []
             if item.get("classification") == "candidate-fixed-upstream-proxy-confusion-impact"
         ]
+        sidecar_artifact_dir = root / "sidecar-artifacts"
+        append_jsonl(
+            rewrite_response_sidecar_path(sidecar_artifact_dir),
+            [
+                {
+                    "approved": True,
+                    "method": "GET",
+                    "path": approved_path,
+                    "status": 200,
+                    "content_type": "application/json",
+                    "impact_indicators": ["sensitive-data-exposure"],
+                    "sensitive_field_markers": [
+                        {"field_path": "$.vault.balance", "matched_keywords": ["vault", "balance"]},
+                        {"field_path": "$.vault.wallet", "matched_keywords": ["vault", "wallet"]},
+                    ],
+                    "impact_summary": "Approved redacted sidecar: vault balance and wallet metadata exposed.",
+                    "response_sample": "token=sidecar-raw-should-not-appear",
+                }
+            ],
+        )
+        sidecar_review = build_rewrite_response_review(
+            target=target,
+            profile=profile,
+            artifact_dir=sidecar_artifact_dir,
+        )
+        sidecar_response_item = (
+            (sidecar_review.get("items") or [{}])[0]
+            if sidecar_review.get("items")
+            else {}
+        )
+        sidecar_observations = [
+            item for item in sidecar_response_item.get("observations", []) or [] if isinstance(item, dict)
+        ]
+        sidecar_finding_gate = build_finding_gate([], [], None, sidecar_review)
+        sidecar_gate_item = next(
+            (
+                item
+                for item in sidecar_finding_gate.get("gates", []) or []
+                if item.get("classification") == "candidate-fixed-upstream-proxy-confusion-impact"
+            ),
+            None,
+        )
         append_jsonl(
             artifact_dir / "burp-history-observations.jsonl",
             [
@@ -36601,6 +36924,7 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             None,
         )
         review_text = json.dumps(review, sort_keys=True)
+        sidecar_review_text = json.dumps(sidecar_review, sort_keys=True)
         closure_text = json.dumps(closure, sort_keys=True)
         finding_gate_text = json.dumps(finding_gate, sort_keys=True)
         followup_command_text = "\n".join(str(command) for command in review.get("followup_commands", []) or [])
@@ -36695,6 +37019,31 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                 "status": review.get("status"),
                 "summary": review.get("summary"),
                 "item": response_item,
+            },
+        },
+        {
+            "id": "approved-sidecar-response-enters-candidate-impact-review-without-raw-body",
+            "passed": (
+                sidecar_review.get("status") == "candidate-impact-review"
+                and sidecar_response_item.get("status") == "candidate-impact-review"
+                and (sidecar_review.get("summary") or {}).get("burp_observations") == 0
+                and (sidecar_review.get("summary") or {}).get("sidecar_rows") == 1
+                and (sidecar_review.get("summary") or {}).get("observed_approved_responses") == 1
+                and (sidecar_review.get("summary") or {}).get("candidate_impact_observations") == 1
+                and len(sidecar_observations) == 1
+                and sidecar_observations[0].get("source") == "rewrite-response-sidecar"
+                and sidecar_observations[0].get("candidate_impact") is True
+                and "raw-field-ignored" in (sidecar_observations[0].get("impact_indicators") or [])
+                and "sidecar-raw-should-not-appear" not in sidecar_review_text
+                and sidecar_gate_item is not None
+                and sidecar_gate_item.get("gate_status") == "manual-review"
+            ),
+            "expected": "one approved redacted rewrite-response sidecar can enter candidate impact review without retaining raw response bodies",
+            "actual": {
+                "review_status": sidecar_review.get("status"),
+                "summary": sidecar_review.get("summary"),
+                "observations": sidecar_observations,
+                "gate_item": sidecar_gate_item,
             },
         },
         {
@@ -51991,6 +52340,7 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
         "Responses: "
         f"items={summary.get('items', 0)} "
         f"burp_observations={summary.get('burp_observations', 0)} "
+        f"sidecar={summary.get('sidecar_status', 'missing')}:{summary.get('sidecar_rows', 0)} "
         f"approved={summary.get('observed_approved_responses', 0)} "
         f"candidate_impact={summary.get('candidate_impact_observations', 0)} "
         f"precheck={summary.get('impact_precheck_observations', 0)} "
@@ -52015,6 +52365,7 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
                     f"approved={observation.get('approved_path')} "
                     f"precheck={observation.get('impact_precheck')} "
                     f"hint={observation.get('manual_impact_review_hint')} "
+                    f"source={observation.get('source') or 'burp-history'} "
                     f"indicators={','.join(observation.get('impact_indicators', []) or []) or '-'}"
                 )
                 markers = observation.get("sensitive_field_markers", []) or []
@@ -52049,6 +52400,9 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
         print("Follow-up commands:")
         for command_text in (review.get("followup_commands", []) or [])[: max(0, int(args.top))]:
             print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    if args.show_sidecar_template_json:
+        print("Rewrite response sidecar template JSON:")
+        print(json.dumps(review.get("sidecar_template", {}), indent=2, sort_keys=True))
     print(f"Gate: {inline_summary_text(review.get('reportability_gate'), max_chars=280)}")
     if no_write:
         print("No files written (--no-write).")
@@ -55516,6 +55870,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-observation-contract",
         action="store_true",
         help="Print the single-path promotion/resource/observe/review contract for approved rewrite response evidence.",
+    )
+    rewrite_response_review.add_argument(
+        "--show-sidecar-template-json",
+        action="store_true",
+        help="Print a redacted JSONL sidecar template for one manually approved rewrite response.",
     )
     rewrite_response_review.add_argument(
         "--no-write",
