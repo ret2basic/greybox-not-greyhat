@@ -12596,6 +12596,7 @@ def assessment_objective_satisfaction_summary(
         "objective_blocker_counts": dict(sorted(blocker_counts.items())),
         "unblocker_lane_counts": unblocker_rollup.get("lane_counts", {}),
         "unblocker_actionability_counts": unblocker_rollup.get("actionability_counts", {}),
+        "unblocker_package_status_counts": unblocker_rollup.get("package_status_counts", {}),
         "top_unblocker": unblocker_rollup.get("top_unblocker"),
         "unblockers": unblocker_rollup.get("items", []),
         "safe_offline_commands": unblocker_rollup.get("safe_offline_commands", []),
@@ -12687,6 +12688,93 @@ def objective_unblocker_actionability(lane: str, step_status: str) -> str:
     if lane in {"read-only-path-selection", "offline-source-context", "finding-gate-review"}:
         return "offline-review"
     return "needs-evidence-triage"
+
+
+def objective_unblocker_package_status(
+    *,
+    lane: str,
+    step_status: str,
+    missing_requirements: list[str],
+    active_step: str,
+) -> dict[str, str]:
+    tokens = " ".join([lane, step_status, active_step, *missing_requirements]).lower()
+    if step_status == "blocked-resource" or lane == "resource-gate":
+        return {
+            "status": "blocked-resource-gate",
+            "next_step_kind": "resource-gate",
+            "reason": "Resource gate must be healthy before any active validation.",
+        }
+    if lane == "approved-transaction-payload":
+        if any(token in tokens for token in ["approved-payload-sidecar", "transaction-payload"]):
+            return {
+                "status": "needs-approved-transaction-sidecar",
+                "next_step_kind": "approved-sidecar",
+                "reason": "One approved quote response or extracted transaction payload sidecar is still missing.",
+            }
+        return {
+            "status": "needs-transaction-payload-review",
+            "next_step_kind": "offline-review",
+            "reason": "Review the approved transaction payload corpus before decode or finding-gate.",
+        }
+    if lane == "single-approved-response":
+        return {
+            "status": "needs-approved-response-sidecar",
+            "next_step_kind": "approved-sidecar",
+            "reason": "One approved read-only response observation sidecar is still missing or not accepted.",
+        }
+    if lane == "provider-operator-evidence":
+        return {
+            "status": "needs-provider-operator-evidence",
+            "next_step_kind": "operator-evidence",
+            "reason": "Provider quota, billing, rate-limit, or monitoring evidence is still missing.",
+        }
+    if lane == "deployment-resource-evidence":
+        return {
+            "status": "needs-deployment-operator-evidence",
+            "next_step_kind": "operator-evidence",
+            "reason": "Deployment, proxy/header trust, rate-limit store, or resource-bound evidence is still missing.",
+        }
+    if lane == "transaction-intent-policy":
+        return {
+            "status": "needs-intent-policy-sidecar",
+            "next_step_kind": "offline-sidecar",
+            "reason": "Transaction intent policy sidecar must be completed before decode review.",
+        }
+    if lane == "decoded-transaction-review":
+        return {
+            "status": "needs-decoded-transaction-review",
+            "next_step_kind": "offline-review",
+            "reason": "Decode and compare the approved corpus against the intent policy offline.",
+        }
+    if lane == "read-only-path-selection":
+        return {
+            "status": "needs-read-only-path-selection",
+            "next_step_kind": "offline-review",
+            "reason": "Select exactly one concrete read-only path before any response observation.",
+        }
+    if lane == "impact-classification":
+        return {
+            "status": "needs-impact-classification",
+            "next_step_kind": "finding-gate",
+            "reason": "Classify concrete impact from the approved evidence before reporting.",
+        }
+    if lane == "finding-gate-review":
+        return {
+            "status": "needs-finding-gate-review",
+            "next_step_kind": "finding-gate",
+            "reason": "Run finding-gate and adjudication previews on the collected evidence.",
+        }
+    if lane == "offline-source-context":
+        return {
+            "status": "needs-source-context-review",
+            "next_step_kind": "offline-review",
+            "reason": "Finish source/context indexing before selecting validation evidence.",
+        }
+    return {
+        "status": "needs-evidence-triage",
+        "next_step_kind": "triage",
+        "reason": "Classify the evidence lane before active validation.",
+    }
 
 
 OBJECTIVE_UNBLOCKER_EVIDENCE_PACKAGES: dict[str, dict[str, Any]] = {
@@ -12902,6 +12990,12 @@ def assessment_item_objective_unblocker(
         else {}
     )
     evidence_package = objective_unblocker_evidence_package(lane)
+    package_status = objective_unblocker_package_status(
+        lane=lane,
+        step_status=step_status,
+        missing_requirements=missing_requirements,
+        active_step=active_step,
+    )
     unblocker = {
         "item_id": assessment_item_identity(item),
         "priority": item.get("priority") or item.get("validation_item_priority"),
@@ -12909,6 +13003,9 @@ def assessment_item_objective_unblocker(
         "path": item.get("path"),
         "lane": lane,
         "actionability": objective_unblocker_actionability(lane, step_status),
+        "package_status": package_status.get("status"),
+        "package_next_step_kind": package_status.get("next_step_kind"),
+        "package_status_reason": package_status.get("reason"),
         "evidence_package": evidence_package,
         "evidence_package_id": evidence_package.get("id"),
         "active_step": active_step or None,
@@ -12939,10 +13036,12 @@ def objective_unblocker_rollup(
     ]
     lane_counts: dict[str, int] = {}
     actionability_counts: dict[str, int] = {}
+    package_status_counts: dict[str, int] = {}
     command_refs = []
     for unblocker in unblockers:
         increment_count(lane_counts, str(unblocker.get("lane") or "unknown"))
         increment_count(actionability_counts, str(unblocker.get("actionability") or "unknown"))
+        increment_count(package_status_counts, str(unblocker.get("package_status") or "unknown"))
         for ref in unblocker.get("safe_offline_command_refs", []) or []:
             if isinstance(ref, dict):
                 command_refs.append(ref)
@@ -12951,6 +13050,7 @@ def objective_unblocker_rollup(
         "top_unblocker": unblockers[0] if unblockers else None,
         "lane_counts": dict(sorted(lane_counts.items())),
         "actionability_counts": dict(sorted(actionability_counts.items())),
+        "package_status_counts": dict(sorted(package_status_counts.items())),
         "safe_offline_commands": command_refs[:8],
         "command_safety": command_safety_summary(command_refs) if command_refs else {"commands": 0},
     }
@@ -42557,6 +42657,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 == "approved-transaction-payload"
                 and blackbox_objective_satisfaction_sample.get("top_unblocker", {}).get("evidence_package_id")
                 == "approved-transaction-payload-evidence-package"
+                and blackbox_objective_satisfaction_sample.get("top_unblocker", {}).get("package_status")
+                == "needs-approved-transaction-sidecar"
                 and "transaction-payloads.jsonl"
                 in (
                     blackbox_objective_satisfaction_sample.get("top_unblocker", {})
@@ -42633,6 +42735,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 == "deployment-resource-evidence"
                 and greybox_objective_satisfaction_sample.get("top_unblocker", {}).get("evidence_package_id")
                 == "deployment-resource-evidence-package"
+                and greybox_objective_satisfaction_sample.get("top_unblocker", {}).get("package_status")
+                == "needs-deployment-operator-evidence"
                 and blackbox_objective_satisfaction_sample.get("satisfied_items") == 1
                 and blackbox_objective_satisfaction_sample.get("top_satisfied_id") == "gate-ready-sensitive-data"
                 and blackbox_objective_satisfaction_sample.get("open_items") == 2
@@ -43049,6 +43153,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "objective=" in methodology_review_stdout_text
                 and "lane=" in methodology_review_stdout_text
                 and "package=" in methodology_review_stdout_text
+                and "package_status=" in methodology_review_stdout_text
                 and "commands=" in methodology_review_stdout_text
                 and "- bounty system-context-threat-model:" in methodology_review_stdout_text
                 and "High-value threads:" in methodology_review_stdout
@@ -43083,6 +43188,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "lane=" in lead_dossier_stdout_text
                 and "action=" in lead_dossier_stdout_text
                 and "package=" in lead_dossier_stdout_text
+                and "package_status=" in lead_dossier_stdout_text
                 and "commands=" in lead_dossier_stdout_text
                 and "strict_validation=blocked-before-finding-gate" in lead_dossier_stdout_text
                 and "question=waiting concrete-impact-evidence" in lead_dossier_stdout_text
@@ -60428,6 +60534,7 @@ def run_methodology_review(args: argparse.Namespace) -> int:
             f"objective={bounty_summary.get('objective_status') or '-'} "
             f"lane={bounty_top_unblocker.get('lane') or '-'} "
             f"package={bounty_top_unblocker.get('evidence_package_id') or '-'} "
+            f"package_status={bounty_top_unblocker.get('package_status') or '-'} "
             f"commands={len(bounty_objective.get('safe_offline_commands', []) or [])} "
             f"top={bounty_summary.get('top_candidate_id') or '-'} "
             f"gate_ready={bounty_summary.get('gate_ready_threads', 0)} "
@@ -60576,6 +60683,7 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
             f"lane={top_unblocker.get('lane') or '-'} "
             f"action={top_unblocker.get('actionability') or '-'} "
             f"package={top_unblocker.get('evidence_package_id') or '-'} "
+            f"package_status={top_unblocker.get('package_status') or '-'} "
             f"commands={len(objective_satisfaction.get('safe_offline_commands', []) or [])}"
         )
     if assessment_policy:
@@ -62792,6 +62900,7 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
             f"lane={top_unblocker.get('lane') or '-'} "
             f"action={top_unblocker.get('actionability') or '-'} "
             f"package={top_unblocker.get('evidence_package_id') or '-'} "
+            f"package_status={top_unblocker.get('package_status') or '-'} "
             f"commands={len(objective_satisfaction.get('safe_offline_commands', []) or [])}"
         )
     if resource_preflight and resource_preflight.get("status") != "not-run":

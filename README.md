@@ -362,10 +362,12 @@ greybox mode it stays open until every ranked dangerous surface is covered or
 closed; in blackbox mode it becomes satisfied as soon as one gate-ready
 Medium/High/Critical report path exists, while weaker broad-coverage leads can
 remain parked. The rollup includes `top_unblocker`,
-`unblocker_lane_counts`, and `unblocker_actionability_counts` so the next loop
-can distinguish approved payload capture, provider/operator evidence,
-deployment resource evidence, read-only response observation, resource gates,
-and finding-gate review. Each unblocker also carries an `evidence_package` with
+`unblocker_lane_counts`, `unblocker_actionability_counts`, and
+`unblocker_package_status_counts` so the next loop can distinguish approved
+payload capture, provider/operator evidence, deployment resource evidence,
+read-only response observation, resource gates, finding-gate review, and whether
+the current package is waiting on a sidecar, operator evidence, offline review,
+or a resource gate. Each unblocker also carries an `evidence_package` with
 required artifacts, safe no-write review commands, active-validation gates, and
 forbidden validation steps for that lane. When an artifact directory is known,
 the package's safe reviews are expanded into command-safety-classified
