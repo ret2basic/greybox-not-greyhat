@@ -31646,6 +31646,11 @@ def build_adjudication(
     evidence_chain: dict[str, Any] | None,
 ) -> dict[str, Any]:
     gates = (finding_gate or {}).get("gates", [])
+    blocked_gate_previews = [
+        item
+        for item in (finding_gate or {}).get("blocked_gate_previews", []) or []
+        if isinstance(item, dict)
+    ]
     suspicion_by_id = {item.get("id"): item for item in suspicions}
     blocked_gates = [item for item in gates if item.get("gate_status") == "blocked"]
     manual_review_gates = [item for item in gates if item.get("gate_status") == "manual-review"]
@@ -31653,6 +31658,18 @@ def build_adjudication(
         item for item in gates if item.get("gate_status") == "accepted-hardening-note"
     ]
     external_blockers = list((blackbox_coverage or {}).get("external_blockers", []))
+    for preview in blocked_gate_previews:
+        external_blockers.append(
+            {
+                "id": preview.get("suspicion_id") or "blocked-gate-preview",
+                "status": "blocked-before-finding-gate",
+                "type": "gate-blocker",
+                "entrypoint": preview.get("entrypoint"),
+                "severity": preview.get("severity"),
+                "packet_type": preview.get("packet_type"),
+                "title": preview.get("title"),
+            }
+        )
     readiness_status = (environment_readiness or {}).get("status")
     if readiness_status and readiness_status != "ready" and not external_blockers:
         external_blockers.append(
@@ -31690,6 +31707,19 @@ def build_adjudication(
                 "checks": gate.get("checks", []),
             }
         )
+    for preview in blocked_gate_previews:
+        decisions.append(
+            {
+                "suspicion_id": preview.get("suspicion_id"),
+                "entrypoint": preview.get("entrypoint"),
+                "classification": preview.get("classification"),
+                "gate_status": preview.get("gate_status"),
+                "report_bucket": "blocked-before-finding-gate",
+                "title": preview.get("title"),
+                "checks": preview.get("checks", []),
+                "safety": preview.get("safety"),
+            }
+        )
 
     if findings:
         status = "reportable-findings"
@@ -31699,6 +31729,8 @@ def build_adjudication(
         status = "blocked"
     elif hardening_notes:
         status = "hardening-notes-only"
+    elif blocked_gate_previews:
+        status = "no-reportable-findings-with-gate-blockers"
     elif external_blockers:
         status = "no-reportable-findings-with-external-blocker"
     else:
@@ -31718,6 +31750,7 @@ def build_adjudication(
             "accepted_hardening_notes": len(hardening_notes),
             "manual_review": len(manual_review_gates),
             "blocked": len(blocked_gates),
+            "blocked_gate_previews": len(blocked_gate_previews),
             "evidence_gaps": gap_ids,
             "external_blockers": [item.get("id") for item in external_blockers],
             "coverage": (blackbox_coverage or {}).get("status"),
@@ -41276,6 +41309,16 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             ),
             None,
         )
+        blocked_preview_adjudication = build_adjudication(
+            [],
+            blocked_preview_gate,
+            [],
+            [],
+            None,
+            None,
+            None,
+            None,
+        )
         rewrite_gate_item = next(
             (
                 item
@@ -41289,6 +41332,7 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
         closure_text = json.dumps(closure, sort_keys=True)
         finding_gate_text = json.dumps(finding_gate, sort_keys=True)
         blocked_preview_gate_text = json.dumps(blocked_preview_gate, sort_keys=True)
+        blocked_preview_adjudication_text = json.dumps(blocked_preview_adjudication, sort_keys=True)
         followup_command_text = "\n".join(str(command) for command in review.get("followup_commands", []) or [])
         closure_command_text = "\n".join(
             str(command.get("command") or command)
@@ -41555,6 +41599,24 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             "actual": {
                 "blocked_preview": blocked_preview_item,
                 "summary": blocked_preview_gate.get("summary"),
+            },
+        },
+        {
+            "id": "adjudication-treats-blocked-previews-as-gate-blockers-not-findings",
+            "passed": (
+                blocked_preview_adjudication.get("status") == "no-reportable-findings-with-gate-blockers"
+                and (blocked_preview_adjudication.get("summary") or {}).get("blocked_gate_previews") == 1
+                and (blocked_preview_adjudication.get("summary") or {}).get("reportable_findings") == 0
+                and any(
+                    decision.get("report_bucket") == "blocked-before-finding-gate"
+                    for decision in blocked_preview_adjudication.get("decisions", []) or []
+                    if isinstance(decision, dict)
+                )
+                and "gate-blocker" in blocked_preview_adjudication_text
+            ),
+            "expected": "adjudication surfaces blocked gate previews as blockers while keeping findings empty",
+            "actual": {
+                "adjudication": blocked_preview_adjudication,
             },
         },
         {
@@ -56353,14 +56415,37 @@ def run_adjudicate(args: argparse.Namespace) -> int:
     suspicions = suspicions_doc.get("suspicions", [])
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
     finding_gate = load_optional_json(artifact_dir / "finding-gate.json")
+    validation_plan = load_optional_json(artifact_dir / VALIDATION_PLAN_ARTIFACT)
+    if not isinstance(validation_plan, dict):
+        validation_plan = build_validation_plan_run(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            limit=8,
+            current_resource_snapshot={"status": "not-run"},
+        )
     wrote_finding_gate = False
     if finding_gate is None:
         transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {}
         rewrite_response_review = load_optional_json(artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT) or {}
-        finding_gate = build_finding_gate(suspicions, burp_history, transaction_intent, rewrite_response_review)
+        finding_gate = build_finding_gate(
+            suspicions,
+            burp_history,
+            transaction_intent,
+            rewrite_response_review,
+            validation_plan,
+        )
         if not no_write:
             write_json(artifact_dir / "finding-gate.json", finding_gate)
             wrote_finding_gate = True
+    elif not (finding_gate.get("blocked_gate_previews") if isinstance(finding_gate, dict) else None):
+        finding_gate = json_clone(finding_gate)
+        blocked_previews = validation_plan_blocked_finding_gate_previews(validation_plan)
+        finding_gate["blocked_gate_previews"] = blocked_previews
+        summary = finding_gate.get("summary") if isinstance(finding_gate.get("summary"), dict) else {}
+        summary["gates"] = len(finding_gate.get("gates", []) or [])
+        summary["blocked_gate_previews"] = len(blocked_previews)
+        finding_gate["summary"] = summary
 
     findings = build_findings(suspicions, finding_gate)
     hardening_notes = build_hardening_notes(suspicions, finding_gate)
@@ -56390,7 +56475,8 @@ def run_adjudicate(args: argparse.Namespace) -> int:
         f"{len(findings)} findings, "
         f"{len(hardening_notes)} hardening notes, "
         f"{adjudication['summary']['manual_review']} manual review, "
-        f"{adjudication['summary']['blocked']} blocked"
+        f"{adjudication['summary']['blocked']} blocked, "
+        f"{adjudication['summary'].get('blocked_gate_previews', 0)} gate blockers"
     )
     if no_write:
         print("No files written (--no-write).")
