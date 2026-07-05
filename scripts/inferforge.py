@@ -147,6 +147,7 @@ HOST_TAKEOVER_BASELINE_ARTIFACT = "host-takeover-baseline.json"
 RESOURCE_SNAPSHOT_ARTIFACT = "resource-snapshot.json"
 SCOPE_POLICY_ARTIFACT = "scope-policy.json"
 WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT = "websocket-candidate-review.json"
+RPC_PROXY_PARITY_REVIEW_ARTIFACT = "rpc-proxy-parity-review.json"
 LEAD_PORTFOLIO_ARTIFACT = "lead-portfolio.json"
 HARNESS_LOOP_ARTIFACT = "harness-loop.json"
 METHODOLOGY_REVIEW_ARTIFACT = "methodology-review.json"
@@ -258,6 +259,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     "burp-transaction-candidates.json",
     "collection-summary.json",
     "environment-readiness.json",
+    RPC_PROXY_PARITY_REVIEW_ARTIFACT,
     LEAD_PORTFOLIO_ARTIFACT,
     HARNESS_LOOP_ARTIFACT,
     HYPOTHESIS_MATRIX_ARTIFACT,
@@ -386,6 +388,7 @@ INDEX_ARTIFACT_ORDER = [
     RESOURCE_SNAPSHOT_ARTIFACT,
     SCOPE_POLICY_ARTIFACT,
     WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT,
+    RPC_PROXY_PARITY_REVIEW_ARTIFACT,
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
@@ -22884,8 +22887,13 @@ def bounty_validation_lane_spec(
             "minimum_witness_level": "boundary",
             "validation_method": "Prove a sensitive browser-controlled header reaches an upstream that trusts, logs, bills, or authorizes from it.",
             "required_official_evidence": [repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)],
-            "required_derived_artifacts": [WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT, "finding-gate.json"],
+            "required_derived_artifacts": [
+                WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT,
+                RPC_PROXY_PARITY_REVIEW_ARTIFACT,
+                "finding-gate.json",
+            ],
             "validation_commands": [
+                validation_command_for_artifact_dir(artifact_dir, "rpc-proxy-parity-review --no-write --show-checks", profile=profile),
                 validation_command_for_artifact_dir(artifact_dir, "websocket-candidate-review --no-write", profile=profile),
                 validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
             ],
@@ -23126,6 +23134,477 @@ def build_bounty_validation_gates(
         "safety": (
             "Offline artifact synthesis only. It sends no target traffic, calls no Burp tool, starts no browser, signs nothing, "
             "submits no transaction, and creates no official evidence sidecars."
+        ),
+    }
+
+
+RPC_PROXY_HTTP_SOURCE = Path("src/app/api/rpc/_shared.ts")
+RPC_PROXY_WS_SOURCE = Path("server.js")
+
+
+def rpc_proxy_source_ref(
+    source_root: Path,
+    path: Path,
+    source: str,
+    token: str,
+) -> dict[str, Any] | None:
+    offset = source.find(token)
+    if offset < 0:
+        return None
+    line = line_number_for_offset(source, offset)
+    lines = source.splitlines()
+    sample = lines[line - 1].strip() if 0 < line <= len(lines) else token
+    return {
+        "file": source_root_relative_or_repo(path, source_root),
+        "line": line,
+        "token": token,
+        "sample": sample,
+    }
+
+
+def rpc_proxy_refs_for_tokens(
+    source_root: Path,
+    path: Path,
+    source: str,
+    tokens: list[str],
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    refs = []
+    seen: set[tuple[str, int, str]] = set()
+    for token in tokens:
+        ref = rpc_proxy_source_ref(source_root, path, source, token)
+        if not ref:
+            continue
+        key = (str(ref.get("file")), int(ref.get("line") or 0), str(ref.get("token")))
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append(ref)
+        if len(refs) >= limit:
+            break
+    return refs
+
+
+def rpc_proxy_signal(
+    *,
+    signal_id: str,
+    label: str,
+    present: bool,
+    source_root: Path,
+    path: Path,
+    source: str,
+    tokens: list[str],
+    detail: str,
+) -> dict[str, Any]:
+    return {
+        "id": signal_id,
+        "label": label,
+        "status": "present" if present else "missing",
+        "present": present,
+        "detail": detail,
+        "refs": rpc_proxy_refs_for_tokens(source_root, path, source, tokens),
+    }
+
+
+def rpc_proxy_parity_check(
+    check_id: str,
+    label: str,
+    status: str,
+    *,
+    severity: str,
+    http_signals: list[str],
+    ws_signals: list[str],
+    evidence_refs: list[dict[str, Any]],
+    promotion_gate: str,
+    reject_if: list[str],
+) -> dict[str, Any]:
+    return {
+        "id": check_id,
+        "label": label,
+        "status": status,
+        "severity": severity,
+        "http_signals": http_signals,
+        "ws_signals": ws_signals,
+        "evidence_refs": ordered_unique_ref_dicts(evidence_refs)[:12],
+        "promotion_gate": promotion_gate,
+        "reject_if": reject_if,
+        "finding_gate_ready": False,
+    }
+
+
+def build_rpc_proxy_parity_review(
+    *,
+    source_root: Path,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    max_file_bytes: int = DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES,
+) -> dict[str, Any]:
+    http_path = source_root / RPC_PROXY_HTTP_SOURCE
+    ws_path = source_root / RPC_PROXY_WS_SOURCE
+    skipped = []
+    warnings = []
+    http_source = ""
+    ws_source = ""
+    for path, label in [(http_path, "http"), (ws_path, "websocket")]:
+        try:
+            text = read_text_file_limited(
+                path,
+                max_input_bytes=max_file_bytes,
+                limit_name="--max-file-bytes",
+            )
+        except FileNotFoundError:
+            skipped.append({"file": repo_relative_or_absolute(path), "reason": "missing"})
+            text = ""
+        except (OSError, UnicodeDecodeError, ValueError) as error:
+            skipped.append({"file": repo_relative_or_absolute(path), "reason": redacted_error_summary(str(error))})
+            text = ""
+        if label == "http":
+            http_source = text
+        else:
+            ws_source = text
+
+    http_signals = [
+        rpc_proxy_signal(
+            signal_id="http-origin-or-referer-gate",
+            label="HTTP RPC rejects disallowed Origin/Referer sources",
+            present="isAllowedRequestSource(req)" in http_source and "origin" in http_source and "referer" in http_source,
+            source_root=source_root,
+            path=http_path,
+            source=http_source,
+            tokens=["isAllowedRequestSource(req)", "const origin = req.headers.get('origin')", "referer"],
+            detail="HTTP requests require an allowed Origin or Referer in production unless explicitly configured otherwise.",
+        ),
+        rpc_proxy_signal(
+            signal_id="http-cluster-allowlist",
+            label="HTTP RPC limits clusters to mainnet/devnet",
+            present="cluster !== 'mainnet' && cluster !== 'devnet'" in http_source,
+            source_root=source_root,
+            path=http_path,
+            source=http_source,
+            tokens=["cluster !== 'mainnet' && cluster !== 'devnet'", "Unknown Solana RPC cluster"],
+            detail="HTTP cluster path rejects unknown Solana clusters before proxying.",
+        ),
+        rpc_proxy_signal(
+            signal_id="http-method-allowlist",
+            label="HTTP RPC uses an allowlist and blocks transaction methods by default",
+            present=all(token in http_source for token in ["DEFAULT_ALLOWED_METHODS", "BLOCKED_METHODS", "ALLOW_TRANSACTION_METHODS"]),
+            source_root=source_root,
+            path=http_path,
+            source=http_source,
+            tokens=["DEFAULT_ALLOWED_METHODS", "BLOCKED_METHODS", "ALLOW_TRANSACTION_METHODS", "TRANSACTION_METHODS"],
+            detail="HTTP JSON-RPC methods are allowlisted, with send/simulate transaction methods gated by env config.",
+        ),
+        rpc_proxy_signal(
+            signal_id="http-body-and-batch-bounds",
+            label="HTTP RPC bounds body bytes and JSON-RPC batch size",
+            present=all(token in http_source for token in ["MAX_BODY_BYTES", "content-length", "MAX_BATCH_SIZE"]),
+            source_root=source_root,
+            path=http_path,
+            source=http_source,
+            tokens=["MAX_BODY_BYTES", "content-length", "MAX_BATCH_SIZE", "JSON-RPC batch size exceeds"],
+            detail="HTTP requests are bounded before and after reading the body, and batch size is capped.",
+        ),
+        rpc_proxy_signal(
+            signal_id="http-duplicate-key-rejection",
+            label="HTTP RPC rejects duplicate JSON keys",
+            present="findDuplicateJsonKey(rawBody)" in http_source,
+            source_root=source_root,
+            path=http_path,
+            source=http_source,
+            tokens=["findDuplicateJsonKey(rawBody)", "Duplicate JSON key is not allowed"],
+            detail="HTTP JSON parser is preceded by a duplicate-key detector.",
+        ),
+        rpc_proxy_signal(
+            signal_id="http-request-rate-limit",
+            label="HTTP RPC has production burst and sustained request rate gates",
+            present=all(token in http_source for token in ["RATE_LIMIT_WINDOWS", "BURST_LIMIT", "SUSTAINED_LIMIT", "checkRateLimit(req, cluster)"]),
+            source_root=source_root,
+            path=http_path,
+            source=http_source,
+            tokens=["RATE_LIMIT_WINDOWS", "BURST_LIMIT", "SUSTAINED_LIMIT", "checkRateLimit(req, cluster)"],
+            detail="HTTP RPC checks burst and sustained windows in production before proxying upstream.",
+        ),
+        rpc_proxy_signal(
+            signal_id="http-upstream-header-minimal",
+            label="HTTP RPC does not forward browser request headers to upstream",
+            present="headers: {\n          accept: 'application/json'" in http_source and "authorization:" not in http_source[http_source.find("fetch(getRpcUrl") : http_source.find("fetch(getRpcUrl") + 600],
+            source_root=source_root,
+            path=http_path,
+            source=http_source,
+            tokens=["fetch(getRpcUrl(cluster)", "accept: 'application/json'", "'content-type': 'application/json'"],
+            detail="HTTP upstream fetch uses a minimal JSON header set rather than relaying caller headers.",
+        ),
+        rpc_proxy_signal(
+            signal_id="http-upstream-timeout",
+            label="HTTP RPC aborts slow upstream requests",
+            present="AbortController" in http_source and "UPSTREAM_TIMEOUT_MS" in http_source,
+            source_root=source_root,
+            path=http_path,
+            source=http_source,
+            tokens=["AbortController", "UPSTREAM_TIMEOUT_MS", "controller.abort"],
+            detail="HTTP upstream requests are bounded by an abort timeout.",
+        ),
+    ]
+
+    ws_sensitive_filters = ["'authorization'", '"authorization"', "'cookie'", '"cookie"']
+    ws_filters_sensitive_headers = any(token in ws_source for token in ws_sensitive_filters)
+    ws_signals = [
+        rpc_proxy_signal(
+            signal_id="ws-origin-gate",
+            label="WebSocket RPC rejects disallowed Origin sources",
+            present="isAllowedOrigin(req)" in ws_source and "req.headers.origin" in ws_source,
+            source_root=source_root,
+            path=ws_path,
+            source=ws_source,
+            tokens=["isAllowedOrigin(req)", "req.headers.origin", "403 Forbidden"],
+            detail="WebSocket upgrades require an allowed Origin in production unless explicitly configured otherwise.",
+        ),
+        rpc_proxy_signal(
+            signal_id="ws-cluster-allowlist",
+            label="WebSocket RPC limits clusters to mainnet/devnet",
+            present="SOLANA_CLUSTERS" in ws_source and "getSolanaClusterFromPathname" in ws_source,
+            source_root=source_root,
+            path=ws_path,
+            source=ws_source,
+            tokens=["SOLANA_CLUSTERS", "getSolanaClusterFromPathname", "SOLANA_RPC_PATH_PREFIX"],
+            detail="WebSocket upgrade routing only recognizes configured Solana clusters.",
+        ),
+        rpc_proxy_signal(
+            signal_id="ws-method-allowlist",
+            label="WebSocket RPC uses a subscription-only method allowlist",
+            present="WS_ALLOWED_METHODS" in ws_source and "WS_ALLOWED_METHODS.has" in ws_source,
+            source_root=source_root,
+            path=ws_path,
+            source=ws_source,
+            tokens=["WS_ALLOWED_METHODS", "WS_ALLOWED_METHODS.has", "accountSubscribe"],
+            detail="WebSocket messages must use allowlisted subscription/unsubscription methods.",
+        ),
+        rpc_proxy_signal(
+            signal_id="ws-message-and-batch-bounds",
+            label="WebSocket RPC bounds message bytes, batch size, and pending queue",
+            present=all(token in ws_source for token in ["MAX_WS_MESSAGE_BYTES", "MAX_WS_BATCH_SIZE", "MAX_PENDING_WS_MESSAGES"]),
+            source_root=source_root,
+            path=ws_path,
+            source=ws_source,
+            tokens=["MAX_WS_MESSAGE_BYTES", "MAX_WS_BATCH_SIZE", "MAX_PENDING_WS_MESSAGES"],
+            detail="WebSocket messages and queued pre-upstream messages are bounded.",
+        ),
+        rpc_proxy_signal(
+            signal_id="ws-duplicate-key-rejection",
+            label="WebSocket RPC rejects duplicate JSON keys",
+            present="findDuplicateJsonKey(message)" in ws_source,
+            source_root=source_root,
+            path=ws_path,
+            source=ws_source,
+            tokens=["findDuplicateJsonKey(message)", "isAllowedWsRpcMessage"],
+            detail="WebSocket message validation rejects duplicate JSON keys before forwarding.",
+        ),
+        rpc_proxy_signal(
+            signal_id="ws-connection-limit",
+            label="WebSocket RPC limits concurrent connections per IP",
+            present="MAX_WS_CONNECTIONS_PER_IP" in ws_source and "wsConnectionsByIp" in ws_source,
+            source_root=source_root,
+            path=ws_path,
+            source=ws_source,
+            tokens=["MAX_WS_CONNECTIONS_PER_IP", "wsConnectionsByIp", "429 Too Many Requests"],
+            detail="WebSocket upgrades are bounded by concurrent connections per client IP.",
+        ),
+        rpc_proxy_signal(
+            signal_id="ws-upstream-header-forwarding",
+            label="WebSocket RPC forwards non-hop-by-hop request headers upstream",
+            present="Object.entries(req.headers)" in ws_source and "headers[key] = value" in ws_source and "getWsForwardHeaders(req)" in ws_source,
+            source_root=source_root,
+            path=ws_path,
+            source=ws_source,
+            tokens=["Object.entries(req.headers)", "headers[key] = value", "getWsForwardHeaders(req)"],
+            detail="WebSocket upstream connection receives caller headers after hop-by-hop/origin filtering.",
+        ),
+        rpc_proxy_signal(
+            signal_id="ws-sensitive-header-filter",
+            label="WebSocket RPC explicitly filters Authorization/Cookie before upstream forwarding",
+            present=ws_filters_sensitive_headers,
+            source_root=source_root,
+            path=ws_path,
+            source=ws_source,
+            tokens=["authorization", "cookie", "HOP_BY_HOP_HEADERS"],
+            detail="Explicit Authorization/Cookie filtering would reduce header-trust impact if browser or proxy credentials are present.",
+        ),
+        rpc_proxy_signal(
+            signal_id="ws-upstream-timeout-and-wss",
+            label="WebSocket RPC validates upstream scheme and handshake timeout",
+            present=all(token in ws_source for token in ["validateUpstreamUrl", "handshakeTimeout", "must use wss: in production"]),
+            source_root=source_root,
+            path=ws_path,
+            source=ws_source,
+            tokens=["validateUpstreamUrl", "handshakeTimeout", "must use wss: in production"],
+            detail="WebSocket upstream URLs must be ws/wss, production requires wss, and handshakes are timed out.",
+        ),
+    ]
+
+    http_by_id = {signal["id"]: signal for signal in http_signals}
+    ws_by_id = {signal["id"]: signal for signal in ws_signals}
+    def refs(*ids: str) -> list[dict[str, Any]]:
+        out = []
+        for signal_id in ids:
+            signal = http_by_id.get(signal_id) or ws_by_id.get(signal_id)
+            if signal:
+                out.extend(signal.get("refs", []) or [])
+        return out
+
+    checks = [
+        rpc_proxy_parity_check(
+            "origin-and-cluster-parity",
+            "HTTP and WebSocket RPC both gate origin and cluster before upstream proxying",
+            "passed" if http_by_id["http-origin-or-referer-gate"]["present"] and ws_by_id["ws-origin-gate"]["present"] and http_by_id["http-cluster-allowlist"]["present"] and ws_by_id["ws-cluster-allowlist"]["present"] else "missing-source-evidence",
+            severity="required",
+            http_signals=["http-origin-or-referer-gate", "http-cluster-allowlist"],
+            ws_signals=["ws-origin-gate", "ws-cluster-allowlist"],
+            evidence_refs=refs("http-origin-or-referer-gate", "ws-origin-gate", "http-cluster-allowlist", "ws-cluster-allowlist"),
+            promotion_gate="Origin/cluster parity failure would need a public-entry bypass and concrete upstream impact.",
+            reject_if=["Both HTTP and WebSocket paths reject disallowed origins and unknown clusters."],
+        ),
+        rpc_proxy_parity_check(
+            "method-and-transaction-parity",
+            "HTTP and WebSocket RPC both constrain dangerous methods before upstream proxying",
+            "passed" if http_by_id["http-method-allowlist"]["present"] and ws_by_id["ws-method-allowlist"]["present"] else "missing-source-evidence",
+            severity="required",
+            http_signals=["http-method-allowlist"],
+            ws_signals=["ws-method-allowlist"],
+            evidence_refs=refs("http-method-allowlist", "ws-method-allowlist"),
+            promotion_gate="A method gate failure needs proof of attacker-reachable high-impact RPC method execution.",
+            reject_if=["HTTP transaction methods remain env-gated and WS remains subscription-only."],
+        ),
+        rpc_proxy_parity_check(
+            "parser-and-size-parity",
+            "HTTP and WebSocket RPC both bound input size, batch size, and duplicate keys",
+            "passed" if http_by_id["http-body-and-batch-bounds"]["present"] and http_by_id["http-duplicate-key-rejection"]["present"] and ws_by_id["ws-message-and-batch-bounds"]["present"] and ws_by_id["ws-duplicate-key-rejection"]["present"] else "missing-source-evidence",
+            severity="required",
+            http_signals=["http-body-and-batch-bounds", "http-duplicate-key-rejection"],
+            ws_signals=["ws-message-and-batch-bounds", "ws-duplicate-key-rejection"],
+            evidence_refs=refs("http-body-and-batch-bounds", "http-duplicate-key-rejection", "ws-message-and-batch-bounds", "ws-duplicate-key-rejection"),
+            promotion_gate="A parser/size failure needs a bounded non-stress reproducer and operator-visible impact.",
+            reject_if=["Both paths reject oversize inputs, oversize batches, and duplicate JSON keys."],
+        ),
+        rpc_proxy_parity_check(
+            "rate-and-connection-parity",
+            "HTTP has request-rate gates while WebSocket has connection and pending-message gates",
+            "review" if http_by_id["http-request-rate-limit"]["present"] and ws_by_id["ws-connection-limit"]["present"] else "missing-source-evidence",
+            severity="review",
+            http_signals=["http-request-rate-limit"],
+            ws_signals=["ws-connection-limit", "ws-message-and-batch-bounds"],
+            evidence_refs=refs("http-request-rate-limit", "ws-connection-limit", "ws-message-and-batch-bounds"),
+            promotion_gate="Medium+ requires non-stress operator evidence that WS limits allow concrete quota, billing, or availability impact.",
+            reject_if=[
+                "Only a theoretical rate-limit mismatch is present.",
+                "Impact requires volumetric stress, broad scanning, or abusive subscription counts.",
+            ],
+        ),
+        rpc_proxy_parity_check(
+            "upstream-header-forwarding-parity",
+            "HTTP uses minimal upstream headers while WebSocket forwards caller headers after hop-by-hop filtering",
+            "review" if ws_by_id["ws-upstream-header-forwarding"]["present"] and not ws_by_id["ws-sensitive-header-filter"]["present"] else "passed",
+            severity="review",
+            http_signals=["http-upstream-header-minimal"],
+            ws_signals=["ws-upstream-header-forwarding", "ws-sensitive-header-filter"],
+            evidence_refs=refs("ws-upstream-header-forwarding", "ws-sensitive-header-filter", "http-upstream-header-minimal"),
+            promotion_gate="Medium+ requires proof that forwarded Authorization/Cookie or equivalent browser/proxy header reaches an upstream trust, auth, billing, or logging boundary.",
+            reject_if=[
+                "No sensitive browser-controlled or proxy-controlled header is present on the WebSocket origin.",
+                "The upstream ignores forwarded headers or treats them only as inert metadata.",
+                "Only source-level header forwarding is available without operator/upstream trust evidence.",
+            ],
+        ),
+        rpc_proxy_parity_check(
+            "upstream-timeout-and-scheme-parity",
+            "HTTP and WebSocket RPC both enforce upstream timeout/scheme constraints",
+            "passed" if http_by_id["http-upstream-timeout"]["present"] and ws_by_id["ws-upstream-timeout-and-wss"]["present"] else "missing-source-evidence",
+            severity="required",
+            http_signals=["http-upstream-timeout"],
+            ws_signals=["ws-upstream-timeout-and-wss"],
+            evidence_refs=refs("http-upstream-timeout", "ws-upstream-timeout-and-wss"),
+            promotion_gate="Scheme/timeout failure needs a public-entry proof and concrete downgrade or availability consequence.",
+            reject_if=["HTTP has abort timeout and WS validates wss in production with handshake timeout."],
+        ),
+    ]
+
+    status_counts: dict[str, int] = {}
+    for check in checks:
+        increment_count(status_counts, str(check.get("status") or "unknown"))
+    review_checks = [check for check in checks if check.get("status") == "review"]
+    missing_checks = [check for check in checks if check.get("status") == "missing-source-evidence"]
+    if skipped:
+        status = "source-scan-incomplete"
+    elif missing_checks:
+        status = "partial-rpc-proxy-parity"
+    elif review_checks:
+        status = "needs-rpc-proxy-parity-evidence"
+    else:
+        status = "rpc-proxy-parity-indexed"
+
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-rpc-proxy-parity-review-v1",
+        "status": status,
+        "source_root": repo_relative_or_absolute(source_root),
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "checks": len(checks),
+            "review_checks": len(review_checks),
+            "missing_source_checks": len(missing_checks),
+            "http_signals": len(http_signals),
+            "ws_signals": len(ws_signals),
+            "skipped": len(skipped),
+            "status_counts": dict(sorted(status_counts.items())),
+            "header_forwarding_review": any(check.get("id") == "upstream-header-forwarding-parity" and check.get("status") == "review" for check in checks),
+            "rate_connection_review": any(check.get("id") == "rate-and-connection-parity" and check.get("status") == "review" for check in checks),
+        },
+        "http": {
+            "source": repo_relative_or_absolute(http_path),
+            "signals": http_signals,
+        },
+        "websocket": {
+            "source": repo_relative_or_absolute(ws_path),
+            "signals": ws_signals,
+        },
+        "checks": checks,
+        "required_official_evidence": [
+            repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+        ],
+        "validation_commands": [
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "rpc-proxy-parity-review --no-write --show-checks",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "websocket-candidate-review --no-write",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "operator-evidence-review --no-write --show-missing --show-sidecar-validation --show-closure-contract",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(artifact_dir, "bounty-validation-gates --no-write --show-gates", profile=profile),
+        ],
+        "finding_gate_ready": False,
+        "finding_gate_boundary": (
+            "RPC proxy parity review is source-derived. Medium+ requires official operator/upstream evidence that a parity gap "
+            "creates concrete quota, billing, auth, logging, availability, or transaction-method impact."
+        ),
+        "next_step": (
+            "Collect operator/upstream evidence for WS forwarded headers and non-stress WS quota/connection impact, or close those lanes as non-impacting."
+            if review_checks
+            else "No RPC proxy parity review blockers remain from local source."
+        ),
+        "skipped": skipped,
+        "warnings": warnings,
+        "safety": (
+            "Offline bounded source review only. It sends no HTTP/WebSocket traffic, does not inspect ports, does not start servers, "
+            "and does not read runtime secrets."
         ),
     }
 
@@ -23534,6 +24013,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     "reproduction-steps.md": "verification-queue",
     REVIEW_BLOCKERS_ARTIFACT: "review-blockers",
     REVIEW_BLOCKERS_MARKDOWN_ARTIFACT: "review-blockers",
+    RPC_PROXY_PARITY_REVIEW_ARTIFACT: "rpc-proxy-parity-review",
     ORACLE_PLAN_ARTIFACT: "oracle-plan",
     CLAIM_EVIDENCE_LEDGER_ARTIFACT: "claim-evidence-ledger",
     CLAIM_WITNESS_LADDER_ARTIFACT: "claim-witness-ladder",
@@ -23576,6 +24056,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "adjudicate",
     "verification-queue",
     "review-blockers",
+    "rpc-proxy-parity-review",
     "oracle-plan",
     "claim-evidence-ledger",
     "claim-witness-ladder",
@@ -23603,6 +24084,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "adjudicate": "adjudicate --no-write",
     "verification-queue": "verification-queue --no-write",
     "review-blockers": "review-blockers --no-write",
+    "rpc-proxy-parity-review": "rpc-proxy-parity-review --no-write",
     "oracle-plan": "oracle-plan --no-write",
     "claim-evidence-ledger": "claim-evidence-ledger --no-write",
     "claim-witness-ladder": "claim-witness-ladder --no-write",
@@ -47875,6 +48357,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("host-takeover-baseline", "run_host_takeover_baseline"),
         refresh_expectation("scope-policy", "run_scope_policy"),
         refresh_expectation("websocket-candidate-review", "run_websocket_candidate_review", min_refreshes=2, min_prints=2),
+        refresh_expectation("rpc-proxy-parity-review", "run_rpc_proxy_parity_review"),
         refresh_expectation("lead-portfolio", "run_lead_portfolio"),
         refresh_expectation("methodology-review", "run_methodology_review"),
         refresh_expectation("lead-dossier", "run_lead_dossier"),
@@ -71562,6 +72045,92 @@ def run_bounty_validation_gates(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_rpc_proxy_parity_review(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    review = build_rpc_proxy_parity_review(
+        source_root=source_root,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        max_file_bytes=args.max_file_bytes,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / RPC_PROXY_PARITY_REVIEW_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(review))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="rpc-proxy-parity-review",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = review.get("summary", {}) if isinstance(review.get("summary"), dict) else {}
+    print(f"RPC proxy parity review: {review.get('status')}")
+    print(
+        "Checks: "
+        f"total={summary.get('checks', 0)} "
+        f"review={summary.get('review_checks', 0)} "
+        f"missing_source={summary.get('missing_source_checks', 0)} "
+        f"http_signals={summary.get('http_signals', 0)} "
+        f"ws_signals={summary.get('ws_signals', 0)} "
+        f"skipped={summary.get('skipped', 0)}"
+    )
+    print(f"Statuses: {json.dumps(summary.get('status_counts', {}), sort_keys=True)}")
+    print(
+        "Review gates: "
+        f"header_forwarding={summary.get('header_forwarding_review')} "
+        f"rate_connection={summary.get('rate_connection_review')}"
+    )
+    if getattr(args, "show_checks", False):
+        display_limit = max(0, int(args.top))
+        for check in (review.get("checks", []) or [])[:display_limit]:
+            if not isinstance(check, dict):
+                continue
+            print(
+                f"- {check.get('severity')} {check.get('status')} {check.get('id')}: "
+                f"{inline_summary_text(check.get('label'), max_chars=220)}"
+            )
+            print(f"  gate={inline_summary_text(check.get('promotion_gate'), max_chars=300)}")
+            reject_if = normalize_string_list(check.get("reject_if"))
+            if reject_if:
+                print(f"  reject_if={inline_summary_text(reject_if[0], max_chars=260)}")
+            for ref in (check.get("evidence_refs", []) or [])[:2]:
+                if isinstance(ref, dict):
+                    print(
+                        "  ref="
+                        f"{ref.get('file')}:{ref.get('line')} "
+                        f"{inline_summary_text(ref.get('sample'), max_chars=160)}"
+                    )
+        remaining = len(review.get("checks", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more check(s); rerun without --no-write to write the full artifact")
+            else:
+                print(f"- {remaining} more check(s) in {output_path}")
+    print(f"Gate: {inline_summary_text(review.get('finding_gate_boundary'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(review.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and review.get("status") not in {
+        "needs-rpc-proxy-parity-evidence",
+        "rpc-proxy-parity-indexed",
+    }:
+        return 1
+    return 0
+
+
 def run_iteration_decision(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -73781,6 +74350,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless review is complete or baselines are complete.",
     )
     websocket_candidate_review.set_defaults(func=run_websocket_candidate_review)
+
+    rpc_proxy_parity_review = sub.add_parser(
+        "rpc-proxy-parity-review",
+        help="Review HTTP and WebSocket Solana RPC proxy guardrail parity without sending traffic",
+    )
+    rpc_proxy_parity_review.add_argument(
+        "--output",
+        help=(
+            f"Where to write {RPC_PROXY_PARITY_REVIEW_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{RPC_PROXY_PARITY_REVIEW_ARTIFACT}."
+        ),
+    )
+    rpc_proxy_parity_review.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES,
+        help=f"Maximum bytes to read per RPC proxy source file. Defaults to {DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES}.",
+    )
+    rpc_proxy_parity_review.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of parity checks to print with --show-checks.",
+    )
+    rpc_proxy_parity_review.add_argument(
+        "--show-checks",
+        action="store_true",
+        help="Print RPC proxy parity checks and evidence refs.",
+    )
+    rpc_proxy_parity_review.add_argument(
+        "--no-write",
+        action="store_true",
+        help=f"Print RPC proxy parity review only; do not write {RPC_PROXY_PARITY_REVIEW_ARTIFACT} or refreshed manifests.",
+    )
+    rpc_proxy_parity_review.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless RPC proxy parity is indexed or waiting only on official impact evidence.",
+    )
+    rpc_proxy_parity_review.set_defaults(func=run_rpc_proxy_parity_review)
 
     lead_portfolio = sub.add_parser(
         "lead-portfolio",
