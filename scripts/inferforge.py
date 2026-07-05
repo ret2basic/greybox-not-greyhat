@@ -9140,6 +9140,7 @@ def current_evidence_gaps_for_artifact_dir(
         profile=profile_doc,
         deployment_review=deployment_review,
         rewrite_response_review=rewrite_response_review,
+        current_resource_snapshot=load_optional_json(artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT),
     )
 
 
@@ -28640,6 +28641,10 @@ def build_evidence_chain(
                         "priority": gap.get("priority"),
                         "title": gap.get("title"),
                         "safe_next_step": gap.get("safe_next_step"),
+                        "active_followup_status": gap.get("active_followup_status"),
+                        "active_followup_resource_status": gap.get("active_followup_resource_status"),
+                        "active_followup_resource_budget_mode": gap.get("active_followup_resource_budget_mode"),
+                        "active_followup_resource_reason": gap.get("active_followup_resource_reason"),
                     }
                     for gap in gaps_by_cluster.get(cluster_id, [])
                 ],
@@ -28670,6 +28675,11 @@ def build_evidence_chain(
             "unexpected_probes": sum(1 for row in results if not row.get("expected")),
             "finding_gates": len((finding_gate or {}).get("gates", [])),
             "evidence_gaps": [gap.get("id") for gap in (evidence_gaps or {}).get("gaps", [])],
+            "evidence_gap_active_followup_status_counts": (
+                (evidence_gaps or {}).get("summary", {}).get("active_followup_status_counts", {})
+                if isinstance((evidence_gaps or {}).get("summary"), dict)
+                else {}
+            ),
             "readiness": (environment_readiness or {}).get("status"),
             "transaction_candidates": (transaction_intent or {}).get("candidates_seen", 0),
             "decoded_transactions": (transaction_intent or {}).get("decoded_transactions", 0),
@@ -50836,6 +50846,13 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
     evidence_gaps = normalize_quote_transaction_evidence_gap_artifact(
         load_optional_json(artifact_dir / "evidence-gaps.json")
     )
+    if not any(
+        isinstance(gap, dict) and gap.get("active_followup_status")
+        for gap in (evidence_gaps or {}).get("gaps", []) or []
+    ):
+        evidence_gaps = normalize_quote_transaction_evidence_gap_artifact(
+            current_evidence_gaps_for_artifact_dir(target=target, profile=profile, artifact_dir=artifact_dir)
+        )
     environment_readiness = load_optional_json(artifact_dir / "environment-readiness.json")
     transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json")
     transaction_decoder_selftest = load_optional_json(artifact_dir / "transaction-decoder-selftest.json")
@@ -50900,6 +50917,13 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
             )
             if gap.get("safe_next_step"):
                 print(f"  next={inline_summary_text(gap.get('safe_next_step'), max_chars=240)}")
+            if gap.get("active_followup_status"):
+                print(
+                    f"  active_followup={gap.get('active_followup_status')} "
+                    f"resource={gap.get('active_followup_resource_status') or 'not-run'}/"
+                    f"{gap.get('active_followup_resource_budget_mode') or 'unknown'} "
+                    f"reason={inline_summary_text(gap.get('active_followup_resource_reason'), max_chars=220)}"
+                )
             for followup in evidence_gap_followup_commands(
                 str(gap.get("id") or ""),
                 artifact_dir=artifact_dir,
