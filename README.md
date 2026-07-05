@@ -1005,6 +1005,8 @@ candidate can be extracted. When a payload sidecar already yields decode-ready
 candidates but `transaction-intent-policy.json` is missing, it also prints the
 matching `prepare-transaction-intent-policy --no-write`, write, and
 `decode-transactions` command sequence for each profile direction.
+An empty `burp-transaction-candidates.json` placeholder counts only as a present
+file; it does not satisfy the candidate-bearing sidecar evidence gate.
 
 `transaction-corpus-checklist` is the offline bridge between source-flow review
 and decoding. It reads the current quote collection, Burp transaction candidate,

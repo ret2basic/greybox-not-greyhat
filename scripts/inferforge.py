@@ -9508,7 +9508,7 @@ def build_transaction_evidence_closure(
     requirements = [
         methodology_requirement(
             "approved-transaction-payload-sidecar",
-            sidecar_checks.get("payload-sidecar-present", "waiting"),
+            sidecar_checks.get("payload-sidecar-candidate-bearing", "waiting"),
             sidecar_review.get("summary", {}),
             "Add one approved quote response or extracted transaction payload sidecar.",
         ),
@@ -21488,6 +21488,7 @@ def build_transaction_sidecar_review(
     )
     present_payload_files = [row for row in payload_files if row.get("status") == "present"]
     oversized_payload_files = [row for row in payload_files if row.get("status") == "too-large"]
+    candidate_sources = sorted({str(candidate.get("source") or "") for candidate in candidates})
 
     policy_path = artifact_dir / "transaction-intent-policy.json"
     policy_file = transaction_sidecar_file_status(policy_path, max_input_bytes)
@@ -21574,6 +21575,11 @@ def build_transaction_sidecar_review(
             "evidence": len(candidates),
         },
         {
+            "id": "payload-sidecar-candidate-bearing",
+            "status": "passed" if candidates else "waiting",
+            "evidence": candidate_sources,
+        },
+        {
             "id": "payload-contract-compatible",
             "status": "passed"
             if payload_contract_allows_decode
@@ -21640,6 +21646,7 @@ def build_transaction_sidecar_review(
         "summary": {
             "payload_files_present": len(present_payload_files),
             "payload_files_oversized": len(oversized_payload_files),
+            "candidate_bearing_payload_files": len(candidate_sources),
             "candidate_count": len(candidates),
             "intent_policy_configured": bool(policy.get("configured")),
             "intent_policy_valid": bool(policy.get("valid")),
@@ -21664,7 +21671,7 @@ def build_transaction_sidecar_review(
             transaction_candidate_review_summary(candidate)
             for candidate in candidates[:20]
         ],
-        "candidate_sources": sorted({str(candidate.get("source") or "") for candidate in candidates}),
+        "candidate_sources": candidate_sources,
         "decode_input_sidecar": decode_input_sidecar,
         "warnings": warnings,
         "acceptance_checks": acceptance_checks,
@@ -37494,6 +37501,8 @@ def build_transaction_decoder_selftest(
         and sidecar_empty_guidance.get("configured_candidate_paths") == quote_response_candidate_paths(profile)
         and len(sidecar_empty_guidance.get("examples", []) or []) >= 3
         and "empty burp-transaction-candidates.json" in str(sidecar_empty_guidance.get("empty_burp_candidate_note", ""))
+        and methodology_check_statuses(sidecar_empty_review).get("payload-sidecar-present") == "passed"
+        and methodology_check_statuses(sidecar_empty_review).get("payload-sidecar-candidate-bearing") == "waiting"
     )
     sidecar_evm_shape_review = (
         sidecar_evm_review.get("payload_shape_review")
@@ -37584,6 +37593,7 @@ def build_transaction_decoder_selftest(
             "review_status": sidecar_empty_review.get("status"),
             "configured_candidate_paths": sidecar_empty_guidance.get("configured_candidate_paths", []),
             "examples": len(sidecar_empty_guidance.get("examples", []) or []),
+            "acceptance_checks": methodology_check_statuses(sidecar_empty_review),
         },
         "sidecar_evm_shape_review": {
             "status": "passed" if sidecar_evm_passed else "failed",
