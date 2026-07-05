@@ -12978,6 +12978,126 @@ def rewrite_response_gate_followup_commands(
     ]
 
 
+def rewrite_response_observation_contracts(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    rewrite_review_item: dict[str, Any] | None,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    if not isinstance(rewrite_review_item, dict):
+        return []
+    candidate_id = rewrite_review_observation_candidate_id(rewrite_review_item)
+    if not candidate_id:
+        return []
+    reviewed_profile = repo_relative_or_absolute(artifact_dir / "reviewed-profile.json")
+    contracts = []
+    for candidate in rewrite_review_item.get("read_only_path_candidates", []) or []:
+        if not isinstance(candidate, dict):
+            continue
+        local_path = str(candidate.get("local_path") or "")
+        if not is_safe_concrete_local_path(local_path):
+            continue
+        promote_base = (
+            "promote-observation-candidate "
+            f"--candidate-id {shlex.quote(candidate_id)} "
+            f"--path {shlex.quote(local_path)} "
+            f"--output {shlex.quote(reviewed_profile)}"
+        )
+        commands = [
+            {
+                "id": "promotion-preview",
+                "risk": "offline-local-preview",
+                "command": validation_command_for_artifact_dir(
+                    artifact_dir,
+                    f"{promote_base} --no-write",
+                    profile=profile,
+                ),
+            },
+            {
+                "id": "promotion-write",
+                "risk": "offline-local-profile-write",
+                "command": validation_command_for_artifact_dir(
+                    artifact_dir,
+                    promote_base,
+                    profile=profile,
+                ),
+            },
+            {
+                "id": "resource-gate",
+                "risk": "offline-local-resource-check",
+                "command": verification_command_for_profile(
+                    reviewed_profile,
+                    artifact_dir,
+                    "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict",
+                ),
+            },
+            {
+                "id": "single-burp-observe",
+                "risk": "active-single-approved-request",
+                "command": verification_command_for_profile(
+                    reviewed_profile,
+                    artifact_dir,
+                    f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}",
+                ),
+            },
+            {
+                "id": "response-review",
+                "risk": "offline-normalized-observation-review",
+                "command": verification_command_for_profile(
+                    reviewed_profile,
+                    artifact_dir,
+                    "rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract",
+                ),
+            },
+            {
+                "id": "finding-gate-preview",
+                "risk": "offline-manual-gate-preview",
+                "command": verification_command_for_profile(
+                    reviewed_profile,
+                    artifact_dir,
+                    "gate --no-write --show-items",
+                ),
+            },
+        ]
+        command_refs = [
+            validation_command_ref(str(row.get("command") or ""), source=f"rewrite-observation-contract:{row.get('id')}")
+            for row in commands
+        ]
+        contracts.append(
+            {
+                "path": local_path,
+                "method": "GET",
+                "candidate_id": candidate_id,
+                "source_ref": candidate.get("source_ref"),
+                "path_sensitivity": candidate.get("sensitivity") or rewrite_path_candidate_sensitivity(local_path),
+                "reviewed_profile": reviewed_profile,
+                "commands": commands,
+                "command_safety": command_safety_summary(command_refs),
+                "required_order": [
+                    "Run promotion-preview and review the generated profile diff.",
+                    "Run promotion-write only after the path is approved.",
+                    "Run resource-gate and stop unless it is healthy.",
+                    "Run single-burp-observe at most once for this reviewed profile.",
+                    "Run response-review and continue to finding-gate only if concrete impact evidence is present.",
+                ],
+                "stop_conditions": [
+                    "Do not enumerate catch-all paths.",
+                    "Do not observe dynamic wallet/project/template paths.",
+                    "Do not keep raw Burp history in artifacts.",
+                    "Do not report 2xx status or fixed-upstream routing alone as a vulnerability.",
+                ],
+                "safety": (
+                    "Observation contract only. It previews the exact sequence for one approved read-only path; "
+                    "it does not send requests or query Burp."
+                ),
+            }
+        )
+        if len(contracts) >= max(1, int(limit)):
+            break
+    return contracts
+
+
 REWRITE_RESPONSE_SENSITIVE_FIELD_KEYWORDS = {
     "account",
     "address",
@@ -13168,6 +13288,12 @@ def build_rewrite_response_review(
             rewrite_review_item=rewrite_item,
             limit=3,
         )
+        observation_contracts = rewrite_response_observation_contracts(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            rewrite_review_item=rewrite_item,
+            limit=3,
+        )
         if candidate_impact_observations:
             followup_commands = rewrite_response_gate_followup_commands(artifact_dir=artifact_dir, profile=profile)
             followup_command_type = "manual-finding-gate"
@@ -13207,6 +13333,7 @@ def build_rewrite_response_review(
                 "candidate_impact_observation_count": len(candidate_impact_observations),
                 "unapproved_observation_count": len(observations) - len(approved_observations),
                 "observations": observations[:10],
+                "observation_contracts": observation_contracts,
                 "followup_commands": followup_commands,
                 "followup_command_type": followup_command_type,
                 "next_step": next_step,
@@ -13215,11 +13342,13 @@ def build_rewrite_response_review(
     status_counts: dict[str, int] = {}
     approved_count = 0
     candidate_impact_count = 0
+    observation_contract_count = 0
     followup_commands = []
     for item in items:
         increment_count(status_counts, str(item.get("status") or "unknown"))
         approved_count += int(item.get("observed_approved_response_count") or 0)
         candidate_impact_count += int(item.get("candidate_impact_observation_count") or 0)
+        observation_contract_count += len(item.get("observation_contracts", []) or [])
         followup_commands.extend(
             str(command)
             for command in item.get("followup_commands", []) or []
@@ -13245,6 +13374,7 @@ def build_rewrite_response_review(
             "burp_observations": len(burp_history),
             "observed_approved_responses": approved_count,
             "candidate_impact_observations": candidate_impact_count,
+            "observation_contracts": observation_contract_count,
             "followup_commands": len(ordered_unique_strings(followup_commands)),
             "endpoint_clusters_source": endpoint_clusters_source,
             "rewrite_review": rewrite_review.get("status"),
@@ -33103,6 +33233,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "rewrite-response-review",
                     "--no-write",
                     "--show-observations",
+                    "--show-observation-contract",
                 ]
             )
             decode_transactions_return_code, decode_transactions_stdout = run_cli(
@@ -34086,6 +34217,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 rewrite_response_review_return_code == 0
                 and "Rewrite response review:" in rewrite_response_review_stdout_text
                 and "Responses:" in rewrite_response_review_stdout_text
+                and "contracts=" in rewrite_response_review_stdout_text
                 and "Gate:" in rewrite_response_review_stdout_text
                 and "No files written (--no-write)." in rewrite_response_review_stdout
                 and not any(
@@ -34538,6 +34670,12 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
         no_history_followup_text = "\n".join(
             str(command) for command in no_history_response_item.get("followup_commands", []) or []
         )
+        no_history_contracts = [
+            item
+            for item in no_history_response_item.get("observation_contracts", []) or []
+            if isinstance(item, dict)
+        ]
+        no_history_contract_text = json.dumps(no_history_contracts, sort_keys=True)
         append_jsonl(
             artifact_dir / "burp-history-observations.jsonl",
             [
@@ -34668,6 +34806,25 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             "actual": {
                 "review_status": no_history_review.get("status"),
                 "item": no_history_response_item,
+            },
+        },
+        {
+            "id": "missing-approved-response-emits-observation-contract",
+            "passed": (
+                len(no_history_contracts) == 1
+                and no_history_contracts[0].get("path") == approved_path
+                and "promotion-preview" in no_history_contract_text
+                and "promotion-write" in no_history_contract_text
+                and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict"
+                in no_history_contract_text
+                and "burp-sync --observe --ws-upgrade --replace" in no_history_contract_text
+                and "rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract"
+                in no_history_contract_text
+                and "Do not enumerate catch-all paths." in no_history_contract_text
+            ),
+            "expected": "missing approved rewrite responses expose a single-path observation contract with gated observe/review steps",
+            "actual": {
+                "contracts": no_history_contracts,
             },
         },
         {
@@ -49341,6 +49498,7 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
         f"burp_observations={summary.get('burp_observations', 0)} "
         f"approved={summary.get('observed_approved_responses', 0)} "
         f"candidate_impact={summary.get('candidate_impact_observations', 0)} "
+        f"contracts={summary.get('observation_contracts', 0)} "
         f"statuses={json.dumps(summary.get('status_counts', {}), sort_keys=True)}"
     )
     for item in (review.get("items", []) or [])[: max(0, int(args.top))]:
@@ -49368,6 +49526,24 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
         if args.show_commands:
             for command_text in (item.get("followup_commands", []) or [])[:3]:
                 print(f"  command={inline_summary_text(command_text, max_chars=420)}")
+        if args.show_observation_contract:
+            for contract in (item.get("observation_contracts", []) or [])[: min(2, max(0, int(args.top)))]:
+                if not isinstance(contract, dict):
+                    continue
+                print(
+                    "  contract="
+                    f"{contract.get('method')} {contract.get('path')} "
+                    f"candidate_id={contract.get('candidate_id')} "
+                    f"reviewed_profile={contract.get('reviewed_profile')}"
+                )
+                for command_row in (contract.get("commands", []) or [])[:4]:
+                    if not isinstance(command_row, dict):
+                        continue
+                    print(
+                        "    step="
+                        f"{command_row.get('id')} risk={command_row.get('risk')} "
+                        f"command={inline_summary_text(command_row.get('command'), max_chars=420)}"
+                    )
     if args.show_commands and review.get("followup_commands"):
         print("Follow-up commands:")
         for command_text in (review.get("followup_commands", []) or [])[: max(0, int(args.top))]:
@@ -52599,6 +52775,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-commands",
         action="store_true",
         help="Print manual gate/adjudication follow-up commands when candidate impact evidence exists.",
+    )
+    rewrite_response_review.add_argument(
+        "--show-observation-contract",
+        action="store_true",
+        help="Print the single-path promotion/resource/observe/review contract for approved rewrite response evidence.",
     )
     rewrite_response_review.add_argument(
         "--no-write",

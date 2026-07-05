@@ -409,6 +409,9 @@ This command is local and read-only. It flags catch-all rewrites, fixed
 upstreams, unconditional routes, and review-only observation candidates, then
 lists the evidence required before a static rewrite/proxy hypothesis can become
 a reportable issue.
+`rewrite-response-review --no-write --show-observation-contract` prints the
+single approved-path promotion, resource-gate, Burp observe, response-review,
+and finding-gate preview sequence without sending requests.
 If `endpoint-clusters.json` or the target profile does not list a static
 `next.config.*` rewrite, `rewrite-review`, `hypothesis-matrix`, and
 `validation-plan` can still merge source-discovered rewrite-proxy clusters into
