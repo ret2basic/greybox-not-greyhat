@@ -412,9 +412,12 @@ This command is local and read-only. It flags catch-all rewrites, fixed
 upstreams, unconditional routes, and review-only observation candidates, then
 lists the evidence required before a static rewrite/proxy hypothesis can become
 a reportable issue.
-`rewrite-response-review --no-write --show-observation-contract` prints the
-single approved-path promotion, resource-gate, Burp observe, response-review,
-and finding-gate preview sequence without sending requests.
+`rewrite-response-review --no-write --show-observation-contract --show-sidecar-template-json`
+prints the single approved-path promotion, resource-gate, Burp observe,
+response-review, and finding-gate preview sequence without sending requests.
+It also prints a redacted `rewrite-response-sidecar.jsonl` template for the
+case where a reviewer has one approved response shape but does not want to keep
+raw Burp history or a full response body in artifacts.
 If `endpoint-clusters.json` or the target profile does not list a static
 `next.config.*` rewrite, `rewrite-review`, `hypothesis-matrix`, and
 `validation-plan` can still merge source-discovered rewrite-proxy clusters into
@@ -428,13 +431,19 @@ client-derived read-only candidates, blocked dynamic templates, and no-write
 The checklist is still offline: it does not invoke Burp, start a browser, send
 HTTP traffic, or enumerate catch-all paths.
 After the reviewed profile has produced a normalized observation, use
-`rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract`
+`rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract --show-sidecar-template-json`
 to review only the existing `burp-history-observations.jsonl` rows for that
 rewrite and keep the single-path promotion/observe/review contract visible. It
 separates “one approved response observed” from “candidate
 sensitive-field or path confusion impact evidence”, redacts response samples,
 and still requires a manual finding-gate decision before anything is treated as
-reportable.
+reportable. The sidecar template includes `path_options` with candidate path,
+cluster, priority, source reference, and sensitivity hints. Choose exactly one
+reviewed in-scope read-only path, set `approved: true` only for that response,
+and keep the sidecar to method/path/status/content-type, high-level impact
+indicators, sensitive field paths, and a short redacted impact summary. Do not
+store cookies, bearer tokens, API keys, private keys, seed phrases, signatures,
+raw Burp history, or full response bodies.
 If candidate impact is present, `gate --no-write --show-items` imports it as a
 redacted manual-review gate item; it does not mark the issue reportable by
 itself.
@@ -969,6 +978,7 @@ python3 scripts/inferforge.py regression-suite --include-external --ws-resource-
 python3 scripts/inferforge.py adjudicate
 python3 scripts/inferforge.py audit --no-ws
 python3 scripts/inferforge.py audit --ws-resource-probes
+python3 scripts/inferforge.py rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract --show-sidecar-template-json
 python3 scripts/inferforge.py transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract
 python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-commands --show-steps --show-payload-template-json --skip-current-resource-check
 python3 scripts/inferforge.py decode-transactions
