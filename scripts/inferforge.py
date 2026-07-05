@@ -155,6 +155,7 @@ HYPOTHESIS_MATRIX_ARTIFACT = "hypothesis-matrix.json"
 VALIDATION_PLAN_ARTIFACT = "validation-plan.json"
 ITERATION_DECISION_ARTIFACT = "iteration-decision.json"
 EVIDENCE_PREP_PACKAGE_ARTIFACT = "evidence-prep-package.json"
+EVIDENCE_PREP_STATUS_ARTIFACT = "evidence-prep-status.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -255,6 +256,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     VALIDATION_PLAN_ARTIFACT,
     ITERATION_DECISION_ARTIFACT,
     EVIDENCE_PREP_PACKAGE_ARTIFACT,
+    EVIDENCE_PREP_STATUS_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -347,6 +349,7 @@ INDEX_ARTIFACT_ORDER = [
     *DISCOVERY_ARTIFACTS,
     *REVIEW_ARTIFACTS,
     EVIDENCE_PREP_PACKAGE_ARTIFACT,
+    EVIDENCE_PREP_STATUS_ARTIFACT,
     "config.json",
     "collection-summary.json",
     "endpoint-clusters.json",
@@ -19801,6 +19804,450 @@ def build_iteration_evidence_preparation_package(decision: dict[str, Any]) -> di
         "safety": (
             "Evidence preparation package only. It does not execute commands, send requests, invoke Burp, "
             "sign wallets, submit transactions, or convert templates into findings."
+        ),
+    }
+
+
+EVIDENCE_PREP_REQUIRED_EVIDENCE_ARTIFACT_NAMES = {
+    REWRITE_RESPONSE_SIDECAR_ARTIFACT,
+    "transaction-payloads.json",
+    "transaction-payloads.jsonl",
+    "transaction-payloads.txt",
+    "transaction-intent-policy.json",
+    OPERATOR_EVIDENCE_ARTIFACT,
+}
+
+EVIDENCE_PREP_TEMPLATE_ARTIFACT_NAMES = {
+    REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT,
+    TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT,
+    ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT,
+}
+
+
+def evidence_prep_artifact_ref_path(ref: Any, artifact_dir: Path) -> Path:
+    text = str(ref or "").strip()
+    if not text:
+        return artifact_dir / "missing-artifact-ref"
+    path = Path(text).expanduser()
+    if path.is_absolute():
+        return path
+    if text.startswith(".") or "/" in text or "\\" in text:
+        return resolve_repo_path(text)
+    return artifact_dir / text
+
+
+def evidence_prep_artifact_file_status(path: Path) -> dict[str, Any]:
+    rel = repo_relative_or_absolute(path)
+    if not path.exists():
+        return {"path": rel, "name": path.name, "status": "missing"}
+    if not path.is_file():
+        return {"path": rel, "name": path.name, "status": "not-a-file"}
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        return {
+            "path": rel,
+            "name": path.name,
+            "status": "stat-failed",
+            "error": redacted_error_summary(error),
+        }
+    return {
+        "path": rel,
+        "name": path.name,
+        "status": "present-empty" if size == 0 else "present",
+        "bytes": size,
+    }
+
+
+def evidence_prep_required_evidence_refs(package_doc: dict[str, Any]) -> list[str]:
+    refs: list[str] = []
+    for ref in normalize_string_list(package_doc.get("required_artifacts")):
+        if Path(ref).name in EVIDENCE_PREP_REQUIRED_EVIDENCE_ARTIFACT_NAMES:
+            refs.append(ref)
+    for packet in package_doc.get("approval_packets", []) or []:
+        if not isinstance(packet, dict):
+            continue
+        for key in ["sidecar", "payload_sidecar", "intent_policy_sidecar", "operator_evidence_sidecar"]:
+            ref = str(packet.get(key) or "").strip()
+            if ref and Path(ref).name in EVIDENCE_PREP_REQUIRED_EVIDENCE_ARTIFACT_NAMES:
+                refs.append(ref)
+    return ordered_unique_strings(refs)
+
+
+def evidence_prep_supporting_artifact_refs(package_doc: dict[str, Any]) -> list[str]:
+    refs = []
+    for ref in normalize_string_list(package_doc.get("required_artifacts")):
+        if Path(ref).name not in EVIDENCE_PREP_REQUIRED_EVIDENCE_ARTIFACT_NAMES:
+            refs.append(ref)
+    return ordered_unique_strings(refs)
+
+
+def evidence_prep_template_artifact_refs(package_doc: dict[str, Any]) -> list[str]:
+    refs = []
+    for package in package_doc.get("template_packages", []) or []:
+        if not isinstance(package, dict):
+            continue
+        for command in package.get("commands", []) or []:
+            if not isinstance(command, dict):
+                continue
+            ref = str(command.get("artifact") or "").strip()
+            if ref and Path(ref).name in EVIDENCE_PREP_TEMPLATE_ARTIFACT_NAMES:
+                refs.append(ref)
+    return ordered_unique_strings(refs)
+
+
+def evidence_prep_dedupe_artifact_refs(refs: list[str], artifact_dir: Path) -> list[str]:
+    deduped = []
+    seen = set()
+    for ref in refs:
+        path = evidence_prep_artifact_ref_path(ref, artifact_dir)
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(ref)
+    return deduped
+
+
+def evidence_prep_artifact_category(name: str) -> str:
+    if name == REWRITE_RESPONSE_SIDECAR_ARTIFACT:
+        return "rewrite-response-sidecar"
+    if name in {"transaction-payloads.json", "transaction-payloads.jsonl", "transaction-payloads.txt"}:
+        return "transaction-payload-sidecar"
+    if name == "transaction-intent-policy.json":
+        return "transaction-intent-policy"
+    if name == OPERATOR_EVIDENCE_ARTIFACT:
+        return "operator-evidence"
+    if name in EVIDENCE_PREP_TEMPLATE_ARTIFACT_NAMES:
+        return "template-package"
+    return "supporting-artifact"
+
+
+def evidence_prep_supporting_reviews(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    evidence_refs: list[str],
+) -> dict[str, Any]:
+    names = {Path(ref).name for ref in evidence_refs}
+    reviews: dict[str, Any] = {}
+    if REWRITE_RESPONSE_SIDECAR_ARTIFACT in names:
+        reviews["rewrite_response_review"] = build_rewrite_response_review(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+        )
+    if names & {"transaction-payloads.json", "transaction-payloads.jsonl", "transaction-payloads.txt", "transaction-intent-policy.json"}:
+        reviews["transaction_sidecar_review"] = build_transaction_sidecar_review(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+        )
+    if OPERATOR_EVIDENCE_ARTIFACT in names:
+        operator_evidence, operator_file = load_operator_evidence_sidecar(artifact_dir)
+        reviews["operator_evidence_review"] = build_operator_evidence_review(
+            target=target,
+            artifact_dir=artifact_dir,
+            operator_evidence=operator_evidence,
+            operator_evidence_file=operator_file,
+            deployment_review=load_optional_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT) or {},
+            rpc_method_policy=load_optional_json(artifact_dir / "rpc-method-policy.json") or {},
+            profile=profile,
+        )
+    return reviews
+
+
+def evidence_prep_readiness_from_validation(
+    *,
+    category: str,
+    file_status: str,
+    validation: dict[str, Any],
+) -> str:
+    if file_status == "missing":
+        return "missing-evidence"
+    if file_status not in {"present", "present-empty"}:
+        return "invalid-evidence"
+    if file_status == "present-empty":
+        return "invalid-evidence"
+    if category == "rewrite-response-sidecar":
+        status = str(validation.get("status") or "")
+        if status == "valid-candidate-impact":
+            return "ready-for-impact-review"
+        if status in {"invalid", "too-large", "parse-error", "not-a-file", "stat-failed"}:
+            return "invalid-evidence"
+        return "waiting-approved-impact-row"
+    if category == "transaction-payload-sidecar":
+        if validation.get("candidate_count") and validation.get("payload_contract_allows_decode"):
+            return "ready-for-policy-or-decode"
+        if validation.get("candidate_count"):
+            return "invalid-evidence"
+        return "waiting-transaction-payload"
+    if category == "transaction-intent-policy":
+        if validation.get("intent_policy_valid"):
+            return "ready-for-decode"
+        if validation.get("intent_policy_configured"):
+            return "invalid-evidence"
+        return "waiting-intent-policy"
+    if category == "operator-evidence":
+        if validation.get("invalid_rows"):
+            return "invalid-evidence"
+        missing_required = normalize_string_list(validation.get("missing_required_decisions"))
+        if not missing_required and validation.get("present_rows"):
+            return "ready-for-operator-review"
+        if validation.get("pending_rows"):
+            return "waiting-operator-evidence"
+        return "waiting-operator-evidence"
+    return "supporting-present"
+
+
+def evidence_prep_validation_for_artifact(
+    *,
+    category: str,
+    reviews: dict[str, Any],
+) -> dict[str, Any]:
+    if category == "rewrite-response-sidecar":
+        review = reviews.get("rewrite_response_review") if isinstance(reviews.get("rewrite_response_review"), dict) else {}
+        validation = review.get("sidecar_validation") if isinstance(review.get("sidecar_validation"), dict) else {}
+        return {
+            "status": validation.get("status"),
+            "row_count": validation.get("row_count", 0),
+            "approved_rows": validation.get("approved_rows", 0),
+            "valid_candidate_rows": validation.get("valid_candidate_rows", 0),
+            "invalid_rows": validation.get("invalid_rows", 0),
+            "warning_rows": validation.get("warning_rows", 0),
+            "first_missing_field": validation.get("first_missing_field"),
+            "first_invalid_field": validation.get("first_invalid_field"),
+        }
+    if category in {"transaction-payload-sidecar", "transaction-intent-policy"}:
+        review = reviews.get("transaction_sidecar_review") if isinstance(reviews.get("transaction_sidecar_review"), dict) else {}
+        summary = review.get("summary") if isinstance(review.get("summary"), dict) else {}
+        policy = (
+            review.get("intent_policy_sidecar", {}).get("policy", {})
+            if isinstance(review.get("intent_policy_sidecar"), dict)
+            else {}
+        )
+        return {
+            "status": review.get("status"),
+            "candidate_count": summary.get("candidate_count", 0),
+            "payload_files_present": summary.get("payload_files_present", 0),
+            "placeholder_payload_files": summary.get("placeholder_payload_files", 0),
+            "payload_contract_status": summary.get("payload_contract_status"),
+            "payload_contract_allows_decode": summary.get("payload_contract_allows_decode"),
+            "intent_policy_configured": summary.get("intent_policy_configured"),
+            "intent_policy_valid": summary.get("intent_policy_valid"),
+            "intent_policy_issues": normalize_string_list(policy.get("issues"))[:6],
+            "ready_for_decode": summary.get("ready_for_decode"),
+        }
+    if category == "operator-evidence":
+        review = reviews.get("operator_evidence_review") if isinstance(reviews.get("operator_evidence_review"), dict) else {}
+        validation = review.get("sidecar_validation") if isinstance(review.get("sidecar_validation"), dict) else {}
+        return {
+            "status": validation.get("status"),
+            "row_count": validation.get("row_count", 0),
+            "present_rows": validation.get("present_rows", 0),
+            "pending_rows": validation.get("pending_rows", 0),
+            "invalid_rows": validation.get("invalid_rows", 0),
+            "warning_rows": validation.get("warning_rows", 0),
+            "missing_required_decisions": normalize_string_list(validation.get("missing_required_decisions"))[:12],
+            "first_missing_field": validation.get("first_missing_field"),
+            "first_invalid_field": validation.get("first_invalid_field"),
+        }
+    return {}
+
+
+def build_evidence_prep_status(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    package_doc: dict[str, Any] | None = None,
+    package_path: Path | None = None,
+) -> dict[str, Any]:
+    package_file = package_path or artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT
+    package_file_status = evidence_prep_artifact_file_status(package_file)
+    if package_doc is None:
+        package_doc = load_optional_json(package_file) if package_file.exists() else None
+    if not isinstance(package_doc, dict):
+        return {
+            "generated_at": utc_now(),
+            "schema": "inferforge-evidence-prep-status-v1",
+            "status": "missing-evidence-prep-package",
+            "target": target,
+            "artifact_dir": repo_relative_or_absolute(artifact_dir),
+            "package_file": package_file_status,
+            "summary": {
+                "required_evidence_artifacts": 0,
+                "ready_evidence_artifacts": 0,
+                "missing_evidence_artifacts": 0,
+                "invalid_evidence_artifacts": 0,
+                "waiting_evidence_artifacts": 0,
+                "template_artifacts": 0,
+                "template_artifacts_present": 0,
+                "supporting_artifacts": 0,
+            },
+            "required_evidence_artifacts": [],
+            "template_artifacts": [],
+            "supporting_artifacts": [],
+            "finding_gate_ready": False,
+            "next_step": "Run iteration-decision --write-evidence-prep-package first.",
+            "safety": (
+                "Evidence prep status only. It reads local artifacts, sends no traffic, invokes no Burp tools, "
+                "and is not a finding."
+            ),
+        }
+
+    evidence_refs = evidence_prep_dedupe_artifact_refs(
+        evidence_prep_required_evidence_refs(package_doc),
+        artifact_dir,
+    )
+    template_refs = evidence_prep_dedupe_artifact_refs(
+        evidence_prep_template_artifact_refs(package_doc),
+        artifact_dir,
+    )
+    supporting_refs = evidence_prep_dedupe_artifact_refs(
+        evidence_prep_supporting_artifact_refs(package_doc),
+        artifact_dir,
+    )
+    reviews = evidence_prep_supporting_reviews(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        evidence_refs=evidence_refs,
+    )
+    package_operator_missing_decisions = ordered_unique_strings(
+        [
+            decision_id
+            for packet in package_doc.get("approval_packets", []) or []
+            if isinstance(packet, dict)
+            for decision_id in normalize_string_list(packet.get("missing_decision_ids"))
+        ]
+    )
+
+    evidence_rows = []
+    for ref in evidence_refs:
+        path = evidence_prep_artifact_ref_path(ref, artifact_dir)
+        file_status = evidence_prep_artifact_file_status(path)
+        category = evidence_prep_artifact_category(path.name)
+        validation = evidence_prep_validation_for_artifact(category=category, reviews=reviews)
+        if category == "operator-evidence" and package_operator_missing_decisions:
+            validation = {
+                **validation,
+                "package_missing_decision_ids": package_operator_missing_decisions[:20],
+            }
+        readiness = evidence_prep_readiness_from_validation(
+            category=category,
+            file_status=str(file_status.get("status") or "missing"),
+            validation=validation,
+        )
+        evidence_rows.append(
+            {
+                "artifact": ref,
+                "path": file_status.get("path"),
+                "name": path.name,
+                "category": category,
+                "file_status": file_status.get("status"),
+                "bytes": file_status.get("bytes"),
+                "readiness": readiness,
+                "validation": validation,
+                "finding_gate_boundary": "This artifact can only support later review; it is not a finding by itself.",
+            }
+        )
+
+    template_rows = []
+    for ref in template_refs:
+        path = evidence_prep_artifact_ref_path(ref, artifact_dir)
+        file_status = evidence_prep_artifact_file_status(path)
+        template_rows.append(
+            {
+                "artifact": ref,
+                "path": file_status.get("path"),
+                "name": path.name,
+                "category": evidence_prep_artifact_category(path.name),
+                "file_status": file_status.get("status"),
+                "bytes": file_status.get("bytes"),
+                "readiness": "template-only-not-evidence",
+            }
+        )
+
+    supporting_rows = []
+    for ref in supporting_refs:
+        path = evidence_prep_artifact_ref_path(ref, artifact_dir)
+        file_status = evidence_prep_artifact_file_status(path)
+        supporting_rows.append(
+            {
+                "artifact": ref,
+                "path": file_status.get("path"),
+                "name": path.name,
+                "category": evidence_prep_artifact_category(path.name),
+                "file_status": file_status.get("status"),
+                "bytes": file_status.get("bytes"),
+                "readiness": "supporting-artifact-present"
+                if file_status.get("status") == "present"
+                else "supporting-artifact-missing",
+            }
+        )
+
+    missing_count = sum(1 for row in evidence_rows if row.get("readiness") == "missing-evidence")
+    invalid_count = sum(1 for row in evidence_rows if row.get("readiness") == "invalid-evidence")
+    ready_count = sum(1 for row in evidence_rows if str(row.get("readiness") or "").startswith("ready-"))
+    waiting_count = len(evidence_rows) - missing_count - invalid_count - ready_count
+    if invalid_count:
+        status = "blocked-invalid-evidence"
+    elif missing_count:
+        status = "blocked-missing-evidence"
+    elif waiting_count:
+        status = "waiting-evidence-review"
+    elif evidence_rows:
+        status = "evidence-artifacts-ready-for-review"
+    else:
+        status = "no-required-evidence-artifacts"
+
+    next_step = "Run iteration-decision --write-evidence-prep-package to refresh the package."
+    if invalid_count:
+        next_step = "Fix invalid local evidence sidecars, then rerun evidence-prep-status --strict."
+    elif missing_count:
+        next_step = "Create only the missing approved/redacted evidence sidecars named in required_evidence_artifacts."
+    elif waiting_count:
+        next_step = "Complete pending sidecar fields or reviewed decisions before decode/finding-gate review."
+    elif evidence_rows:
+        next_step = "Run the matching offline review commands; do not enter finding-gate until concrete impact evidence is accepted."
+
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-evidence-prep-status-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "package_file": package_file_status,
+        "package_status": package_doc.get("status"),
+        "top_unblocker": package_doc.get("top_unblocker") if isinstance(package_doc.get("top_unblocker"), dict) else {},
+        "summary": {
+            "required_evidence_artifacts": len(evidence_rows),
+            "ready_evidence_artifacts": ready_count,
+            "missing_evidence_artifacts": missing_count,
+            "invalid_evidence_artifacts": invalid_count,
+            "waiting_evidence_artifacts": waiting_count,
+            "template_artifacts": len(template_rows),
+            "template_artifacts_present": sum(1 for row in template_rows if row.get("file_status") == "present"),
+            "supporting_artifacts": len(supporting_rows),
+            "supporting_artifacts_present": sum(1 for row in supporting_rows if row.get("file_status") == "present"),
+        },
+        "required_evidence_artifacts": evidence_rows,
+        "template_artifacts": template_rows,
+        "supporting_artifacts": supporting_rows,
+        "finding_gate_ready": False,
+        "forbidden_validation": ordered_unique_strings(
+            [
+                *normalize_string_list(package_doc.get("forbidden_validation")),
+                "Do not treat template artifacts as evidence.",
+                "Do not treat this status document as a finding.",
+            ]
+        ),
+        "next_step": next_step,
+        "safety": (
+            "Evidence prep status only. It reads local redacted artifacts and validators, sends no requests, "
+            "invokes no Burp tools, signs no wallets, submits no transactions, and is not a finding."
         ),
     }
 
@@ -54923,6 +55370,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         focused_iteration_evidence_prep_forbidden = "\n".join(
             normalize_string_list(focused_iteration_evidence_prep_package.get("forbidden_validation"))
         )
+        focused_iteration_evidence_prep_status = build_evidence_prep_status(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_run_dir,
+            package_doc=focused_iteration_evidence_prep_package,
+        )
+        focused_iteration_evidence_prep_status_summary = (
+            focused_iteration_evidence_prep_status.get("summary")
+            if isinstance(focused_iteration_evidence_prep_status.get("summary"), dict)
+            else {}
+        )
         focused_iteration_preview_commands = [
             str(ref.get("command") or "")
             for action in focused_iteration_decision_sample.get("actions", [])
@@ -56190,6 +56648,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and "Do not treat template packages as evidence" in focused_iteration_evidence_prep_forbidden
         and focused_iteration_evidence_prep_package.get("active_validation_gate", {}).get("resource_budget_mode")
         == "critical"
+        and focused_iteration_evidence_prep_status.get("schema") == "inferforge-evidence-prep-status-v1"
+        and focused_iteration_evidence_prep_status.get("status") == "blocked-missing-evidence"
+        and focused_iteration_evidence_prep_status_summary.get("required_evidence_artifacts", 0) >= 3
+        and focused_iteration_evidence_prep_status_summary.get("missing_evidence_artifacts", 0) >= 3
+        and focused_iteration_evidence_prep_status_summary.get("template_artifacts", 0) == 3
+        and focused_iteration_evidence_prep_status.get("finding_gate_ready") is False
         and any(
             item.get("packet_type") == "transaction-corpus"
             and (item.get("packet") or {}).get("status") == "ready-offline-approval"
@@ -59507,6 +59971,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     == "inferforge-evidence-prep-package-v1"
                     and focused_iteration_evidence_prep_package.get("status") == "ready-template-prep"
                     and focused_iteration_evidence_prep_command_plan.get("template_package_count") == 3
+                    and focused_iteration_evidence_prep_status.get("status") == "blocked-missing-evidence"
+                    and focused_iteration_evidence_prep_status_summary.get("template_artifacts", 0) == 3
                     and not any(
                         command in focused_iteration_preview_commands
                         for command in focused_iteration_objective_preview_commands
@@ -59560,6 +60026,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     "forbidden_validation": normalize_string_list(
                         focused_iteration_evidence_prep_package.get("forbidden_validation")
                     ),
+                },
+                "evidence_prep_status": {
+                    "status": focused_iteration_evidence_prep_status.get("status"),
+                    "summary": focused_iteration_evidence_prep_status_summary,
+                    "required_evidence_artifacts": focused_iteration_evidence_prep_status.get(
+                        "required_evidence_artifacts"
+                    ),
+                    "template_artifacts": focused_iteration_evidence_prep_status.get("template_artifacts"),
                 },
                 "expected_commands": [
                     focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
@@ -66709,6 +67183,98 @@ def run_validation_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_evidence_prep_status(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    package_path = (
+        resolve_repo_path(args.package)
+        if getattr(args, "package", None)
+        else artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT
+    )
+    status_doc = build_evidence_prep_status(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        package_path=package_path,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / EVIDENCE_PREP_STATUS_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(status_doc))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="evidence-prep-status",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = status_doc.get("summary", {}) if isinstance(status_doc.get("summary"), dict) else {}
+    print(f"Evidence prep status: {status_doc.get('status')}")
+    print(
+        "Evidence: "
+        f"required={summary.get('required_evidence_artifacts', 0)} "
+        f"ready={summary.get('ready_evidence_artifacts', 0)} "
+        f"missing={summary.get('missing_evidence_artifacts', 0)} "
+        f"invalid={summary.get('invalid_evidence_artifacts', 0)} "
+        f"waiting={summary.get('waiting_evidence_artifacts', 0)}"
+    )
+    print(
+        "Templates: "
+        f"artifacts={summary.get('template_artifacts', 0)} "
+        f"present={summary.get('template_artifacts_present', 0)} "
+        f"supporting={summary.get('supporting_artifacts_present', 0)}/"
+        f"{summary.get('supporting_artifacts', 0)}"
+    )
+    top_unblocker = (
+        status_doc.get("top_unblocker")
+        if isinstance(status_doc.get("top_unblocker"), dict)
+        else {}
+    )
+    if top_unblocker:
+        print(
+            "Top unblocker: "
+            f"item={top_unblocker.get('validation_item_id') or '-'} "
+            f"lane={top_unblocker.get('lane') or '-'} "
+            f"oracle={top_unblocker.get('oracle_type') or '-'} "
+            f"first_missing={top_unblocker.get('first_missing_artifact') or '-'}"
+        )
+    if getattr(args, "show_details", False):
+        print("Required evidence artifacts:")
+        for row in status_doc.get("required_evidence_artifacts", []) or []:
+            if not isinstance(row, dict):
+                continue
+            validation = row.get("validation") if isinstance(row.get("validation"), dict) else {}
+            print(
+                f"- {row.get('readiness')} {row.get('name')} "
+                f"file={row.get('file_status')} "
+                f"validator={validation.get('status') or '-'} "
+                f"missing={validation.get('first_missing_field') or '-'} "
+                f"invalid={validation.get('first_invalid_field') or '-'}"
+            )
+        print("Template artifacts:")
+        for row in status_doc.get("template_artifacts", []) or []:
+            if not isinstance(row, dict):
+                continue
+            print(f"- {row.get('readiness')} {row.get('name')} file={row.get('file_status')}")
+    print(f"Next: {inline_summary_text(status_doc.get('next_step'), max_chars=320)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and status_doc.get("status") != "evidence-artifacts-ready-for-review":
+        return 1
+    return 0
+
+
 def run_iteration_decision(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -69702,6 +70268,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless the plan has ready or resource-gated validation items.",
     )
     validation_plan.set_defaults(func=run_validation_plan)
+
+    evidence_prep_status = sub.add_parser(
+        "evidence-prep-status",
+        help="Check local evidence-prep package artifacts without treating templates as evidence",
+    )
+    evidence_prep_status.add_argument(
+        "--package",
+        help=(
+            f"Evidence prep package to read. Defaults to --artifact-dir/{EVIDENCE_PREP_PACKAGE_ARTIFACT}."
+        ),
+    )
+    evidence_prep_status.add_argument(
+        "--output",
+        help=(
+            f"Where to write {EVIDENCE_PREP_STATUS_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{EVIDENCE_PREP_STATUS_ARTIFACT}."
+        ),
+    )
+    evidence_prep_status.add_argument(
+        "--show-details",
+        action="store_true",
+        help="Print each required evidence and template artifact status.",
+    )
+    evidence_prep_status.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print evidence prep status only; do not write {EVIDENCE_PREP_STATUS_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    evidence_prep_status.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless all required evidence artifacts are ready for offline review.",
+    )
+    evidence_prep_status.set_defaults(func=run_evidence_prep_status)
 
     iteration_decision = sub.add_parser(
         "iteration-decision",
