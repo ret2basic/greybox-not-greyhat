@@ -26535,6 +26535,54 @@ def evidence_gap_active_followup_resource_annotation(
     }
 
 
+def quote_transaction_corpus_approval_review_candidate(
+    transaction_corpus_checklist: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(transaction_corpus_checklist, dict):
+        return None
+    approval_packet = (
+        transaction_corpus_checklist.get("transaction_corpus_approval_packet")
+        if isinstance(transaction_corpus_checklist.get("transaction_corpus_approval_packet"), dict)
+        else {}
+    )
+    if not approval_packet:
+        return None
+    approval_sequence = []
+    for step in approval_packet.get("approval_sequence", []) or []:
+        if not isinstance(step, dict):
+            continue
+        approval_sequence.append(
+            {
+                "id": step.get("id"),
+                "status": step.get("status"),
+                "risk": step.get("risk"),
+                "has_command": bool(step.get("command")),
+                "has_action": bool(step.get("action")),
+            }
+        )
+    blockers = [
+        str(item)
+        for item in approval_packet.get("finding_gate_blockers", []) or []
+        if str(item).strip()
+    ]
+    return {
+        "id": "review_quote_transaction_corpus_approval_packet",
+        "type": "transaction-corpus-approval-packet",
+        "status": approval_packet.get("status"),
+        "checklist_status": transaction_corpus_checklist.get("status"),
+        "assessment": approval_packet.get("assessment", {}),
+        "recommended_quote": approval_packet.get("recommended_quote", {}),
+        "payload_sidecar": approval_packet.get("payload_sidecar"),
+        "intent_policy_sidecar": approval_packet.get("intent_policy_sidecar"),
+        "resource_capture_gate": approval_packet.get("resource_capture_gate", {}),
+        "approval_sequence": approval_sequence,
+        "finding_gate_blockers": blockers[:8],
+        "finding_gate_blocker_count": len(blockers),
+        "next_step": transaction_corpus_checklist.get("next_step"),
+        "safety": approval_packet.get("safety"),
+    }
+
+
 def build_evidence_gaps(
     clusters: dict[str, Any],
     results: list[dict[str, Any]],
@@ -26548,6 +26596,7 @@ def build_evidence_gaps(
     deployment_review: dict[str, Any] | None = None,
     rewrite_response_review: dict[str, Any] | None = None,
     current_resource_snapshot: dict[str, Any] | None = None,
+    transaction_corpus_checklist: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     resource_preflight = validation_resource_preflight_summary(current_resource_snapshot)
     burp_cluster_ids = observed_cluster_ids(build_traffic_index([], burp_history), clusters)
@@ -26778,6 +26827,9 @@ def build_evidence_gaps(
             )
         else:
             quote_next_step = QUOTE_TRANSACTION_CORPUS_CONTRACT_NEXT_STEP
+        approval_review_candidate = quote_transaction_corpus_approval_review_candidate(
+            transaction_corpus_checklist,
+        )
         add_gap(
             "GAP-quote-transaction-corpus",
             "quote",
@@ -26786,6 +26838,7 @@ def build_evidence_gaps(
             quote_reason,
             quote_next_step,
             "Never sign or submit returned transactions automatically.",
+            review_candidates=[approval_review_candidate] if approval_review_candidate else None,
         )
         next_probe_candidates.extend(quote_transaction_evidence_contract_next_probe_candidates())
 
@@ -49668,11 +49721,18 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         [],
         [{"method": "POST", "path": "/bridge/quote", "status": 400, "source": "self-test"}],
     )
+    external_transaction_corpus_checklist = build_transaction_corpus_checklist(
+        target="http://127.0.0.1:9998",
+        profile=None,
+        artifact_dir=queue_artifact_dir / "quote-corpus-gap",
+        transaction_intent={"candidates_seen": 0},
+    )
     external_evidence_gaps = build_evidence_gaps(
         quote_strategy_clusters,
         [],
         [{"method": "POST", "path": "/bridge/quote", "status": 400, "source": "self-test"}],
         {"candidates_seen": 0},
+        transaction_corpus_checklist=external_transaction_corpus_checklist,
     )
     unknown_waiting_actions = waiting_attack_strategy_actions(unknown_attack_strategy)
     external_waiting_summaries = [
@@ -49770,6 +49830,28 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         empty_replay_queue.get("summary", {}).get("items") == 4
         and not any(item_id.startswith("REPLAY-") for item_id in empty_replay_queue_item_ids)
     )
+    external_quote_gap = next(
+        (
+            gap
+            for gap in external_evidence_gaps.get("gaps", []) or []
+            if isinstance(gap, dict) and gap.get("id") == "GAP-quote-transaction-corpus"
+        ),
+        {},
+    )
+    external_quote_packet_candidate = next(
+        (
+            candidate
+            for candidate in external_quote_gap.get("review_candidates", []) or []
+            if isinstance(candidate, dict)
+            and candidate.get("type") == "transaction-corpus-approval-packet"
+        ),
+        {},
+    )
+    external_quote_packet_recommended = (
+        external_quote_packet_candidate.get("recommended_quote")
+        if isinstance(external_quote_packet_candidate.get("recommended_quote"), dict)
+        else {}
+    )
     provider_neutral_quote_output_blob = json.dumps(
         {
             "attack_strategy": external_attack_strategy,
@@ -49798,6 +49880,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and external_evidence_gaps.get("summary", {}).get("gap_priority_counts", {}).get("high") == 1
         and external_evidence_gaps.get("summary", {}).get("gap_priority_counts", {}).get("medium") == 1
         and external_evidence_gaps.get("summary", {}).get("gap_priority_counts", {}).get("low") == 1
+        and external_quote_packet_candidate.get("status") == "ready-offline-approval"
+        and external_quote_packet_candidate.get("finding_gate_blocker_count", 0) >= 4
+        and external_quote_packet_recommended.get("method") == "POST"
+        and external_quote_packet_recommended.get("direction") in {"buy", "sell"}
+        and "transaction-payloads.jsonl" in str(external_quote_packet_candidate.get("payload_sidecar") or "")
+        and "transaction-intent-policy.json" in str(external_quote_packet_candidate.get("intent_policy_sidecar") or "")
     )
     attack_strategy_status_passed = (
         rewrite_attack_strategy.get("status") == "ready-for-regression"
@@ -51436,6 +51524,20 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
         write_json(deployment_review_path, sanitize_artifact_samples(deployment_review))
     orca_baseline = load_optional_json(artifact_dir / "orca-baseline.json")
     quote_collection = load_optional_json(artifact_dir / "quote-collection.json")
+    transaction_corpus_checklist = load_optional_json(artifact_dir / TRANSACTION_CORPUS_CHECKLIST_ARTIFACT)
+    if not isinstance(transaction_corpus_checklist, dict) or not isinstance(
+        transaction_corpus_checklist.get("transaction_corpus_approval_packet"),
+        dict,
+    ):
+        transaction_corpus_checklist = build_transaction_corpus_checklist(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            quote_collection=quote_collection,
+            transaction_intent=transaction_intent,
+            burp_transaction_candidates=load_optional_json(artifact_dir / "burp-transaction-candidates.json"),
+            current_resource_snapshot=current_resource_snapshot,
+        )
     rewrite_response_review = load_optional_json(
         artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT
     ) or build_rewrite_response_review(
@@ -51456,6 +51558,7 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
         deployment_review=deployment_review,
         rewrite_response_review=rewrite_response_review,
         current_resource_snapshot=current_resource_snapshot,
+        transaction_corpus_checklist=transaction_corpus_checklist,
     )
     evidence_gaps["resource_preflight_source"] = resource_preflight_source
     evidence_gaps_path = artifact_dir / "evidence-gaps.json"
@@ -51566,6 +51669,27 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
                     f"resource={gap.get('active_followup_resource_status') or 'not-run'}/"
                     f"{gap.get('active_followup_resource_budget_mode') or 'unknown'} "
                     f"reason={inline_summary_text(gap.get('active_followup_resource_reason'), max_chars=220)}"
+                )
+            approval_candidates = [
+                candidate
+                for candidate in gap.get("review_candidates", []) or []
+                if isinstance(candidate, dict)
+                and candidate.get("type") == "transaction-corpus-approval-packet"
+            ]
+            for candidate in approval_candidates[:1]:
+                recommended_quote = (
+                    candidate.get("recommended_quote")
+                    if isinstance(candidate.get("recommended_quote"), dict)
+                    else {}
+                )
+                print(
+                    "  approval_packet="
+                    f"{candidate.get('status') or 'unknown'} "
+                    f"recommended={recommended_quote.get('method') or '-'} {recommended_quote.get('path') or '-'} "
+                    f"direction={recommended_quote.get('direction') or '-'} "
+                    f"payload={candidate.get('payload_sidecar') or '-'} "
+                    f"policy={candidate.get('intent_policy_sidecar') or '-'} "
+                    f"blockers={candidate.get('finding_gate_blocker_count', 0)}"
                 )
             if args.show_commands:
                 commands = evidence_gap_followup_commands(gap_id, artifact_dir=artifact_dir, profile=profile)
