@@ -18095,6 +18095,23 @@ def build_transaction_corpus_checklist(
             },
         },
     ]
+    post_decode_commands = []
+    if reportability_review.get("ready_for_finding_gate"):
+        post_decode_commands = [
+            validation_command_for_artifact_dir(artifact_dir, "gate --no-write", profile=profile),
+            validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+            validation_command_for_artifact_dir(artifact_dir, "evidence-chain --no-write", profile=profile),
+        ]
+    if reportability_review.get("ready_for_finding_gate"):
+        next_step = "Run gate --no-write to create a manual finding-gate review candidate for the decoded mismatch."
+    elif status == "ready-to-decode":
+        next_step = "Run decode-transactions with the matching policy template."
+    elif status == "blocked-resource-needs-corpus":
+        next_step = "Wait for a healthy resource gate, then capture one approved quote response and save it to a sidecar."
+    elif status.startswith("decoded-"):
+        next_step = "Review decoded intent checks and only escalate concrete mismatches."
+    else:
+        next_step = "Prepare one approved quote response sidecar and matching intent policy values."
 
     return {
         "generated_at": utc_now(),
@@ -18127,6 +18144,7 @@ def build_transaction_corpus_checklist(
         "sidecar_jsonl_example": sidecar_example,
         "acceptance_checks": acceptance_checks,
         "decode_commands": [row.get("decode_command") for row in policy_templates if row.get("decode_command")],
+        "post_decode_commands": post_decode_commands,
         "reportability_gate": (
             "A corpus only advances the transaction-integrity thread when decode-transactions shows a concrete signer, "
             "account, mint, amount, or program mismatch, or another user-funds impact. Do not sign or submit transactions."
@@ -18138,15 +18156,7 @@ def build_transaction_corpus_checklist(
             "Do not collect more than the minimum approved quote corpus needed for decoding.",
             "Do not run active capture while resource_capture_gate.status is blocked-resource.",
         ],
-        "next_step": (
-            "Run decode-transactions with the matching policy template."
-            if status == "ready-to-decode"
-            else "Wait for a healthy resource gate, then capture one approved quote response and save it to a sidecar."
-            if status == "blocked-resource-needs-corpus"
-            else "Review decoded intent checks and only escalate concrete mismatches."
-            if status.startswith("decoded-")
-            else "Prepare one approved quote response sidecar and matching intent policy values."
-        ),
+        "next_step": next_step,
         "safety": (
             "Offline checklist only. It reads local artifacts and /proc resource state, sends no requests, reads no raw Burp "
             "history, invokes no wallet, and submits no transaction."
@@ -37568,6 +37578,35 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for check in transaction_gate_item.get("checks", [])
         )
     )
+    transaction_corpus_gate_checklist = build_transaction_corpus_checklist(
+        target=target,
+        profile=test_profile,
+        artifact_dir=artifact_dir / "transaction-corpus-gate-checklist",
+        transaction_intent={
+            "candidates_seen": 1,
+            "decoded_transactions": 1,
+            "intent_policy_checks": {"status": "failed", "summary": "synthetic mismatch"},
+            "reportability_review": {
+                "status": "candidate-transaction-integrity-impact",
+                "candidate_severity": "high",
+                "ready_for_finding_gate": True,
+                "reportable_now": False,
+                "decoded_transactions": 1,
+                "high_impact_failure_count": 2,
+            },
+        },
+        current_resource_snapshot={"status": "healthy", "resource_budget": build_resource_budget("healthy", [], {})},
+    )
+    transaction_corpus_gate_commands = "\n".join(
+        str(command) for command in transaction_corpus_gate_checklist.get("post_decode_commands", [])
+    )
+    transaction_corpus_gate_checklist_passed = (
+        transaction_corpus_gate_checklist.get("status") == "decoded-intent-mismatch-review"
+        and transaction_corpus_gate_checklist.get("summary", {}).get("ready_for_finding_gate") is True
+        and " gate --no-write" in transaction_corpus_gate_commands
+        and " adjudicate --no-write" in transaction_corpus_gate_commands
+        and " evidence-chain --no-write" in transaction_corpus_gate_commands
+    )
     quote_source_profile = json_clone(test_profile)
     for cluster in quote_source_profile.get("clusters", []):
         if cluster.get("id") == "quote":
@@ -38082,6 +38121,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and empty_replay_queue_passed
         and resource_release_candidates_passed
         and transaction_gate_ingestion_passed
+        and transaction_corpus_gate_checklist_passed
         )
 
     artifact = {
@@ -38109,6 +38149,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         "transaction_gate_ingestion": {
             "status": "passed" if transaction_gate_ingestion_passed else "failed",
             "gate": transaction_gate_item,
+        },
+        "transaction_corpus_gate_checklist": {
+            "status": "passed" if transaction_corpus_gate_checklist_passed else "failed",
+            "checklist_status": transaction_corpus_gate_checklist.get("status"),
+            "post_decode_commands": transaction_corpus_gate_checklist.get("post_decode_commands", []),
         },
         "route_method_export_list": {
             "status": "passed" if route_method_export_list_passed else "failed",
@@ -42495,6 +42540,11 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
         )
         if args.show_commands and row.get("decode_command"):
             print(f"  decode={inline_summary_text(row.get('decode_command'), max_chars=420)}")
+    post_decode_commands = checklist.get("post_decode_commands", []) or []
+    if args.show_commands and post_decode_commands:
+        print("Post-decode commands:")
+        for command_text in post_decode_commands[:3]:
+            print(f"- {inline_summary_text(command_text, max_chars=420)}")
     if args.show_steps:
         print("Capture steps:")
         for step in checklist.get("capture_steps", []) or []:
