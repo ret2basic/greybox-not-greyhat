@@ -10089,6 +10089,7 @@ def build_methodology_supporting_reviews(
     )
     reviews.update(
         {
+            "rpc_method_policy": rpc_method_policy,
             "transaction_flow_review": transaction_flow_review,
             "deployment_review": deployment_review,
             "operator_evidence_review": operator_evidence_review,
@@ -10425,6 +10426,167 @@ def build_resource_evidence_closure(
     }
 
 
+def build_rpc_proxy_abuse_evidence_closure(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    item: dict[str, Any],
+    supporting_reviews: dict[str, Any],
+) -> dict[str, Any]:
+    rpc_method_policy = (
+        supporting_reviews.get("rpc_method_policy")
+        if isinstance(supporting_reviews.get("rpc_method_policy"), dict)
+        else {}
+    )
+    deployment_review = (
+        supporting_reviews.get("deployment_review")
+        if isinstance(supporting_reviews.get("deployment_review"), dict)
+        else {}
+    )
+    operator_review = (
+        supporting_reviews.get("operator_evidence_review")
+        if isinstance(supporting_reviews.get("operator_evidence_review"), dict)
+        else {}
+    )
+    current_resource_snapshot = (
+        supporting_reviews.get("current_resource_snapshot")
+        if isinstance(supporting_reviews.get("current_resource_snapshot"), dict)
+        else {"status": "not-run"}
+    )
+    evidence_contract = rpc_proxy_abuse_lead_evidence_contract(
+        thread=item,
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
+    transaction_review = (
+        rpc_method_policy.get("transaction_method_exposure_review")
+        if isinstance(rpc_method_policy.get("transaction_method_exposure_review"), dict)
+        else {}
+    )
+    rate_review = (
+        rpc_method_policy.get("rate_limit_resource_review")
+        if isinstance(rpc_method_policy.get("rate_limit_resource_review"), dict)
+        else {}
+    )
+    deployment_summary = deployment_review.get("summary", {}) if isinstance(deployment_review.get("summary"), dict) else {}
+    operator_summary = operator_review.get("summary", {}) if isinstance(operator_review.get("summary"), dict) else {}
+    transaction_status = str(transaction_review.get("status") or "unknown")
+    rate_status = str(rate_review.get("status") or "missing")
+    policy_available = bool(rpc_method_policy) and str(rpc_method_policy.get("status") or "indexed") not in {
+        "source-unavailable",
+        "not-applicable",
+    }
+    default_methods_reviewed = policy_available and bool(rpc_method_policy.get("default_allowed_methods"))
+    blocked_high_cost = set(str(item) for item in transaction_review.get("blocked_high_cost_methods", []) or [])
+    high_cost_block_reviewed = {"getProgramAccounts", "getSignaturesForAddress"} <= blocked_high_cost
+    transaction_exposure_reviewed = transaction_status in {
+        "transaction-methods-env-gated",
+        "no-transaction-methods-default",
+        "transaction-methods-default-allowed",
+        "transaction-methods-runner-env-enabled",
+    }
+    deployment_missing = set(str(item) for item in deployment_summary.get("critical_missing", []) or [])
+    operator_missing = set(str(item) for item in operator_summary.get("missing_decisions", []) or [])
+    resource_controls_missing = bool(
+        rate_status == "needs-deployment-review"
+        and (deployment_missing.intersection(OPERATOR_RESOURCE_CONTROL_DECISION_IDS) or operator_missing.intersection(OPERATOR_RESOURCE_CONTROL_DECISION_IDS))
+    )
+    approval_packet = rpc_proxy_abuse_approval_packet(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        rpc_method_policy=rpc_method_policy,
+        deployment_review=deployment_review,
+        operator_review=operator_review,
+        resource_preflight=validation_resource_preflight_summary(current_resource_snapshot),
+        evidence_contract=evidence_contract,
+    )
+    requirements = [
+        methodology_requirement(
+            "rpc-method-policy-indexed",
+            "passed" if policy_available else "waiting",
+            {
+                "policy_posture": rpc_method_policy.get("policy_posture"),
+                "policy_status": rpc_method_policy.get("status") or "indexed",
+            },
+            "Index the local RPC method policy or attach one approved observation for black-box review.",
+        ),
+        methodology_requirement(
+            "rpc-allowed-and-blocked-methods-reviewed",
+            "passed" if default_methods_reviewed and high_cost_block_reviewed else "waiting",
+            {
+                "default_allowed_methods": rpc_method_policy.get("default_allowed_methods", []),
+                "blocked_high_cost_methods": sorted(blocked_high_cost),
+            },
+            "Review allowed methods and high-cost blocked methods before treating RPC reachability as a vulnerability.",
+        ),
+        methodology_requirement(
+            "rpc-transaction-method-exposure-reviewed",
+            "ready-offline" if transaction_status == "transaction-methods-env-gated" else "passed" if transaction_exposure_reviewed else "waiting",
+            transaction_review,
+            "Review deployment flags/allowlist overrides for sendTransaction and simulateTransaction exposure.",
+        ),
+        methodology_requirement(
+            "rpc-origin-and-rate-controls-reviewed",
+            "waiting" if resource_controls_missing else "ready-offline" if rate_status == "needs-deployment-review" else "passed",
+            {
+                "rate_limit_resource_status": rate_status,
+                "deployment_critical_missing": sorted(deployment_missing),
+                "operator_missing_decisions": sorted(operator_missing),
+            },
+            "Collect deployment/operator evidence for origin, client IP trust, rate-control, and fallback behavior.",
+        ),
+        methodology_requirement(
+            "concrete-non-dos-rpc-impact",
+            "waiting",
+            item.get("required_evidence", []),
+            "Prove concrete user, funds, sensitive-data, quota, or operator impact without method enumeration, transaction submission, or stress testing.",
+        ),
+    ]
+    commands = []
+    for source, subcommand in [
+        ("hypothesis-matrix", "hypothesis-matrix --no-write --show-next"),
+        ("deployment", "deployment-review --no-write --top 8"),
+        (
+            "operator-evidence",
+            "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
+        ),
+        ("validation-plan", "validation-plan --no-write --top 8 --show-commands --skip-current-resource-check"),
+    ]:
+        ref = methodology_command_ref(
+            artifact_dir,
+            profile,
+            subcommand,
+            source=f"{item.get('id')}:closure:{source}",
+        )
+        if ref:
+            commands.append(ref)
+    return {
+        "status": methodology_closure_status(requirements),
+        "gate_ready": False,
+        "impact": item.get("impact"),
+        "artifact_statuses": {
+            "rpc_method_policy": rpc_method_policy.get("policy_posture") or rpc_method_policy.get("status") or "missing",
+            "transaction_method_exposure": transaction_status,
+            "rate_limit_resource_review": rate_status,
+            "deployment_review": deployment_review.get("status") or "missing",
+            "operator_evidence_review": operator_review.get("status") or "missing",
+        },
+        "requirements": requirements,
+        "missing_requirements": [
+            req.get("id")
+            for req in requirements
+            if req.get("status") not in {"passed", "ready-offline", "ready-after-resource-check"}
+        ],
+        "next_safe_commands": commands[:6],
+        "evidence_contract": evidence_contract,
+        "rpc_proxy_abuse_approval_packet": approval_packet,
+        "finding_gate_entry_condition": (
+            "Only enter finding-gate after one exact RPC method/control boundary has concrete non-DoS impact. "
+            "Static proxy exposure, public chain reads, and configurable method policy are not enough."
+        ),
+    }
+
+
 def build_rewrite_evidence_closure(
     *,
     artifact_dir: Path,
@@ -10677,6 +10839,13 @@ def build_evidence_closure_for_validation_item(
         )
     if impact == "resource-exhaustion" or hypothesis_type == "resource-abuse-review":
         return build_resource_evidence_closure(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            item=item,
+            supporting_reviews=supporting_reviews,
+        )
+    if impact == "rpc-proxy-abuse":
+        return build_rpc_proxy_abuse_evidence_closure(
             artifact_dir=artifact_dir,
             profile=profile,
             item=item,
@@ -11558,6 +11727,219 @@ def rpc_proxy_abuse_lead_evidence_contract(
     }
 
 
+def rpc_proxy_abuse_approval_packet(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    rpc_method_policy: dict[str, Any],
+    deployment_review: dict[str, Any] | None = None,
+    operator_review: dict[str, Any] | None = None,
+    resource_preflight: dict[str, Any] | None = None,
+    evidence_contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    assessment_policy = assessment_mode_policy(profile)
+    policy = rpc_method_policy if isinstance(rpc_method_policy, dict) else {}
+    transaction_review = (
+        policy.get("transaction_method_exposure_review")
+        if isinstance(policy.get("transaction_method_exposure_review"), dict)
+        else {}
+    )
+    rate_review = (
+        policy.get("rate_limit_resource_review")
+        if isinstance(policy.get("rate_limit_resource_review"), dict)
+        else {}
+    )
+    client_ip_review = (
+        rate_review.get("client_ip_trust_review")
+        if isinstance(rate_review.get("client_ip_trust_review"), dict)
+        else {}
+    )
+    deployment = deployment_review if isinstance(deployment_review, dict) else {}
+    deployment_summary = deployment.get("summary") if isinstance(deployment.get("summary"), dict) else {}
+    operator = operator_review if isinstance(operator_review, dict) else {}
+    operator_summary = operator.get("summary") if isinstance(operator.get("summary"), dict) else {}
+    contract = evidence_contract if isinstance(evidence_contract, dict) else {}
+    entrypoint = str(
+        contract.get("entrypoint")
+        or f"POST {probe_target_path(profile, 'solana-rpc-http', 'path', '/api/rpc/solana/{cluster}')}"
+    )
+    policy_status = str(policy.get("status") or "indexed")
+    policy_posture = str(policy.get("policy_posture") or "unknown")
+    transaction_status = str(transaction_review.get("status") or "unknown")
+    blocked_high_cost = set(str(item) for item in transaction_review.get("blocked_high_cost_methods", []) or [])
+    required_high_cost_blocks = {"getProgramAccounts", "getSignaturesForAddress"}
+    origin_refs = policy.get("origin_control_refs") if isinstance(policy.get("origin_control_refs"), list) else []
+    default_methods = policy.get("default_allowed_methods") if isinstance(policy.get("default_allowed_methods"), list) else []
+    resource_status = str((resource_preflight or {}).get("status") or "not-run")
+    budget = (
+        (resource_preflight or {}).get("resource_budget")
+        if isinstance((resource_preflight or {}).get("resource_budget"), dict)
+        else {}
+    )
+    active_blocked = resource_status not in {"healthy", "not-run"} or budget.get("active_target_traffic") == "blocked"
+
+    missing_decision_ids = []
+    if not policy or policy_status in {"source-unavailable", "not-applicable"}:
+        missing_decision_ids.append("rpc-method-policy-source-or-approved-observation")
+    if not default_methods and transaction_status in {"unknown", "transaction-method-policy-unclear", "source-unavailable"}:
+        missing_decision_ids.append("rpc-allowed-method-policy-review")
+    if policy and policy_status not in {"source-unavailable", "not-applicable"} and not required_high_cost_blocks <= blocked_high_cost:
+        missing_decision_ids.append("rpc-blocked-high-cost-method-policy")
+    if transaction_status in {"transaction-methods-default-allowed", "transaction-methods-runner-env-enabled"}:
+        missing_decision_ids.append("high-impact-rpc-method-authorization-impact")
+    elif transaction_status == "transaction-methods-env-gated":
+        missing_decision_ids.append("deployment-rpc-method-env-config")
+    elif transaction_status in {"unknown", "transaction-method-policy-unclear", "source-unavailable"}:
+        missing_decision_ids.append("rpc-transaction-method-exposure-policy")
+    if policy and policy_status not in {"source-unavailable", "not-applicable"} and not origin_refs:
+        missing_decision_ids.append("rpc-origin-enforcement-policy")
+    rate_status = str(rate_review.get("status") or "unknown")
+    deployment_critical_missing = [str(item) for item in deployment_summary.get("critical_missing", []) or []]
+    operator_missing = [str(item) for item in operator_summary.get("missing_decisions", []) or []]
+    if rate_status == "needs-deployment-review":
+        missing_resource_decisions = [
+            item
+            for item in ordered_unique_strings([*deployment_critical_missing, *operator_missing])
+            if item in OPERATOR_RESOURCE_CONTROL_DECISION_IDS
+        ]
+        if missing_resource_decisions:
+            missing_decision_ids.extend(missing_resource_decisions)
+        else:
+            missing_decision_ids.append("rpc-rate-limit-resource-control-evidence")
+    missing_decision_ids.append("concrete-non-dos-rpc-impact")
+    missing_decision_ids = ordered_unique_strings(missing_decision_ids)
+
+    high_impact_reachable = transaction_status in {
+        "transaction-methods-default-allowed",
+        "transaction-methods-runner-env-enabled",
+    }
+    if not policy or policy_status in {"source-unavailable", "not-applicable"}:
+        packet_status = "waiting-rpc-method-policy-review"
+    elif high_impact_reachable:
+        packet_status = "waiting-high-impact-rpc-method-evidence"
+    elif transaction_status == "transaction-methods-env-gated":
+        packet_status = "waiting-deployment-rpc-method-evidence"
+    elif rate_status == "needs-deployment-review":
+        packet_status = "waiting-rpc-control-deployment-evidence"
+    else:
+        packet_status = "waiting-concrete-rpc-impact-evidence"
+    if active_blocked and packet_status.startswith("waiting-"):
+        packet_status = f"blocked-resource-{packet_status}"
+
+    def command(subcommand: str) -> str:
+        return validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile)
+
+    approval_sequence = [
+        {
+            "id": "rpc-method-policy-review",
+            "status": "ready",
+            "risk": "offline-local-source-policy-review",
+            "command": command("hypothesis-matrix --no-write --show-next"),
+        },
+        {
+            "id": "deployment-context",
+            "status": "ready",
+            "risk": "offline-local-deployment-review",
+            "command": command("deployment-review --no-write --top 8"),
+        },
+        {
+            "id": "operator-evidence-review",
+            "status": "ready-after-sidecar-edit",
+            "risk": "offline-redacted-sidecar-review",
+            "command": command("operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract"),
+        },
+        {
+            "id": "evidence-gap-review",
+            "status": "ready",
+            "risk": "offline-local-gap-review",
+            "command": command("evidence-gaps --no-write --top 12 --show-followups"),
+        },
+        {
+            "id": "resource-gate",
+            "status": "blocked-until-healthy-resource-snapshot" if active_blocked else "ready-before-active-validation",
+            "risk": "offline-local-resource-check",
+            "command": command("resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict"),
+        },
+        {
+            "id": "single-rpc-observation",
+            "status": "blocked-until-policy-impact-and-resource-gate",
+            "risk": "single-approved-target-request",
+            "action": (
+                "Use at most one approved redacted RPC observation for one exact method/control boundary; "
+                "do not enumerate methods, submit transactions, or test rate limits."
+            ),
+        },
+        {
+            "id": "finding-gate-preview",
+            "status": "waiting-concrete-rpc-impact-evidence",
+            "risk": "offline-manual-gate-preview",
+            "command": command("gate --no-write --show-items"),
+        },
+    ]
+    blocker_by_decision = {
+        "rpc-method-policy-source-or-approved-observation": "No current RPC method policy or approved RPC observation is present for this proxy path.",
+        "rpc-allowed-method-policy-review": "The effective allowed JSON-RPC method policy has not been reviewed.",
+        "rpc-blocked-high-cost-method-policy": "High-cost RPC method blocking is not evidenced for getProgramAccounts/getSignaturesForAddress.",
+        "high-impact-rpc-method-authorization-impact": "High-impact transaction RPC reachability lacks authorization and concrete impact evidence.",
+        "deployment-rpc-method-env-config": "Deployment values for transaction-method flags or allowlist overrides are not evidenced.",
+        "rpc-transaction-method-exposure-policy": "Transaction-method exposure policy is unclear.",
+        "rpc-origin-enforcement-policy": "Origin enforcement and missing-origin behavior are not evidenced for the RPC proxy.",
+        "external-rate-limit-store-config": "External rate-limit store deployment/health evidence is missing.",
+        "proxy-header-trust-model": "Production proxy/header trust evidence is missing.",
+        "rpc-client-ip-header-trust-model": "Direct-to-app reachability or client-controlled IP-key evidence is missing.",
+        "rate-limit-bounds": "Rate-limit TTL, eviction, burst, sustained, or connection-bound evidence is missing.",
+        "fallback-monitoring-alerts": "Fallback monitoring or alerting evidence is missing.",
+        "rpc-rate-limit-resource-control-evidence": "Resource-control deployment evidence is incomplete for the RPC proxy.",
+        "concrete-non-dos-rpc-impact": "No concrete non-DoS RPC impact has been accepted by finding-gate.",
+    }
+    blockers = [
+        blocker_by_decision.get(decision_id, f"No reviewed evidence is present for {decision_id}.")
+        for decision_id in missing_decision_ids
+    ]
+    if active_blocked:
+        blockers.append("Current resource gate is not healthy; even a single RPC observation remains blocked.")
+    blockers.append("Static RPC proxy exposure, public chain read access, or source policy configurability is not reportable by itself.")
+    finding_gate_blockers = ordered_unique_strings(blockers)
+    return {
+        "type": "rpc-proxy-abuse-approval-packet",
+        "packet_type": "rpc-proxy-abuse-approval-packet",
+        "status": packet_status,
+        "assessment": {
+            "mode": assessment_policy.get("mode"),
+            "optimization_goal": assessment_policy.get("optimization_goal"),
+            "rpc_lead_bias": (
+                "coverage-first: close every RPC method, origin, rate-control, and deployment decision before clearing the surface."
+                if assessment_policy.get("mode") == "greybox"
+                else "bounty-first: continue only when one exact RPC boundary can support a valid high-impact, non-DoS report."
+            ),
+        },
+        "recommended_evidence": {
+            "entrypoint": entrypoint,
+            "provider": "rpc-source/deployment/operator",
+            "rpc_method_policy": repo_relative_or_absolute(artifact_dir / "rpc-method-policy.json"),
+            "policy_posture": policy_posture,
+            "transaction_method_exposure_status": transaction_status,
+            "rate_limit_resource_status": rate_status,
+            "client_ip_trust_status": client_ip_review.get("status") or "missing",
+            "missing_decision_ids": missing_decision_ids,
+        },
+        "operator_evidence_sidecar": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+        "offline_commands": [
+            command("hypothesis-matrix --no-write --show-next"),
+            command("deployment-review --no-write --top 8"),
+            command("operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract"),
+            command("validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check"),
+        ],
+        "approval_sequence": approval_sequence,
+        "finding_gate_blockers": finding_gate_blockers,
+        "finding_gate_blocker_count": len(finding_gate_blockers),
+        "safety": (
+            "Offline RPC-proxy approval packet only. It sends no RPC traffic, performs no method enumeration, "
+            "runs no rate-limit validation, invokes no Burp tools, signs no wallets, and submits no transactions."
+        ),
+    }
+
+
 def unauthorized_state_change_lead_evidence_contract(
     *,
     thread: dict[str, Any],
@@ -11915,6 +12297,7 @@ def build_lead_dossier(
                     closure.get("transaction_corpus_approval_packet")
                     or closure.get("credential_impact_approval_packet")
                     or closure.get("resource_control_approval_packet")
+                    or closure.get("rpc_proxy_abuse_approval_packet")
                     or closure.get("rewrite_response_approval_packet")
                     or closure.get("websocket_header_forwarding_approval_packet")
                     if closure
@@ -12496,7 +12879,10 @@ def rpc_method_policy_for_hypothesis_matrix(
             if isinstance(artifact.get("rate_limit_resource_review"), dict)
             else {}
         )
-        if isinstance(rate_review.get("client_ip_trust_review"), dict):
+        if isinstance(rate_review.get("client_ip_trust_review"), dict) and isinstance(
+            artifact.get("origin_control_refs"),
+            list,
+        ):
             return artifact, "artifact"
     elif artifact:
         return artifact, "artifact"
@@ -15599,6 +15985,16 @@ def validation_allowed_commands(
             command("operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract"),
         )
         allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
+    if hypothesis.get("impact") == "rpc-proxy-abuse":
+        for subcommand in reversed(
+            [
+                "hypothesis-matrix --no-write --show-next",
+                "evidence-gaps --no-write --top 12 --show-followups",
+                "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
+                "deployment-review --no-write --top 8",
+            ]
+        ):
+            allowed_now_commands.insert(3, command(subcommand))
     if hypothesis.get("type") == "transaction-flow-review" or hypothesis.get("impact") == "transaction-integrity":
         allowed_now_commands.insert(3, command("transaction-flow-review --no-write --top 8"))
         allowed_now_commands.insert(3, command(TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND))
@@ -15913,6 +16309,50 @@ def validation_item_from_hypothesis(
                     "resource_control_approval_packet": resource_packet_full,
                 }
             )
+    rpc_proxy_approval_packet = None
+    if hypothesis.get("impact") == "rpc-proxy-abuse":
+        rpc_method_policy, _rpc_method_policy_source = rpc_method_policy_for_hypothesis_matrix(
+            profile=profile,
+            artifact_dir=artifact_dir,
+        )
+        operator_evidence = load_optional_json(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
+        deployment_review = load_optional_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT)
+        operator_review = load_optional_json(artifact_dir / OPERATOR_EVIDENCE_REVIEW_ARTIFACT)
+        profile_doc = profile if isinstance(profile, dict) else {}
+        source_root_value = str(profile_doc.get("default_source_root") or DEFAULT_SOURCE_ROOT)
+        source_root = resolve_repo_path(source_root_value)
+        source_available = source_root.exists() and not is_blackbox_profile_like(profile_doc)
+        if source_available and (
+            not isinstance(deployment_review, dict)
+            or not isinstance(deployment_review.get("decisions"), list)
+        ):
+            deployment_review = build_deployment_resource_review(
+                source_root,
+                profile,
+                operator_evidence=operator_evidence,
+            )
+        if not isinstance(operator_review, dict) or not isinstance(operator_review.get("summary"), dict):
+            operator_review = build_operator_evidence_review(
+                target=target,
+                artifact_dir=artifact_dir,
+                operator_evidence=operator_evidence,
+                deployment_review=deployment_review if isinstance(deployment_review, dict) else {},
+                rpc_method_policy=rpc_method_policy,
+                profile=profile,
+            )
+        rpc_proxy_approval_packet = rpc_proxy_abuse_approval_packet(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            rpc_method_policy=rpc_method_policy,
+            deployment_review=deployment_review if isinstance(deployment_review, dict) else {},
+            operator_review=operator_review if isinstance(operator_review, dict) else {},
+            resource_preflight=validation_resource_preflight_summary(current_resource_snapshot),
+            evidence_contract=rpc_proxy_abuse_lead_evidence_contract(
+                thread=hypothesis,
+                profile=profile,
+                artifact_dir=artifact_dir,
+            ),
+        )
 
     return {
         "id": f"VAL-{safe_hypothesis_id(hypothesis.get('id'))}",
@@ -15937,6 +16377,7 @@ def validation_item_from_hypothesis(
         "credential_proxy_review": hypothesis.get("credential_proxy_review"),
         "credential_impact_approval_packet": credential_approval_packet,
         "resource_control_approval_packet": resource_approval_packet,
+        "rpc_proxy_abuse_approval_packet": rpc_proxy_approval_packet,
         "websocket_header_forwarding_approval_packet": websocket_header_approval_packet,
         "command_safety": command_summary,
         "blocked_command_safety": blocked_command_summary,
@@ -16577,6 +17018,7 @@ def build_iteration_decision_from_plan(
             ("transaction_corpus_approval_packet", "transaction-corpus"),
             ("credential_impact_approval_packet", "credential-impact"),
             ("resource_control_approval_packet", "resource-control"),
+            ("rpc_proxy_abuse_approval_packet", "rpc-proxy-abuse"),
             ("rewrite_response_approval_packet", "rewrite-response"),
             ("websocket_header_forwarding_approval_packet", "websocket-header-forwarding"),
         ]:
@@ -26278,6 +26720,7 @@ def build_rpc_method_policy(
             "default_high_impact_methods": [],
             "default_transaction_methods": [],
             "explicit_transaction_method_gate_present": False,
+            "origin_control_refs": [],
             "runner_environment": {
                 "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS": os.environ.get("SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS"),
                 "SOLANA_RPC_PROXY_ALLOWED_METHODS_set": os.environ.get("SOLANA_RPC_PROXY_ALLOWED_METHODS") is not None,
@@ -26321,6 +26764,7 @@ def build_rpc_method_policy(
             "default_high_impact_methods": [],
             "default_transaction_methods": [],
             "explicit_transaction_method_gate_present": False,
+            "origin_control_refs": [],
             "runner_environment": {
                 "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS": os.environ.get("SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS"),
                 "SOLANA_RPC_PROXY_ALLOWED_METHODS_set": os.environ.get("SOLANA_RPC_PROXY_ALLOWED_METHODS") is not None,
@@ -26475,6 +26919,7 @@ def build_rpc_method_policy(
         "default_high_impact_methods": default_high_impact,
         "default_transaction_methods": transaction_method_exposure_review.get("default_transaction_methods", []),
         "explicit_transaction_method_gate_present": explicit_gate_present,
+        "origin_control_refs": source_ref_groups["origin_control_refs"],
         "runner_environment": {
             "SOLANA_RPC_PROXY_ALLOW_TRANSACTION_METHODS": env_allow_transaction_methods,
             "SOLANA_RPC_PROXY_ALLOWED_METHODS_set": env_configured_methods is not None,
@@ -27651,6 +28096,8 @@ def format_approval_packet_inline(
         raw_kind = str(packet.get("packet_type") or packet.get("type") or "")
         if "resource-control" in raw_kind:
             kind_label = "resource-control"
+        elif "rpc-proxy-abuse" in raw_kind:
+            kind_label = "rpc-proxy-abuse"
         elif "websocket" in raw_kind:
             kind_label = "websocket-header-forwarding"
         elif "credential" in raw_kind:
@@ -48975,6 +49422,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             ),
             None,
         )
+        rewrite_rpc_proxy_validation_item = next(
+            (
+                item
+                for item in rewrite_transaction_validation_plan.get("items", [])
+                if item.get("impact") == "rpc-proxy-abuse"
+            ),
+            None,
+        )
         rewrite_fixed_upstream_validation_item = next(
             (
                 item
@@ -49113,6 +49568,33 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             rewrite_resource_validation_packet.get("recommended_evidence")
             if isinstance(rewrite_resource_validation_packet.get("recommended_evidence"), dict)
             else {}
+        )
+        rewrite_rpc_proxy_validation_packet = (
+            rewrite_rpc_proxy_validation_item.get("rpc_proxy_abuse_approval_packet")
+            if isinstance(rewrite_rpc_proxy_validation_item, dict)
+            and isinstance(rewrite_rpc_proxy_validation_item.get("rpc_proxy_abuse_approval_packet"), dict)
+            else {}
+        )
+        rewrite_rpc_proxy_validation_packet_evidence = (
+            rewrite_rpc_proxy_validation_packet.get("recommended_evidence")
+            if isinstance(rewrite_rpc_proxy_validation_packet.get("recommended_evidence"), dict)
+            else {}
+        )
+        rewrite_rpc_proxy_validation_packet_passed = (
+            rewrite_rpc_proxy_validation_item is not None
+            and rewrite_rpc_proxy_validation_item.get("status") in {"ready-offline", "blocked-resource"}
+            and rewrite_rpc_proxy_validation_packet.get("type") == "rpc-proxy-abuse-approval-packet"
+            and rewrite_rpc_proxy_validation_packet_evidence.get("entrypoint") == "POST /api/rpc/solana/{cluster}"
+            and "deployment-rpc-method-env-config"
+            in (rewrite_rpc_proxy_validation_packet_evidence.get("missing_decision_ids") or [])
+            and "concrete-non-dos-rpc-impact"
+            in (rewrite_rpc_proxy_validation_packet_evidence.get("missing_decision_ids") or [])
+            and rewrite_rpc_proxy_validation_packet.get("finding_gate_blocker_count", 0) >= 3
+            and any(
+                item.get("packet_type") == "rpc-proxy-abuse"
+                for item in rewrite_iteration_decision_sample.get("approval_packets", [])
+                if isinstance(item, dict)
+            )
         )
         rewrite_fixed_upstream_validation_packet = (
             rewrite_fixed_upstream_validation_item.get("rewrite_response_approval_packet")
@@ -51324,6 +51806,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and rewrite_transaction_lead_contract_passed
         and rewrite_fixed_upstream_lead_contract_passed
         and rewrite_fixed_upstream_validation_packet_passed
+        and rewrite_rpc_proxy_validation_packet_passed
         and rate_limit_resource_review_passed
         and transaction_method_exposure_passed
         and profile_custom_ws_discovery_passed
@@ -51811,6 +52294,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "fixed_upstream_validation_packet": {
                 "status": "passed" if rewrite_fixed_upstream_validation_packet_passed else "failed",
                 "packet": rewrite_fixed_upstream_validation_packet,
+                "iteration_packet_types": [
+                    item.get("packet_type")
+                    for item in rewrite_iteration_decision_sample.get("approval_packets", [])
+                    if isinstance(item, dict)
+                ],
+            },
+            "rpc_proxy_abuse_validation_packet": {
+                "status": "passed" if rewrite_rpc_proxy_validation_packet_passed else "failed",
+                "packet": rewrite_rpc_proxy_validation_packet,
+                "validation_item": rewrite_rpc_proxy_validation_item,
                 "iteration_packet_types": [
                     item.get("packet_type")
                     for item in rewrite_iteration_decision_sample.get("approval_packets", [])
@@ -57901,6 +58394,13 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                 )
                 if resource_packet:
                     print(f"  resource_approval_packet={format_approval_packet_inline(resource_packet)}")
+                rpc_packet = (
+                    item.get("rpc_proxy_abuse_approval_packet")
+                    if isinstance(item.get("rpc_proxy_abuse_approval_packet"), dict)
+                    else {}
+                )
+                if rpc_packet:
+                    print(f"  rpc_proxy_approval_packet={format_approval_packet_inline(rpc_packet)}")
                 credential_review = (
                     item.get("credential_proxy_review")
                     if isinstance(item.get("credential_proxy_review"), dict)

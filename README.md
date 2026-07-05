@@ -464,6 +464,19 @@ Scanner, Intruder, or DoS validation. In `greybox` mode it closes resource
 coverage decisions; in `blackbox` mode it keeps the thread parked unless
 non-stress deployment/operator evidence can support a valid availability,
 quota, or operator-impact report.
+RPC proxy abuse leads also emit `rpc_proxy_abuse_approval_packet` through
+`validation-plan`, `lead-dossier`, and `iteration-decision`. This packet is
+separate from resource exhaustion: it records the exact RPC proxy entrypoint,
+the local `rpc-method-policy.json` reference, transaction-method exposure
+status, origin/rate-control review status, deployment/operator sidecar path,
+missing method/env/origin/resource decisions, and current finding-gate blockers.
+Static proxy exposure, public-chain read access, or a configurable method policy
+is not enough for a finding. Greybox mode uses the packet to close every
+dangerous RPC method, origin, rate-control, and deployment evidence gap; blackbox
+mode keeps the work focused on one exact RPC boundary that can support a valid
+high-impact, non-DoS bounty report. It never authorizes broad method
+enumeration, rate-limit stress, wallet signing, `sendTransaction` submission, or
+Burp Scanner/Intruder traffic.
 When RPC source shows rate-limit buckets keyed from
 `x-forwarded-for`, that template also includes
 `rpc-client-ip-header-trust-model`, which asks for production edge/header
