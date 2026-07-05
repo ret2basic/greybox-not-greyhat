@@ -924,8 +924,11 @@ python3 scripts/inferforge.py collect-orca-baseline
 `decode-transactions` scans quote probe responses and optional sidecar files for
 base64 Solana transaction payloads, then uses the app's `@solana/web3.js`
 dependency to decode account keys, signer/writable flags, recent blockhash, and
-compiled instruction metadata. It can also compare decoded payloads against an
-expected swap intent. It never signs or submits transactions. Extra payload
+compiled instruction metadata. It also parses SPL Token and Token-2022
+`Transfer` / `TransferChecked` instructions enough to compare decoded source
+mint transfer amounts against the requested `amountIn` when reliable
+`TransferChecked` mint evidence is present. It can compare decoded payloads
+against an expected swap intent. It never signs or submits transactions. Extra payload
 files can be supplied as JSON, JSONL, or text. Each sidecar input is capped at
 4 MiB by default so large Burp exports or response dumps do not create a memory
 spike; skipped inputs are recorded in `transaction-intent.json.warnings`, and

@@ -47,6 +47,9 @@ DEFAULT_PROFILE_PATH = ROOT / "profiles/infrafi-web.json"
 DEFAULT_NODE = "/home/ret2basic/.npm/_npx/52027bd8fc0022aa/node_modules/node/bin/node"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDTEL_MINT = "dawn7ZUF7h7anFuEsDdAU1Y3HYwikwqNMAENZsQJdNL"
+SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+SPL_TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+SPL_TOKEN_PROGRAM_IDS = {SPL_TOKEN_PROGRAM_ID, SPL_TOKEN_2022_PROGRAM_ID}
 DEFAULT_TEST_WALLET = "EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR"
 PLACEHOLDER_REAL_WALLET = "REPLACE_WITH_REAL_WALLET"
 PLACEHOLDER_APPROVED_POOL_ADDRESS = "REPLACE_WITH_APPROVED_POOL_ADDRESS"
@@ -33603,6 +33606,69 @@ function instructionAccounts(ix) {
   return Array.from(ix.accountKeyIndexes ?? ix.accounts ?? [])
 }
 
+function instructionDataBytes(ix) {
+  if (!ix.data) {
+    return Buffer.alloc(0)
+  }
+  if (Buffer.isBuffer(ix.data)) {
+    return ix.data
+  }
+  if (ix.data instanceof Uint8Array) {
+    return Buffer.from(ix.data)
+  }
+  if (Array.isArray(ix.data)) {
+    return Buffer.from(ix.data)
+  }
+  if (typeof ix.data === 'string') {
+    try {
+      return Buffer.from(ix.data, 'base64')
+    } catch {
+      return Buffer.alloc(0)
+    }
+  }
+  return Buffer.alloc(0)
+}
+
+function readAmount(data) {
+  if (data.length < 9) {
+    return null
+  }
+  return data.readBigUInt64LE(1).toString()
+}
+
+const TOKEN_PROGRAMS = new Set([
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+])
+
+function parsedTokenInstruction(programId, accountKeys, data) {
+  if (!TOKEN_PROGRAMS.has(programId) || data.length < 1) {
+    return null
+  }
+  const discriminator = data[0]
+  if (discriminator === 3 && data.length >= 9) {
+    return {
+      type: 'transfer',
+      amount: readAmount(data),
+      source_account: accountKeys[0] ?? null,
+      destination_account: accountKeys[1] ?? null,
+      authority: accountKeys[2] ?? null,
+    }
+  }
+  if (discriminator === 12 && data.length >= 10) {
+    return {
+      type: 'transfer_checked',
+      amount: readAmount(data),
+      decimals: data[9],
+      source_account: accountKeys[0] ?? null,
+      mint: accountKeys[1] ?? null,
+      destination_account: accountKeys[2] ?? null,
+      authority: accountKeys[3] ?? null,
+    }
+  }
+  return null
+}
+
 const transactions = input.candidates.map((candidate) => {
   const result = {
     id: candidate.id,
@@ -33637,13 +33703,17 @@ const transactions = input.candidates.map((candidate) => {
     result.compiled_instructions = Array.from(message.compiledInstructions ?? message.instructions ?? []).map((ix, index) => {
       const accountIndexes = instructionAccounts(ix)
       const programIdIndex = ix.programIdIndex
+      const programId = keys[programIdIndex] ?? null
+      const accountKeys = accountIndexes.map((accountIndex) => keys[accountIndex] ?? null)
+      const data = instructionDataBytes(ix)
       return {
         index,
         program_id_index: programIdIndex,
-        program_id: keys[programIdIndex] ?? null,
+        program_id: programId,
         account_indexes: accountIndexes,
-        account_keys: accountIndexes.map((accountIndex) => keys[accountIndex] ?? null),
-        data_length: ix.data ? ix.data.length : 0,
+        account_keys: accountKeys,
+        data_length: data.length,
+        parsed_token_instruction: parsedTokenInstruction(programId, accountKeys, data),
       }
     })
     result.address_table_lookups = Array.from(message.addressTableLookups ?? []).map((lookup, index) => ({
@@ -33860,6 +33930,79 @@ def transaction_program_ids(transaction: dict[str, Any]) -> set[str]:
     }
 
 
+def transaction_token_transfer_summaries(transaction: dict[str, Any]) -> list[dict[str, Any]]:
+    transfers = []
+    for instruction in transaction.get("compiled_instructions", []) or []:
+        if not isinstance(instruction, dict):
+            continue
+        parsed = instruction.get("parsed_token_instruction")
+        if not isinstance(parsed, dict):
+            continue
+        program_id = str(instruction.get("program_id") or "")
+        if program_id not in SPL_TOKEN_PROGRAM_IDS:
+            continue
+        transfer_type = str(parsed.get("type") or "")
+        amount = parsed.get("amount")
+        if transfer_type not in {"transfer", "transfer_checked"} or amount is None:
+            continue
+        row = {
+            "instruction_index": instruction.get("index"),
+            "program_id": program_id,
+            "type": transfer_type,
+            "amount": str(amount),
+            "source_account": parsed.get("source_account"),
+            "destination_account": parsed.get("destination_account"),
+            "authority": parsed.get("authority"),
+        }
+        if parsed.get("mint"):
+            row["mint"] = parsed.get("mint")
+        if parsed.get("decimals") is not None:
+            row["decimals"] = parsed.get("decimals")
+        transfers.append(row)
+    return transfers
+
+
+def transaction_source_mint_amount_review(transaction: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+    amount_in = policy.get("amountIn")
+    source_mint = policy.get("sourceMint")
+    if not amount_in:
+        return {
+            "status": "not-configured",
+            "reason": "amountIn is not configured in the intent policy.",
+        }
+    transfers = transaction_token_transfer_summaries(transaction)
+    checked_source_transfers = [
+        item
+        for item in transfers
+        if item.get("type") == "transfer_checked" and item.get("mint") == source_mint
+    ]
+    if not checked_source_transfers:
+        return {
+            "status": "review",
+            "reason": "No decoded transfer_checked instruction for the expected source mint was found.",
+            "sourceMint": source_mint,
+            "amountIn": amount_in,
+            "token_transfers": transfers[:8],
+        }
+    amounts = [str(item.get("amount")) for item in checked_source_transfers if item.get("amount") is not None]
+    exact_match = str(amount_in) in amounts
+    total_amount = None
+    try:
+        total_amount = str(sum(int(amount) for amount in amounts))
+    except ValueError:
+        total_amount = None
+    total_match = total_amount == str(amount_in)
+    return {
+        "status": "passed" if exact_match or total_match else "failed",
+        "sourceMint": source_mint,
+        "amountIn": str(amount_in),
+        "amounts": amounts,
+        "total_amount": total_amount,
+        "match_mode": "single-transfer" if exact_match else "summed-transfers" if total_match else "none",
+        "token_transfers": checked_source_transfers[:8],
+    }
+
+
 def make_intent_check(
     check_id: str,
     label: str,
@@ -33939,6 +34082,7 @@ def build_transaction_intent_checks(
         program_ids = transaction_program_ids(transaction)
         unexpected_programs = sorted(program_ids - allowed_programs) if allowed_programs else []
         has_address_lookups = bool(transaction.get("address_table_lookups"))
+        source_amount_review = transaction_source_mint_amount_review(transaction, policy)
 
         checks.extend(
             [
@@ -33973,6 +34117,13 @@ def build_transaction_intent_checks(
                     "Transaction contains compiled instructions",
                     "passed" if transaction.get("compiled_instructions") else "failed",
                     len(transaction.get("compiled_instructions", [])),
+                ),
+                make_intent_check(
+                    f"{tx_id}:amount-in",
+                    "Decoded source-mint transfer amount matches requested amountIn",
+                    str(source_amount_review.get("status") or "review"),
+                    source_amount_review,
+                    severity="review" if source_amount_review.get("status") == "review" else "required",
                 ),
             ]
         )
@@ -34046,6 +34197,7 @@ def build_transaction_intent_reportability_review(
         "wallet-signer",
         "source-mint",
         "destination-mint",
+        "amount-in",
         "program-allowlist",
     }
     high_impact_failures = [
@@ -34082,7 +34234,7 @@ def build_transaction_intent_reportability_review(
         status = "candidate-transaction-integrity-impact"
         candidate_severity = "high"
         ready_for_finding_gate = True
-        next_step = "Open a finding-gate review with the failed signer, wallet, mint, or program evidence."
+        next_step = "Open a finding-gate review with the failed signer, wallet, mint, amount, or program evidence."
     elif structural_failures:
         status = "required-transaction-structure-failure"
         candidate_severity = "medium"
@@ -34206,6 +34358,7 @@ def generate_synthetic_transaction_payload(
     profile: dict[str, Any] | None = None,
     direction: str,
     wallet: str,
+    amount_in: str,
 ) -> dict[str, Any]:
     node_path = Path(node)
     if not node_path.exists():
@@ -34233,8 +34386,8 @@ def generate_synthetic_transaction_payload(
     script = """
 import fs from 'node:fs'
 import {
+  Keypair,
   PublicKey,
-  SystemProgram,
   TransactionInstruction,
   TransactionMessage,
   VersionedTransaction,
@@ -34244,19 +34397,43 @@ const input = JSON.parse(fs.readFileSync(0, 'utf8'))
 const wallet = new PublicKey(input.wallet)
 const sourceMint = new PublicKey(input.sourceMint)
 const destinationMint = new PublicKey(input.destinationMint)
-const ix = new TransactionInstruction({
-  programId: SystemProgram.programId,
-  keys: [
-    { pubkey: wallet, isSigner: true, isWritable: true },
-    { pubkey: sourceMint, isSigner: false, isWritable: false },
-    { pubkey: destinationMint, isSigner: false, isWritable: false },
-  ],
-  data: Buffer.from([0]),
-})
+const tokenProgramId = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')
+const amountIn = BigInt(input.amountIn)
+const sourceTokenAccount = Keypair.generate().publicKey
+const sourceDestinationAccount = Keypair.generate().publicKey
+const destinationTokenAccount = Keypair.generate().publicKey
+const destinationRecipientAccount = Keypair.generate().publicKey
+
+function transferChecked(source, mint, destination, owner, amount, decimals) {
+  const data = Buffer.alloc(10)
+  data[0] = 12
+  data.writeBigUInt64LE(amount, 1)
+  data[9] = decimals
+  return new TransactionInstruction({
+    programId: tokenProgramId,
+    keys: [
+      { pubkey: source, isSigner: false, isWritable: true },
+      { pubkey: mint, isSigner: false, isWritable: false },
+      { pubkey: destination, isSigner: false, isWritable: true },
+      { pubkey: owner, isSigner: true, isWritable: false },
+    ],
+    data,
+  })
+}
+
+const sourceTransfer = transferChecked(sourceTokenAccount, sourceMint, sourceDestinationAccount, wallet, amountIn, 6)
+const destinationMintReference = transferChecked(
+  destinationTokenAccount,
+  destinationMint,
+  destinationRecipientAccount,
+  wallet,
+  1n,
+  6,
+)
 const message = new TransactionMessage({
   payerKey: wallet,
   recentBlockhash: '11111111111111111111111111111111',
-  instructions: [ix],
+  instructions: [sourceTransfer, destinationMintReference],
 }).compileToV0Message()
 const tx = new VersionedTransaction(message)
 const base64 = Buffer.from(tx.serialize()).toString('base64')
@@ -34265,13 +34442,20 @@ console.log(JSON.stringify({
   sourceMint: sourceMint.toBase58(),
   destinationMint: destinationMint.toBase58(),
   wallet: wallet.toBase58(),
-  allowedProgram: SystemProgram.programId.toBase58(),
+  allowedProgram: tokenProgramId.toBase58(),
 }, null, 2))
 """
     proc = subprocess.run(
         [node, "--input-type=module", "--eval", script],
         cwd=str(source_root),
-        input=json.dumps({"wallet": wallet, "sourceMint": expected[0], "destinationMint": expected[1]}),
+        input=json.dumps(
+            {
+                "wallet": wallet,
+                "sourceMint": expected[0],
+                "destinationMint": expected[1],
+                "amountIn": amount_in,
+            }
+        ),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -34304,6 +34488,7 @@ def build_transaction_decoder_selftest(
         profile=profile,
         direction=direction,
         wallet=wallet,
+        amount_in=amount_in,
     )
     if not payload.get("ok"):
         return {
@@ -34362,6 +34547,35 @@ def build_transaction_decoder_selftest(
         and mismatch_reportability_review.get("ready_for_finding_gate") is True
         and mismatch_reportability_review.get("reportable_now") is False
         and int(mismatch_reportability_review.get("high_impact_failure_count") or 0) >= 2
+    )
+    amount_mismatch_policy = normalize_transaction_intent_policy(
+        {
+            "direction": direction,
+            "wallet": payload["wallet"],
+            "amountIn": str(int(amount_in) + 1),
+            "sourceMint": payload["sourceMint"],
+            "destinationMint": payload["destinationMint"],
+            "allowedPrograms": [payload["allowedProgram"]],
+        },
+        profile,
+    )
+    amount_mismatch_policy_checks = build_transaction_intent_checks(transactions, amount_mismatch_policy)
+    amount_mismatch_reportability_review = build_transaction_intent_reportability_review(
+        transactions,
+        amount_mismatch_policy,
+        amount_mismatch_policy_checks,
+    )
+    amount_mismatch_failures = [
+        check
+        for check in amount_mismatch_policy_checks.get("checks", []) or []
+        if isinstance(check, dict) and transaction_intent_check_suffix(check) == "amount-in"
+    ]
+    amount_mismatch_gate_passed = (
+        amount_mismatch_policy_checks.get("status") == "failed"
+        and amount_mismatch_reportability_review.get("status") == "candidate-transaction-integrity-impact"
+        and amount_mismatch_reportability_review.get("candidate_severity") == "high"
+        and amount_mismatch_reportability_review.get("ready_for_finding_gate") is True
+        and any(check.get("status") == "failed" for check in amount_mismatch_failures)
     )
     decoded_count = sum(1 for item in transactions if item.get("decoded"))
     sidecar_ready_review: dict[str, Any] = {}
@@ -34457,6 +34671,7 @@ def build_transaction_decoder_selftest(
         and policy_checks.get("status") == "passed"
         and reportability_review.get("status") == "intent-checks-passed"
         and mismatch_gate_passed
+        and amount_mismatch_gate_passed
         and sidecar_guard_passed
         and sidecar_ready_passed
         and sidecar_empty_passed
@@ -34484,6 +34699,11 @@ def build_transaction_decoder_selftest(
             "status": "passed" if mismatch_gate_passed else "failed",
             "intent_policy_checks": mismatch_policy_checks,
             "reportability_review": mismatch_reportability_review,
+        },
+        "amount_mismatch_gate_selftest": {
+            "status": "passed" if amount_mismatch_gate_passed else "failed",
+            "intent_policy_checks": amount_mismatch_policy_checks,
+            "reportability_review": amount_mismatch_reportability_review,
         },
         "sidecar_input_guard": {
             "status": "passed" if sidecar_guard_passed else "failed",
@@ -37042,6 +37262,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         profile=missing_quote_intent_profile,
         direction="buy",
         wallet=DEFAULT_TEST_WALLET,
+        amount_in="1000000",
     )
     quote_body_swap = quote_body_sample.get("swap") if isinstance(quote_body_sample.get("swap"), dict) else {}
     quote_body_swap_from = quote_body_swap.get("from") if isinstance(quote_body_swap.get("from"), dict) else {}
