@@ -8045,6 +8045,20 @@ METHODOLOGY_RESEARCH_SOURCES = [
         "role": "validation-depth-reference",
         "takeaway": "Logic bugs require comparing intended security model with implemented behavior; reportability needs concrete validation, not static suspicion alone.",
     },
+    {
+        "id": "owasp-wstg-business-logic",
+        "title": "OWASP WSTG: Business Logic Testing",
+        "url": "https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/10-Business_Logic_Testing/README",
+        "role": "business-logic-testing-reference",
+        "takeaway": "Map each high-value endpoint to data validation, request forgery, integrity, workflow, and misuse/limit tests before running probes.",
+    },
+    {
+        "id": "portswigger-business-logic",
+        "title": "PortSwigger Web Security Academy: Business logic vulnerabilities",
+        "url": "https://portswigger.net/web-security/logic-flaws",
+        "role": "business-logic-impact-reference",
+        "takeaway": "Focus on flawed assumptions about user behavior and prove concrete impact with context-specific evidence.",
+    },
 ]
 
 
@@ -8562,6 +8576,126 @@ def methodology_thread_rank(thread: dict[str, Any]) -> tuple[int, int, int, str]
     return (status_rank, impact_rank.get(impact, 9), priority_rank, str(thread.get("id") or thread.get("path") or ""))
 
 
+BUSINESS_LOGIC_TEST_LIBRARY: dict[str, dict[str, Any]] = {
+    "data-validation": {
+        "title": "Business logic data validation",
+        "source_ids": ["owasp-wstg-business-logic", "portswigger-business-logic"],
+        "question": "Are shape-valid but business-invalid parameters rejected before upstream calls or state changes?",
+    },
+    "request-forgery": {
+        "title": "Ability to forge requests",
+        "source_ids": ["owasp-wstg-business-logic", "portswigger-business-logic"],
+        "question": "Can the client forge a request that skips intended UI, wallet, auth, origin, or routing assumptions?",
+    },
+    "integrity-checks": {
+        "title": "Integrity checks",
+        "source_ids": ["owasp-wstg-business-logic", "portswigger-business-logic"],
+        "question": "Does evidence prove the final transaction, upstream call, or returned object matches approved intent?",
+    },
+    "workflow-circumvention": {
+        "title": "Workflow circumvention",
+        "source_ids": ["owasp-wstg-business-logic", "portswigger-business-logic"],
+        "question": "Can a protected business step be executed without the expected prior workflow or user-controlled boundary?",
+    },
+    "misuse-limits": {
+        "title": "Application misuse and function-use limits",
+        "source_ids": ["owasp-wstg-business-logic", "portswigger-business-logic"],
+        "question": "Can repeated or unauthenticated use consume quota, availability, provider budget, or other scarce resources?",
+    },
+}
+
+
+def business_logic_dimension_ids_for_hypothesis(item: dict[str, Any]) -> list[str]:
+    impact = str(item.get("impact") or "")
+    hypothesis_type = str(item.get("type") or item.get("hypothesis_type") or "")
+    if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
+        return ["integrity-checks", "data-validation", "request-forgery", "workflow-circumvention"]
+    if impact == "credentialed-upstream-cost-abuse" or hypothesis_type == "credential-proxy-review":
+        return ["misuse-limits", "request-forgery", "data-validation"]
+    if impact == "resource-exhaustion" or hypothesis_type == "resource-abuse-review":
+        return ["misuse-limits", "request-forgery"]
+    if impact == "rpc-proxy-abuse":
+        return ["request-forgery", "misuse-limits", "data-validation"]
+    if impact == "fixed-upstream-proxy-confusion":
+        return ["request-forgery", "data-validation", "integrity-checks"]
+    if impact == "unauthorized-state-change":
+        return ["workflow-circumvention", "request-forgery", "integrity-checks"]
+    return ["data-validation"]
+
+
+def business_logic_tests_for_hypothesis(item: dict[str, Any]) -> list[dict[str, Any]]:
+    tests = []
+    for dimension_id in business_logic_dimension_ids_for_hypothesis(item):
+        template = BUSINESS_LOGIC_TEST_LIBRARY.get(dimension_id)
+        if not template:
+            continue
+        tests.append(
+            {
+                "id": dimension_id,
+                "title": template.get("title"),
+                "source_ids": template.get("source_ids", []),
+                "review_question": template.get("question"),
+            }
+        )
+    return tests
+
+
+def build_business_logic_methodology_map(
+    high_value_threads: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> dict[str, Any]:
+    rows = []
+    dimension_counts: dict[str, int] = {}
+    blocked_count = 0
+    for thread in high_value_threads[: max(1, int(limit))]:
+        tests = business_logic_tests_for_hypothesis(thread)
+        for test in tests:
+            increment_count(dimension_counts, str(test.get("id") or "unknown"))
+        status = str(thread.get("status") or "")
+        if status.startswith("blocked"):
+            blocked_count += 1
+        rows.append(
+            {
+                "thread_id": thread.get("id"),
+                "priority": thread.get("priority"),
+                "status": thread.get("status"),
+                "type": thread.get("type"),
+                "impact": thread.get("impact"),
+                "path": thread.get("path"),
+                "business_logic_tests": tests,
+                "next_offline_command": thread.get("next_offline_command"),
+                "current_blocker": thread.get("current_blocker"),
+                "reportability_gate": thread.get("reportability_gate"),
+            }
+        )
+    if any(row.get("business_logic_tests") for row in rows):
+        status = "mapped"
+    else:
+        status = "no-high-value-business-logic-threads"
+    if rows and blocked_count == len(rows):
+        status = "mapped-resource-gated"
+    return {
+        "status": status,
+        "summary": {
+            "threads": len(rows),
+            "blocked_threads": blocked_count,
+            "dimension_counts": dict(sorted(dimension_counts.items())),
+            "source_ids": ["owasp-wstg-business-logic", "portswigger-business-logic"],
+        },
+        "threads": rows,
+        "reportability_gate": (
+            "Business-logic mapping is a prioritization aid only. A Medium/High/Critical claim still needs "
+            "endpoint-specific evidence proving data validation failure, forged request impact, integrity mismatch, "
+            "workflow bypass, or resource/provider misuse."
+        ),
+        "safety": (
+            "Offline methodology mapping only. It does not execute requests, run scanners, sign wallets, submit "
+            "transactions, or validate impact."
+        ),
+    }
+
+
 def build_methodology_review(
     *,
     target: str,
@@ -8635,6 +8769,10 @@ def build_methodology_review(
             }
         )
     high_value_threads.sort(key=methodology_thread_rank)
+    business_logic_map = build_business_logic_methodology_map(
+        high_value_threads,
+        limit=max(1, int(limit)),
+    )
 
     focus = harness_loop.get("focus") if isinstance(harness_loop.get("focus"), dict) else {}
     resource_budget = resource_budget_for_snapshot(resource_snapshot)
@@ -8663,6 +8801,7 @@ def build_methodology_review(
         "summary": summary,
         "research_sources": METHODOLOGY_RESEARCH_SOURCES,
         "stage_reviews": stage_reviews,
+        "business_logic_map": business_logic_map,
         "high_value_threads": high_value_threads[: max(1, int(limit))],
         "resource_preflight": validation_resource_preflight_summary(resource_snapshot),
         "artifact_refs": {
@@ -43649,6 +43788,25 @@ def run_methodology_review(args: argparse.Namespace) -> int:
         if args.show_commands:
             for ref in (stage.get("offline_commands", []) or [])[:2]:
                 print(f"    - {format_command_ref_label(ref)} {inline_summary_text(ref.get('command'), max_chars=420)}")
+    business_logic_map = review.get("business_logic_map", {}) if isinstance(review.get("business_logic_map"), dict) else {}
+    if business_logic_map:
+        bl_summary = business_logic_map.get("summary", {}) if isinstance(business_logic_map.get("summary"), dict) else {}
+        print(
+            "Business logic map: "
+            f"{business_logic_map.get('status')} "
+            f"threads={bl_summary.get('threads', 0)} "
+            f"dimensions={json.dumps(bl_summary.get('dimension_counts', {}), sort_keys=True)}"
+        )
+        for row in (business_logic_map.get("threads", []) or [])[: min(3, max(0, int(args.limit)))]:
+            test_ids = [
+                str(test.get("id"))
+                for test in row.get("business_logic_tests", []) or []
+                if isinstance(test, dict)
+            ]
+            print(
+                f"- {row.get('priority')} {row.get('status')} "
+                f"path={row.get('path') or '-'} tests={','.join(test_ids[:4])}"
+            )
     print("High-value threads:")
     for thread in (review.get("high_value_threads", []) or [])[: max(0, int(args.limit))]:
         print(

@@ -270,6 +270,21 @@ use it after `resource-snapshot --strict` to decide whether to deepen an
 existing lead, regenerate passive leads, refresh adjudication, or stop because
 there is no reportable evidence yet.
 
+Use `methodology-review` to align the harness with business-logic testing
+methodology before broadening. It maps high-value threads to offline-safe
+business logic dimensions such as data validation, request forgery, integrity
+checks, workflow circumvention, and misuse/function-use limits:
+
+```bash
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  methodology-review --no-write --show-commands
+```
+
+The business-logic map is still a prioritization aid, not a finding. A
+Medium/High/Critical claim still requires endpoint-specific evidence proving a
+data validation failure, forged request impact, transaction/upstream integrity
+mismatch, workflow bypass, or quota/provider/resource misuse.
+
 When the loop is ready but no reportable evidence exists, use
 `hypothesis-matrix` to rank the next research questions from current local
 artifacts:
