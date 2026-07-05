@@ -30663,6 +30663,8 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "--check-dir",
                 str(discovered_dir),
                 "--no-write",
+                "--top",
+                "8",
             ]
         )
         stdout_buffer = io.StringIO()
@@ -48465,9 +48467,10 @@ def run_review_blockers(args: argparse.Namespace) -> int:
             f"run_status_counts={json.dumps(review_blockers['summary']['run_status_counts'], sort_keys=True)}"
         )
     groups = review_blockers.get("groups", []) or []
+    display_limit = max(0, int(args.top))
     if groups:
         print("Groups:")
-        for group in groups[:8]:
+        for group in groups[:display_limit]:
             print(f"- {format_review_blocker_group_summary(group)}")
             if no_write:
                 command_refs = review_blocker_group_command_refs(group)
@@ -48485,18 +48488,30 @@ def run_review_blockers(args: argparse.Namespace) -> int:
                 else:
                     for line in review_blocker_group_followup_preview_lines(group):
                         print(line)
-        if len(groups) > 8:
+        if len(groups) > display_limit:
             if no_write:
-                print(f"- {len(groups) - 8} more group(s); rerun without --no-write to write the full blocker artifact")
+                print(
+                    f"- {len(groups) - display_limit} more group(s); "
+                    "rerun without --no-write to write the full blocker artifact"
+                )
             else:
-                print(f"- {len(groups) - 8} more group(s) in {output_path}")
+                print(f"- {len(groups) - display_limit} more group(s) in {output_path}")
     else:
         print("Blockers:")
-        for blocker in review_blockers.get("blockers", [])[:8]:
+        blockers = review_blockers.get("blockers", []) or []
+        for blocker in blockers[:display_limit]:
             print(
                 f"- {blocker.get('id')}: {blocker.get('status')} "
                 f"source={blocker.get('source')} title={blocker.get('title')}"
             )
+        if len(blockers) > display_limit:
+            if no_write:
+                print(
+                    f"- {len(blockers) - display_limit} more blocker(s); "
+                    "rerun without --no-write to write the full blocker artifact"
+                )
+            else:
+                print(f"- {len(blockers) - display_limit} more blocker(s) in {output_path}")
     if no_write:
         print("No files written (--no-write).")
     else:
@@ -54025,6 +54040,12 @@ def build_parser() -> argparse.ArgumentParser:
     review_blockers.add_argument(
         "--markdown-output",
         help="Where to write review-blockers.md. Defaults to --artifact-dir/review-blockers.md.",
+    )
+    review_blockers.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of blocker groups or fallback blockers to print in the CLI summary.",
     )
     review_blockers.add_argument(
         "--no-write",
