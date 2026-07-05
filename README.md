@@ -1341,6 +1341,10 @@ commands, read-only refresh commands, and explicit external blockers.
 Use `verification-queue --no-write` to preview the queue status, command safety
 totals, top queue items, and labeled command previews without writing queue
 artifacts, reproduction steps, review blocker outputs, or refreshed manifests.
+Add `--current-resource-check` before considering active target traffic; when
+local memory or swap pressure makes the resource gate unhealthy, active queue
+items such as bounded `audit` reruns are marked `blocked-resource` while
+offline index/gate commands remain available.
 Manual-review or external-blocker items that have no generated command template
 also print compact follow-up details, including reason, prerequisites, review
 candidates, evidence refs, and safety notes, so commandless review work is

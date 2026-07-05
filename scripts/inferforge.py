@@ -29465,6 +29465,74 @@ def apply_verification_queue_command_statuses(items: list[dict[str, Any]]) -> No
             item["command_status_reason"] = "No command templates are runnable under the current command-safety policy."
 
 
+def verification_queue_command_requires_active_target(command: str) -> bool:
+    tokens = validation_command_tokens(command)
+    if "--no-write" in tokens:
+        return False
+    if any(
+        token in tokens
+        for token in [
+            "audit",
+            "burp-observe",
+            "burp-sync",
+            "collect",
+            "collect-quote",
+            "collect-orca-baseline",
+        ]
+    ):
+        return True
+    return "websocket-candidate-review" in tokens and "--handshake-baseline" in tokens
+
+
+def verification_queue_resource_blocks_active(resource_preflight: dict[str, Any] | None) -> bool:
+    if not isinstance(resource_preflight, dict):
+        return False
+    status = str(resource_preflight.get("status") or "not-run")
+    if status in {"", "not-run"}:
+        return False
+    budget = resource_preflight.get("resource_budget") if isinstance(resource_preflight.get("resource_budget"), dict) else {}
+    if budget.get("active_target_traffic") == "blocked":
+        return True
+    return status not in {"healthy", "not-run"}
+
+
+def apply_verification_queue_resource_gate(
+    items: list[dict[str, Any]],
+    resource_preflight: dict[str, Any] | None,
+) -> None:
+    if not verification_queue_resource_blocks_active(resource_preflight):
+        return
+    resource_status = str((resource_preflight or {}).get("status") or "unknown")
+    budget = (
+        (resource_preflight or {}).get("resource_budget")
+        if isinstance((resource_preflight or {}).get("resource_budget"), dict)
+        else {}
+    )
+    budget_mode = str(budget.get("mode") or resource_status)
+    for item in items:
+        if item.get("status") != "ready":
+            continue
+        active_commands = [
+            command
+            for command in item.get("commands", []) or []
+            if verification_queue_command_requires_active_target(str(command))
+        ]
+        if not active_commands:
+            continue
+        item["status"] = "blocked-resource"
+        item["resource_status"] = resource_status
+        item["resource_budget_mode"] = budget_mode
+        item["resource_status_reason"] = (
+            f"Current resource gate is {resource_status}/{budget_mode}; active target traffic is blocked."
+        )
+        item.setdefault("prerequisites", [])
+        if isinstance(item["prerequisites"], list):
+            item["prerequisites"] = [
+                "Run resource-snapshot --strict until healthy before active target traffic.",
+                *item["prerequisites"],
+            ]
+
+
 def verification_command_for_profile(profile_path: str, artifact_dir: Path | None, subcommand: str) -> str:
     parts = ["python3", "scripts/inferforge.py", "--profile", profile_path]
     if artifact_dir is not None:
@@ -29650,6 +29718,7 @@ def build_verification_queue(
     environment_readiness: dict[str, Any] | None,
     artifact_dir: Path | None = None,
     attack_strategy: dict[str, Any] | None = None,
+    current_resource_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     cmd = lambda subcommand: verification_command(clusters, artifact_dir, subcommand)
@@ -30400,6 +30469,8 @@ def build_verification_queue(
 
     command_safety = annotate_verification_queue_commands(items)
     apply_verification_queue_command_statuses(items)
+    resource_preflight = validation_resource_preflight_summary(current_resource_snapshot)
+    apply_verification_queue_resource_gate(items, resource_preflight)
     status_counts: dict[str, int] = {}
     for item in items:
         status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
@@ -30409,6 +30480,8 @@ def build_verification_queue(
         status = "needs-human-review"
     elif status_counts.get("blocked-external"):
         status = "ready-with-external-blockers"
+    elif status_counts.get("blocked-resource"):
+        status = "resource-gated"
     else:
         status = "ready"
 
@@ -30425,7 +30498,16 @@ def build_verification_queue(
             "readiness": (environment_readiness or {}).get("status"),
             "attack_strategy": (attack_strategy or {}).get("status"),
             "command_safety": command_safety,
+            "current_resource_snapshot": resource_preflight.get("status") or "not-run",
+            "resource_budget_mode": (
+                (resource_preflight.get("resource_budget") or {}).get("mode")
+                if isinstance(resource_preflight.get("resource_budget"), dict)
+                else None
+            )
+            or resource_preflight.get("status")
+            or "not-run",
         },
+        "resource_preflight": resource_preflight,
         "items": items,
         "artifact_refs": {
             "evidence_appendix": "evidence-appendix.json",
@@ -30873,6 +30955,7 @@ def verification_queue_item_status_rank(status: str) -> int:
         "manual-review": 0,
         "blocked": 0,
         "blocked-external": 1,
+        "blocked-resource": 1,
         "ready": 2,
     }.get(status, 9)
 
@@ -30943,9 +31026,13 @@ def verification_queue_command_preview_lines(item: dict[str, Any], *, limit: int
     if not command_refs:
         return []
     lines = []
+    item_status = str(item.get("status") or "")
     for ref in command_refs[:limit]:
         command = inline_summary_text(ref.get("command"), max_chars=500)
-        lines.append(f"    - {format_command_ref_label(ref)} {command}")
+        label = format_command_ref_label(ref)
+        if item_status == "blocked-resource" and verification_queue_command_requires_active_target(str(ref.get("command") or "")):
+            label = replace_command_ref_label_status(label, "blocked-resource")
+        lines.append(f"    - {label} {command}")
     if len(command_refs) > limit:
         lines.append(f"    - ... +{len(command_refs) - limit} more commands")
     if str(item.get("status") or "") == "blocked-external":
@@ -44089,6 +44176,35 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         {"status": "ready"},
         ROOT / ".greybox/selftest",
     )
+    blackbox_resource_gated_verification_queue_sample = build_verification_queue(
+        "http://blackbox.test",
+        blackbox_clusters_sample,
+        None,
+        {"gaps": []},
+        {"status": "covered"},
+        {"status": "no-reportable-findings", "external_blockers": [], "decisions": []},
+        {"status": "ready"},
+        ROOT / ".greybox/selftest",
+        current_resource_snapshot={
+            "status": "warning",
+            "warnings": ["swap-usage-above-threshold"],
+            "memory": {"swap_used_pct": 62.0},
+            "resource_budget": build_resource_budget(
+                "warning",
+                ["swap-usage-above-threshold"],
+                {"swap_used_pct": 62.0},
+            ),
+        },
+    )
+    blackbox_resource_gated_audit_item = validation_queue_items_by_id(
+        blackbox_resource_gated_verification_queue_sample
+    ).get("VERIFY-safe-audit-loop", {})
+    blackbox_resource_gated_gate_item = validation_queue_items_by_id(
+        blackbox_resource_gated_verification_queue_sample
+    ).get("VERIFY-reportability-gates", {})
+    blackbox_resource_gated_audit_preview_text = "\n".join(
+        verification_queue_command_preview_lines(blackbox_resource_gated_audit_item)
+    )
     blackbox_verification_command_text = "\n".join(
         str(command)
         for item in blackbox_verification_queue_sample.get("items", [])
@@ -45094,6 +45210,15 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_target_info_sample.get("health_source") == "blackbox-burp-history"
         and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_verification_command_text
         and EXTERNAL_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_verification_command_text
+        and blackbox_resource_gated_verification_queue_sample.get("summary", {}).get("current_resource_snapshot")
+        == "warning"
+        and blackbox_resource_gated_verification_queue_sample.get("summary", {}).get("status_counts", {}).get(
+            "blocked-resource"
+        )
+        == 1
+        and blackbox_resource_gated_audit_item.get("status") == "blocked-resource"
+        and blackbox_resource_gated_gate_item.get("status") == "ready"
+        and "[blocked-resource]" in blackbox_resource_gated_audit_preview_text
         and blackbox_asset_map_sample.get("status") == "candidates-found"
         and blackbox_asset_map_sample.get("page", {}).get("script_urls_seen") == 2
         and blackbox_asset_map_sample.get("page", {}).get("same_origin_script_urls_seen") == 1
@@ -48052,6 +48177,19 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "focus_stage_counts",
                 {},
             ),
+            "resource_gated_queue": {
+                "status": "passed"
+                if (
+                    blackbox_resource_gated_audit_item.get("status") == "blocked-resource"
+                    and blackbox_resource_gated_gate_item.get("status") == "ready"
+                    and "[blocked-resource]" in blackbox_resource_gated_audit_preview_text
+                )
+                else "failed",
+                "summary": blackbox_resource_gated_verification_queue_sample.get("summary", {}),
+                "audit_item": blackbox_resource_gated_audit_item,
+                "gate_item": blackbox_resource_gated_gate_item,
+                "audit_preview": blackbox_resource_gated_audit_preview_text,
+            },
             "focused_iteration": {
                 "status": "passed"
                 if (
@@ -49999,6 +50137,11 @@ def run_verification_queue(args: argparse.Namespace) -> int:
         write_target_profile_artifact(artifact_dir, profile, target, source_root)
     clusters_path = artifact_dir / "endpoint-clusters.json"
     clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
+    current_resource_snapshot = (
+        build_default_resource_snapshot(max_processes=8)
+        if getattr(args, "current_resource_check", False)
+        else None
+    )
     verification_queue = build_verification_queue(
         target,
         clusters,
@@ -50009,6 +50152,7 @@ def run_verification_queue(args: argparse.Namespace) -> int:
         load_optional_json(artifact_dir / "environment-readiness.json"),
         artifact_dir,
         attack_strategy=load_optional_json(artifact_dir / "attack-strategy.json"),
+        current_resource_snapshot=current_resource_snapshot,
     )
     verification_queue_path = artifact_dir / "verification-queue.json"
     reproduction_steps_path = artifact_dir / "reproduction-steps.md"
@@ -50051,6 +50195,13 @@ def run_verification_queue(args: argparse.Namespace) -> int:
         "Command safety: "
         f"{format_command_safety_summary(verification_queue['summary'].get('command_safety', {}) or {})}"
     )
+    if getattr(args, "current_resource_check", False):
+        summary = verification_queue.get("summary", {}) or {}
+        print(
+            "Resource preflight: "
+            f"status={summary.get('current_resource_snapshot') or 'not-run'} "
+            f"mode={summary.get('resource_budget_mode') or 'not-run'}"
+        )
     item_summaries = top_verification_queue_item_summaries(verification_queue)
     if item_summaries:
         print("Queue items:")
@@ -55912,6 +56063,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-write",
         action="store_true",
         help="Print queue summary only; do not write verification-queue.json, reproduction steps, review blockers, or refreshed manifests.",
+    )
+    verification_queue.add_argument(
+        "--current-resource-check",
+        action="store_true",
+        help="Read current local resource state and mark active target-traffic queue items blocked when the resource gate is unhealthy.",
     )
     verification_queue.set_defaults(func=run_verification_queue)
 
