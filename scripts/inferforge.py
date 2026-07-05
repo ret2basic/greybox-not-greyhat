@@ -9929,12 +9929,42 @@ def build_rewrite_evidence_closure(
     approved_response_count = int(response_item.get("observed_approved_response_count") or 0)
     candidate_impact_count = int(response_item.get("candidate_impact_observation_count") or 0)
     rewrite_indexed = bool(rewrite_review)
+    source_guard_summary = source_guard.get("summary", {}) if isinstance(source_guard.get("summary"), dict) else {}
+    config_rewrite_refs = int(source_guard_summary.get("next_config_rewrite_refs") or 0)
+    rewrite_destination_refs = int(source_guard_summary.get("rewrite_destination_refs") or 0)
+    positive_guard_refs = int(source_guard_summary.get("positive_guard_refs") or 0)
     requirements = [
         methodology_requirement(
             "rewrite-review-indexed",
             "passed" if rewrite_indexed else "waiting",
             rewrite_review,
             "Run rewrite-review --no-write --show-next to index the fixed-upstream rewrite/proxy shape.",
+        ),
+        methodology_requirement(
+            "config-rewrite-source-indexed",
+            "passed" if config_rewrite_refs or rewrite_destination_refs or source_guard else "waiting",
+            {
+                "source_guard_status": source_guard.get("status") or "missing",
+                "next_config_rewrite_refs": config_rewrite_refs,
+                "rewrite_destination_refs": rewrite_destination_refs,
+                "fixed_upstream_fetch_refs": source_guard_summary.get("fixed_upstream_fetch_refs", 0),
+            },
+            "Index the Next config rewrite source, destination expression, or route-handler source guard evidence.",
+        ),
+        methodology_requirement(
+            "positive-source-guard-status-reviewed",
+            "passed" if positive_guard_refs else "ready-offline" if config_rewrite_refs or rewrite_destination_refs else "waiting",
+            {
+                "positive_guard_refs": positive_guard_refs,
+                "config_rewrite_refs": config_rewrite_refs,
+                "rewrite_destination_refs": rewrite_destination_refs,
+            },
+            (
+                "Positive route guards are absent for a config rewrite; keep this as static risk context and require "
+                "one approved response before any reportability claim."
+            )
+            if config_rewrite_refs or rewrite_destination_refs
+            else "Review source for positive route, path, or parameter guards before treating the proxy boundary as constrained.",
         ),
         methodology_requirement(
             "approved-read-only-path-candidate",
@@ -10007,6 +10037,9 @@ def build_rewrite_evidence_closure(
             "rewrite_response_review": response_review.get("status"),
             "observed_approved_responses": approved_response_count,
             "candidate_impact_observations": candidate_impact_count,
+            "next_config_rewrite_refs": config_rewrite_refs,
+            "rewrite_destination_refs": rewrite_destination_refs,
+            "positive_guard_refs": positive_guard_refs,
         },
         "requirements": requirements,
         "missing_requirements": [
