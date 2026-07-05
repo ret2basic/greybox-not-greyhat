@@ -448,7 +448,11 @@ The same command also performs a bounded offline source review for WebSocket
 proxies that forward client request headers to an upstream socket. A
 `needs-source-header-review` result is a lead only: it requires authentication
 context, browser/client header constraints, and upstream trust or disclosure
-evidence before it can become a reportable finding.
+evidence before it can become a reportable finding. The source review also
+classifies local cookie/auth context: sensitive or unknown app auth keeps the
+lead at `medium`, while non-sensitive preference cookies such as `theme` and
+server-to-upstream bearer headers stay `low` until stronger browser auth
+material is shown.
 
 For takeover-oriented Web/App scope checks, keep the host list explicit:
 

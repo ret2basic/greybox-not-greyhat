@@ -7458,6 +7458,50 @@ WEBSOCKET_HEADER_FORWARDING_CONTEXT_HEADERS = {
     "x-forwarded-for",
     "x-real-ip",
 }
+WEBSOCKET_AUTH_SENSITIVE_COOKIE_TERMS = {
+    "account",
+    "auth",
+    "csrf",
+    "jwt",
+    "login",
+    "session",
+    "sid",
+    "token",
+    "user",
+    "wallet",
+}
+WEBSOCKET_AUTH_NON_SENSITIVE_COOKIE_NAMES = {
+    "color-scheme",
+    "lang",
+    "locale",
+    "theme",
+}
+DOCUMENT_COOKIE_ASSIGN_RE = re.compile(
+    r"\bdocument\.cookie\s*=\s*(?P<quote>['\"`])(?P<name>[A-Za-z0-9_.:-]+)\s*=",
+    re.IGNORECASE,
+)
+COOKIE_SET_RE = re.compile(
+    r"(?:\bcookies\(\)|\.cookies)\.set\s*\(\s*['\"](?P<name>[A-Za-z0-9_.:-]+)['\"]",
+    re.IGNORECASE,
+)
+SET_COOKIE_HEADER_RE = re.compile(
+    r"['\"]Set-Cookie['\"][^'\"]*['\"](?P<name>[A-Za-z0-9_.:-]+)\s*=",
+    re.IGNORECASE,
+)
+COOKIE_HEADER_READ_RE = re.compile(
+    r"(?:\bheaders\(\)|\b(?:req|request)\.headers)\.get\s*\(\s*['\"]cookie['\"]"
+    r"|\b(?:req|request)\.headers\s*\[\s*['\"]cookie['\"]\s*\]",
+    re.IGNORECASE,
+)
+AUTHORIZATION_HEADER_READ_RE = re.compile(
+    r"(?:\bheaders\(\)|\b(?:req|request)\.headers)\.get\s*\(\s*['\"]authorization['\"]"
+    r"|\b(?:req|request)\.headers\s*\[\s*['\"]authorization['\"]\s*\]",
+    re.IGNORECASE,
+)
+SERVER_AUTHORIZATION_HEADER_RE = re.compile(
+    r"\bauthorization\s*:\s*(?:`|'|\")?\s*(?:Bearer|\$\{|process\.env|config\.)",
+    re.IGNORECASE,
+)
 
 
 def websocket_header_forwarding_source_tokens() -> dict[str, list[str]]:
@@ -7507,12 +7551,206 @@ def explicit_header_filter_literals(text: str, headers: set[str]) -> list[str]:
     return found
 
 
+def websocket_cookie_name_sensitivity(name: str) -> str:
+    lowered = name.strip().lower()
+    if not lowered:
+        return "unknown"
+    if lowered in WEBSOCKET_AUTH_NON_SENSITIVE_COOKIE_NAMES:
+        return "non-sensitive"
+    parts = {part for part in re.split(r"[^a-z0-9]+", lowered) if part}
+    if lowered in WEBSOCKET_AUTH_SENSITIVE_COOKIE_TERMS or parts.intersection(WEBSOCKET_AUTH_SENSITIVE_COOKIE_TERMS):
+        return "sensitive"
+    if any(term in lowered for term in WEBSOCKET_AUTH_SENSITIVE_COOKIE_TERMS):
+        return "sensitive"
+    if any(term in lowered for term in ["theme", "locale", "preference", "analytics"]):
+        return "non-sensitive"
+    return "unknown"
+
+
+def build_websocket_auth_context_review(
+    source_root: Path,
+    *,
+    max_file_bytes: int = DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES,
+    max_files: int = 160,
+) -> dict[str, Any]:
+    if not source_root.is_dir():
+        return {
+            "status": "source-root-unavailable",
+            "summary": {
+                "files_scanned": 0,
+                "skipped": 0,
+                "sensitive_context_refs": 0,
+                "unknown_context_refs": 0,
+                "non_sensitive_cookie_refs": 0,
+                "server_authorization_header_refs": 0,
+            },
+            "evidence": [],
+            "skipped": [],
+        }
+
+    scanned = 0
+    skipped = []
+    evidence: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(source_root):
+        dirnames[:] = sorted(
+            dirname
+            for dirname in dirnames
+            if dirname not in SOURCE_SCAN_SKIP_DIRS and not dirname.startswith(".")
+        )
+        for filename in sorted(filenames):
+            if scanned >= max_files:
+                break
+            path = Path(dirpath) / filename
+            if path.suffix not in SOURCE_SCAN_SUFFIXES or path.name.endswith(".d.ts"):
+                continue
+            key = str(path.resolve())
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            rel = source_root_relative_or_repo(path, source_root)
+            try:
+                stat = path.stat()
+            except OSError as error:
+                skipped.append({"file": rel, "reason": "stat-failed", "error": redacted_error_summary(error)})
+                continue
+            if stat.st_size > max_file_bytes:
+                skipped.append(
+                    {
+                        "file": rel,
+                        "reason": "file-too-large",
+                        "bytes": stat.st_size,
+                        "max_file_bytes": max_file_bytes,
+                    }
+                )
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as error:
+                skipped.append({"file": rel, "reason": "read-failed", "error": redacted_error_summary(error)})
+                continue
+
+            scanned += 1
+            for line_no, line in enumerate(text.splitlines(), start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                matched_cookie = False
+                for pattern, category in [
+                    (DOCUMENT_COOKIE_ASSIGN_RE, "document-cookie-write"),
+                    (COOKIE_SET_RE, "server-cookie-set"),
+                    (SET_COOKIE_HEADER_RE, "set-cookie-header"),
+                ]:
+                    match = pattern.search(stripped)
+                    if not match:
+                        continue
+                    cookie_name = str(match.group("name") or "")
+                    evidence.append(
+                        {
+                            "file": rel,
+                            "line": line_no,
+                            "category": category,
+                            "cookie_name": cookie_name,
+                            "sensitivity": websocket_cookie_name_sensitivity(cookie_name),
+                            "sample": redact_text(stripped, max_chars=220) or "",
+                        }
+                    )
+                    matched_cookie = True
+                    break
+                if matched_cookie:
+                    continue
+                if COOKIE_HEADER_READ_RE.search(stripped):
+                    evidence.append(
+                        {
+                            "file": rel,
+                            "line": line_no,
+                            "category": "request-cookie-read",
+                            "sensitivity": "sensitive",
+                            "sample": redact_text(stripped, max_chars=220) or "",
+                        }
+                    )
+                    continue
+                if AUTHORIZATION_HEADER_READ_RE.search(stripped):
+                    evidence.append(
+                        {
+                            "file": rel,
+                            "line": line_no,
+                            "category": "request-authorization-read",
+                            "sensitivity": "sensitive",
+                            "sample": redact_text(stripped, max_chars=220) or "",
+                        }
+                    )
+                    continue
+                if SERVER_AUTHORIZATION_HEADER_RE.search(stripped):
+                    evidence.append(
+                        {
+                            "file": rel,
+                            "line": line_no,
+                            "category": "server-upstream-authorization-header",
+                            "sensitivity": "server-upstream",
+                            "sample": redact_text(stripped, max_chars=220) or "",
+                        }
+                    )
+        if scanned >= max_files:
+            break
+
+    sensitive_refs = [item for item in evidence if item.get("sensitivity") == "sensitive"]
+    unknown_refs = [item for item in evidence if item.get("sensitivity") == "unknown"]
+    non_sensitive_refs = [item for item in evidence if item.get("sensitivity") == "non-sensitive"]
+    server_authorization_refs = [item for item in evidence if item.get("sensitivity") == "server-upstream"]
+    if sensitive_refs:
+        status = "sensitive-app-auth-context"
+    elif unknown_refs:
+        status = "generic-auth-context-needs-review"
+    elif non_sensitive_refs:
+        status = "non-sensitive-cookie-only"
+    else:
+        status = "no-app-auth-context-evidence"
+    return {
+        "status": status,
+        "summary": {
+            "files_scanned": scanned,
+            "skipped": len(skipped),
+            "sensitive_context_refs": len(sensitive_refs),
+            "unknown_context_refs": len(unknown_refs),
+            "non_sensitive_cookie_refs": len(non_sensitive_refs),
+            "server_authorization_header_refs": len(server_authorization_refs),
+        },
+        "evidence": evidence[:24],
+        "sensitive_context_evidence": sensitive_refs[:12],
+        "unknown_context_evidence": unknown_refs[:12],
+        "non_sensitive_cookie_evidence": non_sensitive_refs[:12],
+        "server_authorization_header_evidence": server_authorization_refs[:12],
+        "skipped": skipped,
+        "reportability_gate": (
+            "Auth-context source review only. Non-sensitive preference cookies and server-to-upstream bearer headers "
+            "do not prove browser user auth material would be forwarded by the WebSocket proxy."
+        ),
+    }
+
+
 def build_websocket_header_forwarding_review(
     source_root: Path,
     *,
     max_file_bytes: int = DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES,
     max_files: int = 160,
 ) -> dict[str, Any]:
+    auth_context = build_websocket_auth_context_review(
+        source_root,
+        max_file_bytes=max_file_bytes,
+        max_files=max_files,
+    )
+    auth_context_status = str(auth_context.get("status") or "unknown")
+    auth_context_summary = (
+        auth_context.get("summary")
+        if isinstance(auth_context.get("summary"), dict)
+        else {}
+    )
+    auth_context_medium_statuses = {
+        "sensitive-app-auth-context",
+        "generic-auth-context-needs-review",
+    }
+    lead_priority = "medium" if auth_context_status in auth_context_medium_statuses else "low"
     tokens = websocket_header_forwarding_source_tokens()
     category_matches: dict[str, list[dict[str, Any]]] = {category: [] for category in tokens}
     files = []
@@ -7530,11 +7768,14 @@ def build_websocket_header_forwarding_review(
                 "lead_count": 0,
                 "filtered_forwarding_files": 0,
                 "missing_sensitive_header_filters": sorted(WEBSOCKET_HEADER_FORWARDING_REQUIRED_FILTERS),
+                "auth_context_status": auth_context_status,
+                "auth_context_summary": auth_context_summary,
                 "category_match_counts": {category: 0 for category in tokens},
             },
             "files": [],
             "skipped": [],
             "leads": [],
+            "auth_context": auth_context,
             "reportability_gate": (
                 "No source root was available. This review cannot prove or dismiss WebSocket header-forwarding impact."
             ),
@@ -7674,10 +7915,20 @@ def build_websocket_header_forwarding_review(
                     {
                         "id": f"websocket-header-forwarding:{safe_probe_id(rel)}",
                         "status": file_status,
-                        "priority": "medium",
+                        "priority": lead_priority,
                         "file": rel,
                         "missing_sensitive_header_filters": missing_sensitive_filters,
                         "context_headers_seen": context_headers,
+                        "auth_context_status": auth_context_status,
+                        "auth_context_summary": auth_context_summary,
+                        "auth_context_evidence": {
+                            "sensitive": auth_context.get("sensitive_context_evidence", [])[:4],
+                            "unknown": auth_context.get("unknown_context_evidence", [])[:4],
+                            "non_sensitive_cookie": auth_context.get("non_sensitive_cookie_evidence", [])[:4],
+                            "server_authorization_header": auth_context.get(
+                                "server_authorization_header_evidence", []
+                            )[:4],
+                        },
                         "evidence": evidence,
                         "required_evidence": [
                             "Confirm whether the application sets cookies, session tokens, or Authorization material on the WebSocket origin.",
@@ -7726,6 +7977,8 @@ def build_websocket_header_forwarding_review(
             "filtered_forwarding_files": sum(1 for item in files if item.get("status") == "header-forwarding-filtered"),
             "status_counts": dict(sorted(status_counts.items())),
             "missing_sensitive_header_filters": all_missing_filters,
+            "auth_context_status": auth_context_status,
+            "auth_context_summary": auth_context_summary,
             "category_match_counts": {
                 category: len(matches)
                 for category, matches in sorted(category_matches.items())
@@ -7734,6 +7987,7 @@ def build_websocket_header_forwarding_review(
         "files": files,
         "skipped": skipped,
         "leads": leads,
+        "auth_context": auth_context,
         "reportability_gate": (
             "This source review only identifies WebSocket header-forwarding patterns and is not reportable by itself. "
             "It does not prove a vulnerability without auth/header context, browser/client constraints, and upstream "
@@ -7863,6 +8117,14 @@ def build_websocket_candidate_review(
             "source_review_unresolved": source_review_unresolved,
             "source_header_forwarding_leads": len(source_review.get("leads", []) or []),
             "source_header_forwarding_files": (source_review.get("summary") or {}).get("interesting_files", 0),
+            "source_auth_context_status": (source_review.get("summary") or {}).get(
+                "auth_context_status",
+                "not-run",
+            ),
+            "source_auth_context_summary": (source_review.get("summary") or {}).get(
+                "auth_context_summary",
+                {},
+            ),
         },
         "candidates": candidates,
         "source_review": source_review,
@@ -9420,7 +9682,7 @@ def hypothesis_from_queue_item(
     offline_only = bool(item.get("offline_only")) or not bool(item.get("commands"))
     if item_id.startswith("VERIFY-evidence") or item_id.startswith("VERIFY-reportability"):
         offline_only = True
-    priority = hypothesis_priority_from_values(item.get("priority"), "medium")
+    priority = hypothesis_priority_from_values(item.get("priority") or "medium")
     return {
         "id": f"HYP-queue-{safe_hypothesis_id(item_id)}",
         "type": "verification-queue",
@@ -25066,14 +25328,36 @@ def build_verification_queue(
     ]
     if websocket_header_forwarding_leads:
         websocket_source_summary = websocket_source_review.get("summary", {}) if isinstance(websocket_source_review.get("summary"), dict) else {}
+        websocket_auth_context = (
+            websocket_source_review.get("auth_context")
+            if isinstance(websocket_source_review.get("auth_context"), dict)
+            else {}
+        )
+        websocket_auth_context_status = str(
+            websocket_source_summary.get("auth_context_status")
+            or websocket_auth_context.get("status")
+            or "unknown"
+        )
+        websocket_auth_context_summary = (
+            websocket_source_summary.get("auth_context_summary")
+            if isinstance(websocket_source_summary.get("auth_context_summary"), dict)
+            else websocket_auth_context.get("summary")
+            if isinstance(websocket_auth_context.get("summary"), dict)
+            else {}
+        )
+        websocket_queue_priority = lead_priority_from_values(
+            "low",
+            *[lead.get("priority") for lead in websocket_header_forwarding_leads],
+        )
         add_item(
             "REVIEW-websocket-header-forwarding",
             "Review WebSocket upstream header forwarding",
             "manual-review",
-            "medium",
+            websocket_queue_priority,
             (
                 f"{len(websocket_header_forwarding_leads)} WebSocket source lead(s) forward client request headers "
-                "toward an upstream socket without enough evidence to classify impact."
+                "toward an upstream socket without enough evidence to classify impact. "
+                f"Auth context: {websocket_auth_context_status}."
             ),
             commands=[cmd("websocket-candidate-review --no-write")],
             evidence_refs=[WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT],
@@ -25097,20 +25381,36 @@ def build_verification_queue(
                 "reportability_gate": websocket_source_review.get("reportability_gate")
                 or "WebSocket header forwarding is not reportable without auth/header context and upstream trust evidence.",
                 "required_evidence": [
-                    "Authentication context showing whether cookies, sessions, or Authorization material exist on the WebSocket origin.",
+                    (
+                        "Authentication context showing whether cookies, sessions, or Authorization material exist "
+                        f"on the WebSocket origin; current auth_context={websocket_auth_context_status}."
+                    ),
                     "Evidence that the upstream provider receives, logs, or trusts forwarded headers.",
                     "Browser/client constraint analysis for the exact header needed to demonstrate impact.",
                     "A finding-gate decision showing concrete disclosure, trust-boundary, quota/account, or authorization impact.",
                 ],
                 "websocket_source_review_status": websocket_source_review.get("status"),
                 "websocket_source_review_summary": websocket_source_summary,
+                "websocket_auth_context_status": websocket_auth_context_status,
+                "websocket_auth_context_summary": websocket_auth_context_summary,
+                "websocket_auth_context_evidence": {
+                    "sensitive": websocket_auth_context.get("sensitive_context_evidence", [])[:6],
+                    "unknown": websocket_auth_context.get("unknown_context_evidence", [])[:6],
+                    "non_sensitive_cookie": websocket_auth_context.get("non_sensitive_cookie_evidence", [])[:6],
+                    "server_authorization_header": websocket_auth_context.get(
+                        "server_authorization_header_evidence", []
+                    )[:6],
+                },
                 "websocket_header_forwarding_leads": [
                     {
                         "id": lead.get("id"),
                         "status": lead.get("status"),
+                        "priority": lead.get("priority"),
                         "file": lead.get("file"),
                         "missing_sensitive_header_filters": lead.get("missing_sensitive_header_filters", []),
                         "context_headers_seen": lead.get("context_headers_seen", []),
+                        "auth_context_status": lead.get("auth_context_status"),
+                        "auth_context_summary": lead.get("auth_context_summary", {}),
                         "evidence": lead.get("evidence", [])[:4],
                     }
                     for lead in websocket_header_forwarding_leads[:6]
@@ -37670,6 +37970,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         )
     websocket_header_forwarding_bad_review: dict[str, Any] = {}
     websocket_header_forwarding_filtered_review: dict[str, Any] = {}
+    websocket_header_forwarding_theme_review: dict[str, Any] = {}
+    websocket_header_forwarding_server_auth_review: dict[str, Any] = {}
     websocket_header_forwarding_candidate_review: dict[str, Any] = {}
     websocket_header_forwarding_queue: dict[str, Any] = {}
     websocket_header_forwarding_matrix: dict[str, Any] = {}
@@ -37678,9 +37980,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         ws_header_root = Path(ws_header_temp_dir)
         bad_root = ws_header_root / "bad"
         filtered_root = ws_header_root / "filtered"
+        theme_root = ws_header_root / "theme-only"
+        server_auth_root = ws_header_root / "server-auth-only"
         ws_header_artifact_dir = ws_header_root / "artifacts"
         bad_root.mkdir()
         filtered_root.mkdir()
+        theme_root.mkdir()
+        server_auth_root.mkdir()
         ws_header_artifact_dir.mkdir()
         (bad_root / "server.js").write_text(
             textwrap.dedent(
@@ -37715,6 +38021,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 """
             ).strip()
             + "\n",
+            encoding="utf-8",
+        )
+        (bad_root / "auth.ts").write_text(
+            'document.cookie = "session=redacted; path=/; SameSite=Lax"\n',
             encoding="utf-8",
         )
         (filtered_root / "server.js").write_text(
@@ -37752,6 +38062,31 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             + "\n",
             encoding="utf-8",
         )
+        minimal_unsafe_ws_proxy = (
+            "import { WebSocket } from 'ws'\n"
+            "export function connect(req) { const headers = {}; "
+            "Object.entries(req.headers).forEach(([key, value]) => { headers[key] = value }); "
+            "return new WebSocket('wss://rpc.example.invalid', undefined, { headers }) }\n"
+        )
+        (theme_root / "server.js").write_text(minimal_unsafe_ws_proxy, encoding="utf-8")
+        (theme_root / "app.ts").write_text(
+            'document.cookie = "theme=dark; path=/"\n',
+            encoding="utf-8",
+        )
+        (theme_root / "node_modules").mkdir()
+        (theme_root / "node_modules" / "ignored.ts").write_text(
+            'document.cookie = "session=ignored-generated-file"\n',
+            encoding="utf-8",
+        )
+        (theme_root / "large.ts").write_text(
+            'document.cookie = "session=ignored-large-file"\n' + ("const filler = 1\n" * 240),
+            encoding="utf-8",
+        )
+        (server_auth_root / "server.js").write_text(minimal_unsafe_ws_proxy, encoding="utf-8")
+        (server_auth_root / "rpc.ts").write_text(
+            "const rpcHeaders = { authorization: `Bearer ${config.token}` }\n",
+            encoding="utf-8",
+        )
         (bad_root / "node_modules").mkdir()
         (bad_root / "node_modules/generated.js").write_text(
             "Object.entries(req.headers).forEach(([key, value]) => { headers[key] = value })\n"
@@ -37760,6 +38095,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         )
         websocket_header_forwarding_bad_review = build_websocket_header_forwarding_review(bad_root)
         websocket_header_forwarding_filtered_review = build_websocket_header_forwarding_review(filtered_root)
+        websocket_header_forwarding_theme_review = build_websocket_header_forwarding_review(
+            theme_root,
+            max_file_bytes=2048,
+        )
+        websocket_header_forwarding_server_auth_review = build_websocket_header_forwarding_review(server_auth_root)
         websocket_header_forwarding_candidate_review = build_websocket_candidate_review(
             target="https://ws-header-forwarding.test",
             asset_candidates_doc={"candidates": []},
@@ -37818,23 +38158,66 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         for ref in websocket_validation_item.get("allowed_now", []) or []
         if isinstance(ref, dict)
     )
+    websocket_bad_summary = websocket_header_forwarding_bad_review.get("summary") or {}
+    websocket_bad_auth_summary = websocket_bad_summary.get("auth_context_summary") or {}
+    websocket_bad_leads = websocket_header_forwarding_bad_review.get("leads", []) or []
+    websocket_theme_summary = websocket_header_forwarding_theme_review.get("summary") or {}
+    websocket_theme_auth_summary = websocket_theme_summary.get("auth_context_summary") or {}
+    websocket_theme_leads = websocket_header_forwarding_theme_review.get("leads", []) or []
+    websocket_server_auth_summary = websocket_header_forwarding_server_auth_review.get("summary") or {}
+    websocket_server_auth_context_summary = websocket_server_auth_summary.get("auth_context_summary") or {}
+    websocket_server_auth_leads = websocket_header_forwarding_server_auth_review.get("leads", []) or []
+    websocket_low_queue_hypothesis = hypothesis_from_queue_item(
+        {
+            "id": "REVIEW-websocket-low-context",
+            "status": "manual-review",
+            "priority": "low",
+            "offline_only": True,
+            "commands": [],
+            "impact": "websocket-header-forwarding",
+        },
+        resource_gated=True,
+    ) or {}
     websocket_header_forwarding_passed = (
         websocket_header_forwarding_bad_review.get("status") == "needs-header-trust-review"
-        and (websocket_header_forwarding_bad_review.get("summary") or {}).get("lead_count") == 1
-        and set((websocket_header_forwarding_bad_review.get("summary") or {}).get("missing_sensitive_header_filters", []))
+        and websocket_bad_summary.get("lead_count") == 1
+        and set(websocket_bad_summary.get("missing_sensitive_header_filters", []))
         == {"authorization", "cookie"}
+        and websocket_bad_summary.get("auth_context_status") == "sensitive-app-auth-context"
+        and websocket_bad_auth_summary.get("sensitive_context_refs") == 1
+        and websocket_bad_leads
+        and websocket_bad_leads[0].get("priority") == "medium"
+        and websocket_bad_leads[0].get("auth_context_status") == "sensitive-app-auth-context"
         and websocket_header_forwarding_filtered_review.get("status") == "header-forwarding-filtered"
         and (websocket_header_forwarding_filtered_review.get("summary") or {}).get("lead_count") == 0
+        and websocket_header_forwarding_theme_review.get("status") == "needs-header-trust-review"
+        and websocket_theme_summary.get("auth_context_status") == "non-sensitive-cookie-only"
+        and websocket_theme_auth_summary.get("non_sensitive_cookie_refs") == 1
+        and websocket_theme_auth_summary.get("sensitive_context_refs") == 0
+        and websocket_theme_auth_summary.get("skipped") == 1
+        and websocket_theme_leads
+        and websocket_theme_leads[0].get("priority") == "low"
+        and websocket_header_forwarding_server_auth_review.get("status") == "needs-header-trust-review"
+        and websocket_server_auth_summary.get("auth_context_status") == "no-app-auth-context-evidence"
+        and websocket_server_auth_context_summary.get("server_authorization_header_refs") == 1
+        and websocket_server_auth_context_summary.get("sensitive_context_refs") == 0
+        and websocket_server_auth_leads
+        and websocket_server_auth_leads[0].get("priority") == "low"
         and (websocket_header_forwarding_candidate_review.get("status") == "needs-source-header-review")
         and (websocket_header_forwarding_candidate_review.get("summary") or {}).get("source_review_unresolved") is True
+        and (websocket_header_forwarding_candidate_review.get("summary") or {}).get("source_auth_context_status")
+        == "sensitive-app-auth-context"
         and "not reportable by itself" in str(websocket_header_forwarding_bad_review.get("reportability_gate", ""))
         and websocket_queue_item.get("status") == "manual-review"
+        and websocket_queue_item.get("priority") == "medium"
         and websocket_queue_item.get("offline_only") is True
         and websocket_queue_item.get("impact") == "websocket-header-forwarding"
+        and websocket_queue_item.get("websocket_auth_context_status") == "sensitive-app-auth-context"
         and "websocket-candidate-review --no-write" in "\n".join(websocket_queue_item.get("commands", []) or [])
         and websocket_matrix_hypothesis.get("status") == "ready-for-offline-review"
         and websocket_matrix_hypothesis.get("offline_only") is True
         and websocket_matrix_hypothesis.get("impact") == "websocket-header-forwarding"
+        and websocket_low_queue_hypothesis.get("priority") == "low"
         and websocket_validation_item.get("status") == "ready-offline"
         and "websocket-candidate-review --no-write" in websocket_validation_allowed_now
     )
@@ -44285,7 +44668,8 @@ def run_websocket_candidate_review(args: argparse.Namespace) -> int:
         f"{source_review.get('status', 'not-run')} "
         f"files={source_summary.get('interesting_files', 0)} "
         f"leads={source_summary.get('lead_count', 0)} "
-        f"missing_filters={','.join(source_summary.get('missing_sensitive_header_filters', []) or []) or '(none)'}"
+        f"missing_filters={','.join(source_summary.get('missing_sensitive_header_filters', []) or []) or '(none)'} "
+        f"auth_context={source_summary.get('auth_context_status', 'not-run')}"
     )
     if args.no_write:
         print("No files written (--no-write).")
