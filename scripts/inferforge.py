@@ -22468,6 +22468,16 @@ def build_transaction_corpus_checklist(
         repo_relative_or_absolute(artifact_dir / "transaction-payloads.txt"),
         repo_relative_or_absolute(artifact_dir / "burp-transaction-candidates.json"),
     ]
+    payload_sidecar_files = [
+        transaction_sidecar_file_status(path, DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES)
+        for path in transaction_payload_sidecar_paths(artifact_dir)
+    ]
+    present_payload_sidecar_files = [
+        row for row in payload_sidecar_files if row.get("status") == "present"
+    ]
+    placeholder_payload_sidecar_files = [
+        row for row in present_payload_sidecar_files if row.get("placeholder")
+    ]
     payload_shape_guidance = build_transaction_payload_shape_guidance(profile, artifact_dir)
     intent_policy_sidecar_path = repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json")
     intent_policy_sidecar_templates = [
@@ -22515,7 +22525,7 @@ def build_transaction_corpus_checklist(
         },
         {
             "id": "payload-sidecar",
-            "status": "pending",
+            "status": "waiting-placeholder" if placeholder_payload_sidecar_files else "pending",
             "action": (
                 "Save only the quote response body or extracted transaction payload to transaction-payloads.jsonl, "
                 "transaction-payloads.json, transaction-payloads.txt, or burp-transaction-candidates.json."
@@ -22614,6 +22624,11 @@ def build_transaction_corpus_checklist(
         next_step = "Wait for a healthy resource gate, then capture one approved quote response and save it to a sidecar."
     elif status.startswith("decoded-"):
         next_step = "Review decoded intent checks and only escalate concrete mismatches."
+    elif placeholder_payload_sidecar_files:
+        next_step = (
+            "Replace the empty burp-transaction-candidates.json placeholder with one approved quote response sidecar "
+            "and matching intent policy values."
+        )
     else:
         next_step = "Prepare one approved quote response sidecar and matching intent policy values."
 
@@ -22637,6 +22652,8 @@ def build_transaction_corpus_checklist(
             "quote_collection_status": quote_collection.get("status") or "missing",
             "quote_collection_classification": quote_diagnosis.get("classification") or "missing",
             "quote_collection_success": quote_success,
+            "payload_sidecar_files_present": len(present_payload_sidecar_files),
+            "payload_sidecar_placeholders": len(placeholder_payload_sidecar_files),
             "burp_transaction_candidates": burp_candidate_count,
             "transaction_intent_candidates": candidates_seen,
             "decoded_transactions": decoded_transactions,
@@ -22648,6 +22665,7 @@ def build_transaction_corpus_checklist(
         "policy_templates": policy_templates,
         "capture_steps": capture_steps,
         "payload_sidecars": payload_sidecars,
+        "payload_sidecar_files": payload_sidecar_files,
         "payload_shape_guidance": payload_shape_guidance,
         "intent_policy_sidecar": {
             "path": intent_policy_sidecar_path,
@@ -38460,6 +38478,11 @@ def build_transaction_decoder_selftest(
             profile=profile,
             artifact_dir=empty_artifact_dir,
         )
+        sidecar_empty_corpus_checklist = build_transaction_corpus_checklist(
+            target=DEFAULT_TARGET,
+            profile=profile,
+            artifact_dir=empty_artifact_dir,
+        )
         evm_artifact_dir = Path(temp_dir) / "transaction-sidecar-evm"
         evm_artifact_dir.mkdir()
         write_json(
@@ -38573,9 +38596,16 @@ def build_transaction_decoder_selftest(
         for item in sidecar_empty_shape_review.get("files", []) or []
         if isinstance(item, dict)
     }
+    sidecar_empty_corpus_steps = {
+        item.get("id"): item
+        for item in sidecar_empty_corpus_checklist.get("capture_steps", []) or []
+        if isinstance(item, dict)
+    }
     sidecar_empty_passed = (
         sidecar_empty_review.get("status") == "payload-sidecar-no-candidates"
         and sidecar_empty_review.get("summary", {}).get("placeholder_payload_files") == 1
+        and sidecar_empty_corpus_checklist.get("summary", {}).get("payload_sidecar_placeholders") == 1
+        and sidecar_empty_corpus_steps.get("payload-sidecar", {}).get("status") == "waiting-placeholder"
         and sidecar_empty_guidance.get("configured_candidate_paths") == quote_response_candidate_paths(profile)
         and len(sidecar_empty_guidance.get("examples", []) or []) >= 3
         and "empty burp-transaction-candidates.json" in str(sidecar_empty_guidance.get("empty_burp_candidate_note", ""))
@@ -38591,6 +38621,7 @@ def build_transaction_decoder_selftest(
         and methodology_check_statuses(sidecar_empty_review).get("payload-sidecar-not-empty-placeholder") == "waiting"
         and methodology_check_statuses(sidecar_empty_review).get("payload-sidecar-candidate-bearing") == "waiting"
         and "Replace the empty burp-transaction-candidates.json placeholder" in str(sidecar_empty_review.get("next_step") or "")
+        and "Replace the empty burp-transaction-candidates.json placeholder" in str(sidecar_empty_corpus_checklist.get("next_step") or "")
     )
     sidecar_evm_shape_review = (
         sidecar_evm_review.get("payload_shape_review")
@@ -38704,6 +38735,7 @@ def build_transaction_decoder_selftest(
             "configured_candidate_paths": sidecar_empty_guidance.get("configured_candidate_paths", []),
             "examples": len(sidecar_empty_guidance.get("examples", []) or []),
             "acceptance_checks": methodology_check_statuses(sidecar_empty_review),
+            "corpus_checklist_summary": sidecar_empty_corpus_checklist.get("summary", {}),
         },
         "sidecar_evm_shape_review": {
             "status": "passed" if sidecar_evm_passed else "failed",
@@ -51488,6 +51520,11 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
         f"policy={summary.get('intent_policy_status')} "
         f"gate={summary.get('reportability_status') or 'missing'} "
         f"severity={summary.get('candidate_severity') or 'none'}"
+    )
+    print(
+        "Payload sidecars: "
+        f"present={summary.get('payload_sidecar_files_present', 0)} "
+        f"placeholders={summary.get('payload_sidecar_placeholders', 0)}"
     )
     print(
         "Capture gate: "
