@@ -37615,6 +37615,11 @@ def compact_review_blocker_unblock_plan(plan: dict[str, Any]) -> dict[str, Any]:
     forbidden_validation = normalize_string_list(plan.get("forbidden_validation"))
     if forbidden_validation:
         compact["forbidden_validation"] = forbidden_validation[:6]
+    approval_context = (
+        plan.get("approval_packet_context")
+        if isinstance(plan.get("approval_packet_context"), dict)
+        else {}
+    )
     rewrite_context = (
         plan.get("rewrite_response_context")
         if isinstance(plan.get("rewrite_response_context"), dict)
@@ -37649,6 +37654,46 @@ def compact_review_blocker_unblock_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 "source_refs": compact_source_refs(normalize_string_list(source_context.get("source_refs")))[:8],
                 "catch_all": source_context.get("catch_all"),
             },
+        }
+    if str(plan.get("packet_type") or "") == "transaction-corpus" and approval_context:
+        recommended_quote = (
+            approval_context.get("recommended_quote")
+            if isinstance(approval_context.get("recommended_quote"), dict)
+            else {}
+        )
+        resource_gate = (
+            approval_context.get("resource_capture_gate")
+            if isinstance(approval_context.get("resource_capture_gate"), dict)
+            else {}
+        )
+        compact["transaction_corpus_context"] = {
+            "recommended_quote": {
+                key: recommended_quote.get(key)
+                for key in [
+                    "method",
+                    "path",
+                    "direction",
+                    "sourceMint",
+                    "destinationMint",
+                    "expectedPayloadType",
+                    "programAllowlistStatus",
+                    "allowedPrograms_count",
+                ]
+                if recommended_quote.get(key) is not None
+            },
+            "payload_sidecar": approval_context.get("payload_sidecar"),
+            "accepted_payload_sidecars": normalize_string_list(
+                approval_context.get("accepted_payload_sidecars")
+            )[:8],
+            "intent_policy_sidecar": approval_context.get("intent_policy_sidecar"),
+            "resource_capture_gate": {
+                key: resource_gate.get(key)
+                for key in ["status", "resource_status"]
+                if resource_gate.get(key) is not None
+            },
+            "redacted_sidecar_required_fields": normalize_string_list(
+                approval_context.get("redacted_sidecar_required_fields")
+            )[:8],
         }
     return compact
 
@@ -37903,6 +37948,33 @@ def review_blocker_oracle_evidence_contract(group: dict[str, Any], oracle: dict[
             if isinstance(rewrite_context.get("recommended_request"), dict)
             else {}
         )
+    transaction_context = (
+        selected.get("transaction_corpus_context")
+        if isinstance(selected.get("transaction_corpus_context"), dict)
+        else {}
+    )
+    if transaction_context and not required_fields:
+        required_fields = normalize_string_list(transaction_context.get("redacted_sidecar_required_fields"))
+        sidecar_path = transaction_context.get("payload_sidecar") or transaction_context.get("intent_policy_sidecar")
+        recommended_request = (
+            transaction_context.get("recommended_quote")
+            if isinstance(transaction_context.get("recommended_quote"), dict)
+            else {}
+        )
+    recommended_request_keys = [
+        "method",
+        "path",
+        "client_path",
+        "upstream_path",
+        "cluster_id",
+        "source_ref",
+        "direction",
+        "sourceMint",
+        "destinationMint",
+        "expectedPayloadType",
+        "programAllowlistStatus",
+        "allowedPrograms_count",
+    ]
     return {
         "status": "has-contract",
         "packet_type": selected.get("packet_type"),
@@ -37912,9 +37984,13 @@ def review_blocker_oracle_evidence_contract(group: dict[str, Any], oracle: dict[
         "evidence_artifacts": evidence_artifacts[:12],
         "required_artifact_count": len(evidence_artifacts),
         "sidecar_path": sidecar_path,
+        "payload_sidecar": transaction_context.get("payload_sidecar") if transaction_context else None,
+        "intent_policy_sidecar": (
+            transaction_context.get("intent_policy_sidecar") if transaction_context else None
+        ),
         "recommended_request": {
             key: recommended_request.get(key)
-            for key in ["method", "path", "client_path", "upstream_path", "cluster_id", "source_ref"]
+            for key in recommended_request_keys
             if recommended_request.get(key) is not None
         },
         "required_fields": required_fields[:8],
@@ -38443,6 +38519,51 @@ def finding_gate_preview_unblock_plan(
     return plan
 
 
+def finding_gate_preview_packet_context(
+    preview: dict[str, Any],
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    existing = preview.get("packet_context") if isinstance(preview.get("packet_context"), dict) else {}
+    packet_type = str(preview.get("packet_type") or "").replace("_", "-")
+    packet_key = str(preview.get("packet_key") or "")
+    if existing and normalize_string_list(existing.get("redacted_sidecar_required_fields")):
+        return existing
+    if existing and packet_type != "transaction-corpus" and packet_key != "transaction_corpus_approval_packet":
+        return existing
+
+    def merge_generated_context(generated: dict[str, Any]) -> dict[str, Any]:
+        merged = {**generated, **existing}
+        generated_required = normalize_string_list(generated.get("redacted_sidecar_required_fields"))
+        if generated_required:
+            merged["redacted_sidecar_required_fields"] = generated_required
+        return merged
+
+    if packet_type == "transaction-corpus" or packet_key == "transaction_corpus_approval_packet":
+        checklist = load_optional_json(artifact_dir / "transaction-corpus-checklist.json") or {}
+        packet = (
+            checklist.get("transaction_corpus_approval_packet")
+            if isinstance(checklist.get("transaction_corpus_approval_packet"), dict)
+            else {}
+        )
+        if packet:
+            generated = approval_packet_preview_context("transaction-corpus", packet)
+            return merge_generated_context(generated)
+        generated_packet = transaction_corpus_approval_packet(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            policy_templates=transaction_corpus_policy_templates(profile, artifact_dir),
+            capture_gate=transaction_corpus_capture_gate(None),
+            payload_shape_guidance=build_transaction_payload_shape_guidance(profile, artifact_dir),
+            summary=checklist.get("summary") if isinstance(checklist.get("summary"), dict) else {},
+        )
+        if generated_packet:
+            generated = approval_packet_preview_context("transaction-corpus", generated_packet)
+            return merge_generated_context(generated)
+    return existing
+
+
 def build_review_blockers(
     *,
     target: str,
@@ -38610,8 +38731,14 @@ def build_review_blockers(
             continue
         preview_id = str(preview.get("suspicion_id") or preview.get("id") or "blocked-gate-preview")
         blocker_strings = finding_gate_preview_blocker_strings(preview)
-        unblock_plan = finding_gate_preview_unblock_plan(
+        packet_context = finding_gate_preview_packet_context(
             preview,
+            artifact_dir=artifact_dir,
+            profile=profile,
+        )
+        preview_for_plan = {**preview, "packet_context": packet_context} if packet_context else preview
+        unblock_plan = finding_gate_preview_unblock_plan(
+            preview_for_plan,
             artifact_dir=artifact_dir,
             profile=profile,
         )
@@ -38648,7 +38775,7 @@ def build_review_blockers(
                 "packet_key": preview.get("packet_key"),
                 "packet_type": preview.get("packet_type"),
                 "packet_status": preview.get("packet_status"),
-                "packet_context": preview.get("packet_context", {}),
+                "packet_context": packet_context,
                 "validation_oracle": preview.get("validation_oracle") or unblock_plan.get("validation_oracle"),
                 "oracle_type": preview.get("oracle_type") or unblock_plan.get("oracle_type"),
                 "oracle_status": preview.get("oracle_status") or unblock_plan.get("oracle_status"),
@@ -39149,6 +39276,32 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "packet_key": "transaction_corpus_approval_packet",
                 "packet_type": "transaction-corpus",
                 "packet_status": "blocked-before-finding-gate",
+                "packet_context": {
+                    "recommended_quote": {
+                        "method": "POST",
+                        "path": "/api/quote",
+                        "direction": "buy",
+                        "sourceMint": "So11111111111111111111111111111111111111112",
+                        "destinationMint": "USDtel11111111111111111111111111111111111111",
+                        "expectedPayloadType": "svm",
+                        "programAllowlistStatus": "manual-review-required",
+                        "allowedPrograms_count": 0,
+                    },
+                    "payload_sidecar": ".greybox/selftest-gate-blockers/transaction-payloads.jsonl",
+                    "intent_policy_sidecar": ".greybox/selftest-gate-blockers/transaction-intent-policy.json",
+                    "resource_capture_gate": {
+                        "status": "blocked-until-healthy-resource-snapshot",
+                        "resource_status": "not-run",
+                    },
+                    "redacted_sidecar_required_fields": [
+                        "exactly one approved POST /api/quote response body or extracted base64 transaction payload",
+                        "payloads[*].data.type matching svm when JSON sidecars are used",
+                        "payloads[*].data.transaction or an extracted transaction payload accepted by decode-transactions",
+                        "intent policy fields: direction, wallet, amountIn, sourceMint, destinationMint",
+                        "reviewed allowedPrograms or an explicit manual program-allowlist review note",
+                        "no raw Burp history, cookies, bearer tokens, wallet secrets, private keys, seed phrases, signatures, or signed transactions",
+                    ],
+                },
                 "title": "Approval packet is not ready for finding-gate review",
                 "checks": [
                     {
@@ -39635,6 +39788,8 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 and gate_top_oracle.get("evidence_contract_status") == "has-contract"
                 and gate_top_oracle.get("evidence_contract_kind") == "approved-quote-transaction-corpus"
                 and (gate_top_oracle.get("evidence_contract") or {}).get("required_artifact_count", 0) > 0
+                and gate_top_oracle.get("required_field_count") == 6
+                and "approved POST /api/quote" in str(gate_top_oracle.get("first_required_field") or "")
                 and gate_blockers.get("summary", {}).get("oracle_type_counts", {}).get("transaction-intent") == 1
                 and gate_blockers.get("summary", {}).get("oracle_artifact_status_counts", {}).get("missing-artifacts") == 1
                 and gate_blockers.get("summary", {}).get("top_oracle", {}).get("oracle_type") == "transaction-intent"
@@ -39682,6 +39837,8 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 and "first_missing=" in gate_no_write_stdout
                 and "top=transaction-intent" in gate_no_write_stdout
                 and "contract=approved-quote-transaction-corpus" in gate_no_write_stdout
+                and "required_fields=6" in gate_no_write_stdout
+                and "first_required=exactly one approved POST /api/quote" in gate_no_write_stdout
                 and "oracle_contract=approved-quote-transaction-corpus" in gate_no_write_stdout
                 and "approved quote transaction payload sidecar" in gate_no_write_stdout_text
                 and "No files written (--no-write)." in gate_no_write_stdout
@@ -39703,6 +39860,8 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 and gate_oracle_plan_top.get("recommendation") == "pursue-first"
                 and gate_oracle_plan_top.get("dependency_kind") == "approved-sidecar-or-single-observation"
                 and gate_oracle_plan_top.get("evidence_contract_kind") == "approved-quote-transaction-corpus"
+                and gate_oracle_plan_top.get("required_field_count") == 6
+                and "approved POST /api/quote" in str(gate_oracle_plan_top.get("first_required_field") or "")
                 and gate_oracle_plan_top.get("active_traffic_required") is True
                 and "blocked-until-approval-and-healthy-resource-gate"
                 in str(gate_oracle_plan_top.get("active_traffic_policy") or "")
@@ -39720,6 +39879,7 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 and "top=transaction-intent" in oracle_plan_no_write_stdout
                 and "recommend=pursue-first" in oracle_plan_no_write_stdout
                 and "contract=approved-quote-transaction-corpus" in oracle_plan_no_write_stdout
+                and "first_required=exactly one approved POST /api/quote" in oracle_plan_no_write_stdout
                 and "active_policy=blocked-until-approval-and-healthy-resource-gate" in oracle_plan_no_write_stdout_text
                 and "No files written (--no-write)." in oracle_plan_no_write_stdout
                 and not any(oracle_plan_no_write_outputs_exist.values())
@@ -49387,6 +49547,10 @@ def approval_packet_preview_context(packet_type: str, packet: dict[str, Any]) ->
 
     for key in [
         "sidecar_path",
+        "payload_sidecar",
+        "accepted_payload_sidecars",
+        "intent_policy_sidecar",
+        "resource_capture_gate",
         "path_options_considered",
         "redacted_sidecar_required_fields",
         "source_context",
