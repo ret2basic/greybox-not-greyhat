@@ -36557,6 +36557,14 @@ def review_blocker_group_followup_preview_lines(group: dict[str, Any], *, limit:
             lines.append(f"  oracle_accept={inline_summary_text(check, max_chars=220)}")
         for reject in normalize_string_list(oracle.get("reject_if"))[:2]:
             lines.append(f"  oracle_reject={inline_summary_text(reject, max_chars=220)}")
+        evidence_contract = review_blocker_oracle_evidence_contract(group, oracle)
+        if evidence_contract.get("status") == "has-contract":
+            lines.append(
+                "  oracle_contract="
+                f"{evidence_contract.get('kind') or '-'} "
+                f"required_fields={evidence_contract.get('required_field_count', 0)} "
+                f"first_required={inline_summary_text(evidence_contract.get('first_required_field'), max_chars=220) or '-'}"
+            )
     if len(validation_oracles) > 2:
         lines.append(f"  oracle=... +{len(validation_oracles) - 2} more")
     return lines
@@ -36974,6 +36982,64 @@ def merge_review_candidate_summary(existing: dict[str, Any], candidate: dict[str
     return existing
 
 
+def compact_review_blocker_unblock_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        key: plan.get(key)
+        for key in [
+            "packet_type",
+            "entrypoint",
+            "kind",
+            "first_unblocker",
+            "oracle_type",
+            "oracle_status",
+            "reportability_boundary",
+        ]
+        if plan.get(key) is not None
+    }
+    evidence_artifacts = ordered_unique_strings(plan.get("evidence_artifacts", []) or [])
+    if evidence_artifacts:
+        compact["evidence_artifacts"] = evidence_artifacts[:12]
+    forbidden_validation = normalize_string_list(plan.get("forbidden_validation"))
+    if forbidden_validation:
+        compact["forbidden_validation"] = forbidden_validation[:6]
+    rewrite_context = (
+        plan.get("rewrite_response_context")
+        if isinstance(plan.get("rewrite_response_context"), dict)
+        else {}
+    )
+    if rewrite_context:
+        recommended_request = (
+            rewrite_context.get("recommended_request")
+            if isinstance(rewrite_context.get("recommended_request"), dict)
+            else {}
+        )
+        source_context = (
+            rewrite_context.get("source_context")
+            if isinstance(rewrite_context.get("source_context"), dict)
+            else {}
+        )
+        compact["rewrite_response_context"] = {
+            "recommended_request": {
+                key: recommended_request.get(key)
+                for key in ["method", "path", "client_path", "upstream_path", "cluster_id", "source_ref"]
+                if recommended_request.get(key) is not None
+            },
+            "sidecar_path": rewrite_context.get("sidecar_path"),
+            "redacted_sidecar_required_fields": normalize_string_list(
+                rewrite_context.get("redacted_sidecar_required_fields")
+            )[:8],
+            "path_options_considered": rewrite_context.get("path_options_considered"),
+            "source_context": {
+                "rewrite_review_id": source_context.get("rewrite_review_id"),
+                "cluster_id": source_context.get("cluster_id"),
+                "fixed_upstreams": normalize_string_list(source_context.get("fixed_upstreams"))[:5],
+                "source_refs": compact_source_refs(normalize_string_list(source_context.get("source_refs")))[:8],
+                "catch_all": source_context.get("catch_all"),
+            },
+        }
+    return compact
+
+
 def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     review_candidate_maps: dict[str, dict[str, dict[str, Any]]] = {}
@@ -37003,6 +37069,7 @@ def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str
                 "oracle_types": [],
                 "oracle_status_counts": {},
                 "validation_oracles": [],
+                "unblock_plans": [],
             }
             grouped[key] = group
             review_candidate_maps[key] = {}
@@ -37039,6 +37106,13 @@ def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str
         )
         if validation_oracle:
             group["validation_oracles"].append(validation_oracle)
+        unblock_plan = (
+            blocker_evidence.get("unblock_plan")
+            if isinstance(blocker_evidence.get("unblock_plan"), dict)
+            else {}
+        )
+        if unblock_plan:
+            group["unblock_plans"].append(compact_review_blocker_unblock_plan(unblock_plan))
         if blocker.get("source_review_blockers"):
             group["source_review_blockers"].append(blocker.get("source_review_blockers"))
         group["artifact_refs"].extend(blocker.get("artifact_refs", []) or [])
@@ -37091,6 +37165,22 @@ def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str
             seen_oracles.add(oracle_key)
             deduped_oracles.append(oracle)
         group["validation_oracles"] = deduped_oracles
+        deduped_plans = []
+        seen_plans: set[str] = set()
+        for plan in group.get("unblock_plans", []) or []:
+            if not isinstance(plan, dict):
+                continue
+            plan_key = "|".join(
+                str(plan.get(field) or "")
+                for field in ["packet_type", "entrypoint", "kind", "oracle_type"]
+            )
+            if not plan_key.strip("|"):
+                plan_key = json.dumps(plan, sort_keys=True)
+            if plan_key in seen_plans:
+                continue
+            seen_plans.add(plan_key)
+            deduped_plans.append(plan)
+        group["unblock_plans"] = deduped_plans[:4]
         groups.append(group)
 
     groups.sort(
@@ -37161,6 +37251,66 @@ def review_blocker_oracle_artifact_status(group: dict[str, Any], *, artifact_dir
     }
 
 
+def review_blocker_oracle_evidence_contract(group: dict[str, Any], oracle: dict[str, Any]) -> dict[str, Any]:
+    oracle_type = str(oracle.get("type") or oracle.get("id") or "")
+    plans = [
+        plan
+        for plan in group.get("unblock_plans", []) or []
+        if isinstance(plan, dict)
+    ]
+    selected = next(
+        (
+            plan
+            for plan in plans
+            if not oracle_type or str(plan.get("oracle_type") or "") == oracle_type
+        ),
+        plans[0] if plans else {},
+    )
+    if not selected:
+        return {
+            "status": "missing-contract",
+            "kind": None,
+            "required_field_count": 0,
+            "required_artifact_count": 0,
+        }
+    evidence_artifacts = ordered_unique_strings(selected.get("evidence_artifacts", []) or [])
+    required_fields: list[str] = []
+    sidecar_path = None
+    recommended_request: dict[str, Any] = {}
+    rewrite_context = (
+        selected.get("rewrite_response_context")
+        if isinstance(selected.get("rewrite_response_context"), dict)
+        else {}
+    )
+    if rewrite_context:
+        required_fields = normalize_string_list(rewrite_context.get("redacted_sidecar_required_fields"))
+        sidecar_path = rewrite_context.get("sidecar_path")
+        recommended_request = (
+            rewrite_context.get("recommended_request")
+            if isinstance(rewrite_context.get("recommended_request"), dict)
+            else {}
+        )
+    return {
+        "status": "has-contract",
+        "packet_type": selected.get("packet_type"),
+        "entrypoint": selected.get("entrypoint"),
+        "kind": selected.get("kind"),
+        "first_unblocker": selected.get("first_unblocker"),
+        "evidence_artifacts": evidence_artifacts[:12],
+        "required_artifact_count": len(evidence_artifacts),
+        "sidecar_path": sidecar_path,
+        "recommended_request": {
+            key: recommended_request.get(key)
+            for key in ["method", "path", "client_path", "upstream_path", "cluster_id", "source_ref"]
+            if recommended_request.get(key) is not None
+        },
+        "required_fields": required_fields[:8],
+        "required_field_count": len(required_fields),
+        "first_required_field": required_fields[0] if required_fields else None,
+        "forbidden_validation": normalize_string_list(selected.get("forbidden_validation"))[:6],
+    }
+
+
 def review_blocker_oracle_work_item(
     group: dict[str, Any],
     oracle: dict[str, Any],
@@ -37171,6 +37321,7 @@ def review_blocker_oracle_work_item(
     reject_if = normalize_string_list(oracle.get("reject_if"))
     command_safety = (group.get("command_safety", {}) or {}).get("summary", {}) or {}
     artifact_status = review_blocker_oracle_artifact_status(group, artifact_dir=artifact_dir)
+    evidence_contract = review_blocker_oracle_evidence_contract(group, oracle)
     return {
         "group_id": group.get("id"),
         "group_key": group.get("key"),
@@ -37193,6 +37344,11 @@ def review_blocker_oracle_work_item(
         "artifact_status_label": artifact_status.get("status"),
         "missing_artifact_count": artifact_status.get("missing_artifact_count", 0),
         "first_missing_artifact": artifact_status.get("first_missing_artifact"),
+        "evidence_contract": evidence_contract,
+        "evidence_contract_status": evidence_contract.get("status"),
+        "evidence_contract_kind": evidence_contract.get("kind"),
+        "required_field_count": evidence_contract.get("required_field_count", 0),
+        "first_required_field": evidence_contract.get("first_required_field"),
         "command_safety": command_safety,
         "command_count": int(command_safety.get("commands") or 0) if command_safety else 0,
     }
@@ -38657,6 +38813,9 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 and gate_top_oracle.get("dependency_kind") == "approved-sidecar-or-single-observation"
                 and gate_top_oracle.get("artifact_status_label") == "missing-artifacts"
                 and gate_top_oracle.get("first_missing_artifact")
+                and gate_top_oracle.get("evidence_contract_status") == "has-contract"
+                and gate_top_oracle.get("evidence_contract_kind") == "approved-quote-transaction-corpus"
+                and (gate_top_oracle.get("evidence_contract") or {}).get("required_artifact_count", 0) > 0
                 and gate_blockers.get("summary", {}).get("oracle_type_counts", {}).get("transaction-intent") == 1
                 and gate_blockers.get("summary", {}).get("oracle_artifact_status_counts", {}).get("missing-artifacts") == 1
                 and gate_blockers.get("summary", {}).get("top_oracle", {}).get("oracle_type") == "transaction-intent"
@@ -38703,6 +38862,8 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 and "missing_artifacts=" in gate_no_write_stdout
                 and "first_missing=" in gate_no_write_stdout
                 and "top=transaction-intent" in gate_no_write_stdout
+                and "contract=approved-quote-transaction-corpus" in gate_no_write_stdout
+                and "oracle_contract=approved-quote-transaction-corpus" in gate_no_write_stdout
                 and "approved quote transaction payload sidecar" in gate_no_write_stdout_text
                 and "No files written (--no-write)." in gate_no_write_stdout
                 and not any(gate_no_write_outputs_exist.values())
@@ -38869,6 +39030,13 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
                 reject_if = normalize_string_list(oracle.get("reject_if"))
                 for reject in reject_if[:2]:
                     lines.append(f"      - Reject: {markdown_text(reject)}")
+                evidence_contract = review_blocker_oracle_evidence_contract(item, oracle)
+                if evidence_contract.get("status") == "has-contract":
+                    lines.append(f"      - Contract: `{evidence_contract.get('kind') or '-'}`")
+                    if evidence_contract.get("first_required_field"):
+                        lines.append(
+                            f"      - First required field: {markdown_text(evidence_contract.get('first_required_field'))}"
+                        )
             if len(validation_oracles) > 3:
                 lines.append(f"    - ... +{len(validation_oracles) - 3} more oracles")
         candidates = item.get("review_candidates", []) or []
@@ -38940,6 +39108,8 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
         f"- Oracle missing artifacts: `{oracle_summary.get('missing_artifact_count', 0)}`",
         f"- Top oracle: `{top_oracle.get('oracle_type') or '-'}` group=`{top_oracle.get('group_id') or '-'}`",
         f"- Top oracle first missing artifact: `{top_oracle.get('first_missing_artifact') or '-'}`",
+        f"- Top oracle evidence contract: `{top_oracle.get('evidence_contract_kind') or '-'}`",
+        f"- Top oracle first required field: `{top_oracle.get('first_required_field') or '-'}`",
         "",
         "## Safety",
         "",
@@ -58887,6 +59057,9 @@ def run_review_blockers(args: argparse.Namespace) -> int:
             f"top={top_oracle.get('oracle_type') or '-'} "
             f"group={top_oracle.get('group_id') or '-'} "
             f"first_missing={top_oracle.get('first_missing_artifact') or '-'} "
+            f"contract={top_oracle.get('evidence_contract_kind') or '-'} "
+            f"required_fields={top_oracle.get('required_field_count', 0)} "
+            f"first_required={inline_summary_text(top_oracle.get('first_required_field'), max_chars=140) or '-'} "
             f"next={inline_summary_text(top_oracle.get('next_step'), max_chars=220)}"
         )
     if review_blockers.get("mode") == "rollup":
