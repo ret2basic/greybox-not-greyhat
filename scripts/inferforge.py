@@ -8804,7 +8804,7 @@ HARNESS_STAGE_FOCUS_RANK = {
 
 HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
     "discovery-recon": [
-        "discovery-coverage --no-write",
+        "discovery-coverage --no-write --show-surfaces --show-commands",
         "source-peek-requests --no-write --top 8",
         "source-peek --no-write --top 8",
     ],
