@@ -16208,6 +16208,26 @@ def build_iteration_decision_from_plan(
     blocked_command_summary = command_safety_summary(blocked)
     artifact_health_blocks_active = artifact_health_status in {"failed", "needs-human-review"}
     resource_blocks_active = bool(active_after_gate and resource_status not in {"healthy", "not-run"})
+    approval_packets = []
+    for item in validation_plan.get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        packet = (
+            item.get("transaction_corpus_approval_packet")
+            if isinstance(item.get("transaction_corpus_approval_packet"), dict)
+            else {}
+        )
+        if not packet:
+            continue
+        approval_packets.append(
+            {
+                "validation_item_id": item.get("id"),
+                "validation_item_status": item.get("status"),
+                "validation_item_priority": item.get("priority"),
+                "validation_item_type": item.get("hypothesis_type"),
+                "packet": packet,
+            }
+        )
 
     actions: list[dict[str, Any]] = []
     if offline:
@@ -16325,6 +16345,7 @@ def build_iteration_decision_from_plan(
             "active_after_resource_gate_commands": len(active_after_gate),
             "artifact_health_blocked_active_commands": len(active_after_gate) if artifact_health_blocks_active else 0,
             "resource_blocked_active_commands": len(active_after_gate) if resource_blocks_active else 0,
+            "approval_packets": len(approval_packets),
             "blocked_commands": len(blocked),
             "command_safety": allowed_command_summary,
             "blocked_command_safety": blocked_command_summary,
@@ -16334,6 +16355,7 @@ def build_iteration_decision_from_plan(
             "status": artifact_health_status,
             "summary": artifact_health.get("summary", {}) if isinstance(artifact_health, dict) else {},
         },
+        "approval_packets": approval_packets[:limit],
         "actions": actions,
         "artifact_refs": {
             "validation_plan": VALIDATION_PLAN_ARTIFACT,
@@ -46301,6 +46323,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                         "status": "ready-offline",
                         "priority": "high",
                         "hypothesis_type": "transaction-flow-review",
+                        "transaction_corpus_approval_packet": {
+                            "status": "ready-offline-approval",
+                            "recommended_quote": {
+                                "method": "POST",
+                                "path": "/api/quote",
+                                "direction": "buy",
+                            },
+                            "payload_sidecar": ".greybox/focused/transaction-payloads.jsonl",
+                            "intent_policy_sidecar": ".greybox/focused/transaction-intent-policy.json",
+                            "finding_gate_blocker_count": 5,
+                        },
                         "allowed_now": [
                             focused_iteration_ref(TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND),
                             focused_iteration_ref(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
@@ -47185,6 +47218,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and "top-secret" not in blackbox_iteration_command_text_sample
         and "AbC1234567890Token" not in blackbox_iteration_command_text_sample
         and focused_iteration_decision_sample.get("summary", {}).get("offline_command_preview_limit") == 2
+        and focused_iteration_decision_sample.get("summary", {}).get("approval_packets") == 1
+        and (focused_iteration_decision_sample.get("approval_packets", [{}])[0].get("packet") or {}).get("status")
+        == "ready-offline-approval"
+        and (
+            (focused_iteration_decision_sample.get("approval_packets", [{}])[0].get("packet") or {}).get(
+                "recommended_quote",
+                {},
+            )
+            or {}
+        ).get("direction")
+        == "buy"
         and focused_iteration_preview_commands[:2]
         == [
             focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
@@ -56768,12 +56812,35 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
         f"active_after_gate={summary.get('active_after_resource_gate_commands', 0)} "
         f"artifact_blocked_active={summary.get('artifact_health_blocked_active_commands', 0)} "
         f"resource_blocked_active={summary.get('resource_blocked_active_commands', 0)} "
+        f"approval_packets={summary.get('approval_packets', 0)} "
         f"blocked={summary.get('blocked_commands', 0)}"
     )
     if command_safety:
         print(f"Command safety: {format_command_safety_summary(command_safety)}")
     if blocked_command_safety and blocked_command_safety.get("commands"):
         print(f"Blocked command safety: {format_command_safety_summary(blocked_command_safety)}")
+    approval_packets = [
+        item
+        for item in decision.get("approval_packets", []) or []
+        if isinstance(item, dict)
+    ]
+    for item in approval_packets[: max(0, int(args.top))]:
+        packet = item.get("packet") if isinstance(item.get("packet"), dict) else {}
+        recommended_quote = (
+            packet.get("recommended_quote")
+            if isinstance(packet.get("recommended_quote"), dict)
+            else {}
+        )
+        print(
+            "Approval packet: "
+            f"item={item.get('validation_item_id') or '-'} "
+            f"status={packet.get('status') or 'unknown'} "
+            f"recommended={recommended_quote.get('method') or '-'} {recommended_quote.get('path') or '-'} "
+            f"direction={recommended_quote.get('direction') or '-'} "
+            f"payload={packet.get('payload_sidecar') or '-'} "
+            f"policy={packet.get('intent_policy_sidecar') or '-'} "
+            f"blockers={packet.get('finding_gate_blocker_count', 0)}"
+        )
 
     top_count = max(0, int(args.top))
     if top_count:
