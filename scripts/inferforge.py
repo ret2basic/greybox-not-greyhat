@@ -17199,22 +17199,42 @@ def build_transaction_intent_policy_scaffold(profile: dict[str, Any] | None) -> 
         )
 
     configured_rows = [row for row in rows if row.get("valid_profile_mints")]
+    configured_program_rows = [row for row in configured_rows if row.get("allowedPrograms")]
+    program_missing_directions = [
+        str(row.get("direction") or "")
+        for row in configured_rows
+        if not row.get("allowedPrograms")
+    ]
     if configured_rows:
         status = "profile-quote-intent-indexed"
     elif rows:
         status = "profile-quote-intent-incomplete"
     else:
         status = "missing-profile-quote-intent"
+    missing_before_decode = [
+        "One approved quote transaction payload corpus.",
+        "The executing wallet address for the quote.",
+        "The requested raw amountIn used for the quote.",
+    ]
+    if configured_rows and program_missing_directions:
+        missing_before_decode.append(
+            "Allowed Solana program IDs or an explicit manual program-review decision for decoded instruction program IDs."
+        )
     return {
         "status": status,
         "directions": rows,
         "direction_count": len(rows),
         "configured_direction_count": len(configured_rows),
-        "missing_before_decode": [
-            "One approved quote transaction payload corpus.",
-            "The executing wallet address for the quote.",
-            "The requested raw amountIn used for the quote.",
-        ],
+        "program_allowlist_status": (
+            "configured"
+            if configured_rows and len(configured_program_rows) == len(configured_rows)
+            else "manual-review-required"
+            if configured_rows
+            else "missing-profile-mints"
+        ),
+        "configured_program_allowlist_count": len(configured_program_rows),
+        "program_allowlist_missing_directions": program_missing_directions,
+        "missing_before_decode": missing_before_decode,
         "safety": (
             "Offline policy scaffold only. Placeholder wallet/amount values must be replaced before decode-transactions, "
             "and no wallet signing or transaction submission is performed."
@@ -17932,6 +17952,7 @@ def transaction_corpus_policy_templates(profile: dict[str, Any] | None, artifact
                 "sourceMint": row.get("sourceMint"),
                 "destinationMint": row.get("destinationMint"),
                 "allowedPrograms": allowed_programs,
+                "programAllowlistStatus": "configured" if allowed_programs else "manual-review-required",
                 "missing_runtime_fields": row.get("missing_runtime_fields", []),
                 "intent_policy_sidecar_template": row.get("sidecar_template", {}),
                 "decode_command": validation_command_for_artifact_dir(
@@ -17982,6 +18003,16 @@ def build_transaction_corpus_checklist(
     )
     policy_templates = transaction_corpus_policy_templates(profile, artifact_dir)
     ready_policy_templates = [row for row in policy_templates if row.get("status") == "ready"]
+    program_allowlist_missing_directions = [
+        str(row.get("direction") or "")
+        for row in ready_policy_templates
+        if row.get("programAllowlistStatus") != "configured"
+    ]
+    program_allowlist_status = (
+        "configured" if ready_policy_templates and not program_allowlist_missing_directions else
+        "manual-review-required" if ready_policy_templates else
+        "missing-policy-template"
+    )
     candidate_paths = quote_response_candidate_paths(profile)
     quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
     capture_gate = transaction_corpus_capture_gate(current_resource_snapshot)
@@ -18064,6 +18095,14 @@ def build_transaction_corpus_checklist(
             ),
         },
         {
+            "id": "program-policy-review",
+            "status": "passed" if program_allowlist_status == "configured" else "manual-review-required",
+            "action": (
+                "Configure quote_intent.allowedPrograms or explicitly review every decoded instruction program ID "
+                "before treating program behavior as passed."
+            ),
+        },
+        {
             "id": "decode-intent",
             "status": "pending",
             "action": "Run the matching decode-transactions command and review signer, account, mint, amount, and program checks.",
@@ -18074,6 +18113,14 @@ def build_transaction_corpus_checklist(
             "id": "policy-template-ready",
             "status": "passed" if ready_policy_templates else "waiting",
             "evidence": f"{len(ready_policy_templates)}/{len(policy_templates)} direction templates ready",
+        },
+        {
+            "id": "program-allowlist-policy",
+            "status": "passed" if program_allowlist_status == "configured" else "manual-review-required",
+            "evidence": {
+                "status": program_allowlist_status,
+                "missing_directions": program_allowlist_missing_directions,
+            },
         },
         {
             "id": "transaction-candidate-present",
@@ -18136,6 +18183,8 @@ def build_transaction_corpus_checklist(
         "summary": {
             "policy_templates": len(policy_templates),
             "ready_policy_templates": len(ready_policy_templates),
+            "program_allowlist_status": program_allowlist_status,
+            "program_allowlist_missing_directions": program_allowlist_missing_directions,
             "quote_collection_status": quote_collection.get("status") or "missing",
             "quote_collection_classification": quote_diagnosis.get("classification") or "missing",
             "quote_collection_success": quote_success,
@@ -42880,11 +42929,18 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
         "Policy templates: "
         f"ready={summary.get('ready_policy_templates', 0)}/{summary.get('policy_templates', 0)}"
     )
+    missing_program_directions = summary.get("program_allowlist_missing_directions", []) or []
+    print(
+        "Program allowlist: "
+        f"status={summary.get('program_allowlist_status') or 'unknown'} "
+        f"missing={','.join(str(item) for item in missing_program_directions) if missing_program_directions else 'none'}"
+    )
     for row in (checklist.get("policy_templates", []) or [])[: max(0, int(args.top))]:
         print(
             f"- {row.get('status')} direction={row.get('direction')} "
             f"source={row.get('sourceMint') or '-'} destination={row.get('destinationMint') or '-'} "
-            f"allowed_programs={len(row.get('allowedPrograms', []) or [])}"
+            f"allowed_programs={len(row.get('allowedPrograms', []) or [])} "
+            f"program_policy={row.get('programAllowlistStatus') or 'unknown'}"
         )
         if args.show_commands and row.get("decode_command"):
             print(f"  decode={inline_summary_text(row.get('decode_command'), max_chars=420)}")
