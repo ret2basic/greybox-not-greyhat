@@ -9357,6 +9357,16 @@ def methodology_blocker_for_hypothesis(item: dict[str, Any]) -> str:
         if resource_review:
             return "needs deployment proxy/header trust, external rate-limit store, and rate-limit bound evidence"
         return "needs operator evidence before any resource-abuse reportability claim"
+    if impact == "rpc-proxy-abuse":
+        return (
+            "needs RPC method/control boundary evidence plus concrete non-DoS user, funds, "
+            "availability, quota, or sensitive-data impact"
+        )
+    if impact == "unauthorized-state-change":
+        return (
+            "needs protected-action boundary, expected auth denial, and observed/offline "
+            "state-change impact evidence"
+        )
     if str(item.get("status") or "").startswith("blocked"):
         return f"blocked by {item.get('status')}"
     return "needs concrete impact evidence and a validated finding gate decision"
@@ -9438,6 +9448,103 @@ def methodology_closure_status(requirements: list[dict[str, Any]], *, gate_ready
     if statuses and statuses <= {"passed", "ready-offline", "ready-after-resource-check"}:
         return "evidence-indexed-needs-impact-gate"
     return "needs-evidence"
+
+
+def generic_evidence_requirement_spec(
+    *,
+    item: dict[str, Any],
+    evidence: str,
+    index: int,
+) -> tuple[str, str]:
+    impact = str(item.get("impact") or "")
+    text = str(evidence or "").strip()
+    lowered = text.lower()
+
+    if impact == "rpc-proxy-abuse":
+        if "disallowed or sensitive rpc method" in lowered or "origin/rate controls" in lowered:
+            return (
+                "rpc-disallowed-method-or-policy-evidence",
+                (
+                    "Identify the exact RPC method/control boundary and add one approved observation or "
+                    "offline policy artifact showing whether it is reachable or bypassed."
+                ),
+            )
+        if "practical user, funds, availability" in lowered or "sensitive-data impact" in lowered:
+            return (
+                "rpc-user-funds-availability-or-sensitive-data-impact",
+                (
+                    "Add concrete non-DoS impact evidence for user funds, availability budget, upstream-sensitive "
+                    "data, quota, or equivalent operator impact."
+                ),
+            )
+        if "one concrete in-scope request/response pair" in lowered:
+            return (
+                "rpc-policy-observation-or-artifact-reference",
+                "Attach one redacted in-scope RPC observation or offline RPC policy/source artifact for this exact path.",
+            )
+
+    if impact == "unauthorized-state-change":
+        if "protected action" in lowered or "account state" in lowered or "state changes unexpectedly" in lowered:
+            return (
+                "unauthorized-action-boundary-evidence",
+                (
+                    "Identify the exact protected action, order, account state, or workflow boundary and add "
+                    "evidence that it can change or be accepted unexpectedly."
+                ),
+            )
+        if "authorization context" in lowered:
+            return (
+                "auth-context-and-expected-denial",
+                "Document the expected authorization denial and the user/auth context that should enforce it.",
+            )
+        if "one concrete in-scope request/response pair" in lowered:
+            return (
+                "state-change-observation-or-source-contract",
+                (
+                    "Attach one redacted approved observation, source contract, or operator artifact for the exact "
+                    "state-changing path without mutating real user state."
+                ),
+            )
+
+    if "one concrete in-scope request/response pair" in lowered:
+        return (
+            "single-evidence-reference",
+            "Attach one redacted in-scope request/response observation or offline artifact reference for this exact path.",
+        )
+    if "finding-gate decision" in lowered:
+        return (
+            "finding-gate-impact-decision",
+            "Refresh finding-gate/adjudication after endpoint-specific evidence is indexed; do not escalate static suspicion alone.",
+        )
+    if "reproduction note" in lowered:
+        return (
+            "safe-reproduction-note",
+            "Write a minimal reproduction note with no secrets, wallet signing, transaction submission, flooding, or stress traffic.",
+        )
+
+    evidence_slug = safe_probe_id(text[:72] or f"evidence-{index}")
+    impact_slug = safe_probe_id(impact or "generic")
+    return (
+        f"{impact_slug}-{evidence_slug}",
+        "Collect concrete endpoint-specific impact evidence before reportability review.",
+    )
+
+
+def build_semantic_generic_evidence_requirements(item: dict[str, Any]) -> list[dict[str, Any]]:
+    requirements = []
+    seen_ids: set[str] = set()
+    evidence_items = [str(value).strip() for value in item.get("required_evidence", []) or [] if str(value).strip()]
+    for index, evidence in enumerate(evidence_items, start=1):
+        requirement_id, next_step = generic_evidence_requirement_spec(
+            item=item,
+            evidence=evidence,
+            index=index,
+        )
+        if requirement_id in seen_ids:
+            requirement_id = f"{requirement_id}-{index}"
+        seen_ids.add(requirement_id)
+        requirements.append(methodology_requirement(requirement_id, "waiting", evidence, next_step))
+    return requirements
 
 
 def build_methodology_supporting_reviews(
@@ -9921,29 +10028,34 @@ def build_generic_evidence_closure(
     profile: dict[str, Any] | None,
     item: dict[str, Any],
 ) -> dict[str, Any]:
-    requirements = [
-        methodology_requirement(
-            f"required-evidence-{index}",
-            "waiting",
-            evidence,
-            "Collect concrete endpoint-specific impact evidence before reportability review.",
+    requirements = build_semantic_generic_evidence_requirements(item)
+    command_specs = [("validation-plan", "validation-plan --no-write --top 8 --show-commands --skip-current-resource-check")]
+    impact = str(item.get("impact") or "")
+    if impact == "rpc-proxy-abuse":
+        command_specs.append(("deployment-review", "deployment-review --no-write --top 8"))
+    if impact == "unauthorized-state-change":
+        command_specs.append(("evidence-gaps", "evidence-gaps --no-write"))
+    commands = []
+    for source, subcommand in command_specs:
+        ref = methodology_command_ref(
+            artifact_dir,
+            profile,
+            subcommand,
+            source=f"{item.get('id')}:closure:{source}",
         )
-        for index, evidence in enumerate(item.get("required_evidence", []) or [], start=1)
-    ]
-    ref = methodology_command_ref(
-        artifact_dir,
-        profile,
-        "validation-plan --no-write --top 8 --show-commands --skip-current-resource-check",
-        source=f"{item.get('id')}:closure:validation-plan",
-    )
+        if ref:
+            commands.append(ref)
     return {
         "status": methodology_closure_status(requirements),
         "gate_ready": False,
         "impact": item.get("impact"),
-        "artifact_statuses": {},
+        "artifact_statuses": {
+            "semantic_requirement_ids": bool(requirements),
+            "requirement_count": len(requirements),
+        },
         "requirements": requirements,
         "missing_requirements": [req.get("id") for req in requirements],
-        "next_safe_commands": [ref] if ref else [],
+        "next_safe_commands": commands[:6],
         "finding_gate_entry_condition": "Collect concrete impact evidence and refresh finding-gate/adjudication.",
     }
 
@@ -10035,6 +10147,18 @@ def minimal_poc_manual_inputs_for_thread(item: dict[str, Any]) -> list[str]:
             "Deployment/operator evidence for proxy header trust, direct-to-app reachability, external rate-limit storage, and key/TTL bounds.",
             "Non-stress availability impact evidence from configuration, logs, dashboards, or reviewed operator statements.",
             "A finding-gate decision that does not rely on flooding, rate-limit stress, or DoS traffic.",
+        ]
+    if impact == "rpc-proxy-abuse":
+        return [
+            "The exact RPC method, origin, or rate-control boundary that should reject or constrain the request.",
+            "One approved redacted observation or offline RPC policy/source artifact for the exact RPC proxy path.",
+            "Concrete non-DoS impact evidence: user funds, sensitive data, availability budget, upstream quota, or equivalent operator impact.",
+        ]
+    if impact == "unauthorized-state-change":
+        return [
+            "The exact protected action, order, account state, or workflow boundary and the expected authorization denial.",
+            "One approved observation, source contract, or operator artifact showing the action can be accepted unexpectedly.",
+            "Concrete user, account, funds, order, or business impact notes without wallet signing, transaction submission, or real user-state mutation.",
         ]
     return [
         "Endpoint-specific observed evidence for the claimed impact.",
@@ -34540,7 +34664,51 @@ def build_no_write_selftest() -> dict[str, Any]:
         [DEFAULT_RESOURCE_WATCH_PORTS[0], synthetic_control_plane_port],
         protected_ports={synthetic_control_plane_port},
     )
+    rpc_generic_closure = build_generic_evidence_closure(
+        artifact_dir=root / "semantic-closure-output",
+        profile=profile,
+        item={
+            "id": "HYP-selftest-rpc-proxy-abuse",
+            "impact": "rpc-proxy-abuse",
+            "required_evidence": required_evidence_for_hypothesis({"impact": "rpc-proxy-abuse"}),
+        },
+    )
+    rpc_generic_missing = [str(item) for item in rpc_generic_closure.get("missing_requirements", []) or []]
+    unauthorized_generic_closure = build_generic_evidence_closure(
+        artifact_dir=root / "semantic-closure-output",
+        profile=profile,
+        item={
+            "id": "HYP-selftest-unauthorized-state-change",
+            "impact": "unauthorized-state-change",
+            "required_evidence": required_evidence_for_hypothesis({"impact": "unauthorized-state-change"}),
+        },
+    )
+    unauthorized_generic_missing = [
+        str(item) for item in unauthorized_generic_closure.get("missing_requirements", []) or []
+    ]
     assertions = [
+        {
+            "id": "generic-rpc-evidence-closure-uses-semantic-ids",
+            "passed": (
+                "rpc-disallowed-method-or-policy-evidence" in rpc_generic_missing
+                and "rpc-user-funds-availability-or-sensitive-data-impact" in rpc_generic_missing
+                and "rpc-policy-observation-or-artifact-reference" in rpc_generic_missing
+                and not any(item.startswith("required-evidence-") for item in rpc_generic_missing)
+            ),
+            "expected": "rpc-proxy-abuse generic closure uses impact-specific missing evidence IDs",
+            "actual": rpc_generic_missing,
+        },
+        {
+            "id": "generic-unauthorized-state-change-closure-uses-semantic-ids",
+            "passed": (
+                "unauthorized-action-boundary-evidence" in unauthorized_generic_missing
+                and "auth-context-and-expected-denial" in unauthorized_generic_missing
+                and "state-change-observation-or-source-contract" in unauthorized_generic_missing
+                and not any(item.startswith("required-evidence-") for item in unauthorized_generic_missing)
+            ),
+            "expected": "unauthorized-state-change generic closure uses impact-specific missing evidence IDs",
+            "actual": unauthorized_generic_missing,
+        },
         {
             "id": "review-candidates-no-write-skips-artifacts",
             "passed": (
