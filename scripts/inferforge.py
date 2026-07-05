@@ -162,6 +162,7 @@ CLAIM_WITNESS_LADDER_ARTIFACT = "claim-witness-ladder.json"
 CLAIM_EVIDENCE_REQUESTS_ARTIFACT = "claim-evidence-requests.json"
 SECRET_EXPOSURE_REVIEW_ARTIFACT = "secret-exposure-review.json"
 BOUNTY_FRONTIER_ARTIFACT = "bounty-frontier.json"
+BOUNTY_VALIDATION_GATES_ARTIFACT = "bounty-validation-gates.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -271,6 +272,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     CLAIM_EVIDENCE_REQUESTS_ARTIFACT,
     SECRET_EXPOSURE_REVIEW_ARTIFACT,
     BOUNTY_FRONTIER_ARTIFACT,
+    BOUNTY_VALIDATION_GATES_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -372,6 +374,7 @@ INDEX_ARTIFACT_ORDER = [
     CLAIM_EVIDENCE_REQUESTS_ARTIFACT,
     SECRET_EXPOSURE_REVIEW_ARTIFACT,
     BOUNTY_FRONTIER_ARTIFACT,
+    BOUNTY_VALIDATION_GATES_ARTIFACT,
     "config.json",
     "collection-summary.json",
     "endpoint-clusters.json",
@@ -22676,6 +22679,457 @@ def build_bounty_frontier(
     }
 
 
+def bounty_validation_frontier_rows(frontier: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(frontier, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for key in ["top_bounty_frontiers", "shortest_evidence_frontiers"]:
+        raw_rows = frontier.get(key)
+        if not isinstance(raw_rows, list):
+            continue
+        for row in raw_rows:
+            if not isinstance(row, dict):
+                continue
+            row_id = str(row.get("id") or row.get("claim_id") or "").strip()
+            if not row_id or row_id in seen:
+                continue
+            seen.add(row_id)
+            rows.append(row)
+    return rows
+
+
+def bounty_validation_gate_base_commands(artifact_dir: Path, profile: dict[str, Any] | None) -> list[str]:
+    return [
+        validation_command_for_artifact_dir(artifact_dir, "bounty-frontier --no-write --show-frontiers", profile=profile),
+        validation_command_for_artifact_dir(artifact_dir, "claim-evidence-requests --no-write", profile=profile),
+        validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+    ]
+
+
+def bounty_validation_lane_spec(
+    lane: str,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if lane == "transaction-integrity":
+        return {
+            "gate_type": "offline-decode-boundary-gate",
+            "minimum_witness_level": "boundary",
+            "validation_method": "Decode exactly one approved quote transaction offline and compare it to an explicit user intent policy.",
+            "required_official_evidence": [
+                repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl"),
+                repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json"),
+            ],
+            "required_derived_artifacts": [
+                TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
+                TRANSACTION_INTENT_BOUNDARY_ARTIFACT,
+                "transaction-intent.json",
+                "finding-gate.json",
+            ],
+            "validation_commands": [
+                validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "transaction-sidecar-review --no-write --show-commands --show-evidence-contract",
+                    profile=profile,
+                ),
+                validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "transaction-intent-boundary --no-write --show-boundaries",
+                    profile=profile,
+                ),
+                validation_command_for_artifact_dir(artifact_dir, "decode-transactions --no-write", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+            ],
+            "promotion_criteria": [
+                "The transaction payload comes from one approved quote response and is not a synthetic/template payload.",
+                "The intent policy matches the approved direction, wallet, amountIn, expected mints, and reviewed program allowlist.",
+                "Offline decode shows a required high-impact mismatch in signer, wallet account, source/destination mint, amount, or program allowlist.",
+                "Finding-gate ties the mismatch to concrete user-funds or transaction-integrity impact without signing or submitting.",
+            ],
+            "reject_if": [
+                "No decodable official transaction payload is present.",
+                "Only source-level concern, placeholder payload, synthetic payload, or draft sidecar evidence is available.",
+                "The apparent mismatch is explained by address table lookup coverage, token decimals, benign blockhash rewrite, or approved routing.",
+                "The proof requires wallet signing, transaction submission, or state-changing target traffic.",
+            ],
+            "forbidden_shortcuts": [
+                "Do not promote transaction source flow, policy scaffold, or boundary rows without official payload evidence.",
+                "Do not count wallet/browser/Burp setup as reproduction evidence.",
+            ],
+        }
+    if lane == "build-secret-exposure":
+        return {
+            "gate_type": "build-provenance-retention-gate",
+            "minimum_witness_level": "component",
+            "validation_method": "Review redacted build provenance for actual secret retention or disclosure.",
+            "required_official_evidence": [
+                "redacted build provenance: image history/config, cache/log excerpt, registry artifact, or builder attestation"
+            ],
+            "required_derived_artifacts": [SECRET_EXPOSURE_REVIEW_ARTIFACT, "finding-gate.json"],
+            "validation_commands": [
+                validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "secret-exposure-review --no-write --show-findings",
+                    profile=profile,
+                ),
+                validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+            ],
+            "promotion_criteria": [
+                "A real non-placeholder secret was supplied to the build or written during the build.",
+                "A persisted artifact or log proves retention/disclosure while redacting the raw secret value.",
+                "The exposed value has plausible account, package registry, deployment, or service impact.",
+            ],
+            "reject_if": [
+                "Only Dockerfile/source-level ARG, ENV, or npmrc pattern evidence is available.",
+                "Only placeholders, runtime-only environment references, or server-side references are present.",
+                "Image history, cache, logs, registry artifact, and builder provenance do not retain the secret.",
+            ],
+            "forbidden_shortcuts": [
+                "Do not treat static Docker build patterns as Medium+ without provenance evidence.",
+                "Do not print, persist, or request raw secret values.",
+            ],
+        }
+    if lane == "sensitive-response-impact":
+        return {
+            "gate_type": "single-official-response-impact-gate",
+            "minimum_witness_level": "boundary",
+            "validation_method": "Validate one approved response sidecar against rewrite/response impact oracles.",
+            "required_official_evidence": [repo_relative_or_absolute(artifact_dir / REWRITE_RESPONSE_SIDECAR_ARTIFACT)],
+            "required_derived_artifacts": [REWRITE_RESPONSE_REVIEW_ARTIFACT, "finding-gate.json"],
+            "validation_commands": [
+                validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "rewrite-response-review --no-write --show-sidecar-validation",
+                    profile=profile,
+                ),
+                validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+            ],
+            "promotion_criteria": [
+                "The sidecar is an official approved response observation and not a draft/template sample.",
+                "The response proves concrete sensitive data, authorization, path-confusion, or user-visible impact.",
+                "The impact is reproducible from the persisted redacted evidence and accepted by finding-gate.",
+            ],
+            "reject_if": [
+                "Only source review, template JSON, or draft sidecar exists.",
+                "The response contains no concrete sensitive/authorization impact.",
+                "The observation is out of scope, unauthenticated noise, or lacks a public-entry proof.",
+            ],
+            "forbidden_shortcuts": [
+                "Do not claim response rewrite risk from route shape alone.",
+                "Do not create official sidecars from guessed or synthetic responses.",
+            ],
+        }
+    if lane == "credentialed-provider-impact":
+        return {
+            "gate_type": "operator-provider-impact-gate",
+            "minimum_witness_level": "component",
+            "validation_method": "Use operator/provider evidence to prove quota, billing, monitoring, rate-limit, or credentialed upstream impact.",
+            "required_official_evidence": [repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)],
+            "required_derived_artifacts": [
+                OPERATOR_EVIDENCE_REVIEW_ARTIFACT,
+                CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT,
+                "finding-gate.json",
+            ],
+            "validation_commands": [
+                validation_command_for_artifact_dir(artifact_dir, "operator-evidence-review --no-write", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "credential-impact-checklist --no-write", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+            ],
+            "promotion_criteria": [
+                "Operator/provider evidence proves the upstream trusts the server credential for billable or quota-bearing activity.",
+                "A public entrypoint can cause the impact without privileged credentials or stress traffic.",
+                "Finding-gate accepts concrete account-level or provider-level consequence.",
+            ],
+            "reject_if": [
+                "Only a server-side API key reference is present.",
+                "No provider billing/quota/rate-limit/monitoring evidence is available.",
+                "Validation would require abusive volume, stress testing, or privileged account access.",
+            ],
+            "forbidden_shortcuts": [
+                "Do not infer bounty impact from a credential proxy pattern alone.",
+                "Do not send provider-costing or quota-consuming traffic without explicit approval.",
+            ],
+        }
+    if lane == "resource-control":
+        return {
+            "gate_type": "operator-resource-control-gate",
+            "minimum_witness_level": "component",
+            "validation_method": "Prove attacker-influenced routing, identity, or resource selection with non-stress operator/deployment evidence.",
+            "required_official_evidence": [repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)],
+            "required_derived_artifacts": [DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT, OPERATOR_EVIDENCE_REVIEW_ARTIFACT],
+            "validation_commands": [
+                validation_command_for_artifact_dir(artifact_dir, "deployment-review --no-write", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "operator-evidence-review --no-write", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+            ],
+            "promotion_criteria": [
+                "Evidence proves attacker-reachable control of resource selection, routing, identity, or availability-impacting behavior.",
+                "The impact is concrete and does not depend on volumetric stress, broad scanning, or unsupported scope.",
+                "Finding-gate accepts adversarial reachability and operator-visible consequence.",
+            ],
+            "reject_if": [
+                "Only deployment/source configuration suspicion is available.",
+                "No non-stress proof of attacker control or operator-visible impact exists.",
+                "The proof would require destructive or availability-impacting validation.",
+            ],
+            "forbidden_shortcuts": [
+                "Do not conflate resource preflight failures with target vulnerability evidence.",
+                "Do not use stress or load-based testing as a proof path.",
+            ],
+        }
+    if lane == "websocket-header-trust":
+        return {
+            "gate_type": "header-trust-boundary-gate",
+            "minimum_witness_level": "boundary",
+            "validation_method": "Prove a sensitive browser-controlled header reaches an upstream that trusts, logs, bills, or authorizes from it.",
+            "required_official_evidence": [repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)],
+            "required_derived_artifacts": [WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT, "finding-gate.json"],
+            "validation_commands": [
+                validation_command_for_artifact_dir(artifact_dir, "websocket-candidate-review --no-write", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+            ],
+            "promotion_criteria": [
+                "The forwarded header is attacker/browser-controlled and reaches a trust boundary.",
+                "The receiving upstream uses it for authorization, identity, billing, logging with security impact, or equivalent consequence.",
+                "The proof does not require acting as another user or privileged traffic.",
+            ],
+            "reject_if": [
+                "Only header forwarding source code exists.",
+                "The upstream ignores or treats the header as inert metadata.",
+                "No sensitive browser-controlled value is present on the origin.",
+            ],
+            "forbidden_shortcuts": [
+                "Do not report header forwarding without a trust/use proof.",
+                "Do not authenticate as or act for another user during validation.",
+            ],
+        }
+    return {
+        "gate_type": "official-sidecar-impact-gate",
+        "minimum_witness_level": "component",
+        "validation_method": "Close the claim-specific official evidence request and rerun finding-gate.",
+        "required_official_evidence": [],
+        "required_derived_artifacts": ["finding-gate.json", "adjudication.json"],
+        "validation_commands": [
+            validation_command_for_artifact_dir(artifact_dir, "claim-evidence-requests --no-write", profile=profile),
+            validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+        ],
+        "promotion_criteria": [
+            "Official evidence closes every request attached to the frontier.",
+            "The proof demonstrates concrete security impact and public-entry reachability.",
+            "Adjudication accepts the claim as reportable.",
+        ],
+        "reject_if": [
+            "Evidence remains draft-only, static-only, or missing.",
+            "The mechanism is real but impact or reachability is not proven.",
+        ],
+        "forbidden_shortcuts": [
+            "Do not promote a frontier directly to a finding.",
+        ],
+    }
+
+
+def bounty_validation_gate_status(frontier: dict[str, Any]) -> str:
+    if frontier.get("reportable_now"):
+        return "reportable-needs-final-adjudication"
+    if frontier.get("finding_gate_ready"):
+        return "ready-for-finding-gate-review"
+    status = str(frontier.get("status") or "")
+    missing = int(frontier.get("missing_or_invalid_evidence_count") or 0)
+    if status.startswith("blocked") or missing > 0:
+        return "blocked-missing-official-evidence"
+    if status.startswith("ready"):
+        return "ready-for-validation"
+    return "needs-validation-planning"
+
+
+def bounty_validation_evidence_label(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    path_like = (
+        text.startswith("/")
+        or text.startswith("./")
+        or text.startswith(".greybox/")
+        or text.endswith((".json", ".jsonl", ".txt", ".md"))
+    )
+    return Path(text).name if path_like else text
+
+
+def bounty_validation_evidence_labels(values: Any, *, limit: int = 4) -> list[str]:
+    return ordered_unique_strings(
+        [bounty_validation_evidence_label(value) for value in normalize_string_list(values)]
+    )[:limit]
+
+
+def build_bounty_validation_gates(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    bounty_frontier: dict[str, Any] | None,
+    transaction_boundary: dict[str, Any] | None,
+    adjudication: dict[str, Any] | None,
+) -> dict[str, Any]:
+    frontier_rows = bounty_validation_frontier_rows(bounty_frontier)
+    gates = []
+    status_counts: dict[str, int] = {}
+    gate_type_counts: dict[str, int] = {}
+    lane_counts: dict[str, int] = {}
+    witness_counts: dict[str, int] = {}
+    base_commands = bounty_validation_gate_base_commands(artifact_dir, profile)
+    transaction_boundary_summary = (
+        transaction_boundary.get("summary")
+        if isinstance(transaction_boundary, dict) and isinstance(transaction_boundary.get("summary"), dict)
+        else {}
+    )
+
+    for frontier in frontier_rows:
+        lane = str(frontier.get("bounty_lane") or "evidence-closed-impact")
+        lane_spec = bounty_validation_lane_spec(lane, artifact_dir, profile)
+        gate_status = bounty_validation_gate_status(frontier)
+        required_artifacts = ordered_unique_strings(
+            [
+                *normalize_string_list(frontier.get("required_artifacts")),
+                *normalize_string_list(lane_spec.get("required_official_evidence")),
+            ]
+        )
+        validation_commands = ordered_unique_strings(
+            [
+                *normalize_string_list(frontier.get("verification_commands")),
+                *normalize_string_list(lane_spec.get("validation_commands")),
+                *base_commands,
+            ]
+        )[:12]
+        missing_count = int(frontier.get("missing_or_invalid_evidence_count") or 0)
+        if not missing_count and gate_status == "blocked-missing-official-evidence":
+            missing_count = len(required_artifacts)
+        gate = {
+            "id": f"GATE-{safe_probe_id(str(frontier.get('id') or frontier.get('claim_id') or len(gates) + 1))}",
+            "frontier_id": frontier.get("id"),
+            "claim_id": frontier.get("claim_id"),
+            "entrypoint": frontier.get("entrypoint"),
+            "bounty_lane": lane,
+            "expected_severity": frontier.get("expected_severity"),
+            "frontier_status": frontier.get("status"),
+            "gate_status": gate_status,
+            "gate_type": lane_spec.get("gate_type"),
+            "minimum_witness_level": lane_spec.get("minimum_witness_level"),
+            "validation_method": lane_spec.get("validation_method"),
+            "proof_goal": frontier.get("proof_goal"),
+            "required_official_evidence": required_artifacts,
+            "missing_or_invalid_evidence_count": missing_count,
+            "required_derived_artifacts": normalize_string_list(lane_spec.get("required_derived_artifacts")),
+            "validation_commands": validation_commands,
+            "promotion_criteria": ordered_unique_strings(
+                [
+                    *normalize_string_list(lane_spec.get("promotion_criteria")),
+                    *normalize_string_list(frontier.get("acceptance_criteria"))[:6],
+                ]
+            )[:14],
+            "reject_if": ordered_unique_strings(
+                [
+                    *normalize_string_list(lane_spec.get("reject_if")),
+                    *normalize_string_list(frontier.get("reject_if"))[:6],
+                ]
+            )[:14],
+            "forbidden_shortcuts": normalize_string_list(lane_spec.get("forbidden_shortcuts"))[:8],
+            "finding_gate_ready": bool(frontier.get("finding_gate_ready")),
+            "reportable_now": bool(frontier.get("reportable_now")),
+            "e2e_required": True,
+            "environment_discovery_is_not_witness": True,
+            "validity_boundary": (
+                "This row is a validation gate, not a finding. It can only promote after official evidence, "
+                "the lane-specific oracle, and final adjudication agree."
+            ),
+        }
+        if lane == "transaction-integrity":
+            gate["transaction_boundary_status"] = (
+                transaction_boundary.get("status")
+                if isinstance(transaction_boundary, dict)
+                else "missing"
+            )
+            gate["transaction_boundary_counts"] = {
+                "boundaries": transaction_boundary_summary.get("boundaries", 0),
+                "candidate_boundaries": transaction_boundary_summary.get("candidate_boundaries", 0),
+                "waiting_transaction_corpus_boundaries": transaction_boundary_summary.get(
+                    "waiting_transaction_corpus_boundaries",
+                    0,
+                ),
+                "decoded_transactions": transaction_boundary_summary.get("decoded_transactions", 0),
+            }
+        gates.append(gate)
+        increment_count(status_counts, str(gate.get("gate_status") or "unknown"))
+        increment_count(gate_type_counts, str(gate.get("gate_type") or "unknown"))
+        increment_count(lane_counts, lane)
+        increment_count(witness_counts, str(gate.get("minimum_witness_level") or "unknown"))
+
+    reportable_now = sum(1 for gate in gates if gate.get("reportable_now"))
+    ready = sum(1 for gate in gates if gate.get("gate_status") in {"ready-for-finding-gate-review", "ready-for-validation"})
+    blocked = sum(1 for gate in gates if str(gate.get("gate_status") or "").startswith("blocked"))
+    if reportable_now:
+        status = "reportable-validation-gate-present"
+    elif ready:
+        status = "ready-validation-gate-present"
+    elif gates:
+        status = "validation-gates-indexed-with-blockers"
+    else:
+        status = "no-bounty-validation-gates"
+    gates.sort(
+        key=lambda gate: (
+            BOUNTY_FRONTIER_SEVERITY_RANK.get(str(gate.get("expected_severity") or "info"), 9),
+            int(gate.get("missing_or_invalid_evidence_count") or 99),
+            str(gate.get("bounty_lane") or ""),
+            str(gate.get("frontier_id") or ""),
+        )
+    )
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-validation-gates-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "methodology": {
+            "source_research": [
+                "https://x.com/pkqs91/status/2070157806104457395",
+                "https://blog.monad.xyz/blog/monad-bugfinder",
+                "https://www.anthropic.com/research/mythos-preview",
+            ],
+            "finder_triager_split": "Existing bounty-frontier rows are treated as allegations; this artifact only defines validation gates.",
+            "e2e_promotion_rule": "Medium+ promotion requires official evidence and end-to-end/no-assumptions proof for the lane.",
+            "witness_rule": "Environment discovery, successful builds, browser setup, and helper commands are not witness evidence.",
+            "adjudication_rule": "Mechanism, impact, runtime/offline reproduction, reachability, intended behavior, and terminal state stay separate.",
+        },
+        "summary": {
+            "gates": len(gates),
+            "ready": ready,
+            "blocked": blocked,
+            "reportable_now": reportable_now,
+            "e2e_required": sum(1 for gate in gates if gate.get("e2e_required")),
+            "status_counts": dict(sorted(status_counts.items())),
+            "gate_type_counts": dict(sorted(gate_type_counts.items())),
+            "lane_counts": dict(sorted(lane_counts.items())),
+            "minimum_witness_level_counts": dict(sorted(witness_counts.items())),
+            "bounty_frontier_status": artifact_summary_status(bounty_frontier),
+            "transaction_boundary_status": artifact_summary_status(transaction_boundary),
+            "adjudication_status": artifact_summary_status(adjudication),
+        },
+        "gates": gates,
+        "next_step": (
+            "Work the first blocked gate by collecting the exact official evidence it names; do not add new leads inside validation."
+            if blocked
+            else "Run the ready gate validation commands and adjudicate before reporting."
+            if ready
+            else "No bounty validation gates could be derived from current frontier artifacts."
+        ),
+        "safety": (
+            "Offline artifact synthesis only. It sends no target traffic, calls no Burp tool, starts no browser, signs nothing, "
+            "submits no transaction, and creates no official evidence sidecars."
+        ),
+    }
+
+
 VALIDATION_APPROVAL_PACKET_KEYS = [
     ("transaction_corpus_approval_packet", "transaction-corpus"),
     ("credential_impact_approval_packet", "credential-impact"),
@@ -23086,6 +23540,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     CLAIM_EVIDENCE_REQUESTS_ARTIFACT: "claim-evidence-requests",
     SECRET_EXPOSURE_REVIEW_ARTIFACT: "secret-exposure-review",
     BOUNTY_FRONTIER_ARTIFACT: "bounty-frontier",
+    BOUNTY_VALIDATION_GATES_ARTIFACT: "bounty-validation-gates",
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
     ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT: "oracle-plan --write-sidecar-template",
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT: "rewrite-response-review --write-sidecar-template",
@@ -23127,6 +23582,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "claim-evidence-requests",
     "secret-exposure-review",
     "bounty-frontier",
+    "bounty-validation-gates",
     "transaction-intent-boundary",
     "rewrite-response-review --write-sidecar-template",
     "report",
@@ -23153,6 +23609,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "claim-evidence-requests": "claim-evidence-requests --no-write",
     "secret-exposure-review": "secret-exposure-review --no-write",
     "bounty-frontier": "bounty-frontier --no-write",
+    "bounty-validation-gates": "bounty-validation-gates --no-write",
     "transaction-intent-boundary": "transaction-intent-boundary --no-write",
     "rewrite-response-review --write-sidecar-template": (
         "rewrite-response-review --no-write --show-sidecar-template-json"
@@ -47430,6 +47887,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("operator-evidence-review", "run_operator_evidence_review"),
         refresh_expectation("secret-exposure-review", "run_secret_exposure_review"),
         refresh_expectation("bounty-frontier", "run_bounty_frontier"),
+        refresh_expectation("bounty-validation-gates", "run_bounty_validation_gates"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-intent-boundary", "run_transaction_intent_boundary"),
         refresh_expectation("transaction-sidecar-review", "run_transaction_sidecar_review"),
@@ -70984,6 +71442,126 @@ def run_bounty_frontier(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_bounty_validation_gates(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    frontier = load_optional_json(artifact_dir / BOUNTY_FRONTIER_ARTIFACT)
+    if not isinstance(frontier, dict):
+        claim_requests = load_optional_json(artifact_dir / CLAIM_EVIDENCE_REQUESTS_ARTIFACT)
+        if not isinstance(claim_requests, dict):
+            claim_requests = build_claim_evidence_requests(
+                target=target,
+                profile=profile,
+                artifact_dir=artifact_dir,
+                package_path=artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT,
+                ladder_doc=load_optional_json(artifact_dir / CLAIM_WITNESS_LADDER_ARTIFACT),
+                draft_doc=load_optional_json(artifact_dir / EVIDENCE_SIDECAR_DRAFTS_ARTIFACT),
+            )
+        secret_review = load_optional_json(artifact_dir / SECRET_EXPOSURE_REVIEW_ARTIFACT)
+        if not isinstance(secret_review, dict):
+            secret_review = build_secret_exposure_review(
+                source_root=source_root,
+                profile=profile,
+                max_file_bytes=DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES,
+                max_files=64,
+            )
+        frontier = build_bounty_frontier(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            claim_requests=claim_requests,
+            secret_review=secret_review,
+            review_blockers=load_optional_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT),
+            evidence_gaps=load_optional_json(artifact_dir / "evidence-gaps.json"),
+            transaction_flow_review=load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT),
+            adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+        )
+
+    gates = build_bounty_validation_gates(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_frontier=frontier,
+        transaction_boundary=load_optional_json(artifact_dir / TRANSACTION_INTENT_BOUNDARY_ARTIFACT),
+        adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / BOUNTY_VALIDATION_GATES_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(gates))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-validation-gates",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = gates.get("summary", {}) if isinstance(gates.get("summary"), dict) else {}
+    print(f"Bounty validation gates: {gates.get('status')}")
+    print(
+        "Gates: "
+        f"total={summary.get('gates', 0)} "
+        f"ready={summary.get('ready', 0)} "
+        f"blocked={summary.get('blocked', 0)} "
+        f"reportable_now={summary.get('reportable_now', 0)} "
+        f"e2e_required={summary.get('e2e_required', 0)}"
+    )
+    print(
+        "Inputs: "
+        f"frontier={summary.get('bounty_frontier_status') or '-'} "
+        f"transaction_boundary={summary.get('transaction_boundary_status') or '-'} "
+        f"adjudication={summary.get('adjudication_status') or '-'}"
+    )
+    print(f"Gate types: {json.dumps(summary.get('gate_type_counts', {}), sort_keys=True)}")
+    if getattr(args, "show_gates", False):
+        display_limit = max(0, int(args.top))
+        for gate in (gates.get("gates", []) or [])[:display_limit]:
+            if not isinstance(gate, dict):
+                continue
+            print(
+                f"- {gate.get('id')}: {gate.get('expected_severity')} "
+                f"{gate.get('gate_status')} type={gate.get('gate_type')} "
+                f"lane={gate.get('bounty_lane')} witness={gate.get('minimum_witness_level')}"
+            )
+            evidence = ", ".join(bounty_validation_evidence_labels(gate.get("required_official_evidence")))
+            if evidence:
+                print(f"  needs={inline_summary_text(evidence, max_chars=300)}")
+            print(f"  method={inline_summary_text(gate.get('validation_method'), max_chars=320)}")
+            commands = normalize_string_list(gate.get("validation_commands"))
+            if commands:
+                print(f"  command={inline_summary_text(commands[0], max_chars=420)}")
+            rejects = normalize_string_list(gate.get("reject_if"))
+            if rejects:
+                print(f"  reject_if={inline_summary_text(rejects[0], max_chars=260)}")
+        remaining = len(gates.get("gates", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more gate(s); rerun without --no-write to write the full artifact")
+            else:
+                print(f"- {remaining} more gate(s) in {output_path}")
+    print(f"Next: {inline_summary_text(gates.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and gates.get("status") not in {
+        "validation-gates-indexed-with-blockers",
+        "ready-validation-gate-present",
+        "reportable-validation-gate-present",
+    }:
+        return 1
+    return 0
+
+
 def run_iteration_decision(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -73745,6 +74323,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless at least one frontier is reportable or ready for finding-gate review.",
     )
     bounty_frontier.set_defaults(func=run_bounty_frontier)
+
+    bounty_validation_gates = sub.add_parser(
+        "bounty-validation-gates",
+        help="Map bounty frontiers to strict validation gates before any Medium+ promotion",
+    )
+    bounty_validation_gates.add_argument(
+        "--output",
+        help=(
+            f"Where to write {BOUNTY_VALIDATION_GATES_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{BOUNTY_VALIDATION_GATES_ARTIFACT}."
+        ),
+    )
+    bounty_validation_gates.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of validation gate rows to print with --show-gates.",
+    )
+    bounty_validation_gates.add_argument(
+        "--show-gates",
+        action="store_true",
+        help="Print validation gate rows, required evidence, and first validation command.",
+    )
+    bounty_validation_gates.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print bounty validation gates only; do not write {BOUNTY_VALIDATION_GATES_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    bounty_validation_gates.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless validation gates are indexed for current bounty frontiers.",
+    )
+    bounty_validation_gates.set_defaults(func=run_bounty_validation_gates)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
