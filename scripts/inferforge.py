@@ -82,6 +82,8 @@ MAX_RESPONSE_BYTES = 256 * 1024
 MAX_BODY_SAMPLE_CHARS = 1200
 DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_BURP_HISTORY_INPUT_BYTES = 4 * 1024 * 1024
+DEFAULT_RESOURCE_WARNING_BURP_HISTORY_INPUT_BYTES = 1 * 1024 * 1024
+DEFAULT_RESOURCE_CRITICAL_BURP_HISTORY_INPUT_BYTES = 256 * 1024
 DEFAULT_BURP_SYNC_COUNT = 20
 DEFAULT_RESOURCE_WARNING_BURP_SYNC_COUNT = 10
 DEFAULT_RESOURCE_CRITICAL_BURP_SYNC_COUNT = 3
@@ -6658,10 +6660,13 @@ def build_resource_budget(
         mode = "normal"
         offline_limit = 8
         burp_count_limit = DEFAULT_BURP_SYNC_COUNT
+        burp_input_bytes_limit = DEFAULT_BURP_HISTORY_INPUT_BYTES
         max_parallel_commands = 2
         active_target_traffic = "allowed-after-resource-check"
         browser_automation = "allowed-after-resource-check"
         active_service_start = "allowed-after-resource-check"
+        resource_warning_override = "not-needed"
+        hard_block_reasons: list[str] = []
         recommendations = [
             "Run resource-snapshot --strict immediately before active target traffic.",
             "Keep Burp history reads bounded and avoid raw history persistence unless explicitly debugging.",
@@ -6670,23 +6675,29 @@ def build_resource_budget(
         mode = "critical"
         offline_limit = DEFAULT_RESOURCE_CRITICAL_OFFLINE_COMMAND_LIMIT
         burp_count_limit = DEFAULT_RESOURCE_CRITICAL_BURP_SYNC_COUNT
+        burp_input_bytes_limit = DEFAULT_RESOURCE_CRITICAL_BURP_HISTORY_INPUT_BYTES
         max_parallel_commands = 1
         active_target_traffic = "blocked"
         browser_automation = "blocked"
         active_service_start = "blocked"
+        resource_warning_override = "blocked-critical"
+        hard_block_reasons = ["critical-resource-budget"]
         recommendations = [
             "Do not start the target server, browser automation, Burp Scanner, Intruder, broad crawling, or active probes.",
             "Run only short offline planning, artifact-health, and source-review commands until swap pressure clears.",
-            "If Burp history must be read after explicit approval, use the capped effective count recorded in burp-sync artifacts.",
+            "--allow-resource-warning does not bypass critical local memory/swap pressure.",
         ]
     else:
         mode = "degraded"
         offline_limit = DEFAULT_RESOURCE_DEGRADED_OFFLINE_COMMAND_LIMIT
         burp_count_limit = DEFAULT_RESOURCE_WARNING_BURP_SYNC_COUNT
+        burp_input_bytes_limit = DEFAULT_RESOURCE_WARNING_BURP_HISTORY_INPUT_BYTES
         max_parallel_commands = 1
         active_target_traffic = "blocked"
         browser_automation = "blocked"
         active_service_start = "blocked"
+        resource_warning_override = "available-with-caps"
+        hard_block_reasons = []
         recommendations = [
             "Prefer no-write offline review commands and avoid starting new long-running local services.",
             "Run active target traffic only after resource-snapshot --strict is healthy.",
@@ -6706,12 +6717,15 @@ def build_resource_budget(
         "warnings": warnings,
         "offline_command_preview_limit": offline_limit,
         "burp_history_count_limit": burp_count_limit,
+        "burp_history_input_bytes_limit": burp_input_bytes_limit,
         "max_parallel_commands": max_parallel_commands,
         "active_target_traffic": active_target_traffic,
         "browser_automation": browser_automation,
         "active_service_start": active_service_start,
         "release_candidate_count": len(release_candidates),
         "release_candidate_rss_mib": release_candidate_rss_mib,
+        "resource_warning_override": resource_warning_override,
+        "hard_block_reasons": hard_block_reasons,
         "allow_raw_burp_history": False,
         "allow_scanner_or_intruder": False,
         "recommendations": recommendations,
@@ -7026,6 +7040,65 @@ def resource_gate_warnings_text(resource_snapshot: dict[str, Any] | None) -> str
     return ",".join(str(item) for item in warnings) if warnings else "none"
 
 
+def resource_warning_override_policy(
+    resource_snapshot: dict[str, Any] | None,
+    *,
+    allow_flag: str = "--allow-resource-warning",
+) -> dict[str, Any]:
+    status = artifact_summary_status(resource_snapshot)
+    budget = resource_budget_for_snapshot(resource_snapshot)
+    mode = str(budget.get("mode") or status or "unknown")
+    if status == "healthy":
+        return {
+            "status": "not-needed",
+            "mode": mode,
+            "allow_flag": allow_flag,
+            "reason": "resource-healthy",
+            "guidance": "Resource snapshot is healthy; warning override is not needed.",
+        }
+    if mode == "critical":
+        return {
+            "status": "blocked",
+            "mode": mode,
+            "allow_flag": allow_flag,
+            "reason": "critical-resource-budget",
+            "guidance": (
+                f"{allow_flag} does not override critical local memory/swap pressure. "
+                "Free memory, reduce swap usage, or close reviewed release candidates first."
+            ),
+        }
+    if mode == "degraded":
+        return {
+            "status": "available-with-caps",
+            "mode": mode,
+            "allow_flag": allow_flag,
+            "reason": "degraded-resource-budget",
+            "guidance": (
+                f"{allow_flag} may be used only after explicit review with the resource-budget caps, "
+                "no raw Burp history persistence, and the smallest practical count/probe limits."
+            ),
+        }
+    return {
+        "status": "blocked",
+        "mode": mode,
+        "allow_flag": allow_flag,
+        "reason": "unknown-resource-budget",
+        "guidance": "Resource status is not healthy and no degraded override policy is available.",
+    }
+
+
+def resource_gate_blocks_work(
+    resource_snapshot: dict[str, Any] | None,
+    *,
+    allow_resource_warning: bool,
+) -> bool:
+    if artifact_summary_status(resource_snapshot) == "healthy":
+        return False
+    if not allow_resource_warning:
+        return True
+    return resource_warning_override_policy(resource_snapshot).get("status") != "available-with-caps"
+
+
 def resource_gate_blocked_artifact(
     *,
     command: str,
@@ -7035,6 +7108,17 @@ def resource_gate_blocked_artifact(
     blocked_actions: list[str],
     allow_flag: str = "--allow-resource-warning",
 ) -> dict[str, Any]:
+    override_policy = resource_warning_override_policy(resource_snapshot, allow_flag=allow_flag)
+    if override_policy.get("reason") == "critical-resource-budget":
+        next_step = (
+            "Free memory or reduce swap usage first; "
+            f"{allow_flag} does not override a critical resource budget."
+        )
+    else:
+        next_step = (
+            "Free memory or rerun after explicit review with "
+            f"{allow_flag} and the smallest practical target/probe/history limits."
+        )
     return {
         "generated_at": utc_now(),
         "status": "blocked-resource-gate",
@@ -7043,11 +7127,9 @@ def resource_gate_blocked_artifact(
         "profile": profile_summary(profile),
         "resource_preflight": validation_resource_preflight_summary(resource_snapshot),
         "resource_snapshot": resource_snapshot,
+        "override_policy": override_policy,
         "blocked_actions": blocked_actions,
-        "next_step": (
-            "Free memory or rerun after explicit review with "
-            f"{allow_flag} and the smallest practical target/probe/history limits."
-        ),
+        "next_step": next_step,
         "safety": [
             "No active target probes, Burp history reads, scanner actions, fuzzing, wallet signing, or transaction submission were run.",
             "The command stopped before long-running or memory-sensitive work because the local memory/swap gate is warning.",
@@ -7099,6 +7181,33 @@ def effective_burp_history_count(
         "budget_mode": budget.get("mode") if budget else resource_status,
         "requested_count": requested,
         "effective_count": effective,
+        "limit": limit,
+    }
+
+
+def effective_burp_history_input_bytes(
+    requested_max_bytes: int,
+    resource_snapshot: dict[str, Any] | None,
+) -> tuple[int, dict[str, Any] | None]:
+    requested = max(1, int(requested_max_bytes))
+    resource_status = artifact_summary_status(resource_snapshot)
+    if resource_status == "healthy":
+        return requested, None
+    budget = resource_budget_for_snapshot(resource_snapshot)
+    raw_limit = budget.get("burp_history_input_bytes_limit") if budget else None
+    try:
+        limit = max(1, int(raw_limit))
+    except (TypeError, ValueError):
+        limit = DEFAULT_RESOURCE_WARNING_BURP_HISTORY_INPUT_BYTES
+    effective = min(requested, limit)
+    if effective == requested:
+        return effective, None
+    return effective, {
+        "reason": "resource-budget-cap",
+        "resource_status": resource_status,
+        "budget_mode": budget.get("mode") if budget else resource_status,
+        "requested_max_bytes": requested,
+        "effective_max_bytes": effective,
         "limit": limit,
     }
 
@@ -30563,6 +30672,7 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
         allow_resource_warning: bool = True,
         resource_snapshot_override: dict[str, Any] | None = None,
         count: int = 1,
+        max_history_bytes: int | None = None,
     ) -> dict[str, Any]:
         case_dir = root / case_id
         profile_path = root / f"{case_id}-profile.json"
@@ -30586,19 +30696,34 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
             str(count),
             "--replace",
         ]
+        if max_history_bytes is not None:
+            command_args.extend(["--max-history-bytes", str(max_history_bytes)])
         if allow_resource_warning:
             command_args.append("--allow-resource-warning")
         parsed_args = parser.parse_args(command_args)
         original_mcp_sse_client = globals()["McpSseClient"]
         original_import_burp_history_inputs = globals()["import_burp_history_inputs"]
         original_build_resource_snapshot = globals()["build_resource_snapshot"]
+        if resource_snapshot_override is None:
+            resource_snapshot_override = {
+                "generated_at": utc_now(),
+                "status": "healthy",
+                "warnings": [],
+                "memory": {
+                    "mem_available_mib": 4096,
+                    "mem_available_pct": 50.0,
+                    "swap_used_mib": 0,
+                    "swap_used_pct": 0.0,
+                },
+                "watched_ports": {"3100": {"listening": False}, "2455": {"listening": False}},
+                "top_rss_processes": [],
+            }
 
         def failing_import(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
             raise RuntimeError(sentinel)
 
         try:
-            if resource_snapshot_override is not None:
-                globals()["build_resource_snapshot"] = lambda **_kwargs: resource_snapshot_override
+            globals()["build_resource_snapshot"] = lambda **_kwargs: resource_snapshot_override
             if mcp_client_cls is not None:
                 globals()["McpSseClient"] = mcp_client_cls
             if import_failure:
@@ -30637,7 +30762,15 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="inferforge-burp-sync-failure-selftest-") as temp_dir:
         root = Path(temp_dir)
-        warning_resource_snapshot = {
+        degraded_resource_snapshot = {
+            "generated_at": utc_now(),
+            "status": "warning",
+            "warnings": ["available-memory-below-threshold"],
+            "memory": {"mem_available_mib": 1500, "swap_used_mib": 512, "swap_used_pct": 12.5},
+            "watched_ports": {"3100": {"listening": False}, "2455": {"listening": True}},
+            "top_rss_processes": [],
+        }
+        critical_resource_snapshot = {
             "generated_at": utc_now(),
             "status": "warning",
             "warnings": ["swap-usage-above-threshold"],
@@ -30651,7 +30784,14 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
                 "resource-gate",
                 make_profile("/health"),
                 allow_resource_warning=False,
-                resource_snapshot_override=warning_resource_snapshot,
+                resource_snapshot_override=degraded_resource_snapshot,
+            ),
+            "resource_critical_override": run_case(
+                root,
+                "resource-critical-override",
+                make_profile("/health"),
+                allow_resource_warning=True,
+                resource_snapshot_override=critical_resource_snapshot,
             ),
             "profile_validation": run_case(
                 root,
@@ -30677,12 +30817,19 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
                 make_profile("/health"),
                 mcp_client_cls=SuccessfulHistoryMcpSseClient,
             ),
+            "history_size_limit": run_case(
+                root,
+                "history-size-limit",
+                make_profile("/health"),
+                mcp_client_cls=SuccessfulHistoryMcpSseClient,
+                max_history_bytes=32,
+            ),
             "resource_warning_capped_history": run_case(
                 root,
                 "resource-warning-capped-history",
                 make_profile("/health"),
                 mcp_client_cls=SuccessfulHistoryMcpSseClient,
-                resource_snapshot_override=warning_resource_snapshot,
+                resource_snapshot_override=degraded_resource_snapshot,
                 count=50,
             ),
         }
@@ -30773,18 +30920,34 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
                 and cases["resource_warning_capped_history"]["sync"].get("status") == "synced"
                 and cases["resource_warning_capped_history"]["http_history"].get("requested_count") == 50
                 and cases["resource_warning_capped_history"]["http_history"].get("count")
-                == DEFAULT_RESOURCE_CRITICAL_BURP_SYNC_COUNT
+                == DEFAULT_RESOURCE_WARNING_BURP_SYNC_COUNT
                 and cases["resource_warning_capped_history"]["http_history"].get("count_cap", {}).get("reason")
                 == "resource-budget-cap"
                 and cases["resource_warning_capped_history"]["http_history"].get("count_cap", {}).get("budget_mode")
-                == "critical"
+                == "degraded"
                 and cases["resource_warning_capped_history"]["raw_file_exists"] is False
                 and not cases["resource_warning_capped_history"]["security_issues"]
                 and not cases["resource_warning_capped_history"]["leaked_files"]
                 and not cases["resource_warning_capped_history"]["stdout_leaked"]
             ),
-            "expected": "burp-sync caps MCP history reads under an explicitly allowed critical resource warning",
+            "expected": "burp-sync caps MCP history reads under an explicitly allowed degraded resource warning",
             "actual": cases["resource_warning_capped_history"],
+        },
+        {
+            "id": "burp-sync-critical-resource-warning-cannot-be-overridden",
+            "passed": (
+                cases["resource_critical_override"]["return_code"] == 2
+                and cases["resource_critical_override"]["sync"].get("status") == "blocked-resource-gate"
+                and cases["resource_critical_override"]["sync"].get("override_policy", {}).get("reason")
+                == "critical-resource-budget"
+                and cases["resource_critical_override"]["sync"].get("http_history") is None
+                and cases["resource_critical_override"]["raw_file_exists"] is False
+                and not cases["resource_critical_override"]["security_issues"]
+                and not cases["resource_critical_override"]["leaked_files"]
+                and not cases["resource_critical_override"]["stdout_leaked"]
+            ),
+            "expected": "burp-sync refuses MCP history reads when --allow-resource-warning is used under a critical resource budget",
+            "actual": cases["resource_critical_override"],
         },
         {
             "id": "profile-validation-failure-redacts-error",
@@ -30845,6 +31008,22 @@ def build_burp_sync_failure_selftest() -> dict[str, Any]:
             ),
             "expected": "successful burp-sync imports raw MCP history in memory, records bytes/hash, and does not persist raw history by default",
             "actual": cases["history_success"],
+        },
+        {
+            "id": "burp-sync-history-size-limit-stops-before-import",
+            "passed": (
+                cases["history_size_limit"]["return_code"] == 2
+                and cases["history_size_limit"]["sync"].get("status") == "blocked-resource-history-size"
+                and cases["history_size_limit"]["http_history"].get("size_limit_exceeded") is True
+                and cases["history_size_limit"]["http_history"].get("max_bytes") == 32
+                and cases["history_size_limit"]["raw_persisted"] is False
+                and cases["history_size_limit"]["raw_file_exists"] is False
+                and not cases["history_size_limit"]["security_issues"]
+                and not cases["history_size_limit"]["leaked_files"]
+                and not cases["history_size_limit"]["stdout_leaked"]
+            ),
+            "expected": "burp-sync stops before parsing/importing or persisting raw history when the MCP payload exceeds --max-history-bytes",
+            "actual": cases["history_size_limit"],
         },
     ]
     failed = [item for item in assertions if not item["passed"]]
@@ -33877,7 +34056,7 @@ def run_audit(args: argparse.Namespace) -> int:
 
     resource_snapshot = build_default_resource_snapshot(max_processes=8)
     resource_status = artifact_summary_status(resource_snapshot)
-    if resource_status != "healthy" and not args.allow_resource_warning:
+    if resource_gate_blocks_work(resource_snapshot, allow_resource_warning=bool(args.allow_resource_warning)):
         resource_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
         blocked_path = artifact_dir / "audit-resource-gate.json"
         write_json(resource_path, resource_snapshot)
@@ -36049,6 +36228,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             resource_budget_swap_pressure_sample.get("mode") == "critical"
             and resource_budget_swap_pressure_sample.get("max_parallel_commands") == 1
             and resource_budget_swap_pressure_sample.get("active_service_start") == "blocked"
+            and resource_budget_swap_pressure_sample.get("resource_warning_override") == "blocked-critical"
+            and "critical-resource-budget" in (resource_budget_swap_pressure_sample.get("hard_block_reasons") or [])
             and resource_budget_swap_pressure_sample.get("release_candidate_count") == 3
             and resource_budget_swap_pressure_sample.get("release_candidate_rss_mib") == 1960.0
         )
@@ -39167,9 +39348,14 @@ def run_burp_sync(args: argparse.Namespace) -> int:
 
     resource_snapshot = build_default_resource_snapshot(max_processes=8)
     resource_status = artifact_summary_status(resource_snapshot)
-    if resource_status != "healthy" and not args.allow_resource_warning:
+    if resource_gate_blocks_work(resource_snapshot, allow_resource_warning=bool(args.allow_resource_warning)):
         sync_path = artifact_dir / "burp-mcp-sync.json"
         warnings = resource_snapshot.get("warnings", []) or []
+        override_policy = resource_warning_override_policy(resource_snapshot)
+        if override_policy.get("reason") == "critical-resource-budget":
+            next_step = "Free memory or reduce swap usage first; --allow-resource-warning does not override a critical resource budget."
+        else:
+            next_step = "Free memory or rerun with --allow-resource-warning and a small --count after explicit approval."
         write_json(
             sync_path,
             {
@@ -39189,11 +39375,9 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                 "mcp_actions": [],
                 "resource_preflight": validation_resource_preflight_summary(resource_snapshot),
                 "resource_snapshot": resource_snapshot,
+                "override_policy": override_policy,
                 "observe_before_sync": bool(args.observe),
-                "next_step": (
-                    "Free memory or rerun with --allow-resource-warning and a small --count "
-                    "after explicit approval."
-                ),
+                "next_step": next_step,
                 "safety": [
                     "No Burp MCP history was read because the local resource snapshot is not healthy.",
                     "Does not run Burp Scanner, sign wallets, submit Solana transactions, or fuzz broadly.",
@@ -39223,6 +39407,7 @@ def run_burp_sync(args: argparse.Namespace) -> int:
     if resource_budget and not resource_snapshot.get("resource_budget"):
         resource_snapshot["resource_budget"] = resource_budget
     history_count, history_count_cap = effective_burp_history_count(args.count, resource_snapshot)
+    history_max_bytes, history_bytes_cap = effective_burp_history_input_bytes(args.max_history_bytes, resource_snapshot)
 
     observe_result = None
     if args.observe:
@@ -39327,6 +39512,9 @@ def run_burp_sync(args: argparse.Namespace) -> int:
             "requested_count": args.count,
             "count": history_count,
             "count_cap": history_count_cap,
+            "requested_max_bytes": args.max_history_bytes,
+            "max_bytes": history_max_bytes,
+            "max_bytes_cap": history_bytes_cap,
             "offset": args.offset,
             "fallback_used": False,
             "fallback_reason": None,
@@ -39428,6 +39616,40 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                     "sha256": hashlib.sha256(raw_text_bytes).hexdigest(),
                 }
             )
+            if len(raw_text_bytes) > history_max_bytes:
+                sync_artifact["status"] = "blocked-resource-history-size"
+                sync_artifact["http_history"]["size_limit_exceeded"] = True
+                sync_artifact["http_history"]["raw_persisted"] = False
+                sync_artifact["http_history"]["raw_retention"] = "blocked-size-limit"
+                sync_artifact["http_history"]["size_limit_reason"] = input_size_limit_message(
+                    "Burp MCP HTTP history",
+                    len(raw_text_bytes),
+                    history_max_bytes,
+                    "max_burp_history_input_bytes",
+                )
+                sync_artifact["next_step"] = (
+                    "Narrow the Burp history regex/count or rerun with a reviewed larger --max-history-bytes "
+                    "only after the resource snapshot is healthy."
+                )
+                sync_path = artifact_dir / "burp-mcp-sync.json"
+                write_json(sync_path, sync_artifact)
+                print(
+                    "Burp MCP sync stopped before import: "
+                    f"HTTP history bytes={len(raw_text_bytes)} exceed max={history_max_bytes}"
+                )
+                print(f"Wrote {sync_path}")
+                print_refreshed_manifests(
+                    refresh_current_artifact_manifest(
+                        artifact_dir=artifact_dir,
+                        target=target,
+                        command="burp-sync",
+                        output_paths=[
+                            *target_profile_artifact_paths(artifact_dir),
+                            sync_path,
+                        ],
+                    )
+                )
+                return 2
             if persist_http_raw_history:
                 raw_path.parent.mkdir(parents=True, exist_ok=True)
                 raw_path.write_text(raw_text, encoding="utf-8")
@@ -39444,9 +39666,6 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                 )
                 ws_raw_text = str(ws_read["raw_text"])
                 ws_raw_text_bytes = ws_raw_text.encode("utf-8")
-                if persist_websocket_raw_history:
-                    ws_raw_path.parent.mkdir(parents=True, exist_ok=True)
-                    ws_raw_path.write_text(ws_raw_text, encoding="utf-8")
                 sync_artifact["websocket_history"] = {
                     "requested_tool": "get_proxy_websocket_history_regex",
                     "fallback_tool": "get_proxy_websocket_history",
@@ -39454,6 +39673,9 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                     "requested_count": args.count,
                     "count": history_count,
                     "count_cap": history_count_cap,
+                    "requested_max_bytes": args.max_history_bytes,
+                    "max_bytes": history_max_bytes,
+                    "max_bytes_cap": history_bytes_cap,
                     "offset": args.offset,
                     "fallback_used": ws_read["fallback_used"],
                     "fallback_reason": ws_read["fallback_reason"],
@@ -39465,6 +39687,43 @@ def run_burp_sync(args: argparse.Namespace) -> int:
                     "bytes": len(ws_raw_text_bytes),
                     "sha256": hashlib.sha256(ws_raw_text_bytes).hexdigest(),
                 }
+                if len(ws_raw_text_bytes) > history_max_bytes:
+                    sync_artifact["status"] = "blocked-resource-history-size"
+                    sync_artifact["websocket_history"]["size_limit_exceeded"] = True
+                    sync_artifact["websocket_history"]["raw_persisted"] = False
+                    sync_artifact["websocket_history"]["raw_retention"] = "blocked-size-limit"
+                    sync_artifact["websocket_history"]["size_limit_reason"] = input_size_limit_message(
+                        "Burp MCP WebSocket history",
+                        len(ws_raw_text_bytes),
+                        history_max_bytes,
+                        "max_burp_history_input_bytes",
+                    )
+                    sync_artifact["next_step"] = (
+                        "Narrow the WebSocket history regex/count or rerun with a reviewed larger --max-history-bytes "
+                        "only after the resource snapshot is healthy."
+                    )
+                    sync_path = artifact_dir / "burp-mcp-sync.json"
+                    write_json(sync_path, sync_artifact)
+                    print(
+                        "Burp MCP sync stopped before import: "
+                        f"WebSocket history bytes={len(ws_raw_text_bytes)} exceed max={history_max_bytes}"
+                    )
+                    print(f"Wrote {sync_path}")
+                    print_refreshed_manifests(
+                        refresh_current_artifact_manifest(
+                            artifact_dir=artifact_dir,
+                            target=target,
+                            command="burp-sync",
+                            output_paths=[
+                                *target_profile_artifact_paths(artifact_dir),
+                                sync_path,
+                            ],
+                        )
+                    )
+                    return 2
+                if persist_websocket_raw_history:
+                    ws_raw_path.parent.mkdir(parents=True, exist_ok=True)
+                    ws_raw_path.write_text(ws_raw_text, encoding="utf-8")
 
     except Exception as error:
         sync_artifact["status"] = "failed"
@@ -40903,7 +41162,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
 
     resource_snapshot = build_default_resource_snapshot(max_processes=8)
     resource_status = artifact_summary_status(resource_snapshot)
-    if resource_status != "healthy" and not args.allow_resource_warning:
+    if resource_gate_blocks_work(resource_snapshot, allow_resource_warning=bool(args.allow_resource_warning)):
         profile_doc = write_target_profile_artifact(artifact_dir, profile, target, source_root)
         resource_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
         write_json(resource_path, resource_snapshot)
@@ -41698,7 +41957,7 @@ def run_blackbox_asset_map(args: argparse.Namespace) -> int:
     else:
         resource_snapshot = build_default_resource_snapshot(max_processes=8)
         resource_status = artifact_summary_status(resource_snapshot)
-        if resource_status != "healthy" and not args.allow_resource_warning:
+        if resource_gate_blocks_work(resource_snapshot, allow_resource_warning=bool(args.allow_resource_warning)):
             resource_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
             blocked_path = artifact_dir / "blackbox-asset-map-resource-gate.json"
             write_json(resource_path, resource_snapshot)
@@ -41832,7 +42091,7 @@ def run_host_takeover_baseline(args: argparse.Namespace) -> int:
         return 2
     resource_snapshot = build_default_resource_snapshot(max_processes=8)
     resource_status = artifact_summary_status(resource_snapshot)
-    if resource_status != "healthy" and not args.allow_resource_warning:
+    if resource_gate_blocks_work(resource_snapshot, allow_resource_warning=bool(args.allow_resource_warning)):
         resource_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
         blocked_path = artifact_dir / "host-takeover-baseline-resource-gate.json"
         write_json(resource_path, resource_snapshot)
@@ -42154,10 +42413,12 @@ def run_resource_snapshot(args: argparse.Namespace) -> int:
             f"mode={budget.get('mode')} "
             f"offline_preview_limit={budget.get('offline_command_preview_limit')} "
             f"burp_history_count_limit={budget.get('burp_history_count_limit')} "
+            f"burp_history_input_bytes_limit={budget.get('burp_history_input_bytes_limit')} "
             f"max_parallel={budget.get('max_parallel_commands')} "
             f"active_target_traffic={budget.get('active_target_traffic')} "
             f"browser_automation={budget.get('browser_automation')} "
-            f"release_candidate_rss={budget.get('release_candidate_rss_mib')}MiB"
+            f"release_candidate_rss={budget.get('release_candidate_rss_mib')}MiB "
+            f"warning_override={budget.get('resource_warning_override')}"
         )
         recommendations = budget.get("recommendations", []) if isinstance(budget.get("recommendations"), list) else []
         if recommendations:
@@ -42271,7 +42532,7 @@ def run_websocket_candidate_review(args: argparse.Namespace) -> int:
             return 2
         resource_snapshot = build_default_resource_snapshot(max_processes=8)
         resource_status = artifact_summary_status(resource_snapshot)
-        if resource_status != "healthy" and not args.allow_resource_warning:
+        if resource_gate_blocks_work(resource_snapshot, allow_resource_warning=bool(args.allow_resource_warning)):
             resource_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
             blocked_path = artifact_dir / "websocket-candidate-review-resource-gate.json"
             if not args.no_write:
@@ -43922,7 +44183,7 @@ def run_collect_quote(args: argparse.Namespace) -> int:
 
     resource_snapshot = build_default_resource_snapshot(max_processes=8)
     resource_status = artifact_summary_status(resource_snapshot)
-    if resource_status != "healthy" and not args.allow_resource_warning:
+    if resource_gate_blocks_work(resource_snapshot, allow_resource_warning=bool(args.allow_resource_warning)):
         resource_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
         blocked_path = artifact_dir / "collect-quote-resource-gate.json"
         write_json(resource_path, resource_snapshot)
@@ -44205,7 +44466,7 @@ def run_collect_orca_baseline(args: argparse.Namespace) -> int:
 
     resource_snapshot = build_default_resource_snapshot(max_processes=8)
     resource_status = artifact_summary_status(resource_snapshot)
-    if resource_status != "healthy" and not args.allow_resource_warning:
+    if resource_gate_blocks_work(resource_snapshot, allow_resource_warning=bool(args.allow_resource_warning)):
         resource_path = artifact_dir / RESOURCE_SNAPSHOT_ARTIFACT
         blocked_path = artifact_dir / "collect-orca-baseline-resource-gate.json"
         write_json(resource_path, resource_snapshot)
@@ -44572,7 +44833,7 @@ def build_parser() -> argparse.ArgumentParser:
     blackbox_asset_map.add_argument(
         "--allow-resource-warning",
         action="store_true",
-        help="Allow live page and script asset fetches when the local memory/swap resource gate is warning.",
+        help="Allow live page and script asset fetches when the local resource budget is degraded; critical still blocks.",
     )
     blackbox_asset_map.set_defaults(func=run_blackbox_asset_map)
 
@@ -44615,7 +44876,7 @@ def build_parser() -> argparse.ArgumentParser:
     host_takeover.add_argument(
         "--allow-resource-warning",
         action="store_true",
-        help="Allow DNS and HTTPS takeover baseline checks when the local memory/swap resource gate is warning.",
+        help="Allow DNS and HTTPS takeover baseline checks when the local resource budget is degraded; critical still blocks.",
     )
     host_takeover.set_defaults(func=run_host_takeover_baseline)
 
@@ -44699,6 +44960,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum Burp history items to request from MCP",
     )
     burp_sync.add_argument(
+        "--max-history-bytes",
+        type=positive_int,
+        default=DEFAULT_BURP_HISTORY_INPUT_BYTES,
+        help=(
+            "Maximum raw Burp MCP history bytes to parse or persist from each read. "
+            "Resource budgets may lower this cap."
+        ),
+    )
+    burp_sync.add_argument(
         "--offset",
         type=int,
         default=0,
@@ -44745,7 +45015,7 @@ def build_parser() -> argparse.ArgumentParser:
     burp_sync.add_argument(
         "--allow-resource-warning",
         action="store_true",
-        help="Allow Burp MCP history reads when the local memory/swap resource gate is warning.",
+        help="Allow Burp MCP history reads when the local resource budget is degraded; critical still blocks.",
     )
     burp_sync.set_defaults(func=run_burp_sync)
 
@@ -44838,7 +45108,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument(
         "--allow-resource-warning",
         action="store_true",
-        help="Allow active audit probes when the local memory/swap resource gate is warning.",
+        help="Allow active audit probes when the local resource budget is degraded; critical still blocks.",
     )
     add_intent_policy_args(audit)
     audit.set_defaults(func=run_audit, ws=True, ws_resource_probes=False)
@@ -45120,7 +45390,7 @@ def build_parser() -> argparse.ArgumentParser:
     regression_suite.add_argument(
         "--allow-resource-warning",
         action="store_true",
-        help="Allow regression steps and child Burp/audit commands when the local memory/swap resource gate is warning.",
+        help="Allow regression steps and child Burp/audit commands when the local resource budget is degraded; critical still blocks.",
     )
     regression_suite.add_argument(
         "--include-external",
@@ -45343,7 +45613,7 @@ def build_parser() -> argparse.ArgumentParser:
     websocket_candidate_review.add_argument(
         "--allow-resource-warning",
         action="store_true",
-        help="Allow handshake baselines when the local memory/swap resource gate is warning.",
+        help="Allow handshake baselines when the local resource budget is degraded; critical still blocks.",
     )
     websocket_candidate_review.add_argument(
         "--strict",
@@ -45931,7 +46201,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect_quote.add_argument(
         "--allow-resource-warning",
         action="store_true",
-        help="Allow the quote request and transaction decoding when the local memory/swap resource gate is warning.",
+        help="Allow the quote request and transaction decoding when the local resource budget is degraded; critical still blocks.",
     )
     collect_quote.set_defaults(func=run_collect_quote)
 
@@ -45950,7 +46220,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect_orca.add_argument(
         "--allow-resource-warning",
         action="store_true",
-        help="Allow the Orca baseline request when the local memory/swap resource gate is warning.",
+        help="Allow the Orca baseline request when the local resource budget is degraded; critical still blocks.",
     )
     collect_orca.set_defaults(func=run_collect_orca_baseline)
     return parser
