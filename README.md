@@ -363,7 +363,9 @@ remain parked. The rollup includes `top_unblocker`,
 `unblocker_lane_counts`, and `unblocker_actionability_counts` so the next loop
 can distinguish approved payload capture, provider/operator evidence,
 deployment resource evidence, read-only response observation, resource gates,
-and finding-gate review.
+and finding-gate review. Each unblocker also carries an `evidence_package` with
+required artifacts, safe no-write review commands, active-validation gates, and
+forbidden validation steps for that lane.
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
@@ -643,7 +645,8 @@ dominant bounty candidate; approval packets also carry the matching assessment
 scorecard for the validation item that produced them. The iteration summary also
 includes `objective_satisfaction`, so unattended runs can tell whether the
 active mode still needs coverage closure or a valid Medium+ bounty report path,
-and which evidence lane is currently blocking it.
+which evidence lane is currently blocking it, and which evidence package should
+be completed before any active validation.
 
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:

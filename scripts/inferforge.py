@@ -12670,6 +12670,151 @@ def objective_unblocker_actionability(lane: str, step_status: str) -> str:
     return "needs-evidence-triage"
 
 
+OBJECTIVE_UNBLOCKER_EVIDENCE_PACKAGES: dict[str, dict[str, Any]] = {
+    "approved-transaction-payload": {
+        "id": "approved-transaction-payload-evidence-package",
+        "required_artifacts": ["transaction-payloads.jsonl", "transaction-intent-policy.json"],
+        "safe_offline_reviews": [
+            "transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract",
+            "transaction-corpus-checklist --no-write --show-commands --show-steps --show-payload-template-json --skip-current-resource-check",
+        ],
+        "active_validation_gate": (
+            "Only one approved in-scope quote capture after resource and scope gates; decode offline before finding-gate."
+        ),
+        "forbidden_validation": [
+            "No wallet signing, transaction submission, trading, or fund movement.",
+            "No raw Burp history, private keys, seed phrases, bearer tokens, or wallet signatures.",
+            "No repeated quote capture or provider stress traffic.",
+        ],
+    },
+    "transaction-intent-policy": {
+        "id": "transaction-intent-policy-evidence-package",
+        "required_artifacts": ["transaction-intent-policy.json", "transaction-payloads.jsonl"],
+        "safe_offline_reviews": [
+            "transaction-corpus-checklist --no-write --show-commands --show-steps --show-payload-template-json --skip-current-resource-check",
+            "decode-transactions --no-write",
+        ],
+        "active_validation_gate": "No active validation is needed; finish the offline policy sidecar first.",
+        "forbidden_validation": [
+            "Do not infer signer/account intent without an approved policy sidecar.",
+            "Do not sign or submit transactions while building the policy.",
+        ],
+    },
+    "decoded-transaction-review": {
+        "id": "decoded-transaction-review-evidence-package",
+        "required_artifacts": ["transaction-intent.json", "transaction-payloads.jsonl", "transaction-intent-policy.json"],
+        "safe_offline_reviews": ["decode-transactions --no-write", "gate --no-write --show-items"],
+        "active_validation_gate": "No active validation is needed after the approved corpus exists; decode and gate offline.",
+        "forbidden_validation": [
+            "No transaction submission.",
+            "No report without decoded signer/account/mint/amount/program impact evidence.",
+        ],
+    },
+    "provider-operator-evidence": {
+        "id": "provider-operator-evidence-package",
+        "required_artifacts": ["operator-evidence.json", "credential-impact-checklist.json"],
+        "safe_offline_reviews": [
+            "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
+            "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check --show-evidence-contract",
+        ],
+        "active_validation_gate": (
+            "At most one approved route-reachability request after provider/operator impact evidence and resource gate pass."
+        ),
+        "forbidden_validation": [
+            "No request floods, quota depletion, Scanner, Intruder, brute force, or provider stress.",
+            "No provider API keys, bearer tokens, cookies, billing account identifiers, or raw dashboards.",
+        ],
+    },
+    "deployment-resource-evidence": {
+        "id": "deployment-resource-evidence-package",
+        "required_artifacts": ["operator-evidence.json", "deployment-resource-review.json", "operator-evidence-review.json"],
+        "safe_offline_reviews": [
+            "deployment-review --no-write --top 8",
+            "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
+        ],
+        "active_validation_gate": (
+            "Only after deployment/operator evidence proves key control or unsafe fallback; never validate by exhausting resources."
+        ),
+        "forbidden_validation": [
+            "No floods, rate-limit stress, high-volume RPC, Scanner, Intruder, or DoS validation.",
+            "No probing spoofed IP headers unless explicitly approved and resource-gated.",
+        ],
+    },
+    "read-only-path-selection": {
+        "id": "read-only-path-selection-evidence-package",
+        "required_artifacts": ["rewrite-validation-checklist.json", "rewrite-review.json"],
+        "safe_offline_reviews": [
+            "rewrite-review --no-write --show-next",
+            "rewrite-validation-checklist --no-write --show-candidates --show-commands",
+        ],
+        "active_validation_gate": "No active request until exactly one concrete read-only path is selected and reviewed.",
+        "forbidden_validation": [
+            "No catch-all enumeration.",
+            "No dynamic, mutating, authenticated, or uncertain-scope path validation.",
+        ],
+    },
+    "single-approved-response": {
+        "id": "single-approved-response-evidence-package",
+        "required_artifacts": ["rewrite-response-sidecar.jsonl", "rewrite-response-review.json"],
+        "safe_offline_reviews": [
+            "rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract --show-sidecar-template-json",
+            "rewrite-validation-checklist --no-write --show-candidates --show-commands",
+        ],
+        "active_validation_gate": (
+            "Exactly one approved read-only response after scope and resource gates; store only normalized/redacted evidence."
+        ),
+        "forbidden_validation": [
+            "No endpoint enumeration or crawling.",
+            "No raw response body retention, cookies, bearer tokens, private keys, wallet signatures, or account identifiers.",
+        ],
+    },
+    "impact-classification": {
+        "id": "impact-classification-evidence-package",
+        "required_artifacts": ["rewrite-response-review.json", "finding-gate.json"],
+        "safe_offline_reviews": ["rewrite-response-review --no-write --show-observations", "gate --no-write --show-items"],
+        "active_validation_gate": "No additional active traffic; classify the one approved observation offline.",
+        "forbidden_validation": [
+            "Do not report static rewrite configuration or 2xx status alone.",
+            "Do not collect another response unless the single-observation approval packet is renewed.",
+        ],
+    },
+    "resource-gate": {
+        "id": "resource-gate-evidence-package",
+        "required_artifacts": ["resource-snapshot.json"],
+        "safe_offline_reviews": ["resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict"],
+        "active_validation_gate": "Active validation remains blocked until resource-snapshot --strict is healthy.",
+        "forbidden_validation": ["No active target traffic while resource budget is warning or critical."],
+    },
+    "finding-gate-review": {
+        "id": "finding-gate-review-evidence-package",
+        "required_artifacts": ["finding-gate.json", "adjudication.json", "evidence-chain.json"],
+        "safe_offline_reviews": ["gate --no-write --show-items", "adjudicate --no-write", "evidence-chain --no-write"],
+        "active_validation_gate": "No active validation; review already collected evidence offline.",
+        "forbidden_validation": ["Do not write a report until finding-gate and adjudication accept concrete impact."],
+    },
+    "offline-source-context": {
+        "id": "offline-source-context-evidence-package",
+        "required_artifacts": ["hypothesis-matrix.json", "rewrite-review.json", "transaction-flow-review.json"],
+        "safe_offline_reviews": ["hypothesis-matrix --no-write --show-next", "source-peek-requests --no-write --top 8"],
+        "active_validation_gate": "No active validation; finish source/context indexing first.",
+        "forbidden_validation": ["Do not treat source suspicion as reportable impact."],
+    },
+}
+
+
+def objective_unblocker_evidence_package(lane: str) -> dict[str, Any]:
+    package = OBJECTIVE_UNBLOCKER_EVIDENCE_PACKAGES.get(lane)
+    if isinstance(package, dict):
+        return json_clone(package)
+    return {
+        "id": "unclassified-evidence-package",
+        "required_artifacts": [],
+        "safe_offline_reviews": ["lead-dossier --no-write --show-commands --show-evidence --skip-current-resource-check"],
+        "active_validation_gate": "Classify the evidence lane before active validation.",
+        "forbidden_validation": ["No active validation until the evidence lane and scope/resource gates are clear."],
+    }
+
+
 def assessment_item_objective_unblocker(item: dict[str, Any]) -> dict[str, Any]:
     closure_plan = item.get("closure_plan") if isinstance(item.get("closure_plan"), dict) else {}
     active_step = str(closure_plan.get("active_step") or "").strip()
@@ -12705,6 +12850,7 @@ def assessment_item_objective_unblocker(item: dict[str, Any]) -> dict[str, Any]:
         if isinstance(assessment.get("objective_alignment"), dict)
         else {}
     )
+    evidence_package = objective_unblocker_evidence_package(lane)
     return {
         "item_id": assessment_item_identity(item),
         "priority": item.get("priority") or item.get("validation_item_priority"),
@@ -12712,6 +12858,8 @@ def assessment_item_objective_unblocker(item: dict[str, Any]) -> dict[str, Any]:
         "path": item.get("path"),
         "lane": lane,
         "actionability": objective_unblocker_actionability(lane, step_status),
+        "evidence_package": evidence_package,
+        "evidence_package_id": evidence_package.get("id"),
         "active_step": active_step or None,
         "step_status": step_status,
         "artifact": active_step_row.get("artifact"),
@@ -42286,6 +42434,14 @@ def build_no_write_selftest() -> dict[str, Any]:
                 == "one-valid-medium-high-critical-report"
                 and blackbox_objective_satisfaction_sample.get("top_unblocker", {}).get("lane")
                 == "approved-transaction-payload"
+                and blackbox_objective_satisfaction_sample.get("top_unblocker", {}).get("evidence_package_id")
+                == "approved-transaction-payload-evidence-package"
+                and "transaction-payloads.jsonl"
+                in (
+                    blackbox_objective_satisfaction_sample.get("top_unblocker", {})
+                    .get("evidence_package", {})
+                    .get("required_artifacts", [])
+                )
             ),
             "expected": "greybox optimizes coverage while blackbox optimizes one valid high-bounty finding, including strict checklist gates",
             "actual": {
@@ -42354,11 +42510,21 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and greybox_objective_satisfaction_sample.get("top_open_id") == "coverage-resource-exhaustion"
                 and greybox_objective_satisfaction_sample.get("top_unblocker", {}).get("lane")
                 == "deployment-resource-evidence"
+                and greybox_objective_satisfaction_sample.get("top_unblocker", {}).get("evidence_package_id")
+                == "deployment-resource-evidence-package"
                 and blackbox_objective_satisfaction_sample.get("satisfied_items") == 1
                 and blackbox_objective_satisfaction_sample.get("top_satisfied_id") == "gate-ready-sensitive-data"
                 and blackbox_objective_satisfaction_sample.get("open_items") == 2
                 and blackbox_objective_satisfaction_sample.get("top_unblocker", {}).get("lane")
                 == "approved-transaction-payload"
+                and any(
+                    "No wallet signing" in str(item)
+                    for item in (
+                        blackbox_objective_satisfaction_sample.get("top_unblocker", {})
+                        .get("evidence_package", {})
+                        .get("forbidden_validation", [])
+                    )
+                )
                 and (
                     blackbox_ranked_sample[0].get("assessment_rank", {}).get("bounty_pressure", {}).get("score", 0)
                     >= blackbox_ranked_sample[0].get("assessment_rank", {}).get("coverage_pressure", {}).get("score", 0)
@@ -42761,6 +42927,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "selection=greybox-coverage-first" in methodology_review_stdout_text
                 and "objective=" in methodology_review_stdout_text
                 and "lane=" in methodology_review_stdout_text
+                and "package=" in methodology_review_stdout_text
                 and "- bounty system-context-threat-model:" in methodology_review_stdout_text
                 and "High-value threads:" in methodology_review_stdout
                 and "poc_plan=" in methodology_review_stdout_text
@@ -42793,6 +42960,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Objective satisfaction:" in lead_dossier_stdout_text
                 and "lane=" in lead_dossier_stdout_text
                 and "action=" in lead_dossier_stdout_text
+                and "package=" in lead_dossier_stdout_text
                 and "strict_validation=blocked-before-finding-gate" in lead_dossier_stdout_text
                 and "question=waiting concrete-impact-evidence" in lead_dossier_stdout_text
                 and "No files written (--no-write)." in lead_dossier_stdout
@@ -60110,6 +60278,7 @@ def run_methodology_review(args: argparse.Namespace) -> int:
             f"selection={bounty_summary.get('lead_selection_strategy') or '-'} "
             f"objective={bounty_summary.get('objective_status') or '-'} "
             f"lane={bounty_top_unblocker.get('lane') or '-'} "
+            f"package={bounty_top_unblocker.get('evidence_package_id') or '-'} "
             f"top={bounty_summary.get('top_candidate_id') or '-'} "
             f"gate_ready={bounty_summary.get('gate_ready_threads', 0)} "
             f"resource={bounty_summary.get('resource_status') or '-'} "
@@ -60255,7 +60424,8 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
             f"open={objective_satisfaction.get('open_items', 0)} "
             f"top_open={objective_satisfaction.get('top_open_id') or '-'} "
             f"lane={top_unblocker.get('lane') or '-'} "
-            f"action={top_unblocker.get('actionability') or '-'}"
+            f"action={top_unblocker.get('actionability') or '-'} "
+            f"package={top_unblocker.get('evidence_package_id') or '-'}"
         )
     if assessment_policy:
         objective_model = (
@@ -62469,7 +62639,8 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
             f"open={objective_satisfaction.get('open_items', 0)} "
             f"top_open={objective_satisfaction.get('top_open_id') or '-'} "
             f"lane={top_unblocker.get('lane') or '-'} "
-            f"action={top_unblocker.get('actionability') or '-'}"
+            f"action={top_unblocker.get('actionability') or '-'} "
+            f"package={top_unblocker.get('evidence_package_id') or '-'}"
         )
     if resource_preflight and resource_preflight.get("status") != "not-run":
         warnings = resource_preflight.get("warnings", []) or []
