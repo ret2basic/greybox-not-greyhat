@@ -1013,6 +1013,9 @@ file; it does not satisfy the candidate-bearing sidecar evidence gate.
 Add `--show-payload-template-json` to print placeholder JSON/JSONL/TXT sidecar
 templates for the single approved quote response before creating a local
 payload sidecar.
+Add `--show-evidence-contract` to print the single-corpus quote capture,
+resource gate, Burp history import, sidecar review, and no-write decode preview
+sequence without sending requests, signing wallets, or submitting transactions.
 
 `transaction-corpus-checklist` is the offline bridge between source-flow review
 and decoding. It reads the current quote collection, Burp transaction candidate,

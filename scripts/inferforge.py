@@ -21440,6 +21440,195 @@ def transaction_corpus_policy_templates(
     return templates
 
 
+def transaction_sidecar_decode_preview_command(
+    *,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    template: dict[str, Any],
+    payload_sidecar: str,
+    max_input_bytes: int,
+) -> str:
+    parts = [
+        "decode-transactions",
+        "--no-write",
+        "--max-input-bytes",
+        str(max_input_bytes),
+        "--input",
+        payload_sidecar,
+        "--intent-direction",
+        str(template.get("direction") or ""),
+        "--intent-wallet",
+        PLACEHOLDER_REAL_WALLET,
+        "--intent-amount-in",
+        "REPLACE_WITH_RAW_AMOUNT",
+    ]
+    for program_id in normalize_string_list(template.get("allowedPrograms")):
+        parts.extend(["--intent-allowed-program", program_id])
+    return validation_command_for_artifact_dir(
+        artifact_dir,
+        " ".join(shlex.quote(str(part)) for part in parts),
+        profile=profile,
+    )
+
+
+def transaction_sidecar_evidence_contracts(
+    *,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    max_input_bytes: int = DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+    limit: int = 2,
+) -> list[dict[str, Any]]:
+    quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
+    payload_sidecar = repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl")
+    intent_policy_sidecar = repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json")
+    templates = transaction_corpus_policy_templates(
+        profile,
+        artifact_dir,
+        payload_sidecar=payload_sidecar,
+    )
+    ready_templates = [row for row in templates if row.get("status") == "ready"]
+    selected_templates = ready_templates or templates
+    contracts = []
+    for template in selected_templates:
+        if not isinstance(template, dict):
+            continue
+        direction = str(template.get("direction") or "")
+        if not direction:
+            continue
+        commands = [
+            {
+                "id": "payload-template-preview",
+                "risk": "offline-local-template",
+                "command": validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json",
+                    profile=profile,
+                ),
+            },
+            {
+                "id": "intent-policy-preview",
+                "risk": "offline-local-preview",
+                "command": template.get("prepare_policy_preview_command"),
+            },
+            {
+                "id": "intent-policy-write",
+                "risk": "offline-local-policy-write",
+                "command": template.get("prepare_policy_command"),
+            },
+            {
+                "id": "resource-gate",
+                "risk": "offline-local-resource-check",
+                "command": validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict",
+                    profile=profile,
+                ),
+            },
+            {
+                "id": "single-approved-quote-capture",
+                "risk": "manual-single-approved-browser-action",
+                "action": (
+                    f"Use the Burp built-in browser to perform exactly one approved POST {quote_path} quote flow "
+                    "for this direction, stop before wallet signing, and keep only the minimum response body needed "
+                    "for offline decoding."
+                ),
+            },
+            {
+                "id": "burp-history-import",
+                "risk": "burp-mcp-history-read-no-raw-persist",
+                "command": validation_command_for_artifact_dir(
+                    artifact_dir,
+                    f"burp-sync --replace --count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}",
+                    profile=profile,
+                ),
+            },
+            {
+                "id": "sidecar-review",
+                "risk": "offline-normalized-sidecar-review",
+                "command": validation_command_for_artifact_dir(
+                    artifact_dir,
+                    (
+                        "transaction-sidecar-review --no-write --show-files --show-candidates --show-commands "
+                        f"--max-input-bytes {max_input_bytes}"
+                    ),
+                    profile=profile,
+                ),
+            },
+            {
+                "id": "decode-preview",
+                "risk": "offline-decode-no-write",
+                "command": transaction_sidecar_decode_preview_command(
+                    profile=profile,
+                    artifact_dir=artifact_dir,
+                    template=template,
+                    payload_sidecar=payload_sidecar,
+                    max_input_bytes=max_input_bytes,
+                ),
+            },
+            {
+                "id": "finding-gate-preview",
+                "risk": "offline-manual-gate-preview",
+                "command": validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "gate --no-write --show-items",
+                    profile=profile,
+                ),
+            },
+        ]
+        command_refs = []
+        for command_row in commands:
+            command_text = str(command_row.get("command") or "")
+            if not command_text:
+                continue
+            item_status = "manual-review" if command_row.get("id") == "burp-history-import" else "ready"
+            command_refs.append(
+                validation_command_ref(
+                    command_text,
+                    source=f"transaction-sidecar-evidence-contract:{command_row.get('id')}",
+                    item_status=item_status,
+                )
+            )
+        contracts.append(
+            {
+                "method": "POST",
+                "path": quote_path,
+                "direction": direction,
+                "payload_sidecar": payload_sidecar,
+                "intent_policy_sidecar": intent_policy_sidecar,
+                "sourceMint": template.get("sourceMint"),
+                "destinationMint": template.get("destinationMint"),
+                "programAllowlistStatus": template.get("programAllowlistStatus") or "unknown",
+                "allowedPrograms_count": len(template.get("allowedPrograms", []) or []),
+                "commands": commands,
+                "command_safety": command_safety_summary(command_refs),
+                "required_order": [
+                    "Review payload-template-preview and create exactly one approved payload sidecar.",
+                    "Run intent-policy-preview and replace wallet/amount placeholders before any write.",
+                    "Run intent-policy-write only after the direction, wallet, amountIn, mints, and program policy are approved.",
+                    "Run resource-gate and stop unless it is healthy.",
+                    "Perform single-approved-quote-capture manually in Burp's built-in browser; do not sign or submit.",
+                    "Run burp-history-import only after the approved browser flow exists in Burp history.",
+                    "Run sidecar-review and decode-preview; continue to finding-gate only on concrete decoded intent impact.",
+                ],
+                "stop_conditions": [
+                    "Do not approve wallet signing prompts.",
+                    "Do not submit transactions, trades, or fund movements.",
+                    "Do not use Burp Scanner, Intruder, crawling, fuzzing, or stress traffic.",
+                    "Do not keep raw Burp MCP history files in artifacts.",
+                    "Do not decode more than the single approved quote corpus needed for this direction.",
+                    "Do not report a remote transaction source without decoded signer/account/mint/amount/program impact.",
+                ],
+                "safety": (
+                    "Evidence contract only. It prints the approved-corpus collection and offline decode sequence; "
+                    "it sends no requests, reads no Burp history, invokes no wallet, and submits no transaction."
+                ),
+            }
+        )
+        if len(contracts) >= max(1, int(limit)):
+            break
+    return contracts
+
+
 def transaction_payload_sidecar_paths(artifact_dir: Path) -> list[Path]:
     return [
         artifact_dir / "transaction-payloads.json",
@@ -21771,6 +21960,13 @@ def build_transaction_sidecar_review(
     else:
         next_step = "Add one approved quote response or extracted transaction payload sidecar before wallet signing."
 
+    evidence_contracts = transaction_sidecar_evidence_contracts(
+        profile=profile,
+        artifact_dir=artifact_dir,
+        max_input_bytes=max_input_bytes,
+        limit=2,
+    )
+
     return {
         "generated_at": utc_now(),
         "status": status,
@@ -21789,6 +21985,7 @@ def build_transaction_sidecar_review(
             "payload_contract_status": payload_contract_review.get("status"),
             "expected_payload_type": payload_contract_review.get("expected_payload_type"),
             "payload_contract_allows_decode": payload_contract_allows_decode,
+            "evidence_contracts": len(evidence_contracts),
             "warnings": len(warnings),
         },
         "payload_shape_guidance": payload_shape_guidance,
@@ -21811,6 +22008,7 @@ def build_transaction_sidecar_review(
         "acceptance_checks": acceptance_checks,
         "policy_template_commands": policy_template_commands,
         "decode_commands": decode_commands,
+        "evidence_contracts": evidence_contracts,
         "reportability_gate": (
             "This review only proves the offline sidecars are ready to decode. It does not prove a vulnerability; "
             "only decoded intent mismatches or another concrete user-funds impact can advance the finding gate."
@@ -33152,6 +33350,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--show-files",
                     "--show-commands",
                     "--show-payload-template-json",
+                    "--show-evidence-contract",
                 ]
             )
             transaction_corpus_checklist_return_code, transaction_corpus_checklist_stdout = run_cli(
@@ -34080,7 +34279,10 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Transaction sidecar review:" in transaction_sidecar_review_stdout_text
                 and "Sidecars:" in transaction_sidecar_review_stdout_text
                 and "Intent policy:" in transaction_sidecar_review_stdout_text
+                and "contracts=" in transaction_sidecar_review_stdout_text
                 and "Payload sidecar template JSON:" in transaction_sidecar_review_stdout_text
+                and "Evidence contracts:" in transaction_sidecar_review_stdout_text
+                and "single-approved-quote-capture" in transaction_sidecar_review_stdout_text
                 and "REPLACE_WITH_BASE64_VERSIONED_TRANSACTION" in transaction_sidecar_review_stdout_text
                 and "No files written (--no-write)." in transaction_sidecar_review_stdout
                 and not any(
@@ -37687,6 +37889,26 @@ def build_transaction_decoder_selftest(
         and (sidecar_evm_shape_review.get("summary", {}).get("kind_counts") or {}).get("evm-executable-payload") == 1
         and "EVM executable payloads" in str(sidecar_evm_review.get("next_step") or "")
     )
+    sidecar_contracts = [
+        item
+        for item in sidecar_empty_review.get("evidence_contracts", []) or []
+        if isinstance(item, dict)
+    ]
+    sidecar_contract_text = json.dumps(sidecar_contracts, sort_keys=True)
+    sidecar_contract_passed = (
+        len(sidecar_contracts) >= 1
+        and sidecar_contracts[0].get("method") == "POST"
+        and sidecar_contracts[0].get("path") == "/api/quote"
+        and "payload-template-preview" in sidecar_contract_text
+        and "intent-policy-preview" in sidecar_contract_text
+        and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict" in sidecar_contract_text
+        and "single-approved-quote-capture" in sidecar_contract_text
+        and "burp-sync --replace --count" in sidecar_contract_text
+        and "transaction-sidecar-review --no-write --show-files --show-candidates --show-commands" in sidecar_contract_text
+        and "decode-transactions --no-write" in sidecar_contract_text
+        and "Do not approve wallet signing prompts." in sidecar_contract_text
+        and payload["base64"] not in sidecar_contract_text
+    )
     status = (
         "passed"
         if decoded_count == 1
@@ -37700,6 +37922,7 @@ def build_transaction_decoder_selftest(
         and sidecar_mismatch_passed
         and sidecar_empty_passed
         and sidecar_evm_passed
+        and sidecar_contract_passed
         else "failed"
     )
     return {
@@ -37773,6 +37996,10 @@ def build_transaction_decoder_selftest(
             "summary": sidecar_evm_review.get("summary", {}),
             "shape_review": sidecar_evm_shape_review,
             "next_step": sidecar_evm_review.get("next_step"),
+        },
+        "sidecar_evidence_contract": {
+            "status": "passed" if sidecar_contract_passed else "failed",
+            "contracts": sidecar_contracts,
         },
         "transactions": transactions,
         "note": "This self-test proves decoder mechanics only; it does not satisfy GAP-quote-transaction-corpus.",
@@ -50143,7 +50370,8 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
         f"expected_type={summary.get('expected_payload_type') or '-'} "
         f"policy_configured={summary.get('intent_policy_configured')} "
         f"policy_valid={summary.get('intent_policy_valid')} "
-        f"ready_for_decode={summary.get('ready_for_decode')}"
+        f"ready_for_decode={summary.get('ready_for_decode')} "
+        f"contracts={summary.get('evidence_contracts', 0)}"
     )
     policy = (
         review.get("intent_policy_sidecar", {}).get("policy", {})
@@ -50204,6 +50432,32 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
         )
     if args.show_payload_template_json:
         print_transaction_payload_template_json(review.get("payload_shape_guidance", {}))
+    if args.show_evidence_contract:
+        print("Evidence contracts:")
+        for contract in (review.get("evidence_contracts", []) or [])[: max(0, int(args.top))]:
+            if not isinstance(contract, dict):
+                continue
+            print(
+                f"- contract={contract.get('method')} {contract.get('path')} "
+                f"direction={contract.get('direction')} "
+                f"payload_sidecar={contract.get('payload_sidecar')} "
+                f"policy={contract.get('intent_policy_sidecar')}"
+            )
+            for command_row in (contract.get("commands", []) or [])[:9]:
+                if not isinstance(command_row, dict):
+                    continue
+                if command_row.get("command"):
+                    print(
+                        "  step="
+                        f"{command_row.get('id')} risk={command_row.get('risk')} "
+                        f"command={inline_summary_text(command_row.get('command'), max_chars=420)}"
+                    )
+                else:
+                    print(
+                        "  step="
+                        f"{command_row.get('id')} risk={command_row.get('risk')} "
+                        f"action={inline_summary_text(command_row.get('action'), max_chars=360)}"
+                    )
     shape_review = review.get("payload_shape_review") if isinstance(review.get("payload_shape_review"), dict) else {}
     if args.show_commands and shape_review and shape_review.get("status") not in {"no-payload-sidecars"}:
         shape_summary = shape_review.get("summary", {}) if isinstance(shape_review.get("summary"), dict) else {}
@@ -53001,6 +53255,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-payload-template-json",
         action="store_true",
         help="Print a placeholder JSON payload sidecar template for an approved quote response.",
+    )
+    transaction_sidecar_review.add_argument(
+        "--show-evidence-contract",
+        action="store_true",
+        help="Print the single-corpus capture, Burp history import, sidecar review, and decode-preview contract.",
     )
     transaction_sidecar_review.add_argument(
         "--no-write",
