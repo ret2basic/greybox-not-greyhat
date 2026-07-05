@@ -32833,6 +32833,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "operator-evidence-review",
                     "--no-write",
                     "--show-template",
+                    "--show-template-json",
                     "--show-missing",
                 ]
             )
@@ -33785,6 +33786,9 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Operator evidence review:" in operator_evidence_review_stdout_text
                 and "Coverage:" in operator_evidence_review_stdout_text
                 and "Sidecar template:" in operator_evidence_review_stdout_text
+                and "Sidecar template JSON:" in operator_evidence_review_stdout_text
+                and '"schema": "inferforge-operator-evidence-v1"' in operator_evidence_review_stdout_text
+                and '"evidence_items": [' in operator_evidence_review_stdout_text
                 and "- template " in operator_evidence_review_stdout_text
                 and "No files written (--no-write)." in operator_evidence_review_stdout
                 and not any(
@@ -49160,6 +49164,10 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
                 print(f"  needed={inline_summary_text(needed, max_chars=180)}")
             for redaction in (item.get("redaction_required", []) or [])[:1]:
                 print(f"  redaction={inline_summary_text(redaction, max_chars=180)}")
+    if args.show_template_json:
+        template = review.get("sidecar_template") if isinstance(review.get("sidecar_template"), dict) else {}
+        print("Sidecar template JSON:")
+        print(json.dumps(sanitize_artifact_samples(template), indent=2, sort_keys=False))
     if no_write:
         print("No files written (--no-write).")
     else:
@@ -52226,6 +52234,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-template",
         action="store_true",
         help="Print sidecar template metadata for missing decisions.",
+    )
+    operator_evidence_review.add_argument(
+        "--show-template-json",
+        action="store_true",
+        help="Print the redacted operator-evidence.json sidecar template JSON for missing decisions.",
     )
     operator_evidence_review.add_argument(
         "--no-write",
