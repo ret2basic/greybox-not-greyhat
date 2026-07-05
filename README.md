@@ -409,6 +409,12 @@ If `endpoint-clusters.json` or the target profile does not list a static
 their in-memory review. This catches profile omissions such as catch-all
 same-origin API proxies without changing the checked-in profile or sending
 traffic.
+Use `rewrite-validation-checklist --no-write --show-candidates --show-commands`
+to turn those review items into a one-path validation checklist. It prints
+client-derived read-only candidates, blocked dynamic templates, and no-write
+`promote-observation-candidate` previews for exactly one approved local path.
+The checklist is still offline: it does not invoke Burp, start a browser, send
+HTTP traffic, or enumerate catch-all paths.
 For source-backed fixed-upstream API routes, it also scans the referenced route
 source for fixed upstream fetches, positive route-parameter guards, query
 forwarding, credential/header forwarding, upstream status forwarding, and cache

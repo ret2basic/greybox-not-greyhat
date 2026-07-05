@@ -130,6 +130,7 @@ HYPOTHESIS_MATRIX_ARTIFACT = "hypothesis-matrix.json"
 VALIDATION_PLAN_ARTIFACT = "validation-plan.json"
 ITERATION_DECISION_ARTIFACT = "iteration-decision.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
+REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT = "deployment-resource-review.json"
 TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
 TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
@@ -221,6 +222,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     VALIDATION_PLAN_ARTIFACT,
     ITERATION_DECISION_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
+    REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
@@ -317,6 +319,7 @@ INDEX_ARTIFACT_ORDER = [
     SCOPE_POLICY_ARTIFACT,
     WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT,
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
+    REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
     TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
@@ -4723,8 +4726,51 @@ def collect_review_observation_candidates(profile: dict[str, Any]) -> list[dict[
     return candidates
 
 
-def find_review_observation_candidate(profile: dict[str, Any], candidate_id: str) -> dict[str, Any] | None:
-    for candidate in collect_review_observation_candidates(profile):
+def collect_artifact_review_observation_candidates(
+    profile: dict[str, Any],
+    artifact_dir: Path,
+) -> list[dict[str, Any]]:
+    endpoint_clusters, _endpoint_clusters_source = endpoint_clusters_for_hypothesis_matrix(
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for cluster in endpoint_clusters.get("clusters", []) or []:
+        if not isinstance(cluster, dict):
+            continue
+        for candidate in review_observation_candidates_for_cluster(cluster):
+            candidate_id = str(candidate.get("id") or "")
+            if not candidate_id or candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            candidates.append(json_clone(candidate))
+    return candidates
+
+
+def merged_review_observation_candidates(
+    profile: dict[str, Any],
+    extra_candidates: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in [*collect_review_observation_candidates(profile), *(extra_candidates or [])]:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get("id") or "")
+        if not candidate_id or candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        candidates.append(json_clone(candidate))
+    return candidates
+
+
+def find_review_observation_candidate(
+    profile: dict[str, Any],
+    candidate_id: str,
+    extra_candidates: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    for candidate in merged_review_observation_candidates(profile, extra_candidates):
         if str(candidate.get("id") or "") == candidate_id:
             return candidate
     return None
@@ -4747,12 +4793,13 @@ def promote_review_observation_candidate(
     *,
     candidate_id: str,
     approved_path: str,
+    extra_candidates: list[dict[str, Any]] | None = None,
     observation_id: str | None = None,
     method: str | None = None,
     expected_statuses: list[int] | None = None,
     note: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    candidate = find_review_observation_candidate(profile, candidate_id)
+    candidate = find_review_observation_candidate(profile, candidate_id, extra_candidates=extra_candidates)
     if candidate is None:
         raise ValueError(f"Review observation candidate not found: {candidate_id}")
     if candidate.get("type") != "burp-http-observation":
@@ -4774,7 +4821,7 @@ def promote_review_observation_candidate(
         observation["review_note"] = note
 
     promoted_profile = public_profile(profile)
-    promoted_profile.setdefault("review_observation_candidates", collect_review_observation_candidates(profile))
+    promoted_profile["review_observation_candidates"] = merged_review_observation_candidates(profile, extra_candidates)
     plan = [json_clone(item) for item in promoted_profile.get("burp_observation_plan", []) or []]
     for item in plan:
         if item.get("id") != observation["id"]:
@@ -8741,6 +8788,7 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
         "methodology-review --no-write --limit 8 --skip-current-resource-check",
         "evidence-gaps --no-write",
         "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check",
+        "rewrite-validation-checklist --no-write --show-candidates --show-commands",
         "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check",
         "operator-evidence-review --no-write --show-missing --show-template",
         "transaction-sidecar-review --no-write --show-files --show-commands",
@@ -9296,7 +9344,7 @@ def methodology_next_command_for_hypothesis(
     elif impact == "resource-exhaustion" or hypothesis_type == "resource-abuse-review":
         subcommand = "deployment-review --no-write --top 8"
     elif impact == "fixed-upstream-proxy-confusion":
-        subcommand = "rewrite-review --no-write --show-next"
+        subcommand = "rewrite-validation-checklist --no-write --show-candidates --show-commands"
     else:
         subcommand = "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check"
     ref = validation_command_ref(
@@ -9768,6 +9816,7 @@ def build_rewrite_evidence_closure(
     commands = []
     for source, subcommand in [
         ("rewrite-review", "rewrite-review --no-write --show-next"),
+        ("rewrite-validation-checklist", "rewrite-validation-checklist --no-write --show-candidates --show-commands"),
         ("validation-plan", "validation-plan --no-write --top 8 --show-commands --skip-current-resource-check"),
     ]:
         ref = methodology_command_ref(
@@ -11522,7 +11571,7 @@ def rewrite_review_item_for_cluster(
         bool((rewrite.get("conditional") if isinstance(rewrite, dict) else False))
         for rewrite in rewrites
     )
-    review_candidates = discovery.get("review_observation_candidates", [])
+    review_candidates = review_observation_candidates_for_cluster(cluster)
     priority = "high" if fixed_upstreams and catch_all else "medium"
     status = "needs-approved-read-only-path" if rewrites and catch_all else "needs-offline-review"
     if not fixed_upstreams:
@@ -12506,6 +12555,171 @@ def validation_rewrite_review_context(rewrite_review_item: dict[str, Any] | None
     }
 
 
+def rewrite_validation_checklist_item(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    rewrite_review_item: dict[str, Any],
+    promotion_limit: int,
+) -> dict[str, Any]:
+    read_only = [
+        candidate
+        for candidate in rewrite_review_item.get("read_only_path_candidates", []) or []
+        if isinstance(candidate, dict)
+    ]
+    blocked = [
+        candidate
+        for candidate in rewrite_review_item.get("blocked_path_candidates", []) or []
+        if isinstance(candidate, dict)
+    ]
+    candidate_id = rewrite_review_observation_candidate_id(rewrite_review_item)
+    promotion_commands = rewrite_review_promotion_preview_commands(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        rewrite_review_item=rewrite_review_item,
+        limit=promotion_limit,
+    )
+    source_guard = (
+        rewrite_review_item.get("source_guard_review")
+        if isinstance(rewrite_review_item.get("source_guard_review"), dict)
+        else {}
+    )
+    if read_only and candidate_id and promotion_commands:
+        status = "ready-for-single-path-promotion-preview"
+    elif read_only and not candidate_id:
+        status = "needs-review-observation-candidate"
+    elif read_only:
+        status = "needs-promotion-preview-review"
+    elif rewrite_review_item.get("catch_all"):
+        status = "needs-approved-read-only-path"
+    else:
+        status = "needs-manual-concrete-path"
+    return {
+        "id": f"REWRITE-CHECKLIST-{safe_probe_id(rewrite_review_item.get('id') or rewrite_review_item.get('path'))}",
+        "status": status,
+        "priority": rewrite_review_item.get("priority"),
+        "rewrite_review_id": rewrite_review_item.get("id"),
+        "cluster_id": rewrite_review_item.get("cluster_id"),
+        "candidate_id": candidate_id,
+        "path": rewrite_review_item.get("path"),
+        "method": rewrite_review_item.get("method"),
+        "fixed_upstreams": rewrite_review_item.get("fixed_upstreams", []) or [],
+        "catch_all": bool(rewrite_review_item.get("catch_all")),
+        "source_guard_status": source_guard.get("status") or "missing",
+        "read_only_path_candidates": read_only[:10],
+        "blocked_path_candidates": blocked[:10],
+        "promotion_preview_commands": promotion_commands,
+        "approval_checks": [
+            {
+                "id": "exactly-one-concrete-local-path",
+                "status": "ready" if read_only else "waiting",
+                "evidence": [candidate.get("local_path") for candidate in read_only[:5]],
+            },
+            {
+                "id": "dynamic-templates-blocked",
+                "status": "passed" if blocked or read_only else "waiting",
+                "evidence": [candidate.get("local_path") for candidate in blocked[:5]],
+            },
+            {
+                "id": "promotion-preview-only",
+                "status": "ready" if promotion_commands else "waiting",
+                "evidence": promotion_commands[:3],
+            },
+            {
+                "id": "single-response-impact-required",
+                "status": "waiting",
+                "evidence": rewrite_review_item.get("required_evidence", []),
+            },
+        ],
+        "next_step": (
+            "Run exactly one no-write promotion preview command, review the resulting profile validation, then decide whether a single observed response is justified."
+            if promotion_commands
+            else rewrite_review_item.get("safe_next_step")
+        ),
+        "forbidden": [
+            "Do not enumerate catch-all paths.",
+            "Do not promote dynamic template paths.",
+            "Do not run Burp Scanner, Intruder, crawler, fuzzing, or rate tests.",
+            "Do not treat static rewrite configuration as a reportable finding without concrete response impact.",
+        ],
+        "reportability_gate": rewrite_review_item.get("reportability_gate"),
+        "evidence_refs": rewrite_review_item.get("evidence_refs", []),
+    }
+
+
+def build_rewrite_validation_checklist(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    top: int = 8,
+) -> dict[str, Any]:
+    rewrite_review = build_rewrite_review_run(target=target, profile=profile, artifact_dir=artifact_dir)
+    items = [
+        rewrite_validation_checklist_item(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            rewrite_review_item=item,
+            promotion_limit=max(1, min(5, int(top))),
+        )
+        for item in rewrite_review.get("items", []) or []
+        if isinstance(item, dict)
+    ]
+    status_counts: dict[str, int] = {}
+    priority_counts: dict[str, int] = {}
+    read_only_count = 0
+    blocked_count = 0
+    promotion_commands: list[str] = []
+    for item in items:
+        increment_count(status_counts, str(item.get("status") or "unknown"))
+        increment_count(priority_counts, str(item.get("priority") or "info"))
+        read_only_count += len(item.get("read_only_path_candidates", []) or [])
+        blocked_count += len(item.get("blocked_path_candidates", []) or [])
+        promotion_commands.extend(
+            str(command)
+            for command in item.get("promotion_preview_commands", []) or []
+            if str(command).strip()
+        )
+    if status_counts.get("ready-for-single-path-promotion-preview"):
+        status = "ready-for-single-path-promotion-preview"
+    elif items:
+        status = "needs-approved-read-only-path"
+    else:
+        status = "no-rewrite-validation-items"
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "summary": {
+            "items": len(items),
+            "status_counts": dict(sorted(status_counts.items())),
+            "priority_counts": dict(sorted(priority_counts.items())),
+            "read_only_path_candidates": read_only_count,
+            "blocked_path_candidates": blocked_count,
+            "promotion_preview_commands": len(promotion_commands),
+            "rewrite_review": rewrite_review.get("status"),
+        },
+        "items": items,
+        "promotion_preview_commands": ordered_unique_strings(promotion_commands),
+        "next_step": (
+            "Choose one reviewed read-only path and run its no-write promotion preview; do not observe traffic until scope, resource, and data-sensitivity gates are satisfied."
+            if promotion_commands
+            else "Review rewrite-review read_only_path_candidates and identify exactly one concrete in-scope read-only path before any request."
+        ),
+        "artifact_refs": {
+            "rewrite_review": REWRITE_REVIEW_ARTIFACT,
+            "target_profile": TARGET_PROFILE_ARTIFACT,
+            "endpoint_clusters": "endpoint-clusters.json",
+        },
+        "safety": (
+            "Offline rewrite validation checklist only. It reads local profile, source, and artifact data; "
+            "it does not send requests, invoke Burp, enumerate catch-all paths, sign wallets, or submit transactions."
+        ),
+    }
+
+
 def validation_allowed_commands(
     *,
     artifact_dir: Path,
@@ -12530,6 +12744,8 @@ def validation_allowed_commands(
         ),
         command("verification-queue --no-write"),
     ]
+    if rewrite_review_item:
+        allowed_now_commands.insert(3, command("rewrite-validation-checklist --no-write --show-candidates --show-commands"))
     if hypothesis.get("type") == "resource-abuse-review" or hypothesis.get("impact") == "resource-exhaustion":
         allowed_now_commands.insert(3, command("operator-evidence-review --no-write --show-missing --show-template"))
         allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
@@ -31678,6 +31894,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("harness-loop", "run_harness_loop"),
         refresh_expectation("hypothesis-matrix", "run_hypothesis_matrix"),
         refresh_expectation("rewrite-review", "run_rewrite_review"),
+        refresh_expectation("rewrite-validation-checklist", "run_rewrite_validation_checklist"),
         refresh_expectation("deployment-review", "run_deployment_review"),
         refresh_expectation("operator-evidence-review", "run_operator_evidence_review"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
@@ -45957,11 +46174,13 @@ def run_promote_observation_candidate(args: argparse.Namespace) -> int:
         print(f"Refusing to overwrite existing profile without --force: {output_path}")
         return 2
     expected_statuses = [int(value) for value in args.expected_status] if args.expected_status else None
+    extra_candidates = collect_artifact_review_observation_candidates(profile, artifact_dir)
     try:
         promoted_profile, observation = promote_review_observation_candidate(
             profile,
             candidate_id=args.candidate_id,
             approved_path=args.path,
+            extra_candidates=extra_candidates,
             observation_id=args.observation_id,
             method=args.method,
             expected_statuses=expected_statuses,
@@ -47589,6 +47808,80 @@ def run_rewrite_review(args: argparse.Namespace) -> int:
     if review["status"] == "failed":
         return 1
     if args.strict and review["status"] != "has-review-items":
+        return 1
+    return 0
+
+
+def run_rewrite_validation_checklist(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    checklist = build_rewrite_validation_checklist(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        top=args.top,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / REWRITE_VALIDATION_CHECKLIST_ARTIFACT
+    )
+    if not no_write:
+        write_json(output_path, checklist)
+
+    summary = checklist.get("summary", {}) or {}
+    print(f"Rewrite validation checklist: {checklist['status']}")
+    print(
+        "Rewrite paths: "
+        f"items={summary.get('items', 0)} "
+        f"read_only_candidates={summary.get('read_only_path_candidates', 0)} "
+        f"blocked_candidates={summary.get('blocked_path_candidates', 0)} "
+        f"promotion_previews={summary.get('promotion_preview_commands', 0)} "
+        f"statuses={json.dumps(summary.get('status_counts', {}), sort_keys=True)}"
+    )
+    for item in (checklist.get("items", []) or [])[: max(0, int(args.top))]:
+        print(
+            f"- {item.get('priority')} {item.get('status')} "
+            f"path={item.get('path') or '-'} candidate_id={item.get('candidate_id') or '-'}"
+        )
+        if args.show_candidates:
+            for candidate in (item.get("read_only_path_candidates", []) or [])[:3]:
+                print(
+                    "  candidate="
+                    f"{candidate.get('method')} {candidate.get('local_path')} "
+                    f"source={candidate.get('source_ref')}"
+                )
+            for candidate in (item.get("blocked_path_candidates", []) or [])[:3]:
+                print(
+                    "  blocked_candidate="
+                    f"{candidate.get('method')} {candidate.get('local_path')} "
+                    f"status={candidate.get('status')}"
+                )
+        if args.show_commands:
+            for command_text in (item.get("promotion_preview_commands", []) or [])[:3]:
+                print(f"  preview={inline_summary_text(command_text, max_chars=520)}")
+    if args.show_commands and checklist.get("promotion_preview_commands"):
+        print("Promotion preview commands:")
+        for command_text in (checklist.get("promotion_preview_commands", []) or [])[: max(0, int(args.top))]:
+            print(f"- {inline_summary_text(command_text, max_chars=520)}")
+    print(f"Next: {inline_summary_text(checklist.get('next_step'), max_chars=280)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="rewrite-validation-checklist",
+                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+            )
+        )
+    if args.strict and checklist["status"] != "ready-for-single-path-promotion-preview":
         return 1
     return 0
 
@@ -50640,6 +50933,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless fixed-upstream rewrite/proxy review items are present.",
     )
     rewrite_review.set_defaults(func=run_rewrite_review)
+
+    rewrite_validation_checklist = sub.add_parser(
+        "rewrite-validation-checklist",
+        help="Plan one approved read-only rewrite validation path without sending requests",
+    )
+    rewrite_validation_checklist.add_argument(
+        "--output",
+        help=(
+            f"Where to write {REWRITE_VALIDATION_CHECKLIST_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{REWRITE_VALIDATION_CHECKLIST_ARTIFACT}."
+        ),
+    )
+    rewrite_validation_checklist.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of rewrite checklist items or commands to print.",
+    )
+    rewrite_validation_checklist.add_argument(
+        "--show-candidates",
+        action="store_true",
+        help="Print read-only and blocked rewrite path candidates.",
+    )
+    rewrite_validation_checklist.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print no-write promotion preview commands for approved candidates.",
+    )
+    rewrite_validation_checklist.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print rewrite validation checklist only; do not write {REWRITE_VALIDATION_CHECKLIST_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    rewrite_validation_checklist.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless at least one rewrite path is ready for a no-write promotion preview.",
+    )
+    rewrite_validation_checklist.set_defaults(func=run_rewrite_validation_checklist)
 
     deployment_review = sub.add_parser(
         "deployment-review",
