@@ -10293,6 +10293,11 @@ def build_rewrite_evidence_closure(
             if req.get("status") not in {"passed", "ready-offline", "ready-after-resource-check"}
         ],
         "next_safe_commands": commands[:6],
+        "evidence_contract": fixed_upstream_proxy_confusion_lead_evidence_contract(
+            thread=item,
+            profile=profile,
+            artifact_dir=artifact_dir,
+        ),
         "finding_gate_entry_condition": (
             "Only enter finding-gate after one approved read-only response proves concrete sensitive-data exposure, "
             "path confusion, authorization bypass, or equivalent impact. Static rewrite configuration is not enough."
@@ -11019,6 +11024,72 @@ def transaction_integrity_lead_evidence_contract(
     }
 
 
+def fixed_upstream_proxy_confusion_lead_evidence_contract(
+    *,
+    thread: dict[str, Any],
+    profile: dict[str, Any] | None,
+    artifact_dir: Path | None,
+) -> dict[str, Any]:
+    path_options = lead_dossier_path_options(thread)
+    entrypoint_path = str(thread.get("path") or "")
+    if not entrypoint_path and path_options:
+        entrypoint_path = str(path_options[0].get("path") or "")
+    if not entrypoint_path:
+        entrypoint_path = "/api/{path*}"
+    response_sidecar = (
+        repo_relative_or_absolute(artifact_dir / REWRITE_RESPONSE_SIDECAR_ARTIFACT)
+        if artifact_dir is not None
+        else REWRITE_RESPONSE_SIDECAR_ARTIFACT
+    )
+    return {
+        "id": "fixed-upstream-proxy-confusion-evidence-contract",
+        "entrypoint": f"GET {entrypoint_path}",
+        "method": "GET",
+        "path": entrypoint_path,
+        "required_operator_decision_ids": [],
+        "path_options": path_options[:5],
+        "rewrite_response_sidecar": response_sidecar,
+        "required_evidence": [
+            "Rewrite/source review showing the fixed upstream, source path shape, destination expression, and any route guards.",
+            "Exactly one approved concrete in-scope read-only local path selected from reviewed client/source evidence.",
+            "One normalized and redacted response observation for that approved path after healthy scope and resource gates.",
+            "Concrete sensitive-data exposure, path-confusion, authorization-boundary, or upstream trust-boundary impact from that response.",
+            "Finding-gate/adjudication evidence proving impact beyond static routing or HTTP status behavior.",
+        ],
+        "reportable_only_if": [
+            "The exact fixed-upstream route or rewrite path is in scope and tied to reviewed source or client path evidence.",
+            "One approved read-only response proves unauthorized sensitive-data exposure, path confusion, authorization bypass, or equivalent upstream trust-boundary impact.",
+            "The finding-gate decision ties the response evidence to concrete user, account, project, financial, or operator impact.",
+            "The evidence package excludes raw Burp history, secrets, credentials, wallet signatures, and broad path enumeration.",
+        ],
+        "not_reportable_when": [
+            "The only evidence is a static Next.js rewrite, fixed upstream fetch, proxy route, or destination URL.",
+            "The only observation is a successful or expected HTTP status without sensitive data, auth confusion, or path confusion.",
+            "The selected path is dynamic, mutating, templated, out of scope, or not approved as a single read-only observation.",
+            "Source guards, auth, route validation, or upstream authorization prevent attacker-controlled access to sensitive behavior.",
+            "Impact would require crawling, path enumeration, fuzzing, Scanner, Intruder, brute force, or repeated probing.",
+        ],
+        "safe_evidence_sources": [
+            "rewrite-review output with fixed-upstream, source guard, and read-only path candidate evidence.",
+            "rewrite-validation-checklist output showing approved and blocked path candidates.",
+            "rewrite-response-review output and rewrite-response-observations sidecar with normalized/redacted response summaries.",
+            "Source refs for Next config rewrites, route handlers, client path callers, and fixed-upstream fetch code.",
+            "Finding-gate and adjudication records that summarize concrete impact without raw secrets or raw Burp history.",
+        ],
+        "forbidden_validation": [
+            "No catch-all path enumeration, crawling, broad probing, fuzzing, Burp Scanner, Intruder, brute force, or stress traffic.",
+            "No dynamic wallet/project/template paths unless a specific concrete path is approved as read-only and in scope.",
+            "No mutating requests, auth bypass attempts, credential use, secret capture, wallet signing, or transaction submission.",
+            "No raw Burp MCP history persistence or unredacted response bodies containing secrets, cookies, tokens, or private account data.",
+            "No fixed-upstream report based only on source configuration, destination host, or HTTP status.",
+        ],
+        "safety": (
+            "Lead-level evidence contract only. It describes one approved read-only observation and offline response review; "
+            "it sends no requests, invokes no Burp tools, enumerates no paths, and mutates no state."
+        ),
+    }
+
+
 def lead_dossier_evidence_contract(
     thread: dict[str, Any],
     *,
@@ -11037,6 +11108,12 @@ def lead_dossier_evidence_contract(
     hypothesis_type = str(thread.get("hypothesis_type") or thread.get("type") or "")
     if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
         return transaction_integrity_lead_evidence_contract(
+            thread=thread,
+            profile=profile,
+            artifact_dir=artifact_dir,
+        )
+    if impact == "fixed-upstream-proxy-confusion":
+        return fixed_upstream_proxy_confusion_lead_evidence_contract(
             thread=thread,
             profile=profile,
             artifact_dir=artifact_dir,
@@ -46517,6 +46594,35 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and "counter-evidence-reviewed" not in rewrite_transaction_lead_blocking
             and "concrete-impact-evidence" in rewrite_transaction_lead_blocking
         )
+        rewrite_fixed_upstream_leads = [
+            item
+            for item in rewrite_transaction_lead_dossier.get("leads", []) or []
+            if isinstance(item, dict)
+            and item.get("impact") == "fixed-upstream-proxy-confusion"
+        ]
+        rewrite_fixed_upstream_lead_contracts = [
+            item.get("evidence_contract", {})
+            for item in rewrite_fixed_upstream_leads
+            if isinstance(item.get("evidence_contract"), dict)
+        ]
+        rewrite_fixed_upstream_lead_blocking = [
+            str(blocker)
+            for item in rewrite_fixed_upstream_leads
+            for blocker in (
+                (item.get("strict_validation") or {}).get("blocking_questions", [])
+                if isinstance(item.get("strict_validation"), dict)
+                else []
+            )
+        ]
+        rewrite_fixed_upstream_lead_contract_passed = (
+            bool(rewrite_fixed_upstream_leads)
+            and any(
+                contract.get("id") == "fixed-upstream-proxy-confusion-evidence-contract"
+                for contract in rewrite_fixed_upstream_lead_contracts
+            )
+            and "counter-evidence-reviewed" not in rewrite_fixed_upstream_lead_blocking
+            and "concrete-impact-evidence" in rewrite_fixed_upstream_lead_blocking
+        )
         rewrite_resource_evidence_gaps = build_evidence_gaps(
             rewrite_clusters,
             [],
@@ -48630,6 +48736,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and guarded_fixed_hypothesis_passed
         and transaction_flow_hypothesis_passed
         and rewrite_transaction_lead_contract_passed
+        and rewrite_fixed_upstream_lead_contract_passed
         and rate_limit_resource_review_passed
         and transaction_method_exposure_passed
         and profile_custom_ws_discovery_passed
@@ -49095,6 +49202,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     if isinstance(contract, dict)
                 ],
                 "blocking_questions": sorted(set(rewrite_transaction_lead_blocking)),
+            },
+            "fixed_upstream_lead_contract": {
+                "status": "passed" if rewrite_fixed_upstream_lead_contract_passed else "failed",
+                "lead_count": len(rewrite_fixed_upstream_leads),
+                "contract_ids": [
+                    contract.get("id")
+                    for contract in rewrite_fixed_upstream_lead_contracts
+                    if isinstance(contract, dict)
+                ],
+                "blocking_questions": sorted(set(rewrite_fixed_upstream_lead_blocking)),
             },
             "guarded_fixed_upstream_hypothesis": {
                 "status": "passed" if guarded_fixed_hypothesis_passed else "failed",
