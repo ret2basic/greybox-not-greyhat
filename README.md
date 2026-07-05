@@ -348,7 +348,11 @@ When that review finds a server-side credentialed upstream without same-file
 auth or rate-limit evidence, the matrix also emits a separate
 `credential-proxy-review` hypothesis. This remains offline-only and requires
 provider quota, billing, availability, or account-abuse evidence before any
-finding claim.
+finding claim. Use
+`credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check --show-evidence-contract`
+to print the credentialed-upstream evidence contract, including reportability
+gates, missing provider/operator decisions, safe evidence sources, and forbidden
+validation steps without sending target or provider traffic.
 Profiles can attach `quote_provider.public_docs` entries for official provider
 documentation. InferForge indexes those references as public context for API-key
 authentication and executable transaction-payload behavior, but it does not
@@ -413,10 +417,11 @@ the missing decisions. Add `--show-template-json` to print the redacted sidecar
 template body directly for manual review before creating `operator-evidence.json`.
 Add `--show-closure-contract` to group the same sidecar requirements into
 credentialed-upstream cost-abuse and RPC resource-exhaustion closure contracts,
-including the offline review/gate commands, stop conditions, and the RPC
-resource evidence contract. The contract spells out which operator decisions
-must be proven, which header-trust/fallback conditions are reportable, and which
-safe evidence sources can support the claim without traffic volume.
+including the offline review/gate commands, stop conditions, and evidence
+contracts. The credential contract spells out provider quota/rate-limit/billing
+impact gates; the RPC contract spells out which operator decisions must be
+proven, which header-trust/fallback conditions are reportable, and which safe
+evidence sources can support the claim without traffic volume.
 When RPC source shows rate-limit buckets keyed from
 `x-forwarded-for`, that template also includes
 `rpc-client-ip-header-trust-model`, which asks for production edge/header

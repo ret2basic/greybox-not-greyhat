@@ -8901,8 +8901,8 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
         "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check",
         "rewrite-validation-checklist --no-write --show-candidates --show-commands",
         REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND,
-        "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check",
-        "operator-evidence-review --no-write --show-missing --show-template",
+        "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check --show-evidence-contract",
+        "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
         TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND,
         TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND,
         "deployment-review --no-write --top 8",
@@ -9606,7 +9606,7 @@ def methodology_next_command_for_hypothesis(
     if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
         subcommand = TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND
     elif impact == "credentialed-upstream-cost-abuse" or hypothesis_type == "credential-proxy-review":
-        subcommand = "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check"
+        subcommand = "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check --show-evidence-contract"
     elif impact == "resource-exhaustion" or hypothesis_type == "resource-abuse-review":
         subcommand = "deployment-review --no-write --top 8"
     elif impact == "fixed-upstream-proxy-confusion":
@@ -9949,6 +9949,11 @@ def build_credential_evidence_closure(
     checks = methodology_check_statuses(checklist)
     checklist_status = str(checklist.get("status") or "missing")
     gate_ready = checklist_status == "provider-impact-ready-for-gate"
+    evidence_contract = (
+        checklist.get("evidence_contract")
+        if isinstance(checklist.get("evidence_contract"), dict)
+        else {}
+    )
     requirements = [
         methodology_requirement(
             "credentialed-upstream-route-without-bound-controls",
@@ -9973,9 +9978,12 @@ def build_credential_evidence_closure(
     for source, subcommand in [
         (
             "credential-impact",
-            "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check",
+            "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check --show-evidence-contract",
         ),
-        ("operator-evidence", "operator-evidence-review --no-write --show-missing --show-template"),
+        (
+            "operator-evidence",
+            "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
+        ),
         ("deployment", "deployment-review --no-write --top 8"),
         ("transaction-flow", "transaction-flow-review --no-write --top 8"),
     ]:
@@ -10003,6 +10011,7 @@ def build_credential_evidence_closure(
             if req.get("status") not in {"passed", "ready-offline", "ready-after-resource-check"}
         ],
         "next_safe_commands": commands[:6],
+        "evidence_contract": evidence_contract,
         "finding_gate_entry_condition": (
             "Only enter finding-gate after provider/operator evidence proves material quota, billing, account, "
             "or availability impact from attacker-controlled unauthenticated use."
@@ -14542,8 +14551,8 @@ def validation_allowed_commands(
     if hypothesis.get("type") == "credential-proxy-review" or hypothesis.get("impact") == "credentialed-upstream-cost-abuse":
         for subcommand in reversed(
             [
-                "operator-evidence-review --no-write --show-missing --show-template",
-                "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check",
+                "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
+                "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check --show-evidence-contract",
                 "deployment-review --no-write --top 8",
                 "transaction-flow-review --no-write --top 8",
             ]
@@ -20685,6 +20694,66 @@ OPERATOR_RESOURCE_CONTROL_DECISION_IDS = {
 }
 
 
+def credentialed_upstream_cost_abuse_evidence_contract(
+    *,
+    entrypoint: str,
+    provider: str,
+    missing_decision_ids: list[str] | None = None,
+    route_reviews: list[dict[str, Any]] | None = None,
+    provider_public_docs_review: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    route_files = ordered_unique_strings(
+        [
+            str(row.get("file"))
+            for row in route_reviews or []
+            if isinstance(row, dict) and row.get("file")
+        ]
+    )
+    provider_docs_summary = (
+        provider_public_docs_review.get("summary")
+        if isinstance(provider_public_docs_review, dict)
+        and isinstance(provider_public_docs_review.get("summary"), dict)
+        else {}
+    )
+    return {
+        "id": "credentialed-upstream-cost-abuse-evidence-contract",
+        "entrypoint": entrypoint,
+        "provider": provider or "unknown",
+        "required_operator_decision_ids": sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS),
+        "missing_operator_decision_ids": ordered_unique_strings(missing_decision_ids or []),
+        "route_files": route_files,
+        "provider_public_docs_status": (
+            provider_public_docs_review.get("status")
+            if isinstance(provider_public_docs_review, dict)
+            else "missing"
+        ),
+        "provider_public_docs_assertions": provider_docs_summary.get("assertions", 0),
+        "reportable_only_if": [
+            "The credentialed upstream route is reachable through attacker-controlled unauthenticated input or an equivalent route-bound auth gap.",
+            "Provider/operator evidence shows account-level quota, rate-limit, billing, credit, monitoring, or availability impact for the credentialed upstream.",
+            "The impact can be confirmed with at most one approved route-reachability request after a healthy resource gate.",
+            "Finding-gate review ties the route behavior to concrete provider cost, quota depletion, account availability, or equivalent operator impact.",
+        ],
+        "not_reportable_when": [
+            "The only evidence is that server-side code uses an upstream API key or provider credential.",
+            "Provider public documentation mentions generic quotas or billing but no operator/account impact is evidenced for this deployment.",
+            "The route is protected by route-bound authentication, effective per-user limits, or request validation that prevents attacker-controlled use.",
+            "Impact evidence would require floods, quota depletion, brute force, Scanner, Intruder, or repeated provider requests.",
+        ],
+        "safe_evidence_sources": [
+            "Redacted operator-evidence.json sidecar with non-placeholder summaries for quota, rate-limit, billing, and monitoring decisions.",
+            "Provider documentation or operator statements showing whether the upstream request consumes quota, credits, billable units, or account limits.",
+            "Source review showing credentialed upstream reachability, route-bound auth context, rate-limit guards, and request validation.",
+            "One approved single request only after resource, scope, and provider-impact gates are healthy and only for route reachability.",
+        ],
+        "forbidden_validation": [
+            "No request floods, quota depletion attempts, rate-limit stress, Burp Scanner, Intruder, crawling, or brute force.",
+            "No provider API keys, bearer tokens, cookies, billing account identifiers, raw dashboards, private keys, seed phrases, or wallet signatures.",
+            "No wallet signing, transaction submission, trading, or state mutation while validating provider cost impact.",
+        ],
+    }
+
+
 def operator_evidence_items(operator_evidence: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not isinstance(operator_evidence, dict):
         return []
@@ -20772,6 +20841,7 @@ def operator_evidence_closure_contracts(
     sidecar_path: str,
     missing_decisions: list[dict[str, Any]],
     accepted_present_statuses: list[str],
+    credential_evidence_contract: dict[str, Any] | None = None,
     resource_evidence_contract: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     missing_lookup = {
@@ -20842,7 +20912,7 @@ def operator_evidence_closure_contracts(
                 "id": "credential-impact-review",
                 "risk": "offline-provider-impact-review",
                 "command": command(
-                    "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check"
+                    "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check --show-evidence-contract"
                 ),
             },
             {
@@ -20867,6 +20937,12 @@ def operator_evidence_closure_contracts(
                 "accepted_present_statuses": accepted_present_statuses,
                 "commands": commands,
                 "command_safety": command_safety(commands),
+                "evidence_contract": credential_evidence_contract
+                or credentialed_upstream_cost_abuse_evidence_contract(
+                    entrypoint=f"POST {quote_path}",
+                    provider="deployment/operator",
+                    missing_decision_ids=credential_missing,
+                ),
                 "required_order": [
                     "Fill only redacted provider/operator evidence for the required credentialed-upstream decisions.",
                     "Run operator-template-preview before editing the sidecar and keep placeholders pending.",
@@ -21064,6 +21140,15 @@ def build_operator_evidence_review(
     )
     provider_summary = provider_review.get("summary", {}) if isinstance(provider_review.get("summary"), dict) else {}
     provider_missing = provider_summary.get("missing_provider_evidence", []) or []
+    credential_evidence_contract = credentialed_upstream_cost_abuse_evidence_contract(
+        entrypoint=f"POST {probe_target_path(profile, 'quote', 'path', '/api/quote')}",
+        provider=str(provider_review.get("provider") or "deployment/operator"),
+        missing_decision_ids=[
+            str(item)
+            for item in provider_missing
+            if str(item) in OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS
+        ],
+    )
     critical_missing = (
         (deployment_review.get("summary", {}) or {}).get("critical_missing", [])
         if isinstance(deployment_review, dict) and isinstance(deployment_review.get("summary"), dict)
@@ -21118,9 +21203,11 @@ def build_operator_evidence_review(
         sidecar_path=sidecar_path,
         missing_decisions=missing_sidecar_decisions,
         accepted_present_statuses=accepted_present_statuses,
+        credential_evidence_contract=credential_evidence_contract,
         resource_evidence_contract=resource_evidence_contract,
     )
     summary["closure_contracts"] = len(closure_contracts)
+    summary["credential_provider_contract"] = credential_evidence_contract.get("id") or "missing"
     return {
         "generated_at": utc_now(),
         "status": status,
@@ -21132,6 +21219,7 @@ def build_operator_evidence_review(
         "decision_coverage": decision_coverage,
         "missing_decisions": missing_sidecar_decisions,
         "closure_contracts": closure_contracts,
+        "credential_evidence_contract": credential_evidence_contract,
         "resource_evidence_contract": resource_evidence_contract,
         "sidecar_template": sidecar_template,
         "accepted_present_statuses": accepted_present_statuses,
@@ -23950,6 +24038,13 @@ def build_credential_impact_checklist(
                 "review_question": row.get("review_question"),
             }
         )
+    evidence_contract = credentialed_upstream_cost_abuse_evidence_contract(
+        entrypoint=f"POST {probe_target_path(profile, 'quote', 'path', '/api/quote')}",
+        provider=str(provider_review.get("provider") or "M0"),
+        missing_decision_ids=missing_provider_evidence,
+        route_reviews=route_reviews,
+        provider_public_docs_review=provider_public_docs_review,
+    )
 
     safe_validation_steps = [
         {
@@ -23977,7 +24072,7 @@ def build_credential_impact_checklist(
     followup_commands = [
         validation_command_for_artifact_dir(
             artifact_dir,
-            "operator-evidence-review --no-write --show-missing --show-template",
+            "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
             profile=profile,
         ),
         validation_command_for_artifact_dir(artifact_dir, "deployment-review --no-write --top 8", profile=profile),
@@ -24017,6 +24112,7 @@ def build_credential_impact_checklist(
         "route_reviews": route_reviews,
         "provider_public_docs_review": provider_public_docs_review,
         "provider_evidence_requests": evidence_requests,
+        "evidence_contract": evidence_contract,
         "operator_evidence_sidecar": {
             "path": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
             "template": sidecar_template,
@@ -35751,6 +35847,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--show-commands",
                     "--show-evidence",
                     "--skip-current-resource-check",
+                    "--show-evidence-contract",
                 ]
             )
             operator_evidence_review_return_code, operator_evidence_review_stdout = run_cli(
@@ -36882,6 +36979,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Credential impact checklist:" in credential_impact_checklist_stdout_text
                 and "Credential proxy:" in credential_impact_checklist_stdout_text
                 and "Provider missing:" in credential_impact_checklist_stdout_text
+                and "Evidence contract: credentialed-upstream-cost-abuse-evidence-contract" in credential_impact_checklist_stdout_text
+                and "Provider/operator evidence shows account-level quota" in credential_impact_checklist_stdout_text
                 and "operator-evidence-review --no-write --show-missing --show-template" in credential_impact_checklist_stdout_text
                 and "No files written (--no-write)." in credential_impact_checklist_stdout
                 and not any(
@@ -44968,6 +45067,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             in operator_closure_contract_text
             and "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check"
             in operator_closure_contract_text
+            and "credentialed-upstream-cost-abuse-evidence-contract" in operator_closure_contract_text
+            and "Provider/operator evidence shows account-level quota" in operator_closure_contract_text
+            and "No request floods" in operator_closure_contract_text
             and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict"
             in operator_closure_contract_text
             and "rpc-resource-exhaustion-evidence-contract" in operator_closure_contract_text
@@ -53862,6 +53964,33 @@ def run_credential_impact_checklist(args: argparse.Namespace) -> int:
             f"assertions={provider_docs_summary.get('assertions', 0)} "
             "impact_gate=does-not-satisfy-quota-billing-evidence"
         )
+    if args.show_evidence_contract:
+        evidence_contract = (
+            checklist.get("evidence_contract")
+            if isinstance(checklist.get("evidence_contract"), dict)
+            else {}
+        )
+        if evidence_contract:
+            decisions = ",".join(
+                str(item)
+                for item in (evidence_contract.get("required_operator_decision_ids", []) or [])[:5]
+            )
+            missing_decisions = ",".join(
+                str(item)
+                for item in (evidence_contract.get("missing_operator_decision_ids", []) or [])[:5]
+            )
+            print(
+                "Evidence contract: "
+                f"{evidence_contract.get('id')} "
+                f"entrypoint={evidence_contract.get('entrypoint') or '-'} "
+                f"provider={evidence_contract.get('provider') or '-'} "
+                f"required_decisions={decisions or 'none'} "
+                f"missing={missing_decisions or 'none'}"
+            )
+            for gate in (evidence_contract.get("reportable_only_if", []) or [])[:2]:
+                print(f"  gate={inline_summary_text(gate, max_chars=260)}")
+            for stop in (evidence_contract.get("forbidden_validation", []) or [])[:2]:
+                print(f"  stop={inline_summary_text(stop, max_chars=260)}")
     top_count = max(0, int(args.top))
     if top_count:
         print("Evidence requests:")
@@ -57265,6 +57394,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-commands",
         action="store_true",
         help="Print safe offline follow-up commands.",
+    )
+    credential_impact_checklist.add_argument(
+        "--show-evidence-contract",
+        action="store_true",
+        help="Print the credentialed-upstream cost-abuse evidence contract.",
     )
     credential_impact_checklist.add_argument(
         "--skip-current-resource-check",
