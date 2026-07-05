@@ -24731,6 +24731,83 @@ def evidence_gap_source_peek_requests(
     return requests
 
 
+def rewrite_source_peek_requests(rewrite_review: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(rewrite_review, dict):
+        return []
+    requests = []
+    for item in rewrite_review.get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        risk_factors = set(normalize_string_list(item.get("risk_factors")))
+        if not (
+            {"fixed-upstream", "catch-all-path", "next-config-rewrite"} & risk_factors
+            or item.get("kind") in {"rewrite-proxy", "fixed-upstream-proxy"}
+        ):
+            continue
+        candidate_refs: list[Any] = []
+        for key in ["read_only_path_candidates", "blocked_path_candidates"]:
+            for candidate in item.get(key, []) or []:
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_refs.append(candidate.get("source_ref"))
+                candidate_refs.extend(candidate.get("source_refs", []) or [])
+        source_refs = compact_source_refs([*(item.get("source_refs", []) or []), *candidate_refs])
+        if not source_refs:
+            continue
+        path = str(item.get("path") or item.get("id") or "rewrite")
+        requests.append(
+            {
+                "id": f"PEEK-rewrite-{safe_probe_id(item.get('id') or path)}",
+                "trigger": "rewrite-source-review",
+                "status": "manual-review",
+                "rewrite_review_id": item.get("id"),
+                "entrypoint": path,
+                "cluster_ids": compact_source_refs([item.get("cluster_id")]),
+                "reason": (
+                    "Fixed-upstream rewrite/proxy source context must explain the local proxy boundary, "
+                    "client-derived path candidates, and any auth/query/header forwarding assumptions."
+                ),
+                "questions": compact_source_refs(
+                    [
+                        "Which local rewrite/proxy source defines the fixed upstream and catch-all path boundary?",
+                        "Which client source refs derive the proposed read-only local_path candidates?",
+                        "Do source guards, middleware, or route policy enforce authentication, authorization, allowlisted paths, or method limits before proxying?",
+                        "Are cookies, Authorization headers, query strings, or attacker-controlled path segments forwarded to the upstream?",
+                        *normalize_string_list(item.get("validation_questions")),
+                    ]
+                ),
+                "source_refs": source_refs,
+                "read_only_path_candidates": [
+                    {
+                        "method": candidate.get("method"),
+                        "local_path": candidate.get("local_path"),
+                        "source_ref": candidate.get("source_ref"),
+                    }
+                    for candidate in (item.get("read_only_path_candidates", []) or [])[:5]
+                    if isinstance(candidate, dict)
+                ],
+                "blocked_path_candidates": [
+                    {
+                        "method": candidate.get("method"),
+                        "local_path": candidate.get("local_path"),
+                        "status": candidate.get("status"),
+                        "source_ref": candidate.get("source_ref"),
+                    }
+                    for candidate in (item.get("blocked_path_candidates", []) or [])[:5]
+                    if isinstance(candidate, dict)
+                ],
+                "answer_artifact": "source-peek-results.json",
+                "max_files": max(1, min(8, len(source_refs))),
+                "max_call_depth": 1,
+                "safety": (
+                    "Offline rewrite/proxy source review only; do not request upstream paths, enumerate catch-all "
+                    "segments, forward credentials, or treat static source context as a finding."
+                ),
+            }
+        )
+    return requests
+
+
 def endpoint_source_peek_requests(
     traffic_index: dict[str, Any] | None,
     clusters: dict[str, Any],
@@ -24795,6 +24872,7 @@ def build_source_peek_requests(
     source_peeks: dict[str, Any] | None,
     suspicions: list[dict[str, Any]] | None,
     evidence_gaps: dict[str, Any] | None,
+    rewrite_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     cluster_refs = cluster_source_refs_by_id(clusters)
     observed_clusters = observed_cluster_ids_from_traffic_index(traffic_index, clusters)
@@ -24805,6 +24883,7 @@ def build_source_peek_requests(
         *suspicion_source_peek_requests(suspicions or []),
         *server_action_source_peek_requests(source_peeks),
         *evidence_gap_source_peek_requests(evidence_gaps, cluster_refs),
+        *rewrite_source_peek_requests(rewrite_review),
     ]:
         requests.append(item)
 
@@ -40106,6 +40185,7 @@ def run_audit(args: argparse.Namespace) -> int:
         source_peeks,
         suspicions,
         evidence_gaps,
+        rewrite_review=build_rewrite_review_run(target=target, profile=profile, artifact_dir=artifact_dir),
     )
     write_json(artifact_dir / "source-peek-requests.json", source_peek_requests)
     blackbox_coverage = build_blackbox_coverage(
@@ -44035,6 +44115,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             rewrite_source_peeks,
             [],
             rewrite_server_action_gaps,
+            rewrite_review=build_rewrite_review_run(
+                target="http://127.0.0.1:9998",
+                profile=rewrite_profile,
+                artifact_dir=queue_artifact_dir,
+            ),
         )
         rewrite_source_peek_request_ids = {
             str(item.get("id"))
@@ -44048,9 +44133,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and any(request_id.startswith("PEEK-endpoint-") for request_id in rewrite_source_peek_request_ids)
             and any(request_id.startswith("PEEK-server-action-") for request_id in rewrite_source_peek_request_ids)
             and any(request_id.startswith("PEEK-gap-gap_server_action_") for request_id in rewrite_source_peek_request_ids)
+            and any(request_id.startswith("PEEK-rewrite-") for request_id in rewrite_source_peek_request_ids)
             and rewrite_source_peek_request_triggers.get("observed-endpoint") == 1
             and rewrite_source_peek_request_triggers.get("source-only-server-action-discovery") == 1
             and rewrite_source_peek_request_triggers.get("evidence-gap") == 1
+            and rewrite_source_peek_request_triggers.get("rewrite-source-review") == 1
         )
         rewrite_burp_observation_coverage = build_burp_observation_coverage(
             "http://127.0.0.1:9998",
@@ -46908,6 +46995,7 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
         source_peeks,
         suspicions_doc.get("suspicions", []),
         evidence_gaps,
+        rewrite_review=build_rewrite_review_run(target=target, profile=profile, artifact_dir=artifact_dir),
     )
     source_peek_requests_path = artifact_dir / "source-peek-requests.json"
     if not no_write:
@@ -47109,6 +47197,7 @@ def run_source_peek(args: argparse.Namespace) -> int:
             load_optional_json(artifact_dir / "source-peek-results.json"),
             (load_optional_json(artifact_dir / "suspicions.json") or {}).get("suspicions", []),
             load_optional_json(artifact_dir / "evidence-gaps.json"),
+            rewrite_review=build_rewrite_review_run(target=target, profile=profile, artifact_dir=artifact_dir),
         )
         if not no_write:
             write_json(source_peek_requests_path, source_peek_requests)
@@ -47190,6 +47279,7 @@ def run_source_peek_requests(args: argparse.Namespace) -> int:
         source_peeks,
         suspicions_doc.get("suspicions", []),
         load_optional_json(artifact_dir / "evidence-gaps.json"),
+        rewrite_review=build_rewrite_review_run(target=target, profile=profile, artifact_dir=artifact_dir),
     )
     output_path = artifact_dir / "source-peek-requests.json"
     if not no_write:
