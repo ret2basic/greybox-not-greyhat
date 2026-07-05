@@ -162,6 +162,7 @@ CLAIM_EVIDENCE_LEDGER_ARTIFACT = "claim-evidence-ledger.json"
 CLAIM_WITNESS_LADDER_ARTIFACT = "claim-witness-ladder.json"
 CLAIM_EVIDENCE_REQUESTS_ARTIFACT = "claim-evidence-requests.json"
 SECRET_EXPOSURE_REVIEW_ARTIFACT = "secret-exposure-review.json"
+BUILD_PROVENANCE_READINESS_ARTIFACT = "build-provenance-readiness.json"
 BOUNTY_FRONTIER_ARTIFACT = "bounty-frontier.json"
 BOUNTY_VALIDATION_GATES_ARTIFACT = "bounty-validation-gates.json"
 BOUNTY_INVALIDITY_REVIEW_ARTIFACT = "bounty-invalidity-review.json"
@@ -276,6 +277,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     CLAIM_WITNESS_LADDER_ARTIFACT,
     CLAIM_EVIDENCE_REQUESTS_ARTIFACT,
     SECRET_EXPOSURE_REVIEW_ARTIFACT,
+    BUILD_PROVENANCE_READINESS_ARTIFACT,
     BOUNTY_FRONTIER_ARTIFACT,
     BOUNTY_VALIDATION_GATES_ARTIFACT,
     BOUNTY_INVALIDITY_REVIEW_ARTIFACT,
@@ -23412,6 +23414,277 @@ def build_bounty_invalidity_review(
     }
 
 
+def build_provenance_invalidity_row(invalidity_review: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(invalidity_review, dict):
+        return {}
+    rows = invalidity_review.get("invalidity_rows")
+    if not isinstance(rows, list):
+        return {}
+    for row in rows:
+        if isinstance(row, dict) and row.get("bounty_lane") == "build-secret-exposure":
+            return row
+    return {}
+
+
+def build_provenance_gate_row(bounty_validation_gates: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(bounty_validation_gates, dict):
+        return {}
+    gates = bounty_validation_gates.get("gates")
+    if not isinstance(gates, list):
+        return {}
+    for gate in gates:
+        if isinstance(gate, dict) and gate.get("bounty_lane") == "build-secret-exposure":
+            return gate
+    return {}
+
+
+def build_provenance_readiness_check(
+    check_id: str,
+    label: str,
+    status: str,
+    evidence: Any,
+    next_step: str,
+) -> dict[str, Any]:
+    return {
+        "id": check_id,
+        "label": label,
+        "status": status,
+        "evidence": evidence,
+        "next_step": next_step,
+    }
+
+
+def build_secret_actionable_rows(secret_review: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in secret_review.get("actionable_review_items", []) or []
+        if isinstance(item, dict) and str(item.get("status") or "") == "needs-build-provenance-review"
+    ]
+
+
+def build_provenance_static_signal_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    kind_counts: dict[str, int] = {}
+    files = []
+    names = []
+    for row in rows:
+        increment_count(kind_counts, str(row.get("kind") or "unknown"))
+        if row.get("file"):
+            files.append(str(row.get("file")))
+        if row.get("name"):
+            names.append(str(row.get("name")))
+    return {
+        "signals": len(rows),
+        "kind_counts": dict(sorted(kind_counts.items())),
+        "files": ordered_unique_strings(files),
+        "names": ordered_unique_strings(names),
+    }
+
+
+def build_provenance_evidence_requirements(actionable_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    requirements = []
+    for row in actionable_rows:
+        requirements.append(
+            {
+                "id": row.get("id"),
+                "kind": row.get("kind"),
+                "file": row.get("file"),
+                "line": row.get("line"),
+                "name": row.get("name"),
+                "required_proof": [
+                    "A real non-placeholder secret was supplied to this build step or written during the build.",
+                    "A redacted image history/config, layer/cache, build log, registry artifact, or builder attestation proves retention or disclosure.",
+                    "The redacted evidence is tied to this Dockerfile source line or build step.",
+                    "The evidence proves plausible token/account/package-registry/deployment impact without exposing the raw secret value.",
+                ],
+                "reject_if": [
+                    "Only Dockerfile source, placeholder values, or a runtime env reference are available.",
+                    "The builder stage, logs, remote cache, registry object, and pushed images are proven unavailable or not retained.",
+                    "The submitted evidence contains raw secret values instead of redacted proof.",
+                ],
+            }
+        )
+    return requirements
+
+
+def build_provenance_readiness_from_reviews(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    secret_review: dict[str, Any] | None,
+    bounty_validation_gates: dict[str, Any] | None,
+    bounty_invalidity_review: dict[str, Any] | None,
+) -> dict[str, Any]:
+    review = secret_review if isinstance(secret_review, dict) else {}
+    actionable_rows = build_secret_actionable_rows(review)
+    gate = build_provenance_gate_row(bounty_validation_gates)
+    invalidity_row = build_provenance_invalidity_row(bounty_invalidity_review)
+    static_summary = build_provenance_static_signal_summary(actionable_rows)
+    gate_exists = bool(gate)
+    invalid_now = bool(invalidity_row.get("invalid_if_reported_now"))
+    official_evidence_ready = gate_exists and bool(invalidity_row) and not invalid_now and bool(actionable_rows)
+    checks = [
+        build_provenance_readiness_check(
+            "static-build-secret-signals",
+            "Docker build secret ARG/ENV/.npmrc persistence signals are indexed from source.",
+            "passed" if actionable_rows else "waiting",
+            static_summary,
+            "Run secret-exposure-review and confirm the Dockerfile build-secret rows are still actionable.",
+        ),
+        build_provenance_readiness_check(
+            "redacted-build-provenance-evidence",
+            "Redacted build provenance proves actual secret retention or disclosure.",
+            "passed" if official_evidence_ready else "waiting",
+            {
+                "required_official_evidence": gate.get("required_official_evidence")
+                or invalidity_row.get("required_official_evidence")
+                or [
+                    "redacted build provenance: image history/config, cache/log excerpt, registry artifact, or builder attestation"
+                ],
+                "minimum_fix": invalidity_row.get("minimum_fix"),
+                "invalid_if_reported_now": invalid_now,
+            },
+            "Provide redacted build provenance showing a real secret was retained or disclosed; source-only Dockerfile evidence stays invalid.",
+        ),
+        build_provenance_readiness_check(
+            "secret-value-redaction-boundary",
+            "Evidence is sufficient to prove exposure while omitting raw secret values.",
+            "passed" if official_evidence_ready else "review-required" if actionable_rows else "waiting",
+            {
+                "forbidden_fields": [
+                    "raw token values",
+                    "full .npmrc contents with token",
+                    "provider or package registry credentials",
+                    "bearer tokens",
+                    "cookies",
+                    "private keys",
+                    "seed phrases",
+                    "raw CI logs containing secrets",
+                ],
+                "accepted_evidence_shape": [
+                    "redacted image history/config excerpt",
+                    "redacted layer/cache proof",
+                    "redacted build log excerpt",
+                    "registry artifact metadata or attestation",
+                    "operator or CI attestation with exact source line/build step reference",
+                ],
+            },
+            "Keep raw secrets out of artifacts; use redacted proof plus source/build-step references.",
+        ),
+        build_provenance_readiness_check(
+            "build-secret-bounty-gate",
+            "Bounty validation gate accepts retention/disclosure impact for build-secret exposure.",
+            "passed" if official_evidence_ready else "blocked",
+            {
+                "gate_id": gate.get("id"),
+                "gate_status": gate.get("gate_status"),
+                "primary_invalidity_category": invalidity_row.get("primary_invalidity_category"),
+                "validation_commands": normalize_string_list(gate.get("validation_commands"))[:4],
+            },
+            invalidity_row.get("minimum_fix")
+            or "Rerun bounty-validation-gates and adjudicate after redacted provenance evidence exists.",
+        ),
+    ]
+    failed_or_waiting = [check for check in checks if check.get("status") != "passed"]
+    if not actionable_rows and not gate_exists:
+        status = "no-build-secret-frontier"
+    elif not actionable_rows:
+        status = "no-static-build-secret-signals"
+    elif official_evidence_ready:
+        status = "ready-for-build-secret-gate-review"
+    else:
+        status = "waiting-redacted-build-provenance"
+    minimum_package = {
+        "evidence_type": "redacted-build-provenance",
+        "source_review_artifact": repo_relative_or_absolute(artifact_dir / SECRET_EXPOSURE_REVIEW_ARTIFACT),
+        "required_static_signal_count": len(actionable_rows),
+        "evidence_requirements": build_provenance_evidence_requirements(actionable_rows),
+        "accepted_sources": [
+            "redacted docker image history or config",
+            "redacted build cache or layer metadata",
+            "redacted CI/build log excerpt",
+            "registry artifact metadata",
+            "builder attestation or operator statement tied to the build step",
+        ],
+        "must_prove": [
+            "a real non-placeholder secret was supplied to the build",
+            "the secret or usable proof of it was retained or disclosed in an artifact/log/cache/registry surface",
+            "the retained/disclosed material has plausible package registry, deployment, account, or service impact",
+            "the evidence can be reviewed without revealing the raw secret value",
+        ],
+        "must_not_include": [
+            "raw secret values",
+            "full tokens",
+            "bearer tokens",
+            "cookies",
+            "private keys",
+            "seed phrases",
+            "wallet signatures",
+            "raw unredacted CI logs",
+        ],
+    }
+    commands = [
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "secret-exposure-review --no-write --show-findings",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "bounty-validation-gates --no-write --show-gates",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "bounty-invalidity-review --no-write --show-reasons",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+        validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+    ]
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-build-provenance-readiness-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "checks": len(checks),
+            "passed": sum(1 for check in checks if check.get("status") == "passed"),
+            "waiting_or_blocked": len(failed_or_waiting),
+            "static_signals": len(actionable_rows),
+            "official_evidence_ready": official_evidence_ready,
+            "invalid_if_reported_now": invalid_now,
+            "secret_review_status": review.get("status") or "missing",
+            "bounty_gate_status": gate.get("gate_status") or "missing",
+            "invalidity_status": (
+                bounty_invalidity_review.get("status")
+                if isinstance(bounty_invalidity_review, dict)
+                else "missing"
+            ),
+        },
+        "static_signal_summary": static_summary,
+        "minimum_official_evidence_package": minimum_package,
+        "checks": checks,
+        "first_blocker": failed_or_waiting[0] if failed_or_waiting else None,
+        "commands": commands,
+        "reportability_rule": (
+            "This readiness artifact is not evidence. Static Docker build-secret patterns only become Medium+ after "
+            "redacted provenance proves actual retention/disclosure, finding-gate accepts impact, and adjudication agrees."
+        ),
+        "next_step": (
+            failed_or_waiting[0].get("next_step")
+            if failed_or_waiting
+            else "Rerun finding-gate and adjudication with the redacted build provenance evidence."
+        ),
+        "safety": (
+            "Offline build-provenance readiness only. It reads local source/review artifacts, sends no target traffic, "
+            "does not query registries or Docker daemons, and must not include raw secret values."
+        ),
+    }
+
+
 RPC_PROXY_HTTP_SOURCE = Path("src/app/api/rpc/_shared.ts")
 RPC_PROXY_WS_SOURCE = Path("server.js")
 
@@ -24457,6 +24730,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     CLAIM_WITNESS_LADDER_ARTIFACT: "claim-witness-ladder",
     CLAIM_EVIDENCE_REQUESTS_ARTIFACT: "claim-evidence-requests",
     SECRET_EXPOSURE_REVIEW_ARTIFACT: "secret-exposure-review",
+    BUILD_PROVENANCE_READINESS_ARTIFACT: "build-provenance-readiness",
     BOUNTY_FRONTIER_ARTIFACT: "bounty-frontier",
     BOUNTY_VALIDATION_GATES_ARTIFACT: "bounty-validation-gates",
     BOUNTY_INVALIDITY_REVIEW_ARTIFACT: "bounty-invalidity-review",
@@ -24503,6 +24777,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "claim-witness-ladder",
     "claim-evidence-requests",
     "secret-exposure-review",
+    "build-provenance-readiness",
     "bounty-frontier",
     "bounty-validation-gates",
     "bounty-invalidity-review",
@@ -24534,6 +24809,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "claim-witness-ladder": "claim-witness-ladder --no-write",
     "claim-evidence-requests": "claim-evidence-requests --no-write",
     "secret-exposure-review": "secret-exposure-review --no-write",
+    "build-provenance-readiness": "build-provenance-readiness --no-write",
     "bounty-frontier": "bounty-frontier --no-write",
     "bounty-validation-gates": "bounty-validation-gates --no-write",
     "bounty-invalidity-review": "bounty-invalidity-review --no-write",
@@ -49611,6 +49887,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("operator-evidence-review", "run_operator_evidence_review"),
         refresh_expectation("operator-impact-readiness", "run_operator_impact_readiness"),
         refresh_expectation("secret-exposure-review", "run_secret_exposure_review"),
+        refresh_expectation("build-provenance-readiness", "run_build_provenance_readiness"),
         refresh_expectation("bounty-frontier", "run_bounty_frontier"),
         refresh_expectation("bounty-validation-gates", "run_bounty_validation_gates"),
         refresh_expectation("bounty-invalidity-review", "run_bounty_invalidity_review"),
@@ -73437,6 +73714,137 @@ def run_secret_exposure_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_build_provenance_readiness(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    secret_review = build_secret_exposure_review(
+        source_root=source_root,
+        profile=profile,
+        max_file_bytes=args.max_file_bytes,
+        max_files=args.max_files,
+    )
+    gates = build_or_load_bounty_validation_gates_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    invalidity_review = load_optional_json(artifact_dir / BOUNTY_INVALIDITY_REVIEW_ARTIFACT)
+    if not isinstance(invalidity_review, dict):
+        invalidity_review = build_bounty_invalidity_review(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            bounty_validation_gates=gates,
+            adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+        )
+    readiness = build_provenance_readiness_from_reviews(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        secret_review=secret_review,
+        bounty_validation_gates=gates,
+        bounty_invalidity_review=invalidity_review,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / BUILD_PROVENANCE_READINESS_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(readiness))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="build-provenance-readiness",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = readiness.get("summary", {}) if isinstance(readiness.get("summary"), dict) else {}
+    print(f"Build provenance readiness: {readiness.get('status')}")
+    print(
+        "Readiness: "
+        f"checks={summary.get('checks', 0)} "
+        f"passed={summary.get('passed', 0)} "
+        f"waiting={summary.get('waiting_or_blocked', 0)} "
+        f"static_signals={summary.get('static_signals', 0)} "
+        f"official_ready={summary.get('official_evidence_ready')} "
+        f"invalid_now={summary.get('invalid_if_reported_now')}"
+    )
+    print(
+        "Inputs: "
+        f"secret={summary.get('secret_review_status') or '-'} "
+        f"gate={summary.get('bounty_gate_status') or '-'} "
+        f"invalidity={summary.get('invalidity_status') or '-'}"
+    )
+    package = (
+        readiness.get("minimum_official_evidence_package")
+        if isinstance(readiness.get("minimum_official_evidence_package"), dict)
+        else {}
+    )
+    print(
+        "Minimum package: "
+        f"type={package.get('evidence_type') or '-'} "
+        f"signals={package.get('required_static_signal_count', 0)} "
+        f"sources={','.join(normalize_string_list(package.get('accepted_sources'))[:5]) or '-'}"
+    )
+    top_count = max(0, int(args.top))
+    if args.show_signals:
+        print("Static signals:")
+        for row in (package.get("evidence_requirements", []) or [])[:top_count]:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('kind')} {row.get('file')}:{row.get('line') or '-'} "
+                f"name={row.get('name') or '-'}"
+            )
+            if args.show_next:
+                proof = normalize_string_list(row.get("required_proof"))
+                if proof:
+                    print(f"  proof={inline_summary_text(proof[0], max_chars=260)}")
+    if args.show_checks:
+        print("Checks:")
+        for check in (readiness.get("checks", []) or [])[:top_count]:
+            if not isinstance(check, dict):
+                continue
+            print(
+                f"- {check.get('status')} {check.get('id')}: "
+                f"{inline_summary_text(check.get('label'), max_chars=220)}"
+            )
+            if args.show_next:
+                print(f"  next={inline_summary_text(check.get('next_step'), max_chars=300)}")
+    if args.show_commands:
+        print("Commands:")
+        for command_text in normalize_string_list(readiness.get("commands"))[:top_count]:
+            print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    first_blocker = (
+        readiness.get("first_blocker")
+        if isinstance(readiness.get("first_blocker"), dict)
+        else {}
+    )
+    if first_blocker:
+        print(
+            "First blocker: "
+            f"{first_blocker.get('id')} status={first_blocker.get('status')} "
+            f"next={inline_summary_text(first_blocker.get('next_step'), max_chars=300)}"
+        )
+    print(f"Rule: {inline_summary_text(readiness.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(readiness.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if args.strict and readiness.get("status") != "ready-for-build-secret-gate-review":
+        return 1
+    return 0
+
+
 def run_bounty_frontier(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -76736,6 +77144,70 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero only when a potential concrete static secret exposure is found.",
     )
     secret_exposure_review.set_defaults(func=run_secret_exposure_review)
+
+    build_provenance_readiness = sub.add_parser(
+        "build-provenance-readiness",
+        help="Summarize redacted build provenance readiness for Docker build-secret exposure gates",
+    )
+    build_provenance_readiness.add_argument(
+        "--output",
+        help=(
+            f"Where to write {BUILD_PROVENANCE_READINESS_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{BUILD_PROVENANCE_READINESS_ARTIFACT}."
+        ),
+    )
+    build_provenance_readiness.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES,
+        help=f"Maximum bytes to read per allowlisted source/config file. Defaults to {DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES}.",
+    )
+    build_provenance_readiness.add_argument(
+        "--max-files",
+        type=positive_int,
+        default=64,
+        help="Maximum allowlisted source/config files to scan. Defaults to 64.",
+    )
+    build_provenance_readiness.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of checks, static signals, or commands to print.",
+    )
+    build_provenance_readiness.add_argument(
+        "--show-signals",
+        action="store_true",
+        help="Print build-secret static signals requiring provenance evidence.",
+    )
+    build_provenance_readiness.add_argument(
+        "--show-checks",
+        action="store_true",
+        help="Print build provenance readiness checks.",
+    )
+    build_provenance_readiness.add_argument(
+        "--show-next",
+        action="store_true",
+        help="Print next action per signal or readiness check.",
+    )
+    build_provenance_readiness.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print safe offline follow-up commands.",
+    )
+    build_provenance_readiness.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print build provenance readiness only; do not write {BUILD_PROVENANCE_READINESS_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    build_provenance_readiness.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless redacted build provenance is ready for build-secret gate review.",
+    )
+    build_provenance_readiness.set_defaults(func=run_build_provenance_readiness)
 
     bounty_frontier = sub.add_parser(
         "bounty-frontier",
