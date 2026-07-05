@@ -158,6 +158,7 @@ REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
 REWRITE_RESPONSE_SIDECAR_ARTIFACT = "rewrite-response-sidecar.jsonl"
+REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT = "rewrite-response-sidecar-template.json"
 DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT = "deployment-resource-review.json"
 TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
 TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
@@ -255,6 +256,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
+    REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT,
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
@@ -356,6 +358,7 @@ INDEX_ARTIFACT_ORDER = [
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
+    REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
     TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
@@ -17857,6 +17860,32 @@ def rewrite_response_sidecar_template(
     }
 
 
+def rewrite_response_sidecar_template_doc(review: dict[str, Any]) -> dict[str, Any]:
+    template = (
+        review.get("sidecar_template")
+        if isinstance(review.get("sidecar_template"), dict)
+        else {}
+    )
+    path_options = [
+        option
+        for option in template.get("path_options", []) or []
+        if isinstance(option, dict)
+    ]
+    return {
+        "schema": "inferforge-rewrite-response-sidecar-template-v1",
+        "status": "template-present" if template else "no-rewrite-response-sidecar-template",
+        "template_count": 1 if template else 0,
+        "target_sidecar": template.get("path") or REWRITE_RESPONSE_SIDECAR_ARTIFACT,
+        "path_option_count": len(path_options),
+        "template": template,
+        "safety": (
+            f"Template package only. It is not {REWRITE_RESPONSE_SIDECAR_ARTIFACT} evidence, sends no traffic, "
+            "queries no Burp tools, reads no raw history, and must not contain cookies, bearer tokens, API keys, "
+            "private keys, seed phrases, signatures, or full response bodies."
+        ),
+    }
+
+
 def rewrite_response_single_request_approval_packet(
     *,
     artifact_dir: Path,
@@ -19866,6 +19895,74 @@ def transaction_intent_policy_template_command_refs_for_iteration(
     return [ref]
 
 
+def rewrite_response_sidecar_template_subcommand(*, limit: int) -> str:
+    display_limit = max(1, min(12, int(limit or 1)))
+    parts = [
+        "rewrite-response-review",
+        "--top",
+        str(display_limit),
+        "--show-observations",
+        "--show-commands",
+        "--show-observation-contract",
+        "--show-sidecar-template-json",
+        "--show-sidecar-validation",
+        "--write-sidecar-template",
+    ]
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def iteration_needs_rewrite_response_sidecar_template(
+    *,
+    validation_plan: dict[str, Any],
+    oracle_plan: dict[str, Any] | None,
+) -> bool:
+    for item in validation_plan.get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for _packet_key, packet_type, packet in validation_item_approval_packets(item):
+            if packet_type == "rewrite-response" and packet:
+                return True
+    if isinstance(oracle_plan, dict):
+        for action in oracle_plan.get("actions", []) or []:
+            if isinstance(action, dict) and action.get("oracle_type") == "single-response-impact":
+                return True
+    return False
+
+
+def rewrite_response_sidecar_template_command_refs_for_iteration(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    validation_plan: dict[str, Any],
+    oracle_plan: dict[str, Any] | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not iteration_needs_rewrite_response_sidecar_template(
+        validation_plan=validation_plan,
+        oracle_plan=oracle_plan,
+    ):
+        return []
+    command = validation_command_for_artifact_dir(
+        artifact_dir,
+        rewrite_response_sidecar_template_subcommand(limit=limit),
+        profile=profile,
+    )
+    ref = validation_command_ref(
+        command,
+        source="iteration-decision:rewrite-response-sidecar-template",
+        item_status="ready",
+    )
+    if ref.get("classification") != "ready":
+        return []
+    ref["artifact"] = REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT
+    ref["template_count"] = 1
+    ref["reason"] = (
+        f"Write {REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT} as a pending rewrite-response sidecar template package only; "
+        f"it is not {REWRITE_RESPONSE_SIDECAR_ARTIFACT} evidence and does not satisfy finding gates."
+    )
+    return [ref]
+
+
 OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     TARGET_PROFILE_ARTIFACT: "profile",
     STRATEGY_REGISTRY_ARTIFACT: "profile",
@@ -19890,6 +19987,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     REVIEW_BLOCKERS_MARKDOWN_ARTIFACT: "review-blockers",
     ORACLE_PLAN_ARTIFACT: "oracle-plan",
     ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT: "oracle-plan --write-sidecar-template",
+    REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT: "rewrite-response-review --write-sidecar-template",
     "finding-gate.json": "gate",
     "adjudication.json": "adjudicate",
     "findings.json": "adjudicate",
@@ -19923,6 +20021,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "verification-queue",
     "review-blockers",
     "oracle-plan",
+    "rewrite-response-review --write-sidecar-template",
     "report",
     "transaction-corpus-checklist --write-policy-template --skip-current-resource-check",
     "decode-transactions",
@@ -19942,6 +20041,9 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "verification-queue": "verification-queue --no-write",
     "review-blockers": "review-blockers --no-write",
     "oracle-plan": "oracle-plan --no-write",
+    "rewrite-response-review --write-sidecar-template": (
+        "rewrite-response-review --no-write --show-sidecar-template-json"
+    ),
     "transaction-corpus-checklist --write-policy-template --skip-current-resource-check": (
         "transaction-corpus-checklist --no-write --show-policy-template-json --skip-current-resource-check"
     ),
@@ -20143,6 +20245,18 @@ def build_iteration_decision_from_plan(
         for ref in oracle_plan_commands
         if str(ref.get("command") or "").strip()
     }
+    rewrite_response_template_commands = rewrite_response_sidecar_template_command_refs_for_iteration(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        validation_plan=validation_plan,
+        oracle_plan=oracle_plan,
+        limit=limit,
+    )
+    rewrite_response_template_command_keys = {
+        str(ref.get("command") or "").strip()
+        for ref in rewrite_response_template_commands
+        if str(ref.get("command") or "").strip()
+    }
     transaction_policy_template_commands = transaction_intent_policy_template_command_refs_for_iteration(
         artifact_dir=artifact_dir,
         profile=profile,
@@ -20172,6 +20286,7 @@ def build_iteration_decision_from_plan(
         for ref in offline
         if str(ref.get("command") or "").strip() not in objective_package_command_keys
         and str(ref.get("command") or "").strip() not in oracle_plan_command_keys
+        and str(ref.get("command") or "").strip() not in rewrite_response_template_command_keys
         and str(ref.get("command") or "").strip() not in transaction_policy_template_command_keys
         and str(ref.get("command") or "").strip() not in oracle_sidecar_template_command_keys
     ]
@@ -20180,6 +20295,7 @@ def build_iteration_decision_from_plan(
             *artifact_repair,
             *objective_package_commands,
             *oracle_plan_commands,
+            *rewrite_response_template_commands,
             *transaction_policy_template_commands,
             *oracle_sidecar_template_commands,
             *offline_after_objective_package,
@@ -20206,6 +20322,20 @@ def build_iteration_decision_from_plan(
                 kind="offline",
                 reason="Rank the validation-oracle blockers and shortest evidence contracts before broad offline planning.",
                 commands=oracle_plan_commands,
+                limit=offline_preview_limit,
+            )
+        )
+    if rewrite_response_template_commands:
+        actions.append(
+            iteration_action(
+                action_id="rewrite-response-template-package",
+                status="ready",
+                kind="offline",
+                reason=(
+                    f"Write {REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT} for rewrite-response blockers; "
+                    f"this is a pending template package, not {REWRITE_RESPONSE_SIDECAR_ARTIFACT} evidence or a finding."
+                ),
+                commands=rewrite_response_template_commands,
                 limit=offline_preview_limit,
             )
         )
@@ -20321,6 +20451,7 @@ def build_iteration_decision_from_plan(
     if (
         objective_package_commands
         or oracle_plan_commands
+        or rewrite_response_template_commands
         or transaction_policy_template_commands
         or oracle_sidecar_template_commands
         or offline_after_objective_package
@@ -20387,6 +20518,11 @@ def build_iteration_decision_from_plan(
             "approval_packets": len(approval_packets),
             "objective_package_commands": len(objective_package_commands),
             "oracle_plan_commands": len(oracle_plan_commands),
+            "rewrite_response_template_commands": len(rewrite_response_template_commands),
+            "rewrite_response_template_packages": len(rewrite_response_template_commands),
+            "rewrite_response_template_artifact": (
+                REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT if rewrite_response_template_commands else None
+            ),
             "transaction_policy_template_commands": len(transaction_policy_template_commands),
             "transaction_policy_template_packages": len(transaction_policy_template_commands),
             "transaction_policy_template_artifact": (
@@ -54401,14 +54537,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "generated_at": utc_now(),
                 "status": "needs-human-review",
                 "assessment_policy": assessment_mode_policy(blackbox_normalized_profile),
-                "summary": {"groups": 2},
+                "summary": {"groups": 3},
                 "oracle_summary": {
-                    "type_counts": {"provider-impact": 1, "transaction-intent": 1},
+                    "type_counts": {"provider-impact": 1, "single-response-impact": 1, "transaction-intent": 1},
                     "dependency_counts": {
-                        "approved-sidecar-or-single-observation": 1,
+                        "approved-sidecar-or-single-observation": 2,
                         "operator-or-deployment-evidence": 1,
                     },
-                    "artifact_status_counts": {"missing-artifacts": 2},
+                    "artifact_status_counts": {"missing-artifacts": 3},
                     "work_items": [
                         {
                             "group_id": "finding-gate-blocker:post-api-quote:transaction-corpus",
@@ -54426,6 +54562,23 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                             "first_required_field": "approved=true for one reviewed quote payload sidecar",
                             "required_field_count": 6,
                             "next_step": "Collect one approved quote payload sidecar, then decode offline against intent policy.",
+                        },
+                        {
+                            "group_id": "finding-gate-blocker:get-api-account:rewrite-response",
+                            "oracle_type": "single-response-impact",
+                            "oracle_status": "waiting-evidence",
+                            "priority": "low",
+                            "category": "finding-gate-blocker",
+                            "cluster_id": "account",
+                            "title": "Blocked rewrite response-impact gate",
+                            "dependency_kind": "approved-sidecar-or-single-observation",
+                            "missing_artifact_count": 1,
+                            "first_missing_artifact": REWRITE_RESPONSE_SIDECAR_ARTIFACT,
+                            "evidence_contract_kind": "approved-redacted-response-impact",
+                            "evidence_contract_status": "has-contract",
+                            "first_required_field": "approved=true for exactly one reviewed in-scope read-only path",
+                            "required_field_count": 7,
+                            "next_step": "Prepare one approved redacted response sidecar template before any finding-gate review.",
                         },
                         {
                             "group_id": "finding-gate-blocker:post-api-quote:provider-impact",
@@ -54552,6 +54705,22 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for ref in action.get("commands", []) or []
             if isinstance(ref, dict)
         ]
+        focused_iteration_rewrite_template_commands = [
+            str(ref.get("command") or "")
+            for action in focused_iteration_decision_sample.get("actions", [])
+            if action.get("id") == "rewrite-response-template-package"
+            for ref in action.get("commands", []) or []
+            if isinstance(ref, dict)
+        ]
+        focused_iteration_rewrite_template_action = next(
+            (
+                action
+                for action in focused_iteration_decision_sample.get("actions", [])
+                if action.get("id") == "rewrite-response-template-package"
+            ),
+            {},
+        )
+        focused_iteration_rewrite_template_command_text = "\n".join(focused_iteration_rewrite_template_commands)
         focused_iteration_transaction_policy_template_commands = [
             str(ref.get("command") or "")
             for action in focused_iteration_decision_sample.get("actions", [])
@@ -55755,7 +55924,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and "AbC1234567890Token" not in blackbox_iteration_command_text_sample
         and focused_iteration_decision_sample.get("summary", {}).get("offline_command_preview_limit") == 2
         and focused_iteration_decision_sample.get("summary", {}).get("approval_packets") == 2
-        and focused_iteration_decision_sample.get("summary", {}).get("oracle_plan_actions") == 2
+        and focused_iteration_decision_sample.get("summary", {}).get("oracle_plan_actions") == 3
+        and focused_iteration_decision_sample.get("summary", {}).get("rewrite_response_template_commands") == 1
+        and focused_iteration_decision_sample.get("summary", {}).get("rewrite_response_template_artifact")
+        == REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT
         and focused_iteration_decision_sample.get("summary", {}).get("transaction_policy_template_commands") == 1
         and focused_iteration_decision_sample.get("summary", {}).get("transaction_policy_template_artifact")
         == TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT
@@ -55790,6 +55962,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         == [
             focused_iteration_command(oracle_plan_cli_subcommand(limit=8)),
         ]
+        and focused_iteration_rewrite_template_commands
+        == [
+            focused_iteration_command(rewrite_response_sidecar_template_subcommand(limit=8)),
+        ]
+        and focused_iteration_rewrite_template_action.get("kind") == "offline"
+        and REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT in focused_iteration_rewrite_template_action.get("reason", "")
+        and f"not {REWRITE_RESPONSE_SIDECAR_ARTIFACT} evidence" in focused_iteration_rewrite_template_action.get(
+            "reason", ""
+        )
+        and REWRITE_RESPONSE_SIDECAR_ARTIFACT not in focused_iteration_rewrite_template_command_text
         and focused_iteration_transaction_policy_template_commands
         == [
             focused_iteration_command(transaction_intent_policy_template_subcommand(limit=8)),
@@ -55821,6 +56003,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         )
         and not any(
             command in [*focused_iteration_preview_commands, *focused_iteration_objective_preview_commands]
+            for command in focused_iteration_rewrite_template_commands
+        )
+        and not any(
+            command in [*focused_iteration_preview_commands, *focused_iteration_objective_preview_commands]
             for command in focused_iteration_transaction_policy_template_commands
         )
         and not any(
@@ -55832,6 +56018,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for command in [
                 *focused_iteration_objective_preview_commands[:2],
                 *focused_iteration_oracle_preview_commands[:1],
+                *focused_iteration_rewrite_template_commands[:1],
                 *focused_iteration_transaction_policy_template_commands[:1],
                 *focused_iteration_sidecar_template_commands[:1],
                 *focused_iteration_preview_commands[:2],
@@ -58967,6 +59154,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     == [
                         focused_iteration_command(oracle_plan_cli_subcommand(limit=8)),
                     ]
+                    and focused_iteration_rewrite_template_commands
+                    == [
+                        focused_iteration_command(rewrite_response_sidecar_template_subcommand(limit=8)),
+                    ]
                     and focused_iteration_transaction_policy_template_commands
                     == [
                         focused_iteration_command(transaction_intent_policy_template_subcommand(limit=8)),
@@ -58977,7 +59168,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                             oracle_plan_cli_subcommand(limit=8, no_write=False, write_sidecar_template=True)
                         ),
                     ]
-                    and focused_iteration_decision_sample.get("summary", {}).get("oracle_plan_actions") == 2
+                    and focused_iteration_decision_sample.get("summary", {}).get("oracle_plan_actions") == 3
+                    and focused_iteration_decision_sample.get("summary", {}).get("rewrite_response_template_commands")
+                    == 1
                     and focused_iteration_decision_sample.get("summary", {}).get(
                         "transaction_policy_template_commands"
                     )
@@ -58996,6 +59189,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                         ]
                         for command in focused_iteration_oracle_preview_commands
                     )
+                    and focused_iteration_rewrite_template_action.get("kind") == "offline"
+                    and REWRITE_RESPONSE_SIDECAR_ARTIFACT not in focused_iteration_rewrite_template_command_text
                     and focused_iteration_transaction_policy_template_action.get("kind") == "offline"
                     and "transaction-intent-policy.json"
                     not in focused_iteration_transaction_policy_template_command_text
@@ -59006,6 +59201,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                         for command in [
                             *focused_iteration_objective_preview_commands[:2],
                             *focused_iteration_oracle_preview_commands[:1],
+                            *focused_iteration_rewrite_template_commands[:1],
                             *focused_iteration_transaction_policy_template_commands[:1],
                             *focused_iteration_sidecar_template_commands[:1],
                             *focused_iteration_preview_commands[:2],
@@ -59019,6 +59215,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "preview_commands": focused_iteration_preview_commands,
                 "objective_preview_commands": focused_iteration_objective_preview_commands,
                 "oracle_preview_commands": focused_iteration_oracle_preview_commands,
+                "rewrite_template_commands": focused_iteration_rewrite_template_commands,
+                "rewrite_template_action": focused_iteration_rewrite_template_action,
                 "transaction_policy_template_commands": focused_iteration_transaction_policy_template_commands,
                 "transaction_policy_template_action": focused_iteration_transaction_policy_template_action,
                 "sidecar_template_commands": focused_iteration_sidecar_template_commands,
@@ -59030,6 +59228,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "expected_oracle_commands": [
                     focused_iteration_command(oracle_plan_cli_subcommand(limit=8)),
                 ],
+                "expected_rewrite_template_commands": [
+                    focused_iteration_command(rewrite_response_sidecar_template_subcommand(limit=8)),
+                ],
                 "expected_transaction_policy_template_commands": [
                     focused_iteration_command(transaction_intent_policy_template_subcommand(limit=8)),
                 ],
@@ -59040,6 +59241,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 ],
                 "oracle_summary": {
                     "actions": focused_iteration_decision_sample.get("summary", {}).get("oracle_plan_actions"),
+                    "rewrite_template_commands": focused_iteration_decision_sample.get("summary", {}).get(
+                        "rewrite_response_template_commands"
+                    ),
                     "transaction_policy_template_commands": focused_iteration_decision_sample.get("summary", {}).get(
                         "transaction_policy_template_commands"
                     ),
@@ -64640,8 +64844,18 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
         if args.output
         else artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT
     )
+    sidecar_template_output_path = (
+        resolve_repo_path(args.sidecar_template_output)
+        if getattr(args, "sidecar_template_output", None)
+        else artifact_dir / REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT
+    )
+    sidecar_template_doc = rewrite_response_sidecar_template_doc(review)
     if not no_write:
+        output_paths = [output_path]
         write_json(output_path, sanitize_artifact_samples(review))
+        if getattr(args, "write_sidecar_template", False):
+            write_json(sidecar_template_output_path, sanitize_artifact_samples(sidecar_template_doc))
+            output_paths.append(sidecar_template_output_path)
 
     summary = review.get("summary", {}) or {}
     print(f"Rewrite response review: {review['status']}")
@@ -64767,18 +64981,20 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
             print(f"- {inline_summary_text(command_text, max_chars=420)}")
     if args.show_sidecar_template_json:
         print("Rewrite response sidecar template JSON:")
-        print(json.dumps(review.get("sidecar_template", {}), indent=2, sort_keys=True))
+        print(json.dumps(sanitize_artifact_samples(sidecar_template_doc), indent=2, sort_keys=True))
     print(f"Gate: {inline_summary_text(review.get('reportability_gate'), max_chars=280)}")
     if no_write:
         print("No files written (--no-write).")
     else:
         print(f"Wrote {output_path}")
+        if getattr(args, "write_sidecar_template", False):
+            print(f"Wrote {sidecar_template_output_path}")
         print_refreshed_manifests(
             refresh_current_artifact_manifest(
                 artifact_dir=artifact_dir,
                 target=target,
                 command="rewrite-response-review",
-                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+                output_paths=[*target_profile_artifact_paths(artifact_dir), *output_paths],
             )
         )
     if args.strict and review["status"] != "candidate-impact-review":
@@ -66280,6 +66496,7 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
         f"approval_packets={summary.get('approval_packets', 0)} "
         f"objective_package={summary.get('objective_package_commands', 0)} "
         f"oracle_plan={summary.get('oracle_plan_commands', 0)} "
+        f"rewrite_response_template={summary.get('rewrite_response_template_commands', 0)} "
         f"transaction_policy_template={summary.get('transaction_policy_template_commands', 0)} "
         f"oracle_sidecar_template={summary.get('oracle_sidecar_template_commands', 0)} "
         f"blocked={summary.get('blocked_commands', 0)}"
@@ -66292,6 +66509,13 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
             f"top={summary.get('top_oracle') or '-'} "
             f"contract={summary.get('top_oracle_contract') or '-'} "
             f"first_missing={summary.get('top_oracle_first_missing') or '-'}"
+        )
+    if summary.get("rewrite_response_template_commands"):
+        print(
+            "Rewrite response template: "
+            f"artifact={summary.get('rewrite_response_template_artifact') or '-'} "
+            f"commands={summary.get('rewrite_response_template_commands', 0)} "
+            f"note=template-only-not-rewrite-response-sidecar"
         )
     if summary.get("transaction_policy_template_commands"):
         print(
@@ -68659,6 +68883,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-sidecar-template-json",
         action="store_true",
         help="Print a redacted JSONL sidecar template for one manually approved rewrite response.",
+    )
+    rewrite_response_review.add_argument(
+        "--write-sidecar-template",
+        action="store_true",
+        help=(
+            f"Also write {REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT}; this is a pending template artifact, "
+            f"not {REWRITE_RESPONSE_SIDECAR_ARTIFACT} evidence."
+        ),
+    )
+    rewrite_response_review.add_argument(
+        "--sidecar-template-output",
+        help=(
+            f"Where to write {REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT}."
+        ),
     )
     rewrite_response_review.add_argument(
         "--show-sidecar-validation",
