@@ -10952,7 +10952,79 @@ def lead_dossier_business_tests(
     return []
 
 
-def lead_dossier_evidence_contract(thread: dict[str, Any]) -> dict[str, Any]:
+def transaction_integrity_lead_evidence_contract(
+    *,
+    thread: dict[str, Any],
+    profile: dict[str, Any] | None,
+    artifact_dir: Path | None,
+) -> dict[str, Any]:
+    quote_path = probe_target_path(profile, "quote", "path", str(thread.get("path") or "/api/quote"))
+    payload_sidecar = (
+        repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl")
+        if artifact_dir is not None
+        else "transaction-payloads.jsonl"
+    )
+    intent_policy_sidecar = (
+        repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json")
+        if artifact_dir is not None
+        else "transaction-intent-policy.json"
+    )
+    return {
+        "id": "transaction-integrity-evidence-contract",
+        "entrypoint": f"POST {quote_path}",
+        "method": "POST",
+        "path": quote_path,
+        "required_operator_decision_ids": [],
+        "payload_sidecar": payload_sidecar,
+        "intent_policy_sidecar": intent_policy_sidecar,
+        "expected_payload_type": quote_response_expected_payload_type(profile) or "unknown",
+        "configured_transaction_candidate_paths": quote_response_candidate_paths(profile),
+        "required_evidence": [
+            "One approved quote response or extracted transaction payload sidecar for the exact in-scope quote flow.",
+            "A payload contract compatible with the configured quote_response.expected_payload_type and transaction candidate paths.",
+            "A valid transaction intent policy covering direction, wallet, amountIn, sourceMint, destinationMint, and reviewed allowedPrograms.",
+            "Decoded transaction review covering signer, wallet/account, mints, amount, instructions, and program IDs.",
+            "Finding-gate/adjudication evidence tying any decoded mismatch to concrete user-funds or transaction-integrity impact.",
+        ],
+        "reportable_only_if": [
+            "The quote transaction corpus comes from one approved in-scope POST quote flow and is decoded offline.",
+            "The decoded transaction signer, wallet/account, mint, amount, instruction, or program behavior conflicts with the approved user intent.",
+            "The mismatch proves concrete user-funds or transaction-integrity impact after finding-gate and adjudication review.",
+            "The evidence package excludes wallet signing, transaction submission, trading, private keys, seed phrases, and raw Burp history.",
+        ],
+        "not_reportable_when": [
+            "The only evidence is source code suggesting a transaction may be returned by the quote endpoint.",
+            "No approved quote response or extracted transaction payload sidecar is available for offline decoding.",
+            "The payload sidecar does not match the configured SVM payload contract or cannot be decoded.",
+            "The decoded transaction matches the approved direction, wallet, amount, mints, and reviewed program policy.",
+            "Impact would require wallet signing, transaction submission, trading, broad quote collection, or provider stress traffic.",
+        ],
+        "safe_evidence_sources": [
+            "transaction-sidecar-review output and payload contract review generated from local approved sidecars.",
+            "transaction-corpus-checklist output and decode-transactions summaries with raw payloads omitted.",
+            "transaction-intent-policy.json containing only approved public wallet/address/mint/amount/program intent values.",
+            "Source refs for the quote route and payload assembly path.",
+            "Finding-gate and adjudication records that summarize decoded mismatches without raw private material.",
+        ],
+        "forbidden_validation": [
+            "No wallet signing, transaction submission, trading, swaps, fund movement, or real user-state mutation.",
+            "No private keys, seed phrases, wallet signatures, bearer tokens, cookies, raw Burp history, or unredacted provider secrets.",
+            "No Burp Scanner, Intruder, crawling, fuzzing, request floods, quota depletion, or broad quote/provider traffic.",
+            "No transaction-integrity report without decoded signer/account/mint/amount/program evidence and a finding-gate decision.",
+        ],
+        "safety": (
+            "Lead-level evidence contract only. It describes approved corpus and offline decoding evidence; "
+            "it sends no requests, invokes no Burp tools, signs no wallets, and submits no transactions."
+        ),
+    }
+
+
+def lead_dossier_evidence_contract(
+    thread: dict[str, Any],
+    *,
+    profile: dict[str, Any] | None = None,
+    artifact_dir: Path | None = None,
+) -> dict[str, Any]:
     closure = thread.get("evidence_closure") if isinstance(thread.get("evidence_closure"), dict) else {}
     closure_contract = (
         closure.get("evidence_contract")
@@ -10961,6 +11033,14 @@ def lead_dossier_evidence_contract(thread: dict[str, Any]) -> dict[str, Any]:
     )
     if closure_contract:
         return closure_contract
+    impact = str(thread.get("impact") or "")
+    hypothesis_type = str(thread.get("hypothesis_type") or thread.get("type") or "")
+    if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
+        return transaction_integrity_lead_evidence_contract(
+            thread=thread,
+            profile=profile,
+            artifact_dir=artifact_dir,
+        )
     resource_review = (
         thread.get("resource_abuse_review")
         if isinstance(thread.get("resource_abuse_review"), dict)
@@ -10976,10 +11056,15 @@ def lead_dossier_strict_validation_checklist(
     *,
     target: str,
     profile: dict[str, Any] | None,
+    artifact_dir: Path | None = None,
 ) -> dict[str, Any]:
     closure = thread.get("evidence_closure") if isinstance(thread.get("evidence_closure"), dict) else {}
     poc_plan = thread.get("minimal_poc_plan") if isinstance(thread.get("minimal_poc_plan"), dict) else {}
-    evidence_contract = lead_dossier_evidence_contract(thread)
+    evidence_contract = lead_dossier_evidence_contract(
+        thread,
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
     path_options = lead_dossier_path_options(thread)
     code_refs = lead_dossier_code_refs(thread, limit=8)
     missing_requirements = [str(item) for item in closure.get("missing_requirements", []) or []]
@@ -11166,11 +11251,16 @@ def build_lead_dossier(
                 "code_refs": lead_dossier_code_refs(thread),
                 "path_options": lead_dossier_path_options(thread),
                 "business_logic_tests": lead_dossier_business_tests(business_logic_map, thread.get("id")),
-                "evidence_contract": lead_dossier_evidence_contract(thread),
+                "evidence_contract": lead_dossier_evidence_contract(
+                    thread,
+                    profile=profile,
+                    artifact_dir=artifact_dir,
+                ),
                 "strict_validation": lead_dossier_strict_validation_checklist(
                     thread,
                     target=target,
                     profile=profile,
+                    artifact_dir=artifact_dir,
                 ),
                 "current_blocker": thread.get("current_blocker"),
                 "required_evidence": thread.get("required_evidence", []),
@@ -46388,6 +46478,45 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             ),
             None,
         )
+        rewrite_transaction_lead_dossier = build_lead_dossier(
+            target="http://127.0.0.1:9998",
+            profile=rewrite_normalized,
+            artifact_dir=rewrite_transaction_matrix_dir,
+            source_root=rewrite_source_root,
+            limit=8,
+        )
+        rewrite_transaction_leads = [
+            item
+            for item in rewrite_transaction_lead_dossier.get("leads", []) or []
+            if isinstance(item, dict)
+            and (
+                item.get("impact") == "transaction-integrity"
+                or item.get("type") == "transaction-flow-review"
+            )
+        ]
+        rewrite_transaction_lead_contracts = [
+            item.get("evidence_contract", {})
+            for item in rewrite_transaction_leads
+            if isinstance(item.get("evidence_contract"), dict)
+        ]
+        rewrite_transaction_lead_blocking = [
+            str(blocker)
+            for item in rewrite_transaction_leads
+            for blocker in (
+                (item.get("strict_validation") or {}).get("blocking_questions", [])
+                if isinstance(item.get("strict_validation"), dict)
+                else []
+            )
+        ]
+        rewrite_transaction_lead_contract_passed = (
+            bool(rewrite_transaction_leads)
+            and any(
+                contract.get("id") == "transaction-integrity-evidence-contract"
+                for contract in rewrite_transaction_lead_contracts
+            )
+            and "counter-evidence-reviewed" not in rewrite_transaction_lead_blocking
+            and "concrete-impact-evidence" in rewrite_transaction_lead_blocking
+        )
         rewrite_resource_evidence_gaps = build_evidence_gaps(
             rewrite_clusters,
             [],
@@ -48500,6 +48629,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and rewrite_discovery_passed
         and guarded_fixed_hypothesis_passed
         and transaction_flow_hypothesis_passed
+        and rewrite_transaction_lead_contract_passed
         and rate_limit_resource_review_passed
         and transaction_method_exposure_passed
         and profile_custom_ws_discovery_passed
@@ -48955,6 +49085,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "matrix_summary": rewrite_transaction_matrix.get("summary", {}),
                 "hypothesis": rewrite_transaction_hypothesis,
                 "validation_item": rewrite_transaction_validation_item,
+            },
+            "transaction_lead_contract": {
+                "status": "passed" if rewrite_transaction_lead_contract_passed else "failed",
+                "lead_count": len(rewrite_transaction_leads),
+                "contract_ids": [
+                    contract.get("id")
+                    for contract in rewrite_transaction_lead_contracts
+                    if isinstance(contract, dict)
+                ],
+                "blocking_questions": sorted(set(rewrite_transaction_lead_blocking)),
             },
             "guarded_fixed_upstream_hypothesis": {
                 "status": "passed" if guarded_fixed_hypothesis_passed else "failed",
