@@ -162,6 +162,7 @@ DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT = "deployment-resource-review.json"
 TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
 TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
 TRANSACTION_SIDECAR_REVIEW_ARTIFACT = "transaction-sidecar-review.json"
+TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT = "transaction-intent-policy-templates.json"
 CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT = "credential-impact-checklist.json"
 OPERATOR_EVIDENCE_ARTIFACT = "operator-evidence.json"
 OPERATOR_EVIDENCE_REVIEW_ARTIFACT = "operator-evidence-review.json"
@@ -258,6 +259,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
     TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
+    TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT,
     CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT,
     OPERATOR_EVIDENCE_ARTIFACT,
     "artifact-health.json",
@@ -357,6 +359,7 @@ INDEX_ARTIFACT_ORDER = [
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
     TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
+    TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT,
     CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT,
     OPERATOR_EVIDENCE_ARTIFACT,
     "response-delta-analysis.json",
@@ -387,6 +390,7 @@ INDEX_ARTIFACT_ORDER = [
     "rpc-method-policy.json",
     "transaction-intent.json",
     "transaction-decoder-selftest.json",
+    TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT,
     "transaction-intent-policy.json",
     "quote-collection.json",
     "orca-baseline.json",
@@ -19775,6 +19779,93 @@ def oracle_plan_sidecar_template_command_refs_for_iteration(
     return [ref]
 
 
+def transaction_intent_policy_template_subcommand(*, limit: int) -> str:
+    display_limit = max(1, min(12, int(limit or 1)))
+    parts = [
+        "transaction-corpus-checklist",
+        "--top",
+        str(display_limit),
+        "--show-commands",
+        "--show-steps",
+        "--show-payload-template-json",
+        "--show-policy-template-json",
+        "--skip-current-resource-check",
+        "--write-policy-template",
+    ]
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def transaction_intent_policy_template_count_for_iteration(
+    *,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+) -> int:
+    templates = transaction_corpus_policy_templates(profile, artifact_dir)
+    return sum(
+        1
+        for row in templates
+        if isinstance(row, dict) and isinstance(row.get("intent_policy_sidecar_template"), dict)
+    )
+
+
+def iteration_needs_transaction_intent_policy_templates(
+    *,
+    validation_plan: dict[str, Any],
+    oracle_plan: dict[str, Any] | None,
+) -> bool:
+    for item in validation_plan.get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for _packet_key, packet_type, packet in validation_item_approval_packets(item):
+            if packet_type == "transaction-corpus" and packet:
+                return True
+    if isinstance(oracle_plan, dict):
+        for action in oracle_plan.get("actions", []) or []:
+            if isinstance(action, dict) and action.get("oracle_type") == "transaction-intent":
+                return True
+    return False
+
+
+def transaction_intent_policy_template_command_refs_for_iteration(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    validation_plan: dict[str, Any],
+    oracle_plan: dict[str, Any] | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not iteration_needs_transaction_intent_policy_templates(
+        validation_plan=validation_plan,
+        oracle_plan=oracle_plan,
+    ):
+        return []
+    template_count = transaction_intent_policy_template_count_for_iteration(
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
+    if template_count <= 0:
+        return []
+    command = validation_command_for_artifact_dir(
+        artifact_dir,
+        transaction_intent_policy_template_subcommand(limit=limit),
+        profile=profile,
+    )
+    ref = validation_command_ref(
+        command,
+        source="iteration-decision:transaction-intent-policy-template",
+        item_status="ready",
+    )
+    if ref.get("classification") != "ready":
+        return []
+    ref["artifact"] = TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT
+    ref["template_count"] = template_count
+    ref["reason"] = (
+        f"Write {TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT} as a pending transaction-intent policy template package only; "
+        "it is not transaction-intent-policy.json evidence and does not satisfy finding gates."
+    )
+    return [ref]
+
+
 OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     TARGET_PROFILE_ARTIFACT: "profile",
     STRATEGY_REGISTRY_ARTIFACT: "profile",
@@ -19806,6 +19897,9 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     "report.md": "report",
     "index.html": "report",
     "transaction-intent.json": "decode-transactions",
+    TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT: (
+        "transaction-corpus-checklist --write-policy-template --skip-current-resource-check"
+    ),
     "transaction-decoder-selftest.json": "self-test-transactions",
 }
 
@@ -19830,6 +19924,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "review-blockers",
     "oracle-plan",
     "report",
+    "transaction-corpus-checklist --write-policy-template --skip-current-resource-check",
     "decode-transactions",
     "self-test-transactions",
 ]
@@ -19847,6 +19942,9 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "verification-queue": "verification-queue --no-write",
     "review-blockers": "review-blockers --no-write",
     "oracle-plan": "oracle-plan --no-write",
+    "transaction-corpus-checklist --write-policy-template --skip-current-resource-check": (
+        "transaction-corpus-checklist --no-write --show-policy-template-json --skip-current-resource-check"
+    ),
     "report": "report --no-write",
 }
 
@@ -20045,6 +20143,18 @@ def build_iteration_decision_from_plan(
         for ref in oracle_plan_commands
         if str(ref.get("command") or "").strip()
     }
+    transaction_policy_template_commands = transaction_intent_policy_template_command_refs_for_iteration(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        validation_plan=validation_plan,
+        oracle_plan=oracle_plan,
+        limit=limit,
+    )
+    transaction_policy_template_command_keys = {
+        str(ref.get("command") or "").strip()
+        for ref in transaction_policy_template_commands
+        if str(ref.get("command") or "").strip()
+    }
     oracle_sidecar_template_commands = oracle_plan_sidecar_template_command_refs_for_iteration(
         artifact_dir=artifact_dir,
         profile=profile,
@@ -20062,6 +20172,7 @@ def build_iteration_decision_from_plan(
         for ref in offline
         if str(ref.get("command") or "").strip() not in objective_package_command_keys
         and str(ref.get("command") or "").strip() not in oracle_plan_command_keys
+        and str(ref.get("command") or "").strip() not in transaction_policy_template_command_keys
         and str(ref.get("command") or "").strip() not in oracle_sidecar_template_command_keys
     ]
     allowed_command_summary = command_safety_summary(
@@ -20069,6 +20180,7 @@ def build_iteration_decision_from_plan(
             *artifact_repair,
             *objective_package_commands,
             *oracle_plan_commands,
+            *transaction_policy_template_commands,
             *oracle_sidecar_template_commands,
             *offline_after_objective_package,
             *resource_checks,
@@ -20094,6 +20206,20 @@ def build_iteration_decision_from_plan(
                 kind="offline",
                 reason="Rank the validation-oracle blockers and shortest evidence contracts before broad offline planning.",
                 commands=oracle_plan_commands,
+                limit=offline_preview_limit,
+            )
+        )
+    if transaction_policy_template_commands:
+        actions.append(
+            iteration_action(
+                action_id="transaction-policy-template-package",
+                status="ready",
+                kind="offline",
+                reason=(
+                    f"Write {TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT} for transaction-intent blockers; "
+                    "this is a pending template package, not transaction-intent-policy.json evidence or a finding."
+                ),
+                commands=transaction_policy_template_commands,
                 limit=offline_preview_limit,
             )
         )
@@ -20195,6 +20321,7 @@ def build_iteration_decision_from_plan(
     if (
         objective_package_commands
         or oracle_plan_commands
+        or transaction_policy_template_commands
         or oracle_sidecar_template_commands
         or offline_after_objective_package
         or artifact_repair
@@ -20260,6 +20387,11 @@ def build_iteration_decision_from_plan(
             "approval_packets": len(approval_packets),
             "objective_package_commands": len(objective_package_commands),
             "oracle_plan_commands": len(oracle_plan_commands),
+            "transaction_policy_template_commands": len(transaction_policy_template_commands),
+            "transaction_policy_template_packages": len(transaction_policy_template_commands),
+            "transaction_policy_template_artifact": (
+                TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT if transaction_policy_template_commands else None
+            ),
             "oracle_sidecar_template_commands": len(oracle_sidecar_template_commands),
             "oracle_sidecar_template_packages": len(oracle_sidecar_template_commands),
             "oracle_sidecar_template_artifact": (
@@ -29610,6 +29742,68 @@ def build_transaction_corpus_checklist(
         "safety": (
             "Offline checklist only. It reads local artifacts and /proc resource state, sends no requests, reads no raw Burp "
             "history, invokes no wallet, and submits no transaction."
+        ),
+    }
+
+
+def transaction_intent_policy_templates_doc(checklist: dict[str, Any]) -> dict[str, Any]:
+    policy_templates = [
+        row
+        for row in checklist.get("policy_templates", []) or []
+        if isinstance(row, dict) and isinstance(row.get("intent_policy_sidecar_template"), dict)
+    ]
+    sidecar = (
+        checklist.get("intent_policy_sidecar")
+        if isinstance(checklist.get("intent_policy_sidecar"), dict)
+        else {}
+    )
+    sidecar_path = str(sidecar.get("path") or "transaction-intent-policy.json")
+    templates = []
+    for row in policy_templates:
+        template = row.get("intent_policy_sidecar_template")
+        if not isinstance(template, dict) or not template:
+            continue
+        command_safety_refs = (
+            row.get("command_safety_refs")
+            if isinstance(row.get("command_safety_refs"), dict)
+            else {}
+        )
+        templates.append(
+            {
+                "direction": row.get("direction"),
+                "status": row.get("status"),
+                "target_policy_sidecar": sidecar_path,
+                "policy_template": template,
+                "manual_fields": normalize_string_list(row.get("missing_runtime_fields")) or ["wallet", "amountIn"],
+                "program_allowlist_status": row.get("programAllowlistStatus") or "unknown",
+                "program_allowlist_review": (
+                    row.get("program_allowlist_review")
+                    if isinstance(row.get("program_allowlist_review"), dict)
+                    else {}
+                ),
+                "prepare_preview_command": row.get("prepare_policy_preview_command"),
+                "prepare_command_classification": (
+                    (command_safety_refs.get("prepare_policy") or {}).get("classification")
+                    if isinstance(command_safety_refs.get("prepare_policy"), dict)
+                    else None
+                ),
+                "decode_preview_command": row.get("decode_preview_command"),
+                "notes": [
+                    f"Copy exactly one policy_template object to {sidecar_path} only after the matching quote is approved.",
+                    "Replace wallet and amountIn placeholders with the approved public wallet and raw amount values.",
+                    "This template does not include private keys, wallet signatures, signed transactions, cookies, bearer tokens, or raw Burp history.",
+                ],
+            }
+        )
+    return {
+        "schema": "inferforge-transaction-intent-policy-templates-v1",
+        "status": "templates-present" if templates else "no-transaction-intent-policy-templates",
+        "template_count": len(templates),
+        "target_policy_sidecar": sidecar_path,
+        "templates": templates,
+        "safety": (
+            f"Template package only. It is not {sidecar_path}, sends no traffic, invokes no wallet, signs nothing, "
+            "submits no transaction, and must not contain secrets, signatures, cookies, bearer tokens, or raw Burp history."
         ),
     }
 
@@ -54358,6 +54552,24 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for ref in action.get("commands", []) or []
             if isinstance(ref, dict)
         ]
+        focused_iteration_transaction_policy_template_commands = [
+            str(ref.get("command") or "")
+            for action in focused_iteration_decision_sample.get("actions", [])
+            if action.get("id") == "transaction-policy-template-package"
+            for ref in action.get("commands", []) or []
+            if isinstance(ref, dict)
+        ]
+        focused_iteration_transaction_policy_template_action = next(
+            (
+                action
+                for action in focused_iteration_decision_sample.get("actions", [])
+                if action.get("id") == "transaction-policy-template-package"
+            ),
+            {},
+        )
+        focused_iteration_transaction_policy_template_command_text = "\n".join(
+            focused_iteration_transaction_policy_template_commands
+        )
         focused_iteration_sidecar_template_commands = [
             str(ref.get("command") or "")
             for action in focused_iteration_decision_sample.get("actions", [])
@@ -55544,6 +55756,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and focused_iteration_decision_sample.get("summary", {}).get("offline_command_preview_limit") == 2
         and focused_iteration_decision_sample.get("summary", {}).get("approval_packets") == 2
         and focused_iteration_decision_sample.get("summary", {}).get("oracle_plan_actions") == 2
+        and focused_iteration_decision_sample.get("summary", {}).get("transaction_policy_template_commands") == 1
+        and focused_iteration_decision_sample.get("summary", {}).get("transaction_policy_template_artifact")
+        == TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT
         and focused_iteration_decision_sample.get("summary", {}).get("oracle_sidecar_template_commands") == 1
         and focused_iteration_decision_sample.get("summary", {}).get("oracle_sidecar_template_artifact")
         == ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT
@@ -55575,6 +55790,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         == [
             focused_iteration_command(oracle_plan_cli_subcommand(limit=8)),
         ]
+        and focused_iteration_transaction_policy_template_commands
+        == [
+            focused_iteration_command(transaction_intent_policy_template_subcommand(limit=8)),
+        ]
+        and focused_iteration_transaction_policy_template_action.get("kind") == "offline"
+        and TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT
+        in focused_iteration_transaction_policy_template_action.get("reason", "")
+        and "not transaction-intent-policy.json evidence" in focused_iteration_transaction_policy_template_action.get(
+            "reason", ""
+        )
+        and "transaction-intent-policy.json" not in focused_iteration_transaction_policy_template_command_text
         and focused_iteration_sidecar_template_commands
         == [
             focused_iteration_command(
@@ -55595,6 +55821,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         )
         and not any(
             command in [*focused_iteration_preview_commands, *focused_iteration_objective_preview_commands]
+            for command in focused_iteration_transaction_policy_template_commands
+        )
+        and not any(
+            command in [*focused_iteration_preview_commands, *focused_iteration_objective_preview_commands]
             for command in focused_iteration_sidecar_template_commands
         )
         and not any(
@@ -55602,6 +55832,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for command in [
                 *focused_iteration_objective_preview_commands[:2],
                 *focused_iteration_oracle_preview_commands[:1],
+                *focused_iteration_transaction_policy_template_commands[:1],
                 *focused_iteration_sidecar_template_commands[:1],
                 *focused_iteration_preview_commands[:2],
             ]
@@ -58028,6 +58259,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         for template in transaction_policy_sidecar_templates
         if isinstance(template, dict)
     )
+    transaction_policy_templates_doc_sample = transaction_intent_policy_templates_doc(
+        transaction_corpus_gate_checklist
+    )
     transaction_prepare_policy_sample = build_transaction_intent_policy_sidecar(
         test_profile,
         direction="buy",
@@ -58038,6 +58272,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         transaction_corpus_gate_checklist.get("status") == "decoded-intent-mismatch-review"
         and transaction_corpus_gate_checklist.get("summary", {}).get("ready_for_finding_gate") is True
         and transaction_corpus_gate_checklist.get("summary", {}).get("intent_policy_sidecar_templates") == 2
+        and transaction_policy_templates_doc_sample.get("schema")
+        == "inferforge-transaction-intent-policy-templates-v1"
+        and transaction_policy_templates_doc_sample.get("template_count") == 2
+        and transaction_policy_templates_doc_sample.get("status") == "templates-present"
+        and str(transaction_policy_templates_doc_sample.get("target_policy_sidecar") or "").endswith(
+            "transaction-intent-policy.json"
+        )
+        and "Template package only" in str(transaction_policy_templates_doc_sample.get("safety") or "")
         and str(transaction_policy_sidecar.get("path") or "").endswith("transaction-intent-policy.json")
         and {"direction", "wallet", "amountIn", "sourceMint", "destinationMint"}.issubset(
             transaction_policy_template_fields
@@ -58657,6 +58899,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         "transaction_corpus_gate_checklist": {
             "status": "passed" if transaction_corpus_gate_checklist_passed else "failed",
             "checklist_status": transaction_corpus_gate_checklist.get("status"),
+            "policy_template_doc": {
+                "schema": transaction_policy_templates_doc_sample.get("schema"),
+                "status": transaction_policy_templates_doc_sample.get("status"),
+                "template_count": transaction_policy_templates_doc_sample.get("template_count"),
+                "target_policy_sidecar": transaction_policy_templates_doc_sample.get("target_policy_sidecar"),
+            },
             "prepare_policy_commands": transaction_policy_prepare_commands.splitlines(),
             "prepare_policy_sample": transaction_prepare_policy_sample,
             "post_decode_commands": transaction_corpus_gate_checklist.get("post_decode_commands", []),
@@ -58719,6 +58967,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     == [
                         focused_iteration_command(oracle_plan_cli_subcommand(limit=8)),
                     ]
+                    and focused_iteration_transaction_policy_template_commands
+                    == [
+                        focused_iteration_command(transaction_intent_policy_template_subcommand(limit=8)),
+                    ]
                     and focused_iteration_sidecar_template_commands
                     == [
                         focused_iteration_command(
@@ -58726,6 +58978,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                         ),
                     ]
                     and focused_iteration_decision_sample.get("summary", {}).get("oracle_plan_actions") == 2
+                    and focused_iteration_decision_sample.get("summary", {}).get(
+                        "transaction_policy_template_commands"
+                    )
+                    == 1
                     and focused_iteration_decision_sample.get("summary", {}).get("oracle_sidecar_template_commands")
                     == 1
                     and focused_iteration_decision_sample.get("summary", {}).get("top_oracle") == "transaction-intent"
@@ -58740,6 +58996,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                         ]
                         for command in focused_iteration_oracle_preview_commands
                     )
+                    and focused_iteration_transaction_policy_template_action.get("kind") == "offline"
+                    and "transaction-intent-policy.json"
+                    not in focused_iteration_transaction_policy_template_command_text
                     and focused_iteration_sidecar_template_action.get("kind") == "offline"
                     and OPERATOR_EVIDENCE_ARTIFACT not in focused_iteration_sidecar_template_command_text
                     and not any(
@@ -58747,6 +59006,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                         for command in [
                             *focused_iteration_objective_preview_commands[:2],
                             *focused_iteration_oracle_preview_commands[:1],
+                            *focused_iteration_transaction_policy_template_commands[:1],
                             *focused_iteration_sidecar_template_commands[:1],
                             *focused_iteration_preview_commands[:2],
                         ]
@@ -58759,6 +59019,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "preview_commands": focused_iteration_preview_commands,
                 "objective_preview_commands": focused_iteration_objective_preview_commands,
                 "oracle_preview_commands": focused_iteration_oracle_preview_commands,
+                "transaction_policy_template_commands": focused_iteration_transaction_policy_template_commands,
+                "transaction_policy_template_action": focused_iteration_transaction_policy_template_action,
                 "sidecar_template_commands": focused_iteration_sidecar_template_commands,
                 "sidecar_template_action": focused_iteration_sidecar_template_action,
                 "expected_commands": [
@@ -58768,6 +59030,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "expected_oracle_commands": [
                     focused_iteration_command(oracle_plan_cli_subcommand(limit=8)),
                 ],
+                "expected_transaction_policy_template_commands": [
+                    focused_iteration_command(transaction_intent_policy_template_subcommand(limit=8)),
+                ],
                 "expected_sidecar_template_commands": [
                     focused_iteration_command(
                         oracle_plan_cli_subcommand(limit=8, no_write=False, write_sidecar_template=True)
@@ -58775,6 +59040,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 ],
                 "oracle_summary": {
                     "actions": focused_iteration_decision_sample.get("summary", {}).get("oracle_plan_actions"),
+                    "transaction_policy_template_commands": focused_iteration_decision_sample.get("summary", {}).get(
+                        "transaction_policy_template_commands"
+                    ),
                     "sidecar_template_commands": focused_iteration_decision_sample.get("summary", {}).get(
                         "oracle_sidecar_template_commands"
                     ),
@@ -65422,8 +65690,18 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
         if args.output
         else artifact_dir / TRANSACTION_CORPUS_CHECKLIST_ARTIFACT
     )
+    policy_template_output_path = (
+        resolve_repo_path(args.policy_template_output)
+        if getattr(args, "policy_template_output", None)
+        else artifact_dir / TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT
+    )
+    policy_template_doc = transaction_intent_policy_templates_doc(checklist)
     if not no_write:
+        output_paths = [output_path]
         write_json(output_path, checklist)
+        if getattr(args, "write_policy_template", False):
+            write_json(policy_template_output_path, sanitize_artifact_samples(policy_template_doc))
+            output_paths.append(policy_template_output_path)
 
     summary = checklist.get("summary", {}) or {}
     gate = checklist.get("resource_capture_gate", {}) if isinstance(checklist.get("resource_capture_gate"), dict) else {}
@@ -65555,6 +65833,12 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
         )
     if args.show_payload_template_json:
         print_transaction_payload_template_json(checklist.get("payload_shape_guidance", {}))
+    if getattr(args, "show_policy_template_json", False):
+        if policy_template_doc.get("templates"):
+            print("Transaction intent policy template JSON:")
+            print(json.dumps(sanitize_artifact_samples(policy_template_doc), indent=2, sort_keys=False))
+        else:
+            print("Transaction intent policy template JSON: none")
     if args.show_steps:
         print("Capture steps:")
         for step in checklist.get("capture_steps", []) or []:
@@ -65567,12 +65851,14 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
         print("No files written (--no-write).")
     else:
         print(f"Wrote {output_path}")
+        if getattr(args, "write_policy_template", False):
+            print(f"Wrote {policy_template_output_path}")
         print_refreshed_manifests(
             refresh_current_artifact_manifest(
                 artifact_dir=artifact_dir,
                 target=target,
                 command="transaction-corpus-checklist",
-                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+                output_paths=[*target_profile_artifact_paths(artifact_dir), *output_paths],
             )
         )
     if args.strict and checklist["status"] not in {
@@ -65994,6 +66280,7 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
         f"approval_packets={summary.get('approval_packets', 0)} "
         f"objective_package={summary.get('objective_package_commands', 0)} "
         f"oracle_plan={summary.get('oracle_plan_commands', 0)} "
+        f"transaction_policy_template={summary.get('transaction_policy_template_commands', 0)} "
         f"oracle_sidecar_template={summary.get('oracle_sidecar_template_commands', 0)} "
         f"blocked={summary.get('blocked_commands', 0)}"
     )
@@ -66005,6 +66292,13 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
             f"top={summary.get('top_oracle') or '-'} "
             f"contract={summary.get('top_oracle_contract') or '-'} "
             f"first_missing={summary.get('top_oracle_first_missing') or '-'}"
+        )
+    if summary.get("transaction_policy_template_commands"):
+        print(
+            "Transaction policy template: "
+            f"artifact={summary.get('transaction_policy_template_artifact') or '-'} "
+            f"commands={summary.get('transaction_policy_template_commands', 0)} "
+            f"note=template-only-not-transaction-intent-policy"
         )
     if summary.get("oracle_sidecar_template_commands"):
         print(
@@ -68653,6 +68947,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-payload-template-json",
         action="store_true",
         help="Print a placeholder JSON payload sidecar template for an approved quote response.",
+    )
+    transaction_corpus_checklist.add_argument(
+        "--show-policy-template-json",
+        action="store_true",
+        help="Print transaction-intent-policy template package JSON without writing it.",
+    )
+    transaction_corpus_checklist.add_argument(
+        "--write-policy-template",
+        action="store_true",
+        help=(
+            f"Also write {TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT}; this is a pending template package, "
+            "not transaction-intent-policy.json evidence."
+        ),
+    )
+    transaction_corpus_checklist.add_argument(
+        "--policy-template-output",
+        help=(
+            f"Where to write {TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT}."
+        ),
     )
     transaction_corpus_checklist.add_argument(
         "--skip-current-resource-check",
