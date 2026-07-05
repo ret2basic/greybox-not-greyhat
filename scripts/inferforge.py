@@ -13036,10 +13036,29 @@ def build_rewrite_response_review(
             )
         approved_observations = [row for row in observations if row.get("approved_path")]
         candidate_impact_observations = [row for row in observations if row.get("candidate_impact")]
-        followup_commands = (
-            rewrite_response_gate_followup_commands(artifact_dir=artifact_dir, profile=profile)
+        promotion_preview_commands = rewrite_review_promotion_preview_commands(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            rewrite_review_item=rewrite_item,
+            limit=3,
+        )
+        if candidate_impact_observations:
+            followup_commands = rewrite_response_gate_followup_commands(artifact_dir=artifact_dir, profile=profile)
+            followup_command_type = "manual-finding-gate"
+        elif not approved_observations and promotion_preview_commands:
+            followup_commands = promotion_preview_commands
+            followup_command_type = "promotion-preview"
+        else:
+            followup_commands = []
+            followup_command_type = "none"
+        next_step = (
+            "Run gate --no-write --show-items, then adjudicate/evidence-chain only after manual review confirms authorization bypass, sensitive data exposure, path confusion, or equivalent concrete impact."
             if candidate_impact_observations
-            else []
+            else "Run exactly one no-write promotion preview for an approved read-only path, then decide whether a single observed response is justified."
+            if not approved_observations and promotion_preview_commands
+            else "Observe exactly one approved read-only path after scope and resource gates; do not enumerate catch-all paths."
+            if not approved_observations
+            else "Review the approved response for concrete impact; static route shape and a 2xx alone are not enough."
         )
         if candidate_impact_observations:
             item_status = "candidate-impact-review"
@@ -13063,13 +13082,8 @@ def build_rewrite_response_review(
                 "unapproved_observation_count": len(observations) - len(approved_observations),
                 "observations": observations[:10],
                 "followup_commands": followup_commands,
-                "next_step": (
-                    "Run gate --no-write --show-items, then adjudicate/evidence-chain only after manual review confirms authorization bypass, sensitive data exposure, path confusion, or equivalent concrete impact."
-                    if candidate_impact_observations
-                    else "Observe exactly one approved read-only path after scope and resource gates; do not enumerate catch-all paths."
-                    if not approved_observations
-                    else "Review the approved response for concrete impact; static route shape and a 2xx alone are not enough."
-                ),
+                "followup_command_type": followup_command_type,
+                "next_step": next_step,
             }
         )
     status_counts: dict[str, int] = {}
@@ -34238,6 +34252,19 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                 }
             ],
         }
+        no_history_review = build_rewrite_response_review(
+            target=target,
+            profile=profile,
+            artifact_dir=root / "no-history-artifacts",
+        )
+        no_history_response_item = (
+            (no_history_review.get("items") or [{}])[0]
+            if no_history_review.get("items")
+            else {}
+        )
+        no_history_followup_text = "\n".join(
+            str(command) for command in no_history_response_item.get("followup_commands", []) or []
+        )
         append_jsonl(
             artifact_dir / "burp-history-observations.jsonl",
             [
@@ -34351,6 +34378,23 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                 "rewrite_status": rewrite_review.get("status"),
                 "approved_path_candidates": response_item.get("approved_path_candidates"),
                 "rewrite_summary": rewrite_review.get("summary"),
+            },
+        },
+        {
+            "id": "missing-approved-response-emits-promotion-preview-command",
+            "passed": (
+                no_history_review.get("status") == "no-burp-observations"
+                and no_history_response_item.get("status") == "missing-approved-response"
+                and no_history_response_item.get("followup_command_type") == "promotion-preview"
+                and no_history_response_item.get("approved_path_candidates") == [approved_path]
+                and "promote-observation-candidate" in no_history_followup_text
+                and "--no-write" in no_history_followup_text
+                and approved_path in no_history_followup_text
+            ),
+            "expected": "missing approved rewrite responses expose a no-write promotion preview for one read-only path",
+            "actual": {
+                "review_status": no_history_review.get("status"),
+                "item": no_history_response_item,
             },
         },
         {
@@ -34484,9 +34528,11 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             "gate_ready": closure.get("gate_ready"),
             "finding_gate_items": len(finding_gate.get("gates", []) or []),
             "followup_commands": (review.get("summary") or {}).get("followup_commands"),
+            "missing_response_followup_commands": (no_history_review.get("summary") or {}).get("followup_commands"),
             "gate_no_write_return_code": gate_return_code,
         },
         "cases": {
+            "no_history_rewrite_response_review": no_history_review,
             "rewrite_review": rewrite_review,
             "rewrite_response_review": review,
             "rewrite_evidence_closure": closure,
