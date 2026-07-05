@@ -305,6 +305,9 @@ need decoded corpus/intent review, one approved read-only/RPC observation, or
 protected-action impact evidence. Credentialed-upstream threads need redacted
 provider/operator impact evidence, and resource-exhaustion threads need
 deployment/proxy trust evidence plus non-stress availability impact evidence.
+Specialized quote, Solana RPC, and fixed-upstream clusters do not also get a
+generic `unauthorized-state-change` lead merely because the route uses `POST`;
+that impact stays reserved for routes without a more precise boundary model.
 `--show-poc-plan` expands each high-value thread into a minimal reproduction
 evidence package: required sidecars or operator inputs, missing evidence,
 offline no-write commands, gate entry conditions, and forbidden actions. It is a

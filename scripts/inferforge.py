@@ -12314,7 +12314,9 @@ def cluster_impact_hypotheses(cluster: dict[str, Any]) -> list[dict[str, str]]:
     method = str(cluster.get("method") or "").upper()
     path = str(cluster.get("path") or "")
     hypotheses: list[dict[str, str]] = []
+    specialized_boundary = False
     if strategy_set == "quote-transaction-decoder" or "quote" in path:
+        specialized_boundary = True
         hypotheses.append(
             {
                 "impact": "transaction-integrity",
@@ -12323,6 +12325,7 @@ def cluster_impact_hypotheses(cluster: dict[str, Any]) -> list[dict[str, str]]:
             }
         )
     if strategy_set == "solana-json-rpc-proxy" or "rpc" in path:
+        specialized_boundary = True
         hypotheses.append(
             {
                 "impact": "rpc-proxy-abuse",
@@ -12331,6 +12334,7 @@ def cluster_impact_hypotheses(cluster: dict[str, Any]) -> list[dict[str, str]]:
             }
         )
     if strategy_set == "fixed-upstream-proxy":
+        specialized_boundary = True
         hypotheses.append(
             {
                 "impact": "fixed-upstream-proxy-confusion",
@@ -12338,7 +12342,9 @@ def cluster_impact_hypotheses(cluster: dict[str, Any]) -> list[dict[str, str]]:
                 "question": "Can fixed upstream proxy path handling create SSRF, path confusion, or sensitive upstream data exposure?",
             }
         )
-    if method in {"POST", "PUT", "PATCH", "DELETE"} or kind in {"observed-api-endpoint", "state-changing-api-review"}:
+    if not specialized_boundary and (
+        method in {"POST", "PUT", "PATCH", "DELETE"} or kind in {"observed-api-endpoint", "state-changing-api-review"}
+    ):
         hypotheses.append(
             {
                 "impact": "unauthorized-state-change",
@@ -48928,6 +48934,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             ),
             None,
         )
+        rewrite_cluster_strategy_impacts = {
+            (str(item.get("path") or ""), str(item.get("impact") or ""))
+            for item in rewrite_transaction_matrix.get("hypotheses", [])
+            if item.get("type") == "cluster-strategy"
+        }
+        specialized_boundary_hypotheses_passed = (
+            rewrite_transaction_hypothesis is not None
+            and ("/api/rpc/solana/{cluster}", "rpc-proxy-abuse") in rewrite_cluster_strategy_impacts
+            and ("/api/quote", "unauthorized-state-change") not in rewrite_cluster_strategy_impacts
+            and ("/api/rpc/solana/{cluster}", "unauthorized-state-change") not in rewrite_cluster_strategy_impacts
+        )
         rewrite_transaction_validation_plan = build_validation_plan_run(
             target="http://127.0.0.1:9998",
             profile=rewrite_normalized,
@@ -51302,6 +51319,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and any_method_match_reason_passed
         and rewrite_discovery_passed
         and guarded_fixed_hypothesis_passed
+        and specialized_boundary_hypotheses_passed
         and transaction_flow_hypothesis_passed
         and rewrite_transaction_lead_contract_passed
         and rewrite_fixed_upstream_lead_contract_passed
@@ -51803,6 +51821,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "status": "passed" if guarded_fixed_hypothesis_passed else "failed",
                 "matrix_summary": guarded_fixed_matrix.get("summary", {}),
                 "hypothesis": guarded_fixed_hypothesis,
+            },
+            "specialized_boundary_hypotheses": {
+                "status": "passed" if specialized_boundary_hypotheses_passed else "failed",
+                "cluster_strategy_impacts": sorted(
+                    f"{path}:{impact}" for path, impact in rewrite_cluster_strategy_impacts
+                ),
             },
             "rate_limit_resource_review": {
                 "status": "passed" if rate_limit_resource_review_passed else "failed",
