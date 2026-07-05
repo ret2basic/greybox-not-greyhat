@@ -818,7 +818,7 @@ to stable classifications without hard-coding a provider globally:
         "statuses": [503],
         "body_contains": ["Provider configuration missing"],
         "summary": "The target rejected quote collection before upstream forwarding because provider credentials are missing.",
-        "next_step": "Set PROVIDER_TOKEN, restart the target server, then rerun collect-quote."
+        "next_step": "Set PROVIDER_TOKEN, restart the target server, then prepare an approved quote response sidecar and review the transaction evidence contract."
       },
       {
         "id": "provider-upstream-policy-rejected",
@@ -826,7 +826,7 @@ to stable classifications without hard-coding a provider globally:
         "statuses": [401, 403],
         "body_contains": ["Provider quote failed"],
         "summary": "The target reached the quote provider, but upstream rejected the request after local validation.",
-        "next_step": "Verify provider credentials, account permissions, route, wallet, and amount, then rerun collect-quote."
+        "next_step": "Verify provider credentials, account permissions, route, wallet, and amount, then prepare an approved quote response sidecar and review the transaction evidence contract."
       }
     ]
   }
@@ -856,7 +856,7 @@ declare its own provider variables or leave this empty:
         "next_step": "Restart the target after configuring provider credentials."
       }
     ],
-    "quote_collection_next_step": "Rerun collect-quote after provider configuration is ready."
+    "quote_collection_next_step": "Prepare or approve one quote response or extracted transaction payload sidecar, then run `transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract` and `transaction-corpus-checklist --no-write --show-commands --show-steps --show-payload-template-json --skip-current-resource-check` before decoding."
   }
 }
 ```
@@ -968,7 +968,8 @@ python3 scripts/inferforge.py regression-suite --include-external --ws-resource-
 python3 scripts/inferforge.py adjudicate
 python3 scripts/inferforge.py audit --no-ws
 python3 scripts/inferforge.py audit --ws-resource-probes
-python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check
+python3 scripts/inferforge.py transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract
+python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-commands --show-steps --show-payload-template-json --skip-current-resource-check
 python3 scripts/inferforge.py decode-transactions
 python3 scripts/inferforge.py self-test-transactions
 python3 scripts/inferforge.py self-test-profile-routing
@@ -1004,7 +1005,7 @@ those simple JSON paths are applied before the generic recursive/base64 scan so
 candidate summaries retain the provider-specific response location.
 When `quote_response.expected_payload_type` is set, JSON sidecars must also show
 that payload type before the sidecar is marked ready for decode.
-`transaction-sidecar-review --no-write --show-files --show-commands` prints the
+`transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract` prints the
 accepted sidecar files, configured candidate paths, and compact JSON/JSONL/TXT
 payload-shape examples when a sidecar is present but no base64 transaction
 candidate can be extracted. When a payload sidecar already yields decode-ready
@@ -1097,6 +1098,9 @@ evidence/readiness artifacts, and refreshes the managed artifact manifest. It
 does not sign transactions or submit them to Solana. On constrained hosts it
 blocks behind the resource gate before sending the quote request or running
 transaction decoding unless `--allow-resource-warning` is passed explicitly.
+Evidence gaps, methodology review, and the verification queue prefer the
+no-write sidecar/corpus evidence contract first; run `collect-quote` only after
+the specific upstream request, wallet, amount, and resource impact are approved.
 Non-200 responses are recorded as collection metadata without being treated as
 transaction payloads. The collection artifact includes
 `diagnosis.classification`, for example `m0-config-missing-or-placeholder` when

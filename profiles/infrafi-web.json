@@ -139,7 +139,7 @@
         "statuses": [500],
         "body_contains": ["Quote service is not configured"],
         "summary": "The target rejected quote collection before upstream forwarding because the M0 key is missing or still set to a template placeholder.",
-        "next_step": "Configure a real M0_ORCHESTRATION_API_KEY, restart the target server, and rerun collect-quote."
+        "next_step": "Configure a real M0_ORCHESTRATION_API_KEY, restart the target server, then prepare an approved quote response sidecar and review the transaction evidence contract."
       },
       {
         "id": "m0-upstream-auth-or-policy-rejected",
@@ -147,7 +147,7 @@
         "statuses": [401, 403],
         "body_contains": ["M0 orchestration quote failed"],
         "summary": "The target reached M0, but upstream rejected the quote request after local validation.",
-        "next_step": "Verify the M0 key, account permissions, route, wallet, and amount, then rerun collect-quote."
+        "next_step": "Verify the M0 key, account permissions, route, wallet, and amount, then prepare an approved quote response sidecar and review the transaction evidence contract."
       },
       {
         "id": "m0-response-shape-unexpected",
@@ -183,7 +183,7 @@
         "next_step": "Set NEXT_PUBLIC_M0_QUOTE_PREVIEW_WALLET to a real Solana wallet address for quote previews."
       }
     ],
-    "quote_collection_next_step": "Rerun collect-quote after M0 configuration is ready; decode only, with no signing or submission."
+    "quote_collection_next_step": "Prepare or approve one quote response or extracted transaction payload sidecar, then run `transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract` and `transaction-corpus-checklist --no-write --show-commands --show-steps --show-payload-template-json --skip-current-resource-check` before decoding."
   },
   "clusters": [
     {

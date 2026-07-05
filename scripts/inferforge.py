@@ -81,6 +81,20 @@ DEFAULT_QUOTE_RESPONSE_CANDIDATE_PATHS = [
     "$[*].payloads[*].data.transaction",
     "$.payloads[*].data.transaction",
 ]
+TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND = (
+    "transaction-sidecar-review --no-write --show-files --show-commands "
+    "--show-payload-template-json --show-evidence-contract"
+)
+TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND = (
+    "transaction-corpus-checklist --no-write --show-commands --show-steps "
+    "--show-payload-template-json --skip-current-resource-check"
+)
+QUOTE_TRANSACTION_CORPUS_CONTRACT_NEXT_STEP = (
+    "Prepare or approve one quote response or extracted transaction payload sidecar, then run "
+    "`transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json "
+    "--show-evidence-contract` and `transaction-corpus-checklist --no-write --show-commands --show-steps "
+    "--show-payload-template-json --skip-current-resource-check` before decoding."
+)
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_BODY_SAMPLE_CHARS = 1200
 DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES = 4 * 1024 * 1024
@@ -637,7 +651,10 @@ def default_target_profile() -> dict[str, Any]:
                     "statuses": [500],
                     "body_contains": ["Quote service is not configured"],
                     "summary": "The target rejected quote collection before upstream forwarding because the M0 key is missing or still set to a template placeholder.",
-                    "next_step": "Configure a real M0_ORCHESTRATION_API_KEY, restart the target server, and rerun collect-quote.",
+                    "next_step": (
+                        "Configure a real M0_ORCHESTRATION_API_KEY, restart the target server, then prepare "
+                        "an approved quote response sidecar and review the transaction evidence contract."
+                    ),
                 },
                 {
                     "id": "m0-upstream-auth-or-policy-rejected",
@@ -645,7 +662,10 @@ def default_target_profile() -> dict[str, Any]:
                     "statuses": [401, 403],
                     "body_contains": ["M0 orchestration quote failed"],
                     "summary": "The target reached M0, but upstream rejected the quote request after local validation.",
-                    "next_step": "Verify the M0 key, account permissions, route, wallet, and amount, then rerun collect-quote.",
+                    "next_step": (
+                        "Verify the M0 key, account permissions, route, wallet, and amount, then prepare "
+                        "an approved quote response sidecar and review the transaction evidence contract."
+                    ),
                 },
                 {
                     "id": "m0-response-shape-unexpected",
@@ -681,7 +701,7 @@ def default_target_profile() -> dict[str, Any]:
                     "next_step": "Set NEXT_PUBLIC_M0_QUOTE_PREVIEW_WALLET to a real Solana wallet address for quote previews.",
                 },
             ],
-            "quote_collection_next_step": "Rerun collect-quote after M0 configuration is ready; decode only, with no signing or submission.",
+            "quote_collection_next_step": QUOTE_TRANSACTION_CORPUS_CONTRACT_NEXT_STEP,
         },
         "clusters": [
             {
@@ -8786,8 +8806,8 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
     ],
     "finding-identification": [
         "response-deltas --no-write",
-        "transaction-sidecar-review --no-write --show-files --show-commands",
-        "transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check",
+        TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND,
+        TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND,
         "transaction-flow-review --no-write --top 8",
         "hypothesis-matrix --no-write --show-next",
     ],
@@ -8799,8 +8819,8 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
         "rewrite-response-review --no-write --show-observations --show-commands",
         "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check",
         "operator-evidence-review --no-write --show-missing --show-template",
-        "transaction-sidecar-review --no-write --show-files --show-commands",
-        "transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check",
+        TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND,
+        TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND,
         "deployment-review --no-write --top 8",
         "transaction-flow-review --no-write --top 8",
     ],
@@ -9346,7 +9366,7 @@ def methodology_next_command_for_hypothesis(
     impact = str(item.get("impact") or "")
     hypothesis_type = str(item.get("type") or item.get("hypothesis_type") or "")
     if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
-        subcommand = "transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check"
+        subcommand = TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND
     elif impact == "credentialed-upstream-cost-abuse" or hypothesis_type == "credential-proxy-review":
         subcommand = "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check"
     elif impact == "resource-exhaustion" or hypothesis_type == "resource-abuse-review":
@@ -9545,11 +9565,8 @@ def build_transaction_evidence_closure(
             if ref.get("classification") == "ready":
                 commands.append(ref)
     for source, subcommand in [
-        ("transaction-sidecar", "transaction-sidecar-review --no-write --show-files --show-commands"),
-        (
-            "transaction-corpus",
-            "transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check",
-        ),
+        ("transaction-sidecar", TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
+        ("transaction-corpus", TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND),
         ("transaction-flow", "transaction-flow-review --no-write --top 8"),
     ]:
         ref = methodology_command_ref(
@@ -13430,11 +13447,8 @@ def validation_allowed_commands(
         allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
     if hypothesis.get("type") == "transaction-flow-review" or hypothesis.get("impact") == "transaction-integrity":
         allowed_now_commands.insert(3, command("transaction-flow-review --no-write --top 8"))
-        allowed_now_commands.insert(
-            3,
-            command("transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check"),
-        )
-        allowed_now_commands.insert(3, command("transaction-sidecar-review --no-write --show-files --show-commands"))
+        allowed_now_commands.insert(3, command(TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND))
+        allowed_now_commands.insert(3, command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND))
     if hypothesis.get("type") == "credential-proxy-review" or hypothesis.get("impact") == "credentialed-upstream-cost-abuse":
         for subcommand in reversed(
             [
@@ -22459,7 +22473,7 @@ def build_transaction_corpus_checklist(
     post_decode_commands = []
     sidecar_review_command = validation_command_for_artifact_dir(
         artifact_dir,
-        "transaction-sidecar-review --no-write --show-files --show-commands",
+        TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND,
         profile=profile,
     )
     if reportability_review.get("ready_for_finding_gate"):
@@ -24155,6 +24169,15 @@ def build_evidence_gaps(
         quote_next_step_hint = quote_diagnosis.get("next_step") if isinstance(quote_diagnosis, dict) else None
         readiness_config = environment_readiness_config(profile) if profile is not None else {"checks": []}
         readiness_quote_next_step = readiness_config.get("quote_collection_next_step")
+        quote_hint_candidates = [quote_next_step_hint, readiness_quote_next_step]
+        quote_context_hint = next(
+            (
+                hint.strip()
+                for hint in quote_hint_candidates
+                if isinstance(hint, str) and hint.strip() and "collect-quote" not in hint
+            ),
+            "",
+        )
         quote_reason = (
             "The transaction decoder is implemented, but the last quote collection did not produce "
             f"a transaction candidate from {quote_provider}: {quote_summary}"
@@ -24164,19 +24187,14 @@ def build_evidence_gaps(
                 f"quote response from {quote_provider} containing a transaction candidate."
             )
         )
-        quote_next_step = (
-            quote_next_step_hint
-            if isinstance(quote_next_step_hint, str) and quote_next_step_hint
-            else (
-                readiness_quote_next_step
-                if isinstance(readiness_quote_next_step, str) and readiness_quote_next_step
-                else (
-                    "Run collect-quote with a reviewed test wallet and amount once the quote provider "
-                    "returns a 200 quote, then compare decoded account keys, signer, mints, and program "
-                    "IDs against intent."
-                )
+        if quote_context_hint and quote_context_hint != QUOTE_TRANSACTION_CORPUS_CONTRACT_NEXT_STEP:
+            quote_next_step = (
+                f"{quote_context_hint} After that, "
+                f"{QUOTE_TRANSACTION_CORPUS_CONTRACT_NEXT_STEP[:1].lower()}"
+                f"{QUOTE_TRANSACTION_CORPUS_CONTRACT_NEXT_STEP[1:]}"
             )
-        )
+        else:
+            quote_next_step = QUOTE_TRANSACTION_CORPUS_CONTRACT_NEXT_STEP
         add_gap(
             "GAP-quote-transaction-corpus",
             "quote",
@@ -24186,19 +24204,7 @@ def build_evidence_gaps(
             quote_next_step,
             "Never sign or submit returned transactions automatically.",
         )
-        next_probe_candidates.append(
-            {
-                "id": "NEXT-quote-collect-real-payload",
-                "cluster_id": "quote",
-                "priority": "high",
-                "command": (
-                    "python3 scripts/inferforge.py collect-quote --direction buy "
-                    f"--wallet {DEFAULT_TEST_WALLET} --amount-in 1000000"
-                ),
-                "expected_evidence": ".greybox/transaction-payloads.json and .greybox/transaction-intent.json",
-                "safety_gate": "Decode only; no signing or Solana submission.",
-            }
-        )
+        next_probe_candidates.extend(quote_transaction_evidence_contract_next_probe_candidates())
 
     if quote_cluster_present and not any(row.get("external") for row in quote_rows):
         add_gap(
@@ -24440,6 +24446,63 @@ def build_evidence_gaps(
         "gaps": gaps,
         "next_probe_candidates": next_probe_candidates,
     }
+
+
+def quote_transaction_evidence_contract_next_probe_candidates() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "NEXT-quote-transaction-sidecar-contract",
+            "cluster_id": "quote",
+            "priority": "high",
+            "command": f"python3 scripts/inferforge.py {TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND}",
+            "expected_evidence": "transaction-sidecar-review.json evidence contract and approved sidecar template",
+            "safety_gate": "No provider request, no signing, and no Solana submission.",
+        },
+        {
+            "id": "NEXT-quote-transaction-corpus-checklist",
+            "cluster_id": "quote",
+            "priority": "high",
+            "command": f"python3 scripts/inferforge.py {TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND}",
+            "expected_evidence": "transaction-corpus-checklist.json payload contract and decode readiness status",
+            "safety_gate": "No provider request, no signing, and no Solana submission.",
+        },
+    ]
+
+
+def normalize_quote_transaction_evidence_gap_artifact(evidence_gaps: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(evidence_gaps, dict):
+        return evidence_gaps
+    normalized = json_clone(evidence_gaps)
+    for gap in normalized.get("gaps", []) or []:
+        if not isinstance(gap, dict) or gap.get("id") != "GAP-quote-transaction-corpus":
+            continue
+        safe_next_step = str(gap.get("safe_next_step") or "")
+        if not safe_next_step or "collect-quote" in safe_next_step:
+            gap["safe_next_step"] = QUOTE_TRANSACTION_CORPUS_CONTRACT_NEXT_STEP
+        gap["safety_gate"] = "Never sign or submit returned transactions automatically."
+
+    candidates = normalized.get("next_probe_candidates")
+    if isinstance(candidates, list):
+        filtered_candidates: list[Any] = []
+        seen_ids: set[str] = set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                filtered_candidates.append(candidate)
+                continue
+            candidate_id = str(candidate.get("id") or "")
+            candidate_command = str(candidate.get("command") or "")
+            if candidate_id == "NEXT-quote-collect-real-payload":
+                continue
+            if candidate.get("cluster_id") == "quote" and "collect-quote" in candidate_command:
+                continue
+            if candidate_id:
+                seen_ids.add(candidate_id)
+            filtered_candidates.append(candidate)
+        for candidate in quote_transaction_evidence_contract_next_probe_candidates():
+            if candidate["id"] not in seen_ids:
+                filtered_candidates.append(candidate)
+        normalized["next_probe_candidates"] = filtered_candidates
+    return normalized
 
 
 def compact_source_refs(values: list[Any]) -> list[str]:
@@ -27869,14 +27932,8 @@ def build_verification_queue(
 
     def quote_transaction_evidence_contract_commands() -> list[str]:
         return [
-            cmd(
-                "transaction-sidecar-review --no-write --show-files --show-commands "
-                "--show-payload-template-json --show-evidence-contract"
-            ),
-            cmd(
-                "transaction-corpus-checklist --no-write --show-commands --show-steps "
-                "--show-payload-template-json --skip-current-resource-check"
-            ),
+            cmd(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
+            cmd(TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND),
         ]
 
     def add_item(
@@ -36795,7 +36852,7 @@ def ensure_initial_audit_artifacts(artifact_dir: Path, *, target: str | None = N
                 "success": False,
                 "diagnosis": {
                     "classification": "quote-collection-not-run",
-                    "next_step": "Run collect-quote after quote-provider configuration is ready; decode only, with no signing or Solana submission.",
+                    "next_step": QUOTE_TRANSACTION_CORPUS_CONTRACT_NEXT_STEP,
                 },
                 "safety": "Placeholder only. No quote request was sent and no transaction payload was collected.",
             },
@@ -38759,10 +38816,7 @@ def build_environment_readiness(
             continue
         add_next_step(check.get("next_step"))
     if quote_readiness_required(profile) and quote_diagnosis.get("classification") != "quote-payload-collected":
-        add_next_step(
-            readiness_config.get("quote_collection_next_step")
-            or "Rerun collect-quote after quote provider configuration is ready; decode only, with no signing or submission."
-        )
+        add_next_step(readiness_config.get("quote_collection_next_step") or QUOTE_TRANSACTION_CORPUS_CONTRACT_NEXT_STEP)
 
     return {
         "generated_at": utc_now(),
@@ -42001,10 +42055,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                         "priority": "high",
                         "hypothesis_type": "transaction-flow-review",
                         "allowed_now": [
-                            focused_iteration_ref(
-                                "transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check"
-                            ),
-                            focused_iteration_ref("transaction-sidecar-review --no-write --show-files --show-commands"),
+                            focused_iteration_ref(TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND),
+                            focused_iteration_ref(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
                         ],
                     },
                 ],
@@ -42804,7 +42856,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and focused_iteration_decision_sample.get("summary", {}).get("offline_command_preview_limit") == 2
         and focused_iteration_preview_commands[:2]
         == [
-            focused_iteration_command("transaction-sidecar-review --no-write --show-files --show-commands"),
+            focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
             focused_iteration_command("operator-evidence-review --no-write --show-missing --show-template"),
         ]
         and not any(
@@ -44199,13 +44251,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             == "needs-cost-abuse-review"
             and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
             and any(
-                "transaction-sidecar-review --no-write --show-files --show-commands" in str(ref.get("command") or "")
+                TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND in str(ref.get("command") or "")
                 for ref in rewrite_transaction_validation_item.get("allowed_now", []) or []
                 if isinstance(ref, dict)
             )
             and any(
-                "transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check"
-                in str(ref.get("command") or "")
+                TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND in str(ref.get("command") or "")
                 for ref in rewrite_transaction_validation_item.get("allowed_now", []) or []
                 if isinstance(ref, dict)
             )
@@ -45476,9 +45527,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     focused_iteration_decision_sample.get("summary", {}).get("offline_command_preview_limit") == 2
                     and focused_iteration_preview_commands[:2]
                     == [
-                        focused_iteration_command(
-                            "transaction-sidecar-review --no-write --show-files --show-commands"
-                        ),
+                        focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
                         focused_iteration_command(
                             "operator-evidence-review --no-write --show-missing --show-template"
                         ),
@@ -45494,7 +45543,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 ),
                 "preview_commands": focused_iteration_preview_commands,
                 "expected_commands": [
-                    focused_iteration_command("transaction-sidecar-review --no-write --show-files --show-commands"),
+                    focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
                     focused_iteration_command("operator-evidence-review --no-write --show-missing --show-template"),
                 ],
             },
@@ -46877,7 +46926,9 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
     source_peeks = load_optional_json(artifact_dir / "source-peek-results.json")
     finding_gate = load_optional_json(artifact_dir / "finding-gate.json")
-    evidence_gaps = load_optional_json(artifact_dir / "evidence-gaps.json")
+    evidence_gaps = normalize_quote_transaction_evidence_gap_artifact(
+        load_optional_json(artifact_dir / "evidence-gaps.json")
+    )
     environment_readiness = load_optional_json(artifact_dir / "environment-readiness.json")
     transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json")
     transaction_decoder_selftest = load_optional_json(artifact_dir / "transaction-decoder-selftest.json")
@@ -46927,10 +46978,7 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
             if gap_id == "GAP-quote-transaction-corpus":
                 return validation_command_for_artifact_dir(
                     artifact_dir,
-                    (
-                        "transaction-sidecar-review --no-write --show-files --show-commands "
-                        "--show-payload-template-json --show-evidence-contract"
-                    ),
+                    TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND,
                     profile=profile,
                 )
             if gap_id == "GAP-rpc-resource-control-deployment-review":
