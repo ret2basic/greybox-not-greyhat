@@ -160,6 +160,7 @@ EVIDENCE_SIDECAR_DRAFTS_ARTIFACT = "evidence-sidecar-drafts.json"
 CLAIM_EVIDENCE_LEDGER_ARTIFACT = "claim-evidence-ledger.json"
 CLAIM_WITNESS_LADDER_ARTIFACT = "claim-witness-ladder.json"
 CLAIM_EVIDENCE_REQUESTS_ARTIFACT = "claim-evidence-requests.json"
+SECRET_EXPOSURE_REVIEW_ARTIFACT = "secret-exposure-review.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -266,6 +267,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     CLAIM_EVIDENCE_LEDGER_ARTIFACT,
     CLAIM_WITNESS_LADDER_ARTIFACT,
     CLAIM_EVIDENCE_REQUESTS_ARTIFACT,
+    SECRET_EXPOSURE_REVIEW_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -364,6 +366,7 @@ INDEX_ARTIFACT_ORDER = [
     CLAIM_EVIDENCE_LEDGER_ARTIFACT,
     CLAIM_WITNESS_LADDER_ARTIFACT,
     CLAIM_EVIDENCE_REQUESTS_ARTIFACT,
+    SECRET_EXPOSURE_REVIEW_ARTIFACT,
     "config.json",
     "collection-summary.json",
     "endpoint-clusters.json",
@@ -21936,6 +21939,394 @@ def build_claim_evidence_requests(
     }
 
 
+SECRET_EXPOSURE_SECRET_NAME_RE = re.compile(
+    r"(?:^|[_-])(TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY|API[_-]?KEY|AUTH)(?:$|[_-])",
+    re.IGNORECASE,
+)
+SECRET_EXPOSURE_URL_SECRET_PARAM_RE = re.compile(
+    r"(?i)(api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password)="
+)
+
+
+def secret_exposure_candidate_paths(source_root: Path, *, max_files: int) -> list[Path]:
+    candidates: list[Path] = []
+    for path in deployment_review_candidate_paths(source_root, include_local_env_keys=True):
+        candidates.append(path)
+    for rel in [
+        "Dockerfile",
+        ".dockerignore",
+        ".env.template",
+        ".env.example",
+        "next.config.ts",
+        "next.config.js",
+        "server.js",
+        "package.json",
+        "src/lib/serverEnv.ts",
+        "src/app/api/quote/route.ts",
+        "src/app/api/rpc/_shared.ts",
+        "src/app/api/rpc/solana/[cluster]/route.ts",
+    ]:
+        path = source_root / rel
+        if path.exists() and path.is_file():
+            candidates.append(path)
+    seen: set[str] = set()
+    unique = []
+    for path in candidates:
+        if not path.exists() or not path.is_file():
+            continue
+        if any(part in {"node_modules", ".next", "public", "assets"} for part in path.parts):
+            continue
+        if path.name in {"package-lock.json", "yarn.lock", "pnpm-lock.yaml"}:
+            continue
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique[: max(1, max_files)]
+
+
+def secret_exposure_sensitive_name(name: str) -> bool:
+    return bool(SECRET_EXPOSURE_SECRET_NAME_RE.search(str(name or "")))
+
+
+def secret_exposure_value_status(value: str) -> str:
+    text = str(value or "").strip().strip('"').strip("'")
+    if not text:
+        return "empty"
+    if is_placeholder_env_value(text) or "YOUR_" in text.upper() or "REPLACE_WITH_" in text.upper():
+        return "placeholder"
+    if text.lower() in {"redacted", "[redacted]", "<redacted>"}:
+        return "redacted"
+    if text.startswith("$") or "${" in text or "{{" in text:
+        return "runtime-reference"
+    return "concrete"
+
+
+def secret_exposure_redacted_line(line: str) -> str:
+    return redact_deployment_line(line)
+
+
+def secret_exposure_record(
+    *,
+    finding_id: str,
+    kind: str,
+    status: str,
+    severity: str,
+    file: str,
+    line_no: int,
+    name: str,
+    line: str,
+    evidence_role: str,
+    next_step: str,
+    reportability: str,
+) -> dict[str, Any]:
+    return {
+        "id": finding_id,
+        "kind": kind,
+        "status": status,
+        "severity": severity,
+        "file": file,
+        "line": line_no,
+        "name": name,
+        "excerpt": secret_exposure_redacted_line(line),
+        "evidence_role": evidence_role,
+        "next_step": next_step,
+        "reportability_boundary": reportability,
+    }
+
+
+def secret_exposure_scan_line(
+    *,
+    rel: str,
+    line_no: int,
+    line: str,
+    path: Path,
+) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or stripped.startswith("//"):
+        return findings
+    dockerfile = path.name == "Dockerfile"
+    dotenv_like = path.name.startswith(".env")
+    yaml_like = path.suffix.lower() in {".yaml", ".yml"}
+
+    if dockerfile:
+        arg_match = re.match(r"ARG\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:=(.*))?$", stripped)
+        env_match = re.match(r"ENV\s+([A-Za-z_][A-Za-z0-9_]*)\s*[=\s]\s*(.*)$", stripped)
+        run_secret = (
+            ("_authToken" in stripped or "npmrc" in stripped)
+            and ("TOKEN" in stripped.upper() or "SECRET" in stripped.upper() or "PASSWORD" in stripped.upper())
+            and (
+                stripped.startswith("RUN ")
+                or stripped.startswith("echo ")
+                or stripped.startswith("printf ")
+                or ">" in stripped
+            )
+        )
+        if arg_match and secret_exposure_sensitive_name(arg_match.group(1)):
+            value_status = secret_exposure_value_status(arg_match.group(2) or "")
+            findings.append(
+                secret_exposure_record(
+                    finding_id=f"SECRET-{safe_probe_id(rel)}-{line_no}-docker-secret-arg",
+                    kind="docker-build-secret-arg",
+                    status="needs-build-provenance-review",
+                    severity="medium-static-risk",
+                    file=rel,
+                    line_no=line_no,
+                    name=arg_match.group(1),
+                    line=line,
+                    evidence_role="static-build-config",
+                    next_step=(
+                        "Confirm whether this build arg is passed with a real secret and whether builder images, "
+                        "cache, logs, or registry artifacts retain it."
+                    ),
+                    reportability=(
+                        "Static Docker ARG use is not reportable by itself; it needs build provenance or image/cache evidence "
+                        "showing secret retention or exposure."
+                    ),
+                )
+            )
+            if value_status == "concrete":
+                findings[-1]["status"] = "potential-concrete-secret"
+                findings[-1]["severity"] = "high-static-risk"
+        if env_match and secret_exposure_sensitive_name(env_match.group(1)):
+            value_status = secret_exposure_value_status(env_match.group(2) or "")
+            findings.append(
+                secret_exposure_record(
+                    finding_id=f"SECRET-{safe_probe_id(rel)}-{line_no}-docker-secret-env",
+                    kind="docker-secret-env-promotion",
+                    status="needs-build-provenance-review" if value_status != "concrete" else "potential-concrete-secret",
+                    severity="medium-static-risk" if value_status != "concrete" else "high-static-risk",
+                    file=rel,
+                    line_no=line_no,
+                    name=env_match.group(1),
+                    line=line,
+                    evidence_role="static-build-config",
+                    next_step="Confirm whether the secret is promoted into image metadata, build logs, cache, or final runtime environment.",
+                    reportability="Needs image/build/cache evidence before reportability; static ENV promotion alone is not enough.",
+                )
+            )
+        if run_secret:
+            findings.append(
+                secret_exposure_record(
+                    finding_id=f"SECRET-{safe_probe_id(rel)}-{line_no}-docker-secret-write",
+                    kind="docker-secret-written-to-build-layer",
+                    status="needs-build-provenance-review",
+                    severity="medium-static-risk",
+                    file=rel,
+                    line_no=line_no,
+                    name="RUN secret material write",
+                    line=line,
+                    evidence_role="static-build-config",
+                    next_step=(
+                        "Confirm whether the `.npmrc` layer, build logs, remote cache, or pushed builder stage expose the token. "
+                        "Prefer BuildKit secrets over ARG/ENV for npm auth."
+                    ),
+                    reportability="Needs concrete image/cache/log exposure evidence before Medium+ reportability.",
+                )
+            )
+
+    assignment_match = re.match(
+        r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$",
+        stripped,
+    )
+    if assignment_match and (dotenv_like or path.suffix in {".ts", ".js", ".mjs", ".cjs"}):
+        key = assignment_match.group(1)
+        value = assignment_match.group(2)
+        value_status = secret_exposure_value_status(value)
+        public_secret_like = key.startswith("NEXT_PUBLIC_") and secret_exposure_sensitive_name(key)
+        server_secret_like = secret_exposure_sensitive_name(key)
+        url_secret_param = bool(SECRET_EXPOSURE_URL_SECRET_PARAM_RE.search(value))
+        if public_secret_like:
+            findings.append(
+                secret_exposure_record(
+                    finding_id=f"SECRET-{safe_probe_id(rel)}-{line_no}-public-secret-env",
+                    kind="public-secret-like-env",
+                    status="needs-public-env-review" if value_status != "concrete" else "potential-public-secret",
+                    severity="medium-static-risk" if value_status != "concrete" else "high-static-risk",
+                    file=rel,
+                    line_no=line_no,
+                    name=key,
+                    line=line,
+                    evidence_role="static-env-config",
+                    next_step="Confirm whether this NEXT_PUBLIC_* value is intentionally public and contains no credential material.",
+                    reportability="Public env name alone is not reportable; needs concrete secret value exposure in a client bundle or runtime artifact.",
+                )
+            )
+        elif server_secret_like:
+            server_secret_status = value_status
+            if value_status == "placeholder":
+                server_secret_status = "template-only-not-evidence"
+            elif value_status == "concrete":
+                server_secret_status = "potential-concrete-secret"
+            findings.append(
+                secret_exposure_record(
+                    finding_id=f"SECRET-{safe_probe_id(rel)}-{line_no}-server-secret-env",
+                    kind="server-secret-env-reference",
+                    status=server_secret_status,
+                    severity=(
+                        "info"
+                        if value_status in {"placeholder", "runtime-reference", "empty", "redacted"}
+                        else "high-static-risk"
+                    ),
+                    file=rel,
+                    line_no=line_no,
+                    name=key,
+                    line=line,
+                    evidence_role="static-env-config",
+                    next_step=(
+                        "No action if this is a placeholder or runtime reference. If concrete, rotate and prove exposure scope."
+                    ),
+                    reportability="Only concrete non-placeholder secret values in source/artifacts are reportable from static review.",
+                )
+            )
+        elif url_secret_param:
+            findings.append(
+                secret_exposure_record(
+                    finding_id=f"SECRET-{safe_probe_id(rel)}-{line_no}-secret-url-param",
+                    kind="url-secret-parameter",
+                    status="template-only-not-evidence" if value_status == "placeholder" else "needs-secret-url-review",
+                    severity="info" if value_status == "placeholder" else "medium-static-risk",
+                    file=rel,
+                    line_no=line_no,
+                    name=key,
+                    line=line,
+                    evidence_role="static-env-config",
+                    next_step="Confirm whether the URL contains a real credential or only a placeholder/template value.",
+                    reportability="Needs concrete non-placeholder credential value or deployed client exposure before reportability.",
+                )
+            )
+
+    if yaml_like and ("secretKeyRef" in stripped or re.match(r"(secretName|secretKey|key|token|password)\s*:", stripped, re.I)):
+        findings.append(
+            secret_exposure_record(
+                finding_id=f"SECRET-{safe_probe_id(rel)}-{line_no}-k8s-secret-ref",
+                kind="server-side-secret-reference",
+                status="server-side-reference-not-exposure",
+                severity="info",
+                file=rel,
+                line_no=line_no,
+                name="kubernetes-secret-reference",
+                line=line,
+                evidence_role="static-deployment-config",
+                next_step="No exposure claim from secretKeyRef alone; request operator evidence only if runtime leakage is suspected.",
+                reportability="Kubernetes secret references are not reportable without secret value disclosure or mis-scoped access evidence.",
+            )
+        )
+    return findings
+
+
+def build_secret_exposure_review(
+    *,
+    source_root: Path,
+    profile: dict[str, Any] | None,
+    max_file_bytes: int = DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES,
+    max_files: int = 64,
+) -> dict[str, Any]:
+    files = []
+    findings = []
+    skipped = []
+    for path in secret_exposure_candidate_paths(source_root, max_files=max_files):
+        rel = source_root_relative_or_repo(path, source_root)
+        try:
+            stat = path.stat()
+        except OSError as error:
+            skipped.append({"file": rel, "reason": "stat-failed", "error": redacted_error_summary(error)})
+            continue
+        if stat.st_size > max_file_bytes:
+            skipped.append(
+                {
+                    "file": rel,
+                    "reason": "file-too-large",
+                    "bytes": stat.st_size,
+                    "max_file_bytes": max_file_bytes,
+                }
+            )
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            skipped.append({"file": rel, "reason": "read-failed", "error": redacted_error_summary(error)})
+            continue
+        file_findings = []
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            file_findings.extend(secret_exposure_scan_line(rel=rel, line_no=line_no, line=line, path=path))
+        files.append(
+            {
+                "file": rel,
+                "bytes": stat.st_size,
+                "sha256": hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest(),
+                "finding_count": len(file_findings),
+                "findings": file_findings[:24],
+            }
+        )
+        findings.extend(file_findings)
+
+    status_counts: dict[str, int] = {}
+    kind_counts: dict[str, int] = {}
+    severity_counts: dict[str, int] = {}
+    for finding in findings:
+        increment_count(status_counts, str(finding.get("status") or "unknown"))
+        increment_count(kind_counts, str(finding.get("kind") or "unknown"))
+        increment_count(severity_counts, str(finding.get("severity") or "unknown"))
+    if status_counts.get("potential-concrete-secret") or status_counts.get("potential-public-secret"):
+        status = "potential-static-secret-exposure"
+    elif status_counts.get("needs-build-provenance-review"):
+        status = "needs-build-secret-review"
+    elif status_counts.get("needs-public-env-review") or status_counts.get("needs-secret-url-review"):
+        status = "needs-secret-exposure-review"
+    elif findings:
+        status = "secret-references-indexed"
+    else:
+        status = "no-static-secret-signals"
+    actionable = [
+        finding
+        for finding in findings
+        if str(finding.get("status") or "") in {
+            "potential-concrete-secret",
+            "potential-public-secret",
+            "needs-build-provenance-review",
+            "needs-public-env-review",
+            "needs-secret-url-review",
+        }
+    ]
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-secret-exposure-review-v1",
+        "status": status,
+        "source_root": repo_relative_or_absolute(source_root),
+        "profile": profile_summary(profile),
+        "summary": {
+            "files": len(files),
+            "skipped": len(skipped),
+            "findings": len(findings),
+            "actionable_review_items": len(actionable),
+            "status_counts": dict(sorted(status_counts.items())),
+            "kind_counts": dict(sorted(kind_counts.items())),
+            "severity_counts": dict(sorted(severity_counts.items())),
+        },
+        "actionable_review_items": actionable[:20],
+        "files": files,
+        "skipped": skipped,
+        "finding_gate_ready": False,
+        "next_step": (
+            "Review build provenance, image/cache/log retention, or client bundle exposure for actionable rows; "
+            "do not treat placeholders or server-side secret references as findings."
+            if actionable
+            else "No actionable static secret exposure signal was found in bounded source/config review."
+        ),
+        "finding_gate_boundary": (
+            "Static secret exposure review is not evidence by itself. Medium+ requires concrete secret value exposure, "
+            "client bundle disclosure, image/cache/log retention, or equivalent proof."
+        ),
+        "safety": (
+            "Offline source/config review only. It reads bounded local files, redacts values, sends no requests, "
+            "invokes no Burp tools, and does not access runtime secret stores."
+        ),
+    }
+
+
 VALIDATION_APPROVAL_PACKET_KEYS = [
     ("transaction_corpus_approval_packet", "transaction-corpus"),
     ("credential_impact_approval_packet", "credential-impact"),
@@ -22344,6 +22735,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     CLAIM_EVIDENCE_LEDGER_ARTIFACT: "claim-evidence-ledger",
     CLAIM_WITNESS_LADDER_ARTIFACT: "claim-witness-ladder",
     CLAIM_EVIDENCE_REQUESTS_ARTIFACT: "claim-evidence-requests",
+    SECRET_EXPOSURE_REVIEW_ARTIFACT: "secret-exposure-review",
     ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT: "oracle-plan --write-sidecar-template",
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT: "rewrite-response-review --write-sidecar-template",
     "finding-gate.json": "gate",
@@ -22382,6 +22774,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "claim-evidence-ledger",
     "claim-witness-ladder",
     "claim-evidence-requests",
+    "secret-exposure-review",
     "rewrite-response-review --write-sidecar-template",
     "report",
     "transaction-corpus-checklist --write-policy-template --skip-current-resource-check",
@@ -22405,6 +22798,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "claim-evidence-ledger": "claim-evidence-ledger --no-write",
     "claim-witness-ladder": "claim-witness-ladder --no-write",
     "claim-evidence-requests": "claim-evidence-requests --no-write",
+    "secret-exposure-review": "secret-exposure-review --no-write",
     "rewrite-response-review --write-sidecar-template": (
         "rewrite-response-review --no-write --show-sidecar-template-json"
     ),
@@ -46360,6 +46754,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("rewrite-response-review", "run_rewrite_response_review"),
         refresh_expectation("deployment-review", "run_deployment_review"),
         refresh_expectation("operator-evidence-review", "run_operator_evidence_review"),
+        refresh_expectation("secret-exposure-review", "run_secret_exposure_review"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-sidecar-review", "run_transaction_sidecar_review"),
         refresh_expectation("transaction-corpus-checklist", "run_transaction_corpus_checklist"),
@@ -60884,6 +61279,80 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and "route-api-widgets" in {cluster.get("id") for cluster in configured_clusters.get("clusters", [])}
             and "/console/api/widgets/" in configured_observation_paths
         )
+
+        secret_source_root = Path(temp_dir) / "secret-review-app"
+        (secret_source_root / "helm/secret-review/templates").mkdir(parents=True)
+        (secret_source_root / "Dockerfile").write_text(
+            textwrap.dedent(
+                """
+                FROM node:22 AS deps
+                ARG NODE_AUTH_TOKEN
+                ENV NODE_AUTH_TOKEN=$NODE_AUTH_TOKEN
+                RUN echo "@selftest:registry=https://npm.pkg.github.com/" > .npmrc && \\
+                    echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> .npmrc
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (secret_source_root / ".env.template").write_text(
+            textwrap.dedent(
+                """
+                SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY_HERE
+                M0_ORCHESTRATION_API_KEY=YOUR_M0_ORCHESTRATION_API_KEY_HERE
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (secret_source_root / "helm/secret-review/templates/deployment.yaml").write_text(
+            textwrap.dedent(
+                """
+                apiVersion: apps/v1
+                kind: Deployment
+                spec:
+                  template:
+                    spec:
+                      containers:
+                        - name: app
+                          env:
+                            - name: M0_ORCHESTRATION_API_KEY
+                              valueFrom:
+                                secretKeyRef:
+                                  name: app-secrets
+                                  key: m0-key
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        secret_review = build_secret_exposure_review(
+            source_root=secret_source_root,
+            profile=test_profile,
+            max_file_bytes=64 * 1024,
+            max_files=16,
+        )
+        secret_review_text = json.dumps(sanitize_artifact_samples(secret_review), sort_keys=True)
+        secret_review_kind_counts = secret_review.get("summary", {}).get("kind_counts", {})
+        secret_review_status_counts = secret_review.get("summary", {}).get("status_counts", {})
+        secret_review_passed = (
+            secret_review.get("schema") == "inferforge-secret-exposure-review-v1"
+            and secret_review.get("status") == "needs-build-secret-review"
+            and secret_review.get("finding_gate_ready") is False
+            and secret_review.get("summary", {}).get("actionable_review_items") == 3
+            and secret_review_kind_counts.get("docker-build-secret-arg") == 1
+            and secret_review_kind_counts.get("docker-secret-env-promotion") == 1
+            and secret_review_kind_counts.get("docker-secret-written-to-build-layer") == 1
+            and secret_review_kind_counts.get("server-secret-env-reference") == 1
+            and secret_review_kind_counts.get("url-secret-parameter") == 1
+            and secret_review_kind_counts.get("server-side-secret-reference", 0) >= 1
+            and secret_review_status_counts.get("needs-build-provenance-review") == 3
+            and secret_review_status_counts.get("template-only-not-evidence") == 2
+            and secret_review_status_counts.get("server-side-reference-not-exposure", 0) >= 1
+            and "YOUR_API_KEY_HERE" not in secret_review_text
+            and "YOUR_M0_ORCHESTRATION_API_KEY_HERE" not in secret_review_text
+            and "NODE_AUTH_TOKEN}" not in secret_review_text
+        )
     generic_unexpected_row = {
         "ts": utc_now(),
         "phase": "self-test",
@@ -61615,6 +62084,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and transaction_method_exposure_passed
         and profile_custom_ws_discovery_passed
         and configured_nextjs_runtime_passed
+        and secret_review_passed
         and initial_artifacts_passed
         and target_lock_passed
         and quote_intent_profile_passed
@@ -62406,6 +62876,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "rewrite_resolution": configured_rewrite_resolution,
             "source_resolver_report_summary": configured_source_resolver_report,
             "observation_paths": sorted(configured_observation_paths),
+        },
+        "secret_exposure_review": {
+            "status": "passed" if secret_review_passed else "failed",
+            "review_status": secret_review.get("status"),
+            "summary": secret_review.get("summary", {}),
+            "finding_gate_ready": secret_review.get("finding_gate_ready"),
+            "actionable_review_items": secret_review.get("actionable_review_items", []),
+            "boundary": secret_review.get("finding_gate_boundary"),
         },
         "initial_audit_artifacts": {
             "status": "passed" if initial_artifacts_passed else "failed",
@@ -69547,6 +70025,76 @@ def run_claim_evidence_requests(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_secret_exposure_review(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    review = build_secret_exposure_review(
+        source_root=source_root,
+        profile=profile,
+        max_file_bytes=args.max_file_bytes,
+        max_files=args.max_files,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / SECRET_EXPOSURE_REVIEW_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(review))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="secret-exposure-review",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = review.get("summary", {}) if isinstance(review.get("summary"), dict) else {}
+    print(f"Secret exposure review: {review.get('status')}")
+    print(
+        "Files: "
+        f"scanned={summary.get('files', 0)} "
+        f"skipped={summary.get('skipped', 0)} "
+        f"findings={summary.get('findings', 0)} "
+        f"actionable={summary.get('actionable_review_items', 0)}"
+    )
+    print(f"Statuses: {json.dumps(summary.get('status_counts', {}), sort_keys=True)}")
+    print(f"Kinds: {json.dumps(summary.get('kind_counts', {}), sort_keys=True)}")
+    print(f"Severities: {json.dumps(summary.get('severity_counts', {}), sort_keys=True)}")
+    if getattr(args, "show_findings", False):
+        display_limit = max(0, int(args.top))
+        print("Findings:")
+        for finding in (review.get("actionable_review_items", []) or [])[:display_limit]:
+            if not isinstance(finding, dict):
+                continue
+            print(
+                f"- {finding.get('severity')} {finding.get('status')} "
+                f"{finding.get('kind')} {finding.get('file')}:{finding.get('line')} "
+                f"name={finding.get('name') or '-'}"
+            )
+            print(f"  next={inline_summary_text(finding.get('next_step'), max_chars=260)}")
+        remaining = len(review.get("actionable_review_items", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more actionable item(s); rerun without --no-write to write the full review artifact")
+            else:
+                print(f"- {remaining} more actionable item(s) in {output_path}")
+    print(f"Gate: {inline_summary_text(review.get('finding_gate_boundary'), max_chars=320)}")
+    print(f"Next: {inline_summary_text(review.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and review.get("status") == "potential-static-secret-exposure":
+        return 1
+    return 0
+
+
 def run_iteration_decision(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -72234,6 +72782,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless present non-placeholder operator evidence is indexed.",
     )
     operator_evidence_review.set_defaults(func=run_operator_evidence_review)
+
+    secret_exposure_review = sub.add_parser(
+        "secret-exposure-review",
+        help="Review local source/config for static secret exposure signals without target traffic",
+    )
+    secret_exposure_review.add_argument(
+        "--output",
+        help=f"Where to write {SECRET_EXPOSURE_REVIEW_ARTIFACT}. Defaults to --artifact-dir/{SECRET_EXPOSURE_REVIEW_ARTIFACT}.",
+    )
+    secret_exposure_review.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES,
+        help=f"Maximum bytes to read per allowlisted source/config file. Defaults to {DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES}.",
+    )
+    secret_exposure_review.add_argument(
+        "--max-files",
+        type=positive_int,
+        default=64,
+        help="Maximum allowlisted source/config files to scan. Defaults to 64.",
+    )
+    secret_exposure_review.add_argument(
+        "--top",
+        type=positive_int,
+        default=10,
+        help="Number of actionable review items to print with --show-findings.",
+    )
+    secret_exposure_review.add_argument(
+        "--show-findings",
+        action="store_true",
+        help="Print actionable static secret exposure review items.",
+    )
+    secret_exposure_review.add_argument(
+        "--no-write",
+        action="store_true",
+        help=f"Print secret exposure review only; do not write {SECRET_EXPOSURE_REVIEW_ARTIFACT} or refreshed manifests.",
+    )
+    secret_exposure_review.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero only when a potential concrete static secret exposure is found.",
+    )
+    secret_exposure_review.set_defaults(func=run_secret_exposure_review)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
