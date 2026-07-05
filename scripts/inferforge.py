@@ -34902,6 +34902,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--path",
                     "/api/no-write/status",
                     "--single-observation-plan",
+                    "--show-profile-json",
                     "--no-write",
                 ]
             )
@@ -35500,6 +35501,9 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Observation: GET /api/no-write/status cluster=no-write" in promote_stdout
                 and "Observation plan: single-approved-observation" in promote_stdout
                 and "Profile validation:" in promote_stdout_text
+                and "Reviewed profile JSON:" in promote_stdout
+                and '"burp_observation_plan": [' in promote_stdout_text
+                and '"path": "/api/no-write/status"' in promote_stdout_text
                 and "Next commands:" in promote_stdout
                 and "burp-sync --observe" in promote_stdout_text
                 and "burp-sync --observe --replace --count 1" in promote_stdout_text
@@ -50207,6 +50211,9 @@ def run_promote_observation_candidate(args: argparse.Namespace) -> int:
         print(f"Output profile: {output_path}")
         if output_path.exists() and not args.force:
             print("Output profile exists; rerun without --no-write requires --force to overwrite it.")
+        if args.show_profile_json:
+            print("Reviewed profile JSON:")
+            print(json.dumps(public_profile(promoted_profile), indent=2, sort_keys=True))
         if followup_commands:
             print("Next commands:")
             for command in followup_commands:
@@ -54174,6 +54181,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allowed response status for the promoted observation. Repeat as needed.",
     )
     promote_candidate.add_argument("--note", help="Short review note to store with the promoted observation")
+    promote_candidate.add_argument(
+        "--show-profile-json",
+        action="store_true",
+        help="Print the promoted reviewed profile JSON during --no-write preview.",
+    )
     promote_candidate.add_argument(
         "--no-write",
         action="store_true",
