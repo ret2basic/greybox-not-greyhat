@@ -88,6 +88,7 @@ DEFAULT_BURP_HISTORY_INPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_RESOURCE_WARNING_BURP_HISTORY_INPUT_BYTES = 1 * 1024 * 1024
 DEFAULT_RESOURCE_CRITICAL_BURP_HISTORY_INPUT_BYTES = 256 * 1024
 DEFAULT_BURP_SYNC_COUNT = 20
+DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT = 5
 DEFAULT_RESOURCE_WARNING_BURP_SYNC_COUNT = 10
 DEFAULT_RESOURCE_CRITICAL_BURP_SYNC_COUNT = 3
 DEFAULT_RESOURCE_DEGRADED_OFFLINE_COMMAND_LIMIT = 4
@@ -26633,7 +26634,12 @@ def review_candidate_command_templates(
             verification_command_for_profile(
                 reviewed_profile,
                 artifact_dir,
-                f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_BURP_SYNC_COUNT}",
+                "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict",
+            ),
+            verification_command_for_profile(
+                reviewed_profile,
+                artifact_dir,
+                f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}",
             ),
             verification_command_for_profile(
                 reviewed_profile,
@@ -26656,7 +26662,12 @@ def promoted_observation_followup_commands(
         verification_command_for_profile(
             reviewed_profile,
             artifact_dir,
-            f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_BURP_SYNC_COUNT}",
+            "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict",
+        ),
+        verification_command_for_profile(
+            reviewed_profile,
+            artifact_dir,
+            f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}",
         ),
         verification_command_for_profile(
             reviewed_profile,
@@ -28704,7 +28715,7 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             (
                 "python3 scripts/inferforge.py --profile .greybox/regression-discovered/reviewed-profile.json "
                 "--artifact-dir .greybox/regression-discovered "
-                f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_BURP_SYNC_COUNT}"
+                f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}"
             ),
         ],
     }
@@ -32951,7 +32962,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Choose one known safe read-only path." in review_candidates_stdout_text
                 and "promote_to_burp_observation_plan: id=burp_observe_no_write_reviewed_path" in review_candidates_stdout_text
                 and f"path={PLACEHOLDER_APPROVED_CONCRETE_PATH}" in review_candidates_stdout_text
-                and "command_safety=commands=4" in review_candidates_stdout_text
+                and "command_safety=commands=5" in review_candidates_stdout_text
                 and "command_templates:" in review_candidates_stdout_text
                 and "[manual-template]" in review_candidates_stdout_text
                 and "[review-gated]" in review_candidates_stdout_text
@@ -41936,7 +41947,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         )
         queue_promotion_selftest_passed = (
             rewrite_queue_item is not None
-            and len(rewrite_queue_commands) == 4
+            and len(rewrite_queue_commands) == 5
             and "promote-observation-candidate" in rewrite_queue_commands[0]
             and f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH}" in rewrite_queue_commands[0]
             and "reviewed-profile.json" in rewrite_queue_commands[0]
@@ -41945,12 +41956,15 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH}" in rewrite_queue_commands[1]
             and "reviewed-profile.json" in rewrite_queue_commands[1]
             and "--no-write" not in rewrite_queue_commands[1]
-            and "burp-sync --observe" in rewrite_queue_commands[2]
-            and REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND in rewrite_queue_commands[3]
+            and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict" in rewrite_queue_commands[2]
+            and "burp-sync --observe" in rewrite_queue_commands[3]
+            and f"--count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}" in rewrite_queue_commands[3]
+            and REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND in rewrite_queue_commands[4]
             and all(command.count("--profile") <= 1 for command in rewrite_queue_commands)
             and all(command.count("--artifact-dir") == 1 for command in rewrite_queue_commands)
             and rewrite_queue_command_counts.get("manual-template") == 2
             and rewrite_queue_command_counts.get("review-gated") == 2
+            and rewrite_queue_command_counts.get("ready") == 1
             and rewrite_queue_command_safety.get("unsafe_template_count") == 0
             and rewrite_queue_global_command_safety.get("unsafe_template_count") == 0
             and unsafe_command_classification.get("classification") == "unsafe-template"

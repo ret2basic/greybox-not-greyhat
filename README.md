@@ -657,18 +657,21 @@ URLs, placeholders, braces, angle brackets, whitespace, and non-matching
 prefixes are rejected. Use `--no-write` to validate the path, preview the
 promoted observation, and print the follow-up `burp-sync --observe` and `audit`
 commands before writing profile artifacts. Use the reviewed profile with
-`burp-sync --observe` only after the path has been approved. Reviewed-profile
-follow-up audit commands default to `audit --max-probes 6 --no-ws`; add broader
-external or WebSocket resource probes only after scope and runner capacity are
-reviewed.
+`burp-sync --observe` only after the path has been approved and
+`resource-snapshot --strict` is healthy. Reviewed-profile observation follow-up
+commands use a narrower Burp history count than the general default, and audit
+commands default to `audit --max-probes 6 --no-ws`; add broader external or
+WebSocket resource probes only after scope and runner capacity are reviewed.
 
 When a rewrite observation gap is present, `verification-queue` also emits the
 same promotion sequence as manual-review command templates:
 
 1. preview the promotion with `promote-observation-candidate --no-write`;
 2. promote the approved path into `.greybox/reviewed-profile.json`;
-3. run `burp-sync --observe` with that reviewed profile;
-4. rerun the low-resource `audit --max-probes 6 --no-ws` with the reviewed
+3. run `resource-snapshot --strict` with that reviewed profile and stop if it is
+   not healthy;
+4. run narrow `burp-sync --observe` with that reviewed profile;
+5. rerun the low-resource `audit --max-probes 6 --no-ws` with the reviewed
    profile.
 
 The placeholder `REPLACE_WITH_APPROVED_CONCRETE_LOCAL_PATH` in the queue is
