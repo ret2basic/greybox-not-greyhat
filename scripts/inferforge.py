@@ -1568,6 +1568,57 @@ def quote_provider_diagnostics(profile: dict[str, Any] | None) -> list[dict[str,
     return [json_clone(item) for item in diagnostics if isinstance(item, dict)]
 
 
+def quote_provider_public_docs(profile: dict[str, Any] | None) -> list[dict[str, Any]]:
+    docs = quote_provider_config(profile).get("public_docs")
+    if not isinstance(docs, list):
+        return []
+    normalized = []
+    for index, item in enumerate(docs):
+        if not isinstance(item, dict):
+            continue
+        doc_id = str(item.get("id") or f"doc-{index}").strip()
+        url = str(item.get("url") or "").strip()
+        if not doc_id or not url:
+            continue
+        normalized.append(
+            {
+                "id": doc_id,
+                "title": str(item.get("title") or doc_id).strip(),
+                "url": url,
+                "source": str(item.get("source") or "official-docs").strip(),
+                "assertions": normalize_string_list(item.get("assertions")),
+                "impact_tags": normalize_string_list(item.get("impact_tags")),
+            }
+        )
+    return normalized
+
+
+def build_quote_provider_public_docs_review(profile: dict[str, Any] | None) -> dict[str, Any]:
+    docs = quote_provider_public_docs(profile)
+    tag_counts: dict[str, int] = {}
+    assertion_count = 0
+    for doc in docs:
+        assertion_count += len(doc.get("assertions", []) or [])
+        for tag in doc.get("impact_tags", []) or []:
+            increment_count(tag_counts, str(tag))
+    status = "public-docs-indexed" if docs else "no-public-provider-docs"
+    return {
+        "status": status,
+        "provider": quote_provider_name(profile),
+        "summary": {
+            "documents": len(docs),
+            "assertions": assertion_count,
+            "impact_tag_counts": dict(sorted(tag_counts.items())),
+        },
+        "documents": docs,
+        "reportability_gate": (
+            "Public provider documentation can support auth model or transaction-payload context, but it does not "
+            "satisfy quota, billing, rate-limit, or account-impact evidence unless the document explicitly proves that impact."
+        ),
+        "safety": "Offline profile-owned provider documentation index. It performs no network requests.",
+    }
+
+
 def normalize_http_status_codes(value: Any) -> list[int]:
     raw_values = value if isinstance(value, list) else [value]
     statuses: list[int] = []
@@ -2064,6 +2115,48 @@ def build_profile_validation_artifact(
                         "id": f"quote-provider:{diagnostic_id}:{text_field}-not-string",
                         "severity": "warning",
                         "message": f"Quote provider diagnostic `{diagnostic_id}` field `{text_field}` should be a string.",
+                    }
+                )
+    provider_public_docs = quote_provider.get("public_docs")
+    if provider_public_docs is not None and not isinstance(provider_public_docs, list):
+        warnings.append(
+            {
+                "id": "quote-provider:public-docs-not-array",
+                "severity": "warning",
+                "message": "`quote_provider.public_docs` should be an array of provider documentation references.",
+            }
+        )
+        provider_public_docs = []
+    for doc_index, doc in enumerate(provider_public_docs or []):
+        if not isinstance(doc, dict):
+            warnings.append(
+                {
+                    "id": f"quote-provider:public-doc-{doc_index}:not-object",
+                    "severity": "warning",
+                    "message": "Quote provider public_docs entries should be JSON objects.",
+                }
+            )
+            continue
+        doc_id = str(doc.get("id") or f"doc-{doc_index}")
+        for required_field in ["id", "url"]:
+            if not isinstance(doc.get(required_field), str) or not str(doc.get(required_field) or "").strip():
+                warnings.append(
+                    {
+                        "id": f"quote-provider:{doc_id}:missing-{required_field}",
+                        "severity": "warning",
+                        "message": f"Quote provider public doc `{doc_id}` should define a non-empty `{required_field}`.",
+                    }
+                )
+        for list_field in ["assertions", "impact_tags"]:
+            value = doc.get(list_field)
+            if value is not None and not isinstance(value, (list, str)):
+                warnings.append(
+                    {
+                        "id": f"quote-provider:{doc_id}:{list_field}-invalid",
+                        "severity": "warning",
+                        "message": (
+                            f"Quote provider public doc `{doc_id}` field `{list_field}` should be a string or array."
+                        ),
                     }
                 )
 
@@ -19063,6 +19156,7 @@ def build_transaction_flow_review(
         )
 
     policy_scaffold = build_transaction_intent_policy_scaffold(profile)
+    provider_public_docs_review = build_quote_provider_public_docs_review(profile)
     quote_contract_review = build_quote_source_contract_review(refs_by_group, policy_scaffold)
     credential_proxy_review = build_server_credential_proxy_review(refs_by_group, source_root=source_root)
     deployment_provider_review = build_deployment_resource_review(
@@ -19095,6 +19189,29 @@ def build_transaction_flow_review(
             "Client quote request shape and server quote validation policy are indexed for decode-time comparison.",
             contract_refs[:12],
             "Do decoded executable transactions match the source contract for wallet, amountIn, mint direction, quote count, and allowed programs?",
+        )
+    if provider_public_docs_review.get("status") == "public-docs-indexed":
+        docs_summary = provider_public_docs_review.get("summary", {}) or {}
+        docs_refs = [
+            {
+                "file": "target-profile",
+                "line": None,
+                "token": f"{doc.get('id')} {doc.get('url')}",
+                "sample": "; ".join(doc.get("assertions", []) or [])[:220],
+            }
+            for doc in provider_public_docs_review.get("documents", []) or []
+            if isinstance(doc, dict)
+        ]
+        add_dataflow(
+            "quote-provider-public-docs-indexed",
+            "provider-docs-indexed",
+            "info",
+            (
+                f"{docs_summary.get('documents', 0)} provider public doc reference(s) are indexed for auth model "
+                "and transaction-payload context."
+            ),
+            docs_refs[:8],
+            "Which provider-auth and executable-payload facts are public context, and which impact claims still need operator evidence?",
         )
     if credential_proxy_review.get("status") == "needs-cost-abuse-review":
         credential_refs = []
@@ -19169,6 +19286,8 @@ def build_transaction_flow_review(
             "server_quote_validation_refs": len(refs_by_group.get("server_quote_validation", []) or []),
             "quote_source_contract_status": quote_contract_review.get("status"),
             "server_credential_proxy_status": credential_proxy_review.get("status"),
+            "provider_public_docs_status": provider_public_docs_review.get("status"),
+            "provider_public_docs": (provider_public_docs_review.get("summary") or {}).get("documents", 0),
             "deployment_credential_provider_status": deployment_provider_review.get("status")
             if isinstance(deployment_provider_review, dict)
             else None,
@@ -19191,6 +19310,7 @@ def build_transaction_flow_review(
         "dataflows": dataflows,
         "transaction_intent": intent_summary,
         "intent_policy_scaffold": policy_scaffold,
+        "provider_public_docs_review": provider_public_docs_review,
         "quote_source_contract_review": quote_contract_review,
         "server_credential_proxy_review": credential_proxy_review,
         "rpc_method_policy_context": {
@@ -19892,6 +20012,16 @@ def build_credential_impact_checklist(
         else {}
     )
     provider_review = credential_provider_review_from_artifacts(flow_review, deployment_review)
+    provider_public_docs_review = (
+        flow_review.get("provider_public_docs_review")
+        if isinstance(flow_review.get("provider_public_docs_review"), dict)
+        else build_quote_provider_public_docs_review(profile)
+    )
+    provider_public_docs_summary = (
+        provider_public_docs_review.get("summary")
+        if isinstance(provider_public_docs_review.get("summary"), dict)
+        else {}
+    )
     provider_summary = provider_review.get("summary", {}) if isinstance(provider_review.get("summary"), dict) else {}
     missing_provider_evidence = [str(item) for item in provider_summary.get("missing_provider_evidence", []) or []]
     files_needing_review = [
@@ -19998,11 +20128,14 @@ def build_credential_impact_checklist(
             "provider_review_status": provider_review.get("status") or "missing",
             "files_needing_cost_review": len(files_needing_review),
             "missing_provider_evidence": missing_provider_evidence,
+            "provider_public_docs_status": provider_public_docs_review.get("status"),
+            "provider_public_docs": provider_public_docs_summary.get("documents", 0),
             "resource_status": resource_status,
             "resource_budget_mode": budget.get("mode") or "unknown",
         },
         "resource_preflight": resource_preflight,
         "route_reviews": route_reviews,
+        "provider_public_docs_review": provider_public_docs_review,
         "provider_evidence_requests": evidence_requests,
         "operator_evidence_sidecar": {
             "path": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
@@ -45562,6 +45695,16 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
     summary = review.get("summary", {}) or {}
     intent = review.get("transaction_intent", {}) or {}
     scaffold = review.get("intent_policy_scaffold", {}) or {}
+    provider_docs = (
+        review.get("provider_public_docs_review")
+        if isinstance(review.get("provider_public_docs_review"), dict)
+        else {}
+    )
+    provider_docs_summary = (
+        provider_docs.get("summary")
+        if isinstance(provider_docs.get("summary"), dict)
+        else {}
+    )
     source_contract = review.get("quote_source_contract_review") if isinstance(review.get("quote_source_contract_review"), dict) else {}
     source_contract_summary = source_contract.get("summary", {}) if isinstance(source_contract.get("summary"), dict) else {}
     credential_proxy = (
@@ -45593,6 +45736,13 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
         f"status={scaffold.get('status')}, "
         f"directions={scaffold.get('configured_direction_count', 0)}/{scaffold.get('direction_count', 0)}"
     )
+    if provider_docs:
+        print(
+            "Provider docs: "
+            f"status={provider_docs.get('status')} "
+            f"documents={provider_docs_summary.get('documents', 0)} "
+            f"assertions={provider_docs_summary.get('assertions', 0)}"
+        )
     if source_contract:
         print(
             "Source contract: "
@@ -45709,6 +45859,24 @@ def run_credential_impact_checklist(args: argparse.Namespace) -> int:
     )
     missing = summary.get("missing_provider_evidence", []) or []
     print(f"Provider missing: {','.join(str(item) for item in missing) if missing else 'none'}")
+    provider_docs = (
+        checklist.get("provider_public_docs_review")
+        if isinstance(checklist.get("provider_public_docs_review"), dict)
+        else {}
+    )
+    provider_docs_summary = (
+        provider_docs.get("summary")
+        if isinstance(provider_docs.get("summary"), dict)
+        else {}
+    )
+    if provider_docs:
+        print(
+            "Provider docs: "
+            f"status={provider_docs.get('status')} "
+            f"documents={provider_docs_summary.get('documents', 0)} "
+            f"assertions={provider_docs_summary.get('assertions', 0)} "
+            "impact_gate=does-not-satisfy-quota-billing-evidence"
+        )
     top_count = max(0, int(args.top))
     if top_count:
         print("Evidence requests:")

@@ -318,6 +318,11 @@ auth or rate-limit evidence, the matrix also emits a separate
 `credential-proxy-review` hypothesis. This remains offline-only and requires
 provider quota, billing, availability, or account-abuse evidence before any
 finding claim.
+Profiles can attach `quote_provider.public_docs` entries for official provider
+documentation. InferForge indexes those references as public context for API-key
+authentication and executable transaction-payload behavior, but it does not
+treat them as quota, billing, rate-limit, or account-impact evidence unless the
+operator/provider sidecar explicitly proves that impact.
 The RPC/source policy also records static transaction-intent signals such as
 preview-wallet versus execution-wallet paths, remote payload deserialization,
 and client-side recent-blockhash refreshes. These signals only define what the
