@@ -21559,7 +21559,11 @@ def build_transaction_sidecar_review(
     elif candidates and payload_contract_allows_decode:
         decode_commands.extend(
             row.get("decode_command")
-            for row in transaction_corpus_policy_templates(profile, artifact_dir)
+            for row in transaction_corpus_policy_templates(
+                profile,
+                artifact_dir,
+                payload_sidecar=decode_input_sidecar,
+            )
             if row.get("decode_command")
         )
 
@@ -37470,6 +37474,9 @@ def build_transaction_decoder_selftest(
         for command in sidecar_missing_policy_review.get("policy_template_commands", []) or []
         if isinstance(command, dict)
     )
+    sidecar_missing_policy_decode_commands = "\n".join(
+        str(command) for command in sidecar_missing_policy_review.get("decode_commands", []) or []
+    )
     sidecar_missing_policy_passed = (
         sidecar_missing_policy_review.get("status") == "needs-intent-policy"
         and sidecar_missing_policy_review.get("summary", {}).get("candidate_count") == 1
@@ -37477,6 +37484,7 @@ def build_transaction_decoder_selftest(
         and "prepare-transaction-intent-policy --direction" in sidecar_missing_policy_commands
         and "decode-transactions --input" in sidecar_missing_policy_commands
         and "transaction-payloads.json --intent-direction" in sidecar_missing_policy_commands
+        and "transaction-payloads.json --intent-direction" in sidecar_missing_policy_decode_commands
         and "--no-write" in sidecar_missing_policy_preview_commands
         and "--no-write" not in sidecar_missing_policy_write_commands
         and "prepare_preview" not in sidecar_missing_policy_commands
@@ -37578,6 +37586,7 @@ def build_transaction_decoder_selftest(
             "summary": sidecar_missing_policy_review.get("summary", {}),
             "decode_input_sidecar": sidecar_missing_policy_review.get("decode_input_sidecar"),
             "policy_template_commands": sidecar_missing_policy_review.get("policy_template_commands", []),
+            "decode_commands": sidecar_missing_policy_review.get("decode_commands", []),
             "next_step": sidecar_missing_policy_review.get("next_step"),
         },
         "sidecar_payload_type_mismatch": {
