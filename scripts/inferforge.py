@@ -21709,6 +21709,44 @@ def transaction_corpus_policy_templates(
         for program_id in allowed_programs:
             prepare_parts.extend(["--intent-allowed-program", program_id])
             decode_parts.extend(["--intent-allowed-program", program_id])
+        prepare_policy_preview_command = validation_command_for_artifact_dir(
+            artifact_dir,
+            " ".join(shlex.quote(str(part)) for part in [*prepare_parts, "--no-write"]),
+            profile=profile,
+        )
+        prepare_policy_command = validation_command_for_artifact_dir(
+            artifact_dir,
+            " ".join(shlex.quote(str(part)) for part in prepare_parts),
+            profile=profile,
+        )
+        decode_preview_command = validation_command_for_artifact_dir(
+            artifact_dir,
+            " ".join(shlex.quote(str(part)) for part in [*decode_parts, "--no-write"]),
+            profile=profile,
+        )
+        decode_command = validation_command_for_artifact_dir(
+            artifact_dir,
+            " ".join(shlex.quote(str(part)) for part in decode_parts),
+            profile=profile,
+        )
+        command_safety_refs = {
+            "prepare_policy_preview": validation_command_ref(
+                prepare_policy_preview_command,
+                source=f"transaction-corpus-policy-template:{direction}:prepare-policy-preview",
+            ),
+            "prepare_policy": validation_command_ref(
+                prepare_policy_command,
+                source=f"transaction-corpus-policy-template:{direction}:prepare-policy",
+            ),
+            "decode_preview": validation_command_ref(
+                decode_preview_command,
+                source=f"transaction-corpus-policy-template:{direction}:decode-preview",
+            ),
+            "decode": validation_command_ref(
+                decode_command,
+                source=f"transaction-corpus-policy-template:{direction}:decode",
+            ),
+        }
         templates.append(
             {
                 "direction": direction,
@@ -21720,26 +21758,11 @@ def transaction_corpus_policy_templates(
                 "program_allowlist_review": program_allowlist_review,
                 "missing_runtime_fields": row.get("missing_runtime_fields", []),
                 "intent_policy_sidecar_template": row.get("sidecar_template", {}),
-                "prepare_policy_preview_command": validation_command_for_artifact_dir(
-                    artifact_dir,
-                    " ".join(shlex.quote(str(part)) for part in [*prepare_parts, "--no-write"]),
-                    profile=profile,
-                ),
-                "prepare_policy_command": validation_command_for_artifact_dir(
-                    artifact_dir,
-                    " ".join(shlex.quote(str(part)) for part in prepare_parts),
-                    profile=profile,
-                ),
-                "decode_preview_command": validation_command_for_artifact_dir(
-                    artifact_dir,
-                    " ".join(shlex.quote(str(part)) for part in [*decode_parts, "--no-write"]),
-                    profile=profile,
-                ),
-                "decode_command": validation_command_for_artifact_dir(
-                    artifact_dir,
-                    " ".join(shlex.quote(str(part)) for part in decode_parts),
-                    profile=profile,
-                ),
+                "prepare_policy_preview_command": prepare_policy_preview_command,
+                "prepare_policy_command": prepare_policy_command,
+                "decode_preview_command": decode_preview_command,
+                "decode_command": decode_command,
+                "command_safety_refs": command_safety_refs,
             }
         )
     return templates
@@ -22222,6 +22245,7 @@ def build_transaction_sidecar_review(
                     "destinationMint": row.get("destinationMint"),
                     "programAllowlistStatus": row.get("programAllowlistStatus"),
                     "program_allowlist_review": row.get("program_allowlist_review", {}),
+                    "command_safety_refs": row.get("command_safety_refs", {}),
                     "prepare_preview_command": row.get("prepare_policy_preview_command"),
                     "prepare_command": row.get("prepare_policy_command"),
                     "decode_preview_command": row.get("decode_preview_command"),
@@ -38470,6 +38494,20 @@ def build_transaction_decoder_selftest(
             for template in no_program_policy_templates
             if template.get("status") == "ready"
         )
+        and all(
+            {
+                key: (ref or {}).get("classification")
+                for key, ref in ((template.get("command_safety_refs") or {}).items())
+            }
+            == {
+                "prepare_policy_preview": "manual-template",
+                "prepare_policy": "manual-template",
+                "decode_preview": "manual-template",
+                "decode": "manual-template",
+            }
+            for template in no_program_policy_templates
+            if template.get("status") == "ready"
+        )
     )
     decoded_count = sum(1 for item in transactions if item.get("decoded"))
     sidecar_ready_review: dict[str, Any] = {}
@@ -51522,14 +51560,35 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
                     f"{program_review.get('decode_gate') or program_review.get('status')} "
                     f"next={inline_summary_text(program_review.get('next_step'), max_chars=260)}"
                 )
+            command_safety_refs = (
+                row.get("command_safety_refs")
+                if isinstance(row.get("command_safety_refs"), dict)
+                else {}
+            )
             if row.get("prepare_preview_command"):
-                print(f"  prepare_preview={inline_summary_text(row.get('prepare_preview_command'), max_chars=420)}")
+                safety = (command_safety_refs.get("prepare_policy_preview") or {}).get("classification", "-")
+                print(
+                    f"  prepare_preview_safety={safety} "
+                    f"prepare_preview={inline_summary_text(row.get('prepare_preview_command'), max_chars=420)}"
+                )
             if row.get("prepare_command"):
-                print(f"  prepare={inline_summary_text(row.get('prepare_command'), max_chars=420)}")
+                safety = (command_safety_refs.get("prepare_policy") or {}).get("classification", "-")
+                print(
+                    f"  prepare_safety={safety} "
+                    f"prepare={inline_summary_text(row.get('prepare_command'), max_chars=420)}"
+                )
             if row.get("decode_preview_command"):
-                print(f"  decode_preview={inline_summary_text(row.get('decode_preview_command'), max_chars=420)}")
+                safety = (command_safety_refs.get("decode_preview") or {}).get("classification", "-")
+                print(
+                    f"  decode_preview_safety={safety} "
+                    f"decode_preview={inline_summary_text(row.get('decode_preview_command'), max_chars=420)}"
+                )
             if row.get("decode_command"):
-                print(f"  decode={inline_summary_text(row.get('decode_command'), max_chars=420)}")
+                safety = (command_safety_refs.get("decode") or {}).get("classification", "-")
+                print(
+                    f"  decode_safety={safety} "
+                    f"decode={inline_summary_text(row.get('decode_command'), max_chars=420)}"
+                )
     if args.show_commands and review.get("payload_shape_guidance"):
         print_transaction_payload_shape_guidance(
             review.get("payload_shape_guidance", {}),
@@ -51721,14 +51780,35 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
                 f"{program_review.get('decode_gate') or program_review.get('status')} "
                 f"next={inline_summary_text(program_review.get('next_step'), max_chars=260)}"
             )
+        command_safety_refs = (
+            row.get("command_safety_refs")
+            if isinstance(row.get("command_safety_refs"), dict)
+            else {}
+        )
         if args.show_commands and row.get("prepare_policy_preview_command"):
-            print(f"  prepare_preview={inline_summary_text(row.get('prepare_policy_preview_command'), max_chars=420)}")
+            safety = (command_safety_refs.get("prepare_policy_preview") or {}).get("classification", "-")
+            print(
+                f"  prepare_preview_safety={safety} "
+                f"prepare_preview={inline_summary_text(row.get('prepare_policy_preview_command'), max_chars=420)}"
+            )
         if args.show_commands and row.get("prepare_policy_command"):
-            print(f"  prepare={inline_summary_text(row.get('prepare_policy_command'), max_chars=420)}")
+            safety = (command_safety_refs.get("prepare_policy") or {}).get("classification", "-")
+            print(
+                f"  prepare_safety={safety} "
+                f"prepare={inline_summary_text(row.get('prepare_policy_command'), max_chars=420)}"
+            )
         if args.show_commands and row.get("decode_preview_command"):
-            print(f"  decode_preview={inline_summary_text(row.get('decode_preview_command'), max_chars=420)}")
+            safety = (command_safety_refs.get("decode_preview") or {}).get("classification", "-")
+            print(
+                f"  decode_preview_safety={safety} "
+                f"decode_preview={inline_summary_text(row.get('decode_preview_command'), max_chars=420)}"
+            )
         if args.show_commands and row.get("decode_command"):
-            print(f"  decode={inline_summary_text(row.get('decode_command'), max_chars=420)}")
+            safety = (command_safety_refs.get("decode") or {}).get("classification", "-")
+            print(
+                f"  decode_safety={safety} "
+                f"decode={inline_summary_text(row.get('decode_command'), max_chars=420)}"
+            )
     post_decode_commands = checklist.get("post_decode_commands", []) or []
     if args.show_commands and checklist.get("sidecar_review_command"):
         print("Sidecar review command:")
