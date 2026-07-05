@@ -46852,13 +46852,76 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
         transaction_decoder_selftest,
     )
     output_path = artifact_dir / "evidence-chain.json"
+    summary = evidence_chain.get("summary", {}) or {}
     print(f"Evidence chain: {evidence_chain['status']}")
     print(
         "Indexed: "
-        f"{evidence_chain['summary']['clusters']} clusters, "
-        f"{evidence_chain['summary']['probes']} probes, "
-        f"{evidence_chain['summary']['burp_observations']} Burp observations"
+        f"{summary.get('clusters', 0)} clusters, "
+        f"{summary.get('probes', 0)} probes, "
+        f"{summary.get('burp_observations', 0)} Burp observations, "
+        f"unexpected={summary.get('unexpected_probes', 0)} "
+        f"gaps={len(summary.get('evidence_gaps', []) or [])} "
+        f"readiness={summary.get('readiness') or 'unknown'} "
+        f"decoded_transactions={summary.get('decoded_transactions', 0)}"
     )
+    if args.show_gaps:
+        print("Evidence gaps:")
+
+        def gap_followup_command(gap_id: str) -> str | None:
+            if gap_id == "GAP-quote-transaction-corpus":
+                return validation_command_for_artifact_dir(
+                    artifact_dir,
+                    (
+                        "transaction-sidecar-review --no-write --show-files --show-commands "
+                        "--show-payload-template-json --show-evidence-contract"
+                    ),
+                    profile=profile,
+                )
+            if gap_id == "GAP-rpc-resource-control-deployment-review":
+                return validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "operator-evidence-review --no-write --show-missing --show-template --show-closure-contract",
+                    profile=profile,
+                )
+            if gap_id.endswith("-burp-observation"):
+                return validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "burp-observation-coverage",
+                    profile=profile,
+                )
+            if gap_id == "GAP-quote-business-policy-probes":
+                return validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check",
+                    profile=profile,
+                )
+            return None
+
+        gap_rows = []
+        seen_gap_ids: set[str] = set()
+        for cluster in evidence_chain.get("clusters", []) or []:
+            if not isinstance(cluster, dict):
+                continue
+            for gap in cluster.get("evidence_gaps", []) or []:
+                if not isinstance(gap, dict):
+                    continue
+                gap_id = str(gap.get("id") or "")
+                if not gap_id or gap_id in seen_gap_ids:
+                    continue
+                seen_gap_ids.add(gap_id)
+                gap_rows.append((cluster, gap))
+        for cluster, gap in gap_rows[: max(0, int(args.top))]:
+            print(
+                f"- {gap.get('priority') or 'unknown'} {gap.get('id')} "
+                f"cluster={cluster.get('cluster_id')} title={inline_summary_text(gap.get('title'), max_chars=180)}"
+            )
+            if gap.get("safe_next_step"):
+                print(f"  next={inline_summary_text(gap.get('safe_next_step'), max_chars=240)}")
+            followup = gap_followup_command(str(gap.get("id") or ""))
+            if followup:
+                print(f"  followup={inline_summary_text(followup, max_chars=420)}")
+        if len(gap_rows) > max(0, int(args.top)):
+            print(f"- ... +{len(gap_rows) - max(0, int(args.top))} more gap(s)")
     if no_write:
         print("No files written (--no-write).")
     else:
@@ -52596,6 +52659,17 @@ def build_parser() -> argparse.ArgumentParser:
     evidence_chain = sub.add_parser(
         "evidence-chain",
         help="Recompute machine-readable evidence chain from current artifacts",
+    )
+    evidence_chain.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of evidence gaps to print when --show-gaps is used.",
+    )
+    evidence_chain.add_argument(
+        "--show-gaps",
+        action="store_true",
+        help="Print compact evidence-gap rows and safe next steps from the chain.",
     )
     evidence_chain.add_argument(
         "--no-write",
