@@ -169,6 +169,7 @@ BOUNTY_INVALIDITY_REVIEW_ARTIFACT = "bounty-invalidity-review.json"
 BOUNTY_READINESS_ROLLUP_ARTIFACT = "bounty-readiness-rollup.json"
 BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT = "bounty-evidence-workorders.json"
 BOUNTY_SOURCE_INVARIANTS_ARTIFACT = "bounty-source-invariants.json"
+BOUNTY_LANE_PRIORITIES_ARTIFACT = "bounty-lane-priorities.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -288,6 +289,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     BOUNTY_READINESS_ROLLUP_ARTIFACT,
     BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT,
     BOUNTY_SOURCE_INVARIANTS_ARTIFACT,
+    BOUNTY_LANE_PRIORITIES_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -24827,6 +24829,230 @@ def build_bounty_source_invariants(
     }
 
 
+BOUNTY_LANE_SOURCE_STRENGTH = {
+    "remote-payload-wallet-signing-path-indexed": 24,
+    "docker-build-secret-static-risk-indexed": 14,
+    "fixed-upstream-or-rewrite-boundary-indexed": 10,
+    "rpc-resource-control-boundary-indexed": 8,
+    "server-credentialed-upstream-path-indexed": 8,
+    "websocket-header-forwarding-indexed": 6,
+    "source-context-indexed": 4,
+    "unmapped-lane": 0,
+}
+
+
+def bounty_lane_priority_decision(lane: str, source_status: str, workorder: dict[str, Any]) -> tuple[str, str, str]:
+    if lane == "transaction-integrity":
+        return (
+            "pursue-first-if-approved-payload-can-be-collected",
+            "Highest severity candidate and source proves remote transaction payload reaches wallet signing.",
+            "Close or park only if no approved quote payload and matching intent policy can be collected.",
+        )
+    if lane == "build-secret-exposure":
+        return (
+            "pursue-if-build-provenance-access-exists",
+            "Shortest evidence distance among current lanes, but static Dockerfile evidence is not enough.",
+            "Close if the operator proves no real secret was supplied or no image/cache/log/registry retention exists.",
+        )
+    if lane == "sensitive-response-impact":
+        return (
+            "pursue-if-approved-single-response-capture-is-available",
+            "A concrete upstream-facing path exists, but one approved redacted response is required for impact.",
+            "Close if the approved response has no sensitive-data, auth, tenant, wallet/account, or path-confusion impact.",
+        )
+    if lane == "websocket-header-trust":
+        return (
+            "park-low-validity-until-upstream-trust-proof",
+            "Source shows header forwarding, but current context lacks browser-controlled sensitive trust proof.",
+            "Close if upstream ignores forwarded headers or uses them only as inert metadata.",
+        )
+    if lane == "resource-control":
+        return (
+            "park-until-operator-resource-impact-evidence",
+            "Source controls are indexed; resource-control impact depends on deployment and operator-visible proof.",
+            "Close if edge policy canonicalizes Host/origin and no attacker-influenced resource identity reaches an impact boundary.",
+        )
+    if lane == "credentialed-provider-impact":
+        entrypoint = str(workorder.get("entrypoint") or "")
+        if "POST /api/quote" in entrypoint:
+            return (
+                "park-behind-transaction-lane-until-provider-impact-evidence",
+                "Provider-impact route overlaps the higher-value transaction-integrity lane.",
+                "Close if provider quota, billing, rate-limit, monitoring, or account impact cannot be proven without depletion traffic.",
+            )
+        return (
+            "park-until-provider-impact-evidence",
+            "Credentialed upstream use needs operator/provider proof before it can become bounty-valid.",
+            "Close if no account, quota, billing, monitoring, or rate-limit consequence is visible to the operator.",
+        )
+    return (
+        "park-until-official-evidence",
+        "Lane is not mapped to a stronger automated priority rule.",
+        "Close if official evidence cannot be collected or finding-gate rejects impact.",
+    )
+
+
+def bounty_lane_priority_score(workorder: dict[str, Any], invariant: dict[str, Any]) -> int:
+    severity_rank = BOUNTY_FRONTIER_SEVERITY_RANK.get(str(workorder.get("expected_severity") or "info"), 9)
+    severity_score = max(0, 90 - severity_rank * 18)
+    source_score = BOUNTY_LANE_SOURCE_STRENGTH.get(str(invariant.get("source_signal") or ""), 0)
+    distance_penalty = int(workorder.get("evidence_distance") or 0) * 4
+    invalidity_penalty = 14 if workorder.get("invalid_if_reported_now") else 0
+    operator_penalty = 8 if workorder.get("operator_input_required") else 0
+    no_promote_penalty = 8 if not invariant.get("can_promote_without_official_evidence") else 0
+    return max(0, severity_score + source_score - distance_penalty - invalidity_penalty - operator_penalty - no_promote_penalty)
+
+
+def build_bounty_lane_priorities(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    bounty_evidence_workorders: dict[str, Any] | None,
+    bounty_source_invariants: dict[str, Any] | None,
+    bounty_readiness_rollup: dict[str, Any] | None,
+) -> dict[str, Any]:
+    workorders = (
+        bounty_evidence_workorders.get("workorders", [])
+        if isinstance(bounty_evidence_workorders, dict)
+        and isinstance(bounty_evidence_workorders.get("workorders"), list)
+        else []
+    )
+    invariant_rows = (
+        bounty_source_invariants.get("source_invariant_rows", [])
+        if isinstance(bounty_source_invariants, dict)
+        and isinstance(bounty_source_invariants.get("source_invariant_rows"), list)
+        else []
+    )
+    invariant_by_workorder = {
+        str(row.get("workorder_id")): row
+        for row in invariant_rows
+        if isinstance(row, dict) and row.get("workorder_id")
+    }
+    rollup_rows = (
+        bounty_readiness_rollup.get("lane_rollups", [])
+        if isinstance(bounty_readiness_rollup, dict) and isinstance(bounty_readiness_rollup.get("lane_rollups"), list)
+        else []
+    )
+    rollup_by_gate = {
+        str(row.get("gate_id")): row
+        for row in rollup_rows
+        if isinstance(row, dict) and row.get("gate_id")
+    }
+    decisions = []
+    for workorder in workorders:
+        if not isinstance(workorder, dict):
+            continue
+        lane = str(workorder.get("lane") or "unknown")
+        invariant = invariant_by_workorder.get(str(workorder.get("id") or ""), {})
+        rollup_row = rollup_by_gate.get(str(workorder.get("gate_id") or ""), {})
+        decision, reason, close_condition = bounty_lane_priority_decision(
+            lane,
+            str(invariant.get("status") or ""),
+            workorder,
+        )
+        score = bounty_lane_priority_score(workorder, invariant)
+        template_commands = normalize_string_list(workorder.get("template_preview_commands"))
+        after_commands = normalize_string_list(workorder.get("after_evidence_validation_commands"))
+        decisions.append(
+            {
+                "id": f"LANE-PRIORITY-{safe_probe_id(str(workorder.get('id') or lane))}",
+                "workorder_id": workorder.get("id"),
+                "gate_id": workorder.get("gate_id"),
+                "lane": lane,
+                "entrypoint": workorder.get("entrypoint"),
+                "expected_severity": workorder.get("expected_severity"),
+                "decision": decision,
+                "score": score,
+                "reason": reason,
+                "close_or_park_condition": close_condition,
+                "source_status": invariant.get("status"),
+                "source_signal": invariant.get("source_signal"),
+                "source_invariants": normalize_string_list(invariant.get("source_invariants")),
+                "negative_controls": normalize_string_list(invariant.get("negative_controls"))[:6],
+                "official_evidence_missing": bool(workorder.get("official_evidence_missing")),
+                "operator_input_required": bool(workorder.get("operator_input_required")),
+                "invalid_if_reported_now": bool(workorder.get("invalid_if_reported_now")),
+                "evidence_distance": int(workorder.get("evidence_distance") or 0),
+                "readiness_status": rollup_row.get("readiness_status") or workorder.get("readiness_status"),
+                "first_blocker": workorder.get("first_blocker"),
+                "required_official_evidence_labels": normalize_string_list(workorder.get("required_official_evidence_labels")),
+                "recommended_preview_command": template_commands[0] if template_commands else workorder.get("recommended_preview_command"),
+                "after_evidence_validation_command": after_commands[0] if after_commands else "",
+                "reportability_boundary": workorder.get("reportability_boundary"),
+            }
+        )
+    decisions.sort(
+        key=lambda row: (
+            -int(row.get("score") or 0),
+            BOUNTY_FRONTIER_SEVERITY_RANK.get(str(row.get("expected_severity") or "info"), 9),
+            int(row.get("evidence_distance") or 99),
+            str(row.get("lane") or ""),
+            str(row.get("id") or ""),
+        )
+    )
+    decision_counts: dict[str, int] = {}
+    lane_counts: dict[str, int] = {}
+    for row in decisions:
+        increment_count(decision_counts, str(row.get("decision") or "unknown"))
+        increment_count(lane_counts, str(row.get("lane") or "unknown"))
+    pursue = [row for row in decisions if str(row.get("decision") or "").startswith("pursue")]
+    parked = [row for row in decisions if str(row.get("decision") or "").startswith("park")]
+    blocked = sum(1 for row in decisions if row.get("invalid_if_reported_now"))
+    status = (
+        "prioritized-bounty-lanes-with-official-evidence-blockers"
+        if decisions
+        else "no-bounty-lane-priorities"
+    )
+    top = decisions[0] if decisions else {}
+    commands = ordered_unique_strings(
+        [
+            str(row.get("recommended_preview_command") or "")
+            for row in decisions
+            if row.get("recommended_preview_command")
+        ]
+    )
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-lane-priorities-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "lanes": len(decisions),
+            "pursue": len(pursue),
+            "parked": len(parked),
+            "invalid_if_reported_now": blocked,
+            "top_lane": top.get("lane"),
+            "top_decision": top.get("decision"),
+            "top_score": top.get("score"),
+            "decision_counts": dict(sorted(decision_counts.items())),
+            "lane_counts": dict(sorted(lane_counts.items())),
+            "bounty_evidence_workorders_status": artifact_summary_status(bounty_evidence_workorders),
+            "bounty_source_invariants_status": artifact_summary_status(bounty_source_invariants),
+            "bounty_readiness_rollup_status": artifact_summary_status(bounty_readiness_rollup),
+        },
+        "lane_priorities": decisions,
+        "pursue_first": pursue[:4],
+        "parked_lanes": parked[:8],
+        "commands": commands[:12],
+        "reportability_rule": (
+            "Priority is a workflow decision, not evidence. A lane remains unreportable until official evidence, "
+            "lane validation, finding-gate, and adjudication all pass."
+        ),
+        "next_step": (
+            top.get("reason")
+            if top
+            else "Build bounty-evidence-workorders and bounty-source-invariants first."
+        ),
+        "safety": (
+            "Offline lane prioritization only. It reads local derived artifacts, sends no requests, calls no Burp tool, "
+            "starts no browser, creates no evidence sidecars, signs no wallet, and submits no transaction."
+        ),
+    }
+
+
 def build_provenance_invalidity_row(invalidity_review: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(invalidity_review, dict):
         return {}
@@ -26150,6 +26376,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     BOUNTY_READINESS_ROLLUP_ARTIFACT: "bounty-readiness-rollup",
     BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT: "bounty-evidence-workorders",
     BOUNTY_SOURCE_INVARIANTS_ARTIFACT: "bounty-source-invariants",
+    BOUNTY_LANE_PRIORITIES_ARTIFACT: "bounty-lane-priorities",
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
     TRANSACTION_EVIDENCE_READINESS_ARTIFACT: "transaction-evidence-readiness",
     OPERATOR_IMPACT_READINESS_ARTIFACT: "operator-impact-readiness",
@@ -26201,6 +26428,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "bounty-readiness-rollup",
     "bounty-evidence-workorders",
     "bounty-source-invariants",
+    "bounty-lane-priorities",
     "transaction-intent-boundary",
     "transaction-evidence-readiness",
     "operator-impact-readiness",
@@ -26237,6 +26465,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "bounty-readiness-rollup": "bounty-readiness-rollup --no-write",
     "bounty-evidence-workorders": "bounty-evidence-workorders --no-write",
     "bounty-source-invariants": "bounty-source-invariants --no-write",
+    "bounty-lane-priorities": "bounty-lane-priorities --no-write",
     "transaction-intent-boundary": "transaction-intent-boundary --no-write",
     "transaction-evidence-readiness": "transaction-evidence-readiness --no-write",
     "operator-impact-readiness": "operator-impact-readiness --no-write",
@@ -51320,6 +51549,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("bounty-readiness-rollup", "run_bounty_readiness_rollup"),
         refresh_expectation("bounty-evidence-workorders", "run_bounty_evidence_workorders"),
         refresh_expectation("bounty-source-invariants", "run_bounty_source_invariants"),
+        refresh_expectation("bounty-lane-priorities", "run_bounty_lane_priorities"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-intent-boundary", "run_transaction_intent_boundary"),
         refresh_expectation("transaction-evidence-readiness", "run_transaction_evidence_readiness"),
@@ -76182,6 +76412,147 @@ def run_bounty_source_invariants(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_or_load_bounty_source_invariants_for_run(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    source_root: Path,
+) -> dict[str, Any]:
+    invariants = load_optional_json(artifact_dir / BOUNTY_SOURCE_INVARIANTS_ARTIFACT)
+    if isinstance(invariants, dict):
+        return invariants
+    workorders = build_or_load_bounty_evidence_workorders_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    return build_bounty_source_invariants(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+        bounty_evidence_workorders=workorders,
+        transaction_flow_review=load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT),
+        rpc_proxy_parity_review=load_optional_json(artifact_dir / RPC_PROXY_PARITY_REVIEW_ARTIFACT),
+        rewrite_review=load_optional_json(artifact_dir / REWRITE_REVIEW_ARTIFACT),
+        route_inventory=load_optional_json(artifact_dir / ROUTE_INVENTORY_ARTIFACT),
+        secret_exposure_review=load_optional_json(artifact_dir / SECRET_EXPOSURE_REVIEW_ARTIFACT),
+        websocket_candidate_review=load_optional_json(artifact_dir / WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT),
+    )
+
+
+def run_bounty_lane_priorities(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    rollup = build_or_load_bounty_readiness_rollup_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    workorders = build_or_load_bounty_evidence_workorders_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    invariants = build_or_load_bounty_source_invariants_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    priorities = build_bounty_lane_priorities(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_evidence_workorders=workorders,
+        bounty_source_invariants=invariants,
+        bounty_readiness_rollup=rollup,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / BOUNTY_LANE_PRIORITIES_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(priorities))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-lane-priorities",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = priorities.get("summary", {}) if isinstance(priorities.get("summary"), dict) else {}
+    print(f"Bounty lane priorities: {priorities.get('status')}")
+    print(
+        "Priorities: "
+        f"lanes={summary.get('lanes', 0)} "
+        f"pursue={summary.get('pursue', 0)} "
+        f"parked={summary.get('parked', 0)} "
+        f"invalid_now={summary.get('invalid_if_reported_now', 0)} "
+        f"top={summary.get('top_lane') or '-'} "
+        f"decision={summary.get('top_decision') or '-'} "
+        f"score={summary.get('top_score') if summary.get('top_score') is not None else '-'}"
+    )
+    print(
+        "Inputs: "
+        f"workorders={summary.get('bounty_evidence_workorders_status') or '-'} "
+        f"invariants={summary.get('bounty_source_invariants_status') or '-'} "
+        f"rollup={summary.get('bounty_readiness_rollup_status') or '-'}"
+    )
+    print(f"Decisions: {json.dumps(summary.get('decision_counts', {}), sort_keys=True)}")
+    display_limit = max(0, int(args.top))
+    if getattr(args, "show_lanes", False):
+        print("Lane priorities:")
+        for row in (priorities.get("lane_priorities", []) or [])[:display_limit]:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('id')}: score={row.get('score')} {row.get('expected_severity')} "
+                f"lane={row.get('lane')} decision={row.get('decision')} "
+                f"distance={row.get('evidence_distance')} invalid_now={row.get('invalid_if_reported_now')}"
+            )
+            print(f"  reason={inline_summary_text(row.get('reason'), max_chars=300)}")
+            if getattr(args, "show_close_conditions", False):
+                print(f"  close_if={inline_summary_text(row.get('close_or_park_condition'), max_chars=300)}")
+            evidence = ", ".join(normalize_string_list(row.get("required_official_evidence_labels"))[:4])
+            if evidence:
+                print(f"  needs={inline_summary_text(evidence, max_chars=300)}")
+            if getattr(args, "show_commands", False):
+                command_text = row.get("recommended_preview_command")
+                if command_text:
+                    print(f"  command={inline_summary_text(command_text, max_chars=420)}")
+        remaining = len(priorities.get("lane_priorities", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more priority row(s); rerun without --no-write to write the full artifact")
+            else:
+                print(f"- {remaining} more priority row(s) in {output_path}")
+    if getattr(args, "show_commands", False) and not getattr(args, "show_lanes", False):
+        print("Commands:")
+        for command_text in normalize_string_list(priorities.get("commands"))[:display_limit]:
+            print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    print(f"Rule: {inline_summary_text(priorities.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(priorities.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and summary.get("pursue", 0) <= 0:
+        return 1
+    return 0
+
+
 def run_rpc_proxy_parity_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -79496,6 +79867,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless source invariants are sufficient for a promotable review path.",
     )
     bounty_source_invariants.set_defaults(func=run_bounty_source_invariants)
+
+    bounty_lane_priorities = sub.add_parser(
+        "bounty-lane-priorities",
+        help="Rank current bounty lanes by severity, source strength, evidence distance, and invalidity risk",
+    )
+    bounty_lane_priorities.add_argument(
+        "--output",
+        help=(
+            f"Where to write {BOUNTY_LANE_PRIORITIES_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{BOUNTY_LANE_PRIORITIES_ARTIFACT}."
+        ),
+    )
+    bounty_lane_priorities.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of priority rows or commands to print.",
+    )
+    bounty_lane_priorities.add_argument(
+        "--show-lanes",
+        action="store_true",
+        help="Print ranked lane priority rows.",
+    )
+    bounty_lane_priorities.add_argument(
+        "--show-close-conditions",
+        action="store_true",
+        help="Print close or park condition per lane.",
+    )
+    bounty_lane_priorities.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print safe offline preview commands for prioritized lanes.",
+    )
+    bounty_lane_priorities.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print bounty lane priorities only; do not write {BOUNTY_LANE_PRIORITIES_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    bounty_lane_priorities.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless at least one lane is worth pursuing from the current priority model.",
+    )
+    bounty_lane_priorities.set_defaults(func=run_bounty_lane_priorities)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
