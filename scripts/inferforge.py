@@ -166,6 +166,7 @@ BUILD_PROVENANCE_READINESS_ARTIFACT = "build-provenance-readiness.json"
 BOUNTY_FRONTIER_ARTIFACT = "bounty-frontier.json"
 BOUNTY_VALIDATION_GATES_ARTIFACT = "bounty-validation-gates.json"
 BOUNTY_INVALIDITY_REVIEW_ARTIFACT = "bounty-invalidity-review.json"
+BOUNTY_READINESS_ROLLUP_ARTIFACT = "bounty-readiness-rollup.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -282,6 +283,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     BOUNTY_FRONTIER_ARTIFACT,
     BOUNTY_VALIDATION_GATES_ARTIFACT,
     BOUNTY_INVALIDITY_REVIEW_ARTIFACT,
+    BOUNTY_READINESS_ROLLUP_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -23677,6 +23679,426 @@ def build_bounty_invalidity_review(
     }
 
 
+BOUNTY_READINESS_ARTIFACT_BY_LANE = {
+    "transaction-integrity": TRANSACTION_EVIDENCE_READINESS_ARTIFACT,
+    "credentialed-provider-impact": OPERATOR_IMPACT_READINESS_ARTIFACT,
+    "resource-control": OPERATOR_IMPACT_READINESS_ARTIFACT,
+    "websocket-header-trust": OPERATOR_IMPACT_READINESS_ARTIFACT,
+    "build-secret-exposure": BUILD_PROVENANCE_READINESS_ARTIFACT,
+    "sensitive-response-impact": RESPONSE_EVIDENCE_READINESS_ARTIFACT,
+}
+
+BOUNTY_READINESS_PREVIEW_SUBCOMMAND_BY_ARTIFACT = {
+    TRANSACTION_EVIDENCE_READINESS_ARTIFACT: (
+        "transaction-evidence-readiness --no-write --show-checks --show-next --show-commands --top 8"
+    ),
+    OPERATOR_IMPACT_READINESS_ARTIFACT: (
+        "operator-impact-readiness --no-write --show-checks --show-next --show-gates "
+        "--show-contracts --show-commands --top 8"
+    ),
+    BUILD_PROVENANCE_READINESS_ARTIFACT: (
+        "build-provenance-readiness --no-write --show-signals --show-checks --show-next --show-commands --top 8"
+    ),
+    RESPONSE_EVIDENCE_READINESS_ARTIFACT: (
+        "response-evidence-readiness --no-write --show-checks --show-next --show-package --show-commands --top 8"
+    ),
+}
+
+
+def bounty_readiness_artifact_for_lane(lane: str) -> str:
+    return BOUNTY_READINESS_ARTIFACT_BY_LANE.get(str(lane or ""), "")
+
+
+def bounty_readiness_preview_command(
+    *,
+    artifact_name: str,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> str:
+    subcommand = BOUNTY_READINESS_PREVIEW_SUBCOMMAND_BY_ARTIFACT.get(str(artifact_name or ""), "")
+    if not subcommand:
+        return ""
+    return validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile)
+
+
+def bounty_readiness_summary(doc: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(doc, dict):
+        return {}
+    summary = doc.get("summary")
+    return summary if isinstance(summary, dict) else {}
+
+
+def bounty_readiness_first_blocker(
+    *,
+    doc: dict[str, Any] | None,
+    artifact_name: str,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if isinstance(doc, dict):
+        first = doc.get("first_blocker")
+        if isinstance(first, dict):
+            return first
+        checks = doc.get("checks")
+        if isinstance(checks, list):
+            for check in checks:
+                if isinstance(check, dict) and check.get("status") != "passed":
+                    return check
+    command = bounty_readiness_preview_command(
+        artifact_name=artifact_name,
+        artifact_dir=artifact_dir,
+        profile=profile,
+    )
+    return {
+        "id": "readiness-artifact-missing",
+        "label": f"{artifact_name} is missing or unreadable.",
+        "status": "missing",
+        "evidence": {"readiness_artifact": repo_relative_or_absolute(artifact_dir / artifact_name)},
+        "next_step": (
+            f"Run {command} to create or refresh {artifact_name}."
+            if command
+            else f"Create or refresh {artifact_name}."
+        ),
+    }
+
+
+def bounty_readiness_waiting_count(doc: dict[str, Any] | None) -> int:
+    summary = bounty_readiness_summary(doc)
+    if "waiting_or_blocked" in summary:
+        return int(summary.get("waiting_or_blocked") or 0)
+    checks = doc.get("checks") if isinstance(doc, dict) else None
+    if isinstance(checks, list):
+        return sum(1 for check in checks if isinstance(check, dict) and check.get("status") != "passed")
+    return 1
+
+
+def bounty_readiness_passed_count(doc: dict[str, Any] | None) -> int:
+    summary = bounty_readiness_summary(doc)
+    if "passed" in summary:
+        return int(summary.get("passed") or 0)
+    checks = doc.get("checks") if isinstance(doc, dict) else None
+    if isinstance(checks, list):
+        return sum(1 for check in checks if isinstance(check, dict) and check.get("status") == "passed")
+    return 0
+
+
+def bounty_readiness_invalid_now(doc: dict[str, Any] | None) -> bool | None:
+    summary = bounty_readiness_summary(doc)
+    if "invalid_if_reported_now" in summary:
+        return bool(summary.get("invalid_if_reported_now"))
+    return None
+
+
+def bounty_readiness_invalidity_by_gate(invalidity_review: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    rows = (
+        invalidity_review.get("invalidity_rows", [])
+        if isinstance(invalidity_review, dict) and isinstance(invalidity_review.get("invalidity_rows"), list)
+        else []
+    )
+    return {
+        str(row.get("gate_id")): row
+        for row in rows
+        if isinstance(row, dict) and row.get("gate_id")
+    }
+
+
+def bounty_readiness_artifact_inputs(
+    *,
+    artifact_dir: Path,
+    readiness_artifacts: dict[str, dict[str, Any] | None],
+    profile: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    inputs: dict[str, dict[str, Any]] = {}
+    for artifact_name in sorted(set(BOUNTY_READINESS_ARTIFACT_BY_LANE.values())):
+        doc = readiness_artifacts.get(artifact_name)
+        blocker = bounty_readiness_first_blocker(
+            doc=doc,
+            artifact_name=artifact_name,
+            artifact_dir=artifact_dir,
+            profile=profile,
+        )
+        inputs[artifact_name] = {
+            "path": repo_relative_or_absolute(artifact_dir / artifact_name),
+            "file_status": artifact_file_status(artifact_dir, artifact_name),
+            "status": artifact_summary_status(doc),
+            "waiting_or_blocked": bounty_readiness_waiting_count(doc),
+            "passed": bounty_readiness_passed_count(doc),
+            "first_blocker": {
+                "id": blocker.get("id"),
+                "status": blocker.get("status"),
+                "next_step": blocker.get("next_step"),
+            },
+            "preview_command": bounty_readiness_preview_command(
+                artifact_name=artifact_name,
+                artifact_dir=artifact_dir,
+                profile=profile,
+            ),
+        }
+    return inputs
+
+
+def bounty_readiness_gate_row(
+    *,
+    gate: dict[str, Any],
+    readiness_artifacts: dict[str, dict[str, Any] | None],
+    invalidity_by_gate: dict[str, dict[str, Any]],
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    lane = str(gate.get("bounty_lane") or "unknown")
+    artifact_name = bounty_readiness_artifact_for_lane(lane)
+    readiness_doc = readiness_artifacts.get(artifact_name)
+    readiness_status = artifact_summary_status(readiness_doc)
+    readiness_summary = bounty_readiness_summary(readiness_doc)
+    first_blocker = bounty_readiness_first_blocker(
+        doc=readiness_doc,
+        artifact_name=artifact_name,
+        artifact_dir=artifact_dir,
+        profile=profile,
+    )
+    invalidity_row = invalidity_by_gate.get(str(gate.get("id") or ""), {})
+    gate_commands = normalize_string_list(gate.get("validation_commands"))
+    readiness_commands = normalize_string_list(readiness_doc.get("commands") if isinstance(readiness_doc, dict) else None)
+    invalidity_commands = normalize_string_list(invalidity_row.get("validation_commands"))
+    preview_command = bounty_readiness_preview_command(
+        artifact_name=artifact_name,
+        artifact_dir=artifact_dir,
+        profile=profile,
+    )
+    commands = ordered_unique_strings(
+        [
+            *readiness_commands,
+            preview_command,
+            *invalidity_commands,
+            *gate_commands,
+            validation_command_for_artifact_dir(artifact_dir, "bounty-validation-gates --no-write --show-gates", profile=profile),
+            validation_command_for_artifact_dir(artifact_dir, "bounty-invalidity-review --no-write --show-reasons", profile=profile),
+            validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+        ]
+    )
+    evidence_labels = bounty_validation_evidence_labels(gate.get("required_official_evidence"), limit=16)
+    official_missing = int(gate.get("missing_or_invalid_evidence_count") or 0)
+    if evidence_labels and official_missing <= 0:
+        official_missing = len(evidence_labels)
+    readiness_waiting = bounty_readiness_waiting_count(readiness_doc)
+    invalid_now = bool(
+        invalidity_row.get("invalid_if_reported_now")
+        if invalidity_row
+        else not bool(gate.get("reportable_now"))
+    )
+    next_step = (
+        first_blocker.get("next_step")
+        or invalidity_row.get("minimum_fix")
+        or gate.get("validation_method")
+        or "Rerun bounty validation gates and adjudication."
+    )
+    return {
+        "gate_id": gate.get("id"),
+        "frontier_id": gate.get("frontier_id"),
+        "claim_id": gate.get("claim_id"),
+        "entrypoint": gate.get("entrypoint"),
+        "lane": lane,
+        "expected_severity": gate.get("expected_severity"),
+        "gate_status": gate.get("gate_status"),
+        "gate_type": gate.get("gate_type"),
+        "readiness_artifact": artifact_name,
+        "readiness_artifact_status": artifact_file_status(artifact_dir, artifact_name) if artifact_name else "missing",
+        "readiness_status": readiness_status,
+        "readiness_waiting_or_blocked": readiness_waiting,
+        "readiness_passed": bounty_readiness_passed_count(readiness_doc),
+        "readiness_invalid_if_reported_now": bounty_readiness_invalid_now(readiness_doc),
+        "first_blocker_id": first_blocker.get("id"),
+        "first_blocker_status": first_blocker.get("status"),
+        "first_blocker_next_step": first_blocker.get("next_step"),
+        "official_evidence_missing_count": official_missing,
+        "required_official_evidence": normalize_string_list(gate.get("required_official_evidence")),
+        "required_official_evidence_labels": evidence_labels,
+        "invalid_if_reported_now": invalid_now,
+        "invalidity_category": invalidity_row.get("primary_invalidity_category"),
+        "invalidity_categories": normalize_string_list(invalidity_row.get("invalidity_categories")),
+        "minimum_fix": invalidity_row.get("minimum_fix") or bounty_invalidity_minimum_fix(gate),
+        "recommended_command": commands[0] if commands else "",
+        "validation_commands": commands[:8],
+        "evidence_distance": official_missing + readiness_waiting,
+        "readiness_summary": {
+            key: readiness_summary.get(key)
+            for key in sorted(readiness_summary)
+            if key
+            in {
+                "checks",
+                "passed",
+                "waiting_or_blocked",
+                "invalid_if_reported_now",
+                "payload_candidates",
+                "policy_valid",
+                "ready_for_decode",
+                "decoded_transactions",
+                "operator_gates",
+                "waiting_operator_gates",
+                "missing_required_decisions",
+                "static_signals",
+                "official_evidence_ready",
+                "sidecar_status",
+                "sidecar_file_status",
+                "approved_rows",
+                "candidate_impact_observations",
+            }
+        },
+        "next_step": next_step,
+        "reportability_boundary": gate.get("validity_boundary")
+        or invalidity_row.get("reportability_boundary")
+        or "This rollup row is not a finding.",
+    }
+
+
+def build_bounty_readiness_rollup(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    bounty_validation_gates: dict[str, Any] | None,
+    bounty_invalidity_review: dict[str, Any] | None,
+    adjudication: dict[str, Any] | None,
+    readiness_artifacts: dict[str, dict[str, Any] | None],
+) -> dict[str, Any]:
+    gates = (
+        bounty_validation_gates.get("gates", [])
+        if isinstance(bounty_validation_gates, dict) and isinstance(bounty_validation_gates.get("gates"), list)
+        else []
+    )
+    invalidity_by_gate = bounty_readiness_invalidity_by_gate(bounty_invalidity_review)
+    rows = [
+        bounty_readiness_gate_row(
+            gate=gate,
+            readiness_artifacts=readiness_artifacts,
+            invalidity_by_gate=invalidity_by_gate,
+            artifact_dir=artifact_dir,
+            profile=profile,
+        )
+        for gate in gates
+        if isinstance(gate, dict)
+    ]
+    rows.sort(
+        key=lambda item: (
+            BOUNTY_FRONTIER_SEVERITY_RANK.get(str(item.get("expected_severity") or "info"), 9),
+            int(item.get("evidence_distance") or 99),
+            BOUNTY_INVALIDITY_CATEGORY_RANK.get(str(item.get("invalidity_category") or ""), 99),
+            str(item.get("lane") or ""),
+            str(item.get("gate_id") or ""),
+        )
+    )
+    shortest_rows = sorted(
+        rows,
+        key=lambda item: (
+            int(item.get("evidence_distance") or 99),
+            int(item.get("official_evidence_missing_count") or 99),
+            BOUNTY_FRONTIER_SEVERITY_RANK.get(str(item.get("expected_severity") or "info"), 9),
+            str(item.get("lane") or ""),
+            str(item.get("gate_id") or ""),
+        ),
+    )
+    lane_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    readiness_status_counts: dict[str, int] = {}
+    for row in rows:
+        increment_count(lane_counts, str(row.get("lane") or "unknown"))
+        increment_count(status_counts, str(row.get("gate_status") or "unknown"))
+        increment_count(readiness_status_counts, str(row.get("readiness_status") or "unknown"))
+    reportable_now = sum(1 for row in rows if str(row.get("gate_status") or "") == "reportable-needs-final-adjudication")
+    ready = sum(1 for row in rows if str(row.get("gate_status") or "") in {"ready-for-finding-gate-review", "ready-for-validation"})
+    blocked = sum(1 for row in rows if str(row.get("gate_status") or "").startswith("blocked"))
+    invalid_now = sum(1 for row in rows if row.get("invalid_if_reported_now"))
+    readiness_inputs = bounty_readiness_artifact_inputs(
+        artifact_dir=artifact_dir,
+        readiness_artifacts=readiness_artifacts,
+        profile=profile,
+    )
+    official_evidence_missing = ordered_unique_strings(
+        [
+            evidence
+            for row in rows
+            if row.get("invalid_if_reported_now")
+            for evidence in normalize_string_list(row.get("required_official_evidence_labels"))
+        ]
+    )
+    missing_readiness_artifacts = [
+        artifact_name
+        for artifact_name, meta in readiness_inputs.items()
+        if meta.get("file_status") != "present"
+    ]
+    if reportable_now:
+        status = "reportable-readiness-present"
+    elif ready:
+        status = "ready-validation-gate-present"
+    elif rows:
+        status = "blocked-missing-official-evidence"
+    else:
+        status = "no-bounty-readiness-gates"
+    top_row = rows[0] if rows else {}
+    shortest_row = shortest_rows[0] if shortest_rows else {}
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-readiness-rollup-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "methodology": {
+            "greybox": "Coverage remains visible, but dangerous lanes do not become findings without official evidence.",
+            "blackbox": "Rank the shortest path to one valid Medium+ report while rejecting static, draft, and environment-only proofs.",
+            "finder_triager_split": "Readiness rows summarize allegations and blockers; adjudication is still the reportability authority.",
+        },
+        "summary": {
+            "gates": len(rows),
+            "ready": ready,
+            "blocked": blocked,
+            "reportable_now": reportable_now,
+            "invalid_if_reported_now": invalid_now,
+            "readiness_artifacts": len(readiness_inputs),
+            "readiness_artifacts_present": sum(1 for meta in readiness_inputs.values() if meta.get("file_status") == "present"),
+            "missing_readiness_artifacts": missing_readiness_artifacts,
+            "official_evidence_missing": official_evidence_missing,
+            "lane_counts": dict(sorted(lane_counts.items())),
+            "gate_status_counts": dict(sorted(status_counts.items())),
+            "readiness_status_counts": dict(sorted(readiness_status_counts.items())),
+            "top_lane": top_row.get("lane"),
+            "top_gate": top_row.get("gate_id"),
+            "top_readiness_status": top_row.get("readiness_status"),
+            "top_first_blocker": top_row.get("first_blocker_id"),
+            "shortest_lane": shortest_row.get("lane"),
+            "shortest_gate": shortest_row.get("gate_id"),
+            "shortest_evidence_distance": shortest_row.get("evidence_distance"),
+            "bounty_validation_gates_status": artifact_summary_status(bounty_validation_gates),
+            "bounty_invalidity_review_status": artifact_summary_status(bounty_invalidity_review),
+            "adjudication_status": artifact_summary_status(adjudication),
+        },
+        "readiness_inputs": readiness_inputs,
+        "lane_rollups": rows,
+        "shortest_evidence_lanes": shortest_rows[:8],
+        "invalid_if_reported_now_lanes": [row for row in rows if row.get("invalid_if_reported_now")][:8],
+        "commands": ordered_unique_strings(
+            [
+                row.get("recommended_command")
+                for row in rows
+                if row.get("recommended_command")
+            ]
+        )[:12],
+        "reportability_rule": (
+            "This rollup is not evidence and must not promote a Medium+ finding. A lane becomes reportable only after "
+            "the required official evidence exists, lane validation passes, finding-gate accepts impact, and adjudication agrees."
+        ),
+        "next_step": (
+            top_row.get("next_step")
+            if top_row
+            else "Build bounty-validation-gates and the lane readiness artifacts first."
+        ),
+        "safety": (
+            "Offline rollup only. It reads local JSON artifacts, sends no target traffic, calls no Burp tool, starts no browser, "
+            "signs no wallet, submits no transaction, and creates no official evidence sidecars."
+        ),
+    }
+
+
 def build_provenance_invalidity_row(invalidity_review: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(invalidity_review, dict):
         return {}
@@ -24997,6 +25419,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     BOUNTY_FRONTIER_ARTIFACT: "bounty-frontier",
     BOUNTY_VALIDATION_GATES_ARTIFACT: "bounty-validation-gates",
     BOUNTY_INVALIDITY_REVIEW_ARTIFACT: "bounty-invalidity-review",
+    BOUNTY_READINESS_ROLLUP_ARTIFACT: "bounty-readiness-rollup",
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
     TRANSACTION_EVIDENCE_READINESS_ARTIFACT: "transaction-evidence-readiness",
     OPERATOR_IMPACT_READINESS_ARTIFACT: "operator-impact-readiness",
@@ -25045,6 +25468,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "bounty-frontier",
     "bounty-validation-gates",
     "bounty-invalidity-review",
+    "bounty-readiness-rollup",
     "transaction-intent-boundary",
     "transaction-evidence-readiness",
     "operator-impact-readiness",
@@ -25078,6 +25502,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "bounty-frontier": "bounty-frontier --no-write",
     "bounty-validation-gates": "bounty-validation-gates --no-write",
     "bounty-invalidity-review": "bounty-invalidity-review --no-write",
+    "bounty-readiness-rollup": "bounty-readiness-rollup --no-write",
     "transaction-intent-boundary": "transaction-intent-boundary --no-write",
     "transaction-evidence-readiness": "transaction-evidence-readiness --no-write",
     "operator-impact-readiness": "operator-impact-readiness --no-write",
@@ -50158,6 +50583,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("bounty-frontier", "run_bounty_frontier"),
         refresh_expectation("bounty-validation-gates", "run_bounty_validation_gates"),
         refresh_expectation("bounty-invalidity-review", "run_bounty_invalidity_review"),
+        refresh_expectation("bounty-readiness-rollup", "run_bounty_readiness_rollup"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-intent-boundary", "run_transaction_intent_boundary"),
         refresh_expectation("transaction-evidence-readiness", "run_transaction_evidence_readiness"),
@@ -74611,6 +75037,134 @@ def run_bounty_invalidity_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_bounty_readiness_rollup(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    gates = build_or_load_bounty_validation_gates_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    adjudication = load_optional_json(artifact_dir / "adjudication.json")
+    invalidity_review = load_optional_json(artifact_dir / BOUNTY_INVALIDITY_REVIEW_ARTIFACT)
+    if not isinstance(invalidity_review, dict):
+        invalidity_review = build_bounty_invalidity_review(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            bounty_validation_gates=gates,
+            adjudication=adjudication,
+        )
+    readiness_artifacts = {
+        artifact_name: load_optional_json(artifact_dir / artifact_name)
+        for artifact_name in sorted(set(BOUNTY_READINESS_ARTIFACT_BY_LANE.values()))
+    }
+    rollup = build_bounty_readiness_rollup(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_validation_gates=gates,
+        bounty_invalidity_review=invalidity_review,
+        adjudication=adjudication,
+        readiness_artifacts=readiness_artifacts,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / BOUNTY_READINESS_ROLLUP_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(rollup))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-readiness-rollup",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = rollup.get("summary", {}) if isinstance(rollup.get("summary"), dict) else {}
+    print(f"Bounty readiness rollup: {rollup.get('status')}")
+    print(
+        "Rollup: "
+        f"gates={summary.get('gates', 0)} "
+        f"ready={summary.get('ready', 0)} "
+        f"blocked={summary.get('blocked', 0)} "
+        f"reportable={summary.get('reportable_now', 0)} "
+        f"invalid_now={summary.get('invalid_if_reported_now', 0)} "
+        f"readiness={summary.get('readiness_artifacts_present', 0)}/{summary.get('readiness_artifacts', 0)}"
+    )
+    print(
+        "Inputs: "
+        f"gates={summary.get('bounty_validation_gates_status') or '-'} "
+        f"invalidity={summary.get('bounty_invalidity_review_status') or '-'} "
+        f"adjudication={summary.get('adjudication_status') or '-'}"
+    )
+    print(
+        "Top lane: "
+        f"{summary.get('top_lane') or '-'} "
+        f"gate={summary.get('top_gate') or '-'} "
+        f"status={summary.get('top_readiness_status') or '-'} "
+        f"first_blocker={summary.get('top_first_blocker') or '-'}"
+    )
+    print(
+        "Shortest evidence: "
+        f"{summary.get('shortest_lane') or '-'} "
+        f"gate={summary.get('shortest_gate') or '-'} "
+        f"distance={summary.get('shortest_evidence_distance') if summary.get('shortest_evidence_distance') is not None else '-'}"
+    )
+    missing = normalize_string_list(summary.get("official_evidence_missing"))
+    if missing:
+        print("Missing official evidence: " + ", ".join(missing[: max(1, min(8, int(args.top)))]))
+    if getattr(args, "show_lanes", False):
+        display_limit = max(0, int(args.top))
+        print("Lanes:")
+        for row in (rollup.get("lane_rollups", []) or [])[:display_limit]:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('gate_id')}: {row.get('expected_severity')} "
+                f"lane={row.get('lane')} gate={row.get('gate_status')} "
+                f"readiness={row.get('readiness_status')} blocker={row.get('first_blocker_id')} "
+                f"invalid_now={row.get('invalid_if_reported_now')} distance={row.get('evidence_distance')}"
+            )
+            evidence = ", ".join(normalize_string_list(row.get("required_official_evidence_labels"))[:4])
+            if evidence:
+                print(f"  needs={inline_summary_text(evidence, max_chars=300)}")
+            if getattr(args, "show_next", False):
+                print(f"  next={inline_summary_text(row.get('next_step'), max_chars=320)}")
+        remaining = len(rollup.get("lane_rollups", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more lane(s); rerun without --no-write to write the full artifact")
+            else:
+                print(f"- {remaining} more lane(s) in {output_path}")
+    if getattr(args, "show_next", False) and not getattr(args, "show_lanes", False):
+        print(f"Next: {inline_summary_text(rollup.get('next_step'), max_chars=360)}")
+    if getattr(args, "show_commands", False):
+        print("Commands:")
+        for command_text in normalize_string_list(rollup.get("commands"))[: max(0, int(args.top))]:
+            print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    print(f"Rule: {inline_summary_text(rollup.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(rollup.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and rollup.get("status") not in {
+        "reportable-readiness-present",
+        "ready-validation-gate-present",
+    }:
+        return 1
+    return 0
+
+
 def run_rpc_proxy_parity_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -77767,6 +78321,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero when any current Medium+ frontier would be invalid if reported now.",
     )
     bounty_invalidity_review.set_defaults(func=run_bounty_invalidity_review)
+
+    bounty_readiness_rollup = sub.add_parser(
+        "bounty-readiness-rollup",
+        help="Roll up validation gates, invalidity, adjudication, and lane readiness into one bounty evidence view",
+    )
+    bounty_readiness_rollup.add_argument(
+        "--output",
+        help=(
+            f"Where to write {BOUNTY_READINESS_ROLLUP_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{BOUNTY_READINESS_ROLLUP_ARTIFACT}."
+        ),
+    )
+    bounty_readiness_rollup.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of lane rows or commands to print.",
+    )
+    bounty_readiness_rollup.add_argument(
+        "--show-lanes",
+        action="store_true",
+        help="Print ranked lane readiness rows with blockers and required official evidence.",
+    )
+    bounty_readiness_rollup.add_argument(
+        "--show-next",
+        action="store_true",
+        help="Print next action per lane or for the top lane.",
+    )
+    bounty_readiness_rollup.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print safe offline follow-up commands for the current top lanes.",
+    )
+    bounty_readiness_rollup.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print bounty readiness rollup only; do not write {BOUNTY_READINESS_ROLLUP_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    bounty_readiness_rollup.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless a lane is ready for validation or final reportability review.",
+    )
+    bounty_readiness_rollup.set_defaults(func=run_bounty_readiness_rollup)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
