@@ -306,7 +306,10 @@ options, missing evidence, blockers, and safe offline commands for each
 Medium/High/Critical thread. For RPC resource-abuse leads, `--show-evidence`
 also prints the evidence contract id, required operator decisions, and the first
 reportability gates so the next step is an evidence closure rather than a broad
-audit:
+audit. Each lead also prints a strict validation checklist status for scope,
+attacker control, concrete impact, minimal evidence, safe reproduction,
+counter-evidence, and severity/report path; the lead stays blocked before
+finding gate until all seven questions are satisfied:
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \

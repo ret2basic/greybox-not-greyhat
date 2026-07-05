@@ -10971,6 +10971,141 @@ def lead_dossier_evidence_contract(thread: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def lead_dossier_strict_validation_checklist(
+    thread: dict[str, Any],
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    closure = thread.get("evidence_closure") if isinstance(thread.get("evidence_closure"), dict) else {}
+    poc_plan = thread.get("minimal_poc_plan") if isinstance(thread.get("minimal_poc_plan"), dict) else {}
+    evidence_contract = lead_dossier_evidence_contract(thread)
+    path_options = lead_dossier_path_options(thread)
+    code_refs = lead_dossier_code_refs(thread, limit=8)
+    missing_requirements = [str(item) for item in closure.get("missing_requirements", []) or []]
+    next_commands = [
+        ref
+        for ref in (closure.get("next_safe_commands", []) or [])
+        if isinstance(ref, dict)
+    ]
+    command_safety = command_safety_summary(next_commands)
+    forbidden = normalize_string_list((thread.get("forbidden", []) or []))
+    reportability_gate = str(thread.get("reportability_gate") or "")
+    scope_status = "passed"
+    if str(thread.get("status") or "").startswith("needs-scope"):
+        scope_status = "waiting"
+    elif not path_options or not str(thread.get("host") or "").strip():
+        scope_status = "waiting"
+    evidence_status = "passed" if not missing_requirements else "waiting"
+    gate_ready = bool(closure.get("gate_ready"))
+    impact_status = "passed" if gate_ready else "waiting"
+    safe_command_status = "passed" if command_safety.get("unsafe_template_count", 0) == 0 else "failed"
+    if command_safety.get("blocked_external", 0):
+        safe_command_status = "waiting"
+    poc_status = str(poc_plan.get("status") or "")
+    reproduction_status = "passed" if poc_status in {"ready-for-finding-gate-review", "ready"} or gate_ready else "waiting"
+    if safe_command_status != "passed":
+        reproduction_status = safe_command_status
+    contract_status = "passed" if evidence_contract else "waiting"
+    severity_status = "passed" if gate_ready and str(thread.get("priority") or "") in {"critical", "high", "medium"} else "waiting"
+    questions = [
+        methodology_requirement(
+            "scope-authorized",
+            scope_status,
+            {
+                "target": target,
+                "profile": profile_summary(profile),
+                "host": thread.get("host"),
+                "path_options": path_options[:3],
+            },
+            "Keep the host and exact endpoint inside the reviewed profile/scope before any validation traffic.",
+        ),
+        methodology_requirement(
+            "attacker-control-defined",
+            "passed" if thread.get("validation_question") and path_options else "waiting",
+            {
+                "validation_question": thread.get("validation_question"),
+                "business_logic_tests": business_logic_tests_for_hypothesis(thread),
+            },
+            "State the attacker-controlled request field, route, or workflow boundary before testing.",
+        ),
+        methodology_requirement(
+            "concrete-impact-evidence",
+            impact_status,
+            {
+                "impact": thread.get("impact"),
+                "reportability_gate": reportability_gate,
+                "gate_ready": gate_ready,
+            },
+            "Do not enter finding-gate until concrete user, funds, quota, availability, or sensitive-data impact is evidenced.",
+        ),
+        methodology_requirement(
+            "fresh-minimal-evidence-package",
+            evidence_status,
+            {
+                "missing_requirements": missing_requirements,
+                "artifact_statuses": closure.get("artifact_statuses", {}),
+                "code_refs": code_refs[:4],
+            },
+            "Collect the smallest current evidence package that satisfies every missing requirement.",
+        ),
+        methodology_requirement(
+            "safe-reproducible-next-step",
+            reproduction_status,
+            {
+                "minimal_poc_status": poc_status or "missing",
+                "next_commands": [ref.get("command") for ref in next_commands[:3]],
+                "command_safety": command_safety,
+            },
+            "Keep reproduction offline or single-approved-request only; rerun resource gates before active traffic.",
+        ),
+        methodology_requirement(
+            "counter-evidence-reviewed",
+            contract_status,
+            {
+                "evidence_contract": evidence_contract.get("id") or "missing",
+                "not_reportable_when": (evidence_contract.get("not_reportable_when", []) or [])[:3],
+            },
+            "Review not-reportable cases and counter-evidence before escalating a lead.",
+        ),
+        methodology_requirement(
+            "severity-and-report-path-ready",
+            severity_status,
+            {
+                "priority": thread.get("priority"),
+                "finding_gate_entry_condition": closure.get("finding_gate_entry_condition"),
+                "forbidden": forbidden[:5],
+            },
+            "Only report Medium/High/Critical after finding-gate and adjudication accept the evidence and severity.",
+        ),
+    ]
+    blocking_questions = [
+        str(item.get("id"))
+        for item in questions
+        if item.get("status") not in {"passed", "ready-offline", "ready-after-resource-check"}
+    ]
+    status = "ready-for-finding-gate-review" if not blocking_questions else "blocked-before-finding-gate"
+    return {
+        "id": "strict-finding-validation-checklist",
+        "status": status,
+        "questions": questions,
+        "blocking_questions": blocking_questions,
+        "passed": len(questions) - len(blocking_questions),
+        "total": len(questions),
+        "source_alignment": [
+            "scope-first",
+            "real-impact-only",
+            "validate-before-report",
+            "minimal-reproduction",
+            "counter-evidence-review",
+        ],
+        "safety": (
+            "Offline validation checklist only. It does not send requests, read raw Burp history, "
+            "run scanners, sign wallets, submit transactions, or mutate state."
+        ),
+    }
+
+
 def build_lead_dossier(
     *,
     target: str,
@@ -11032,6 +11167,11 @@ def build_lead_dossier(
                 "path_options": lead_dossier_path_options(thread),
                 "business_logic_tests": lead_dossier_business_tests(business_logic_map, thread.get("id")),
                 "evidence_contract": lead_dossier_evidence_contract(thread),
+                "strict_validation": lead_dossier_strict_validation_checklist(
+                    thread,
+                    target=target,
+                    profile=profile,
+                ),
                 "current_blocker": thread.get("current_blocker"),
                 "required_evidence": thread.get("required_evidence", []),
                 "missing_requirements": closure.get("missing_requirements", []) if closure else [],
@@ -36899,6 +37039,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 lead_dossier_return_code == 0
                 and "Lead dossier:" in lead_dossier_stdout_text
                 and "Leads:" in lead_dossier_stdout_text
+                and "strict_validation=blocked-before-finding-gate" in lead_dossier_stdout_text
+                and "question=waiting concrete-impact-evidence" in lead_dossier_stdout_text
                 and "No files written (--no-write)." in lead_dossier_stdout
                 and not any(
                     output_paths[key]
@@ -52905,6 +53047,25 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
                 )
                 for gate in (evidence_contract.get("reportable_only_if", []) or [])[:2]:
                     print(f"    gate={inline_summary_text(gate, max_chars=260)}")
+            strict_validation = (
+                lead.get("strict_validation")
+                if isinstance(lead.get("strict_validation"), dict)
+                else {}
+            )
+            if strict_validation:
+                print(
+                    "    strict_validation="
+                    f"{strict_validation.get('status')} "
+                    f"passed={strict_validation.get('passed', 0)}/{strict_validation.get('total', 0)} "
+                    f"blocking={','.join(str(item) for item in (strict_validation.get('blocking_questions', []) or [])[:4]) or 'none'}"
+                )
+                for question in (strict_validation.get("questions", []) or [])[:3]:
+                    if isinstance(question, dict) and question.get("status") != "passed":
+                        print(
+                            "    question="
+                            f"{question.get('status')} {question.get('id')} "
+                            f"next={inline_summary_text(question.get('next_step'), max_chars=220)}"
+                        )
         if args.show_commands:
             command_ref = lead.get("next_offline_command") if isinstance(lead.get("next_offline_command"), dict) else None
             if command_ref:
