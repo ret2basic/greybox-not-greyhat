@@ -19749,6 +19749,11 @@ def build_transaction_sidecar_review(
         artifact_dir,
         max_input_bytes=max_input_bytes,
     )
+    payload_shape_review = build_transaction_payload_shape_review(
+        artifact_dir,
+        profile,
+        max_input_bytes=max_input_bytes,
+    )
     present_payload_files = [row for row in payload_files if row.get("status") == "present"]
     oversized_payload_files = [row for row in payload_files if row.get("status") == "too-large"]
 
@@ -19832,6 +19837,16 @@ def build_transaction_sidecar_review(
         next_step = "Write transaction-intent-policy.json for the approved direction, wallet, amountIn, mints, and reviewed allowedPrograms."
     elif candidates:
         next_step = "Fix transaction-intent-policy.json, then rerun transaction-sidecar-review."
+    elif present_payload_files and payload_shape_review.get("status") == "evm-payloads-indexed":
+        next_step = (
+            "The sidecar contains EVM executable payloads, not Solana base64 transactions. "
+            "Capture the Solana quote response for this target flow or add an explicit decoder for this payload family."
+        )
+    elif present_payload_files and payload_shape_review.get("status") == "needs-candidate-path-review":
+        next_step = (
+            "The sidecar has transaction-shaped payload fields outside the configured extraction paths. "
+            "Review payload_shape_review.files[].records and update quote_response.transaction_candidate_paths if appropriate."
+        )
     elif present_payload_files:
         next_step = (
             "Fix the payload sidecar shape; no base64 transaction candidates were extracted. "
@@ -19853,9 +19868,11 @@ def build_transaction_sidecar_review(
             "intent_policy_configured": bool(policy.get("configured")),
             "intent_policy_valid": bool(policy.get("valid")),
             "ready_for_decode": ready_for_decode,
+            "payload_shape_status": payload_shape_review.get("status"),
             "warnings": len(warnings),
         },
         "payload_shape_guidance": payload_shape_guidance,
+        "payload_shape_review": payload_shape_review,
         "payload_sidecars": payload_files,
         "intent_policy_sidecar": {
             "path": repo_relative_or_absolute(policy_path),
@@ -33391,6 +33408,213 @@ def extract_transaction_candidates_from_burp_items(
     }
 
 
+def add_payload_shape_record(
+    records: list[dict[str, Any]],
+    *,
+    kind: str,
+    json_path: str,
+    provider: Any = None,
+    payload_type: Any = None,
+    chain: Any = None,
+    reason: str,
+) -> None:
+    records.append(
+        {
+            "kind": kind,
+            "json_path": json_path,
+            "provider": str(provider) if provider is not None else None,
+            "payload_type": str(payload_type) if payload_type is not None else None,
+            "chain": str(chain) if chain is not None else None,
+            "reason": reason,
+        }
+    )
+
+
+def walk_quote_payload_shapes(value: Any, *, json_path: str, records: list[dict[str, Any]]) -> None:
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            walk_quote_payload_shapes(item, json_path=f"{json_path}[{index}]", records=records)
+        return
+    if not isinstance(value, dict):
+        return
+
+    payloads = value.get("payloads")
+    if isinstance(payloads, list):
+        add_payload_shape_record(
+            records,
+            kind="quote-payload-list",
+            json_path=f"{json_path}.payloads",
+            reason=f"{len(payloads)} payload item(s)",
+        )
+
+    data = value.get("data")
+    provider = value.get("provider")
+    if isinstance(data, dict):
+        payload_type = data.get("type")
+        chain = data.get("chain")
+        if isinstance(data.get("transaction"), str):
+            add_payload_shape_record(
+                records,
+                kind="solana-transaction-payload",
+                json_path=f"{json_path}.data.transaction",
+                provider=provider,
+                payload_type=payload_type,
+                chain=chain,
+                reason="payload data contains a transaction string",
+            )
+        elif all(key in data for key in ["to", "data", "value"]) or str(payload_type).lower() == "evm":
+            add_payload_shape_record(
+                records,
+                kind="evm-executable-payload",
+                json_path=f"{json_path}.data",
+                provider=provider,
+                payload_type=payload_type,
+                chain=chain,
+                reason="payload data has EVM execution fields, not a Solana base64 transaction",
+            )
+        elif str(payload_type).lower() == "solana" or str(chain).lower() == "solana":
+            add_payload_shape_record(
+                records,
+                kind="solana-payload-without-transaction",
+                json_path=f"{json_path}.data",
+                provider=provider,
+                payload_type=payload_type,
+                chain=chain,
+                reason="payload is marked Solana but lacks data.transaction",
+            )
+        elif any(key in data for key in ["transactionBase64", "serializedTransaction", "instructions", "message"]):
+            add_payload_shape_record(
+                records,
+                kind="alternate-transaction-shaped-payload",
+                json_path=f"{json_path}.data",
+                provider=provider,
+                payload_type=payload_type,
+                chain=chain,
+                reason="payload has transaction-like fields outside configured extraction paths",
+            )
+
+    for key, child in value.items():
+        key_text = str(key)
+        child_path = f"{json_path}.{key_text}" if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key_text) else f"{json_path}[{json.dumps(key_text)}]"
+        walk_quote_payload_shapes(child, json_path=child_path, records=records)
+
+
+def payload_shape_status(records: list[dict[str, Any]], *, parsed_json: bool, base64_regex_hits: int = 0) -> str:
+    kinds = {str(record.get("kind") or "") for record in records}
+    if "solana-transaction-payload" in kinds:
+        return "solana-transaction-payload-indexed"
+    if "alternate-transaction-shaped-payload" in kinds or "solana-payload-without-transaction" in kinds:
+        return "transaction-shaped-payload-needs-path-review"
+    if "evm-executable-payload" in kinds:
+        return "evm-payloads-indexed"
+    if "quote-payload-list" in kinds:
+        return "payload-list-without-transaction"
+    if base64_regex_hits:
+        return "base64-text-candidate-like"
+    if parsed_json:
+        return "json-without-payloads"
+    return "non-json-without-base64-candidates"
+
+
+def inspect_transaction_payload_shape_text(text: str, *, source: str, candidate_paths: list[str]) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    configured_hits = 0
+    parsed_json = False
+    try:
+        parsed = json.loads(text) if text.strip() else None
+    except json.JSONDecodeError:
+        parsed = None
+    if parsed is not None:
+        parsed_json = True
+        for candidate_path in candidate_paths:
+            configured_hits += sum(
+                1
+                for _actual_path, candidate_value in select_simple_json_path_values(parsed, candidate_path)
+                if isinstance(candidate_value, str)
+            )
+        walk_quote_payload_shapes(parsed, json_path="$", records=records)
+    base64_regex_hits = len(BASE64_CANDIDATE_RE.findall(text)) if not parsed_json else 0
+    kind_counts: dict[str, int] = {}
+    for record in records:
+        increment_count(kind_counts, str(record.get("kind") or "unknown"))
+    return {
+        "source": source,
+        "status": payload_shape_status(records, parsed_json=parsed_json, base64_regex_hits=base64_regex_hits),
+        "parsed_json": parsed_json,
+        "configured_candidate_path_hits": configured_hits,
+        "base64_regex_hits": base64_regex_hits,
+        "kind_counts": dict(sorted(kind_counts.items())),
+        "records": records[:12],
+    }
+
+
+def build_transaction_payload_shape_review(
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    *,
+    max_input_bytes: int,
+) -> dict[str, Any]:
+    candidate_paths = quote_response_candidate_paths(profile)
+    files = []
+    status_counts: dict[str, int] = {}
+    kind_counts: dict[str, int] = {}
+    for path in transaction_payload_sidecar_paths(artifact_dir):
+        if not path.exists() or not path.is_file():
+            continue
+        skip_reason = transaction_candidate_input_skip_reason(path, max_input_bytes)
+        if skip_reason:
+            row = {
+                "source": path.name,
+                "status": "skipped-too-large",
+                "reason": skip_reason,
+            }
+        else:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as error:
+                row = {
+                    "source": path.name,
+                    "status": "read-failed",
+                    "error": redacted_error_summary(error),
+                }
+            else:
+                row = inspect_transaction_payload_shape_text(
+                    text,
+                    source=path.name,
+                    candidate_paths=candidate_paths,
+                )
+        files.append(row)
+        increment_count(status_counts, str(row.get("status") or "unknown"))
+        for kind, count in (row.get("kind_counts") or {}).items():
+            kind_counts[str(kind)] = kind_counts.get(str(kind), 0) + int(count or 0)
+
+    if status_counts.get("solana-transaction-payload-indexed") or status_counts.get("base64-text-candidate-like"):
+        status = "transaction-candidate-shape-indexed"
+    elif status_counts.get("transaction-shaped-payload-needs-path-review"):
+        status = "needs-candidate-path-review"
+    elif status_counts.get("evm-payloads-indexed"):
+        status = "evm-payloads-indexed"
+    elif files:
+        status = "no-transaction-payload-shape"
+    else:
+        status = "no-payload-sidecars"
+
+    return {
+        "status": status,
+        "summary": {
+            "files": len(files),
+            "status_counts": dict(sorted(status_counts.items())),
+            "kind_counts": dict(sorted(kind_counts.items())),
+        },
+        "files": files,
+        "candidate_paths": candidate_paths,
+        "safety": (
+            "Shape-only sidecar review. It records JSON paths and payload kinds, not transaction base64, raw HTTP, "
+            "private keys, signatures, or full response bodies."
+        ),
+    }
+
+
 def merge_transaction_candidate_docs(
     docs: list[dict[str, Any]],
     *,
@@ -34745,6 +34969,39 @@ def build_transaction_decoder_selftest(
             profile=profile,
             artifact_dir=empty_artifact_dir,
         )
+        evm_artifact_dir = Path(temp_dir) / "transaction-sidecar-evm"
+        evm_artifact_dir.mkdir()
+        write_json(
+            evm_artifact_dir / "transaction-payloads.json",
+            [
+                {
+                    "route": {
+                        "source": {"chain": "Ethereum", "address": "0x866A2BF4E572CbcF37D5071A7a58503Bfb36be1b"},
+                        "destination": {"chain": "Base", "address": "0x866A2BF4E572CbcF37D5071A7a58503Bfb36be1b"},
+                    },
+                    "amountIn": "1000000",
+                    "payloads": [
+                        {
+                            "provider": "m-wormhole-portal",
+                            "annotation": "Bridge M from Ethereum to Base",
+                            "data": {
+                                "type": "evm",
+                                "chain": "Ethereum",
+                                "chainId": 1,
+                                "to": "0x1234567890abcdef1234567890abcdef12345678",
+                                "data": "0xabcdef",
+                                "value": "0",
+                            },
+                        }
+                    ],
+                }
+            ],
+        )
+        sidecar_evm_review = build_transaction_sidecar_review(
+            target=DEFAULT_TARGET,
+            profile=profile,
+            artifact_dir=evm_artifact_dir,
+        )
     sidecar_guard_passed = (
         sidecar_guard_intent.get("candidates_seen") == 0
         and sidecar_guard_intent.get("resource_limits", {}).get("max_transaction_candidate_input_bytes") == 32
@@ -34770,6 +35027,18 @@ def build_transaction_decoder_selftest(
         and len(sidecar_empty_guidance.get("examples", []) or []) >= 3
         and "empty burp-transaction-candidates.json" in str(sidecar_empty_guidance.get("empty_burp_candidate_note", ""))
     )
+    sidecar_evm_shape_review = (
+        sidecar_evm_review.get("payload_shape_review")
+        if isinstance(sidecar_evm_review.get("payload_shape_review"), dict)
+        else {}
+    )
+    sidecar_evm_passed = (
+        sidecar_evm_review.get("status") == "payload-sidecar-no-candidates"
+        and sidecar_evm_review.get("summary", {}).get("payload_shape_status") == "evm-payloads-indexed"
+        and sidecar_evm_shape_review.get("status") == "evm-payloads-indexed"
+        and (sidecar_evm_shape_review.get("summary", {}).get("kind_counts") or {}).get("evm-executable-payload") == 1
+        and "EVM executable payloads" in str(sidecar_evm_review.get("next_step") or "")
+    )
     status = (
         "passed"
         if decoded_count == 1
@@ -34780,6 +35049,7 @@ def build_transaction_decoder_selftest(
         and sidecar_guard_passed
         and sidecar_ready_passed
         and sidecar_empty_passed
+        and sidecar_evm_passed
         else "failed"
     )
     return {
@@ -34827,6 +35097,13 @@ def build_transaction_decoder_selftest(
             "review_status": sidecar_empty_review.get("status"),
             "configured_candidate_paths": sidecar_empty_guidance.get("configured_candidate_paths", []),
             "examples": len(sidecar_empty_guidance.get("examples", []) or []),
+        },
+        "sidecar_evm_shape_review": {
+            "status": "passed" if sidecar_evm_passed else "failed",
+            "review_status": sidecar_evm_review.get("status"),
+            "summary": sidecar_evm_review.get("summary", {}),
+            "shape_review": sidecar_evm_shape_review,
+            "next_step": sidecar_evm_review.get("next_step"),
         },
         "transactions": transactions,
         "note": "This self-test proves decoder mechanics only; it does not satisfy GAP-quote-transaction-corpus.",
@@ -46622,6 +46899,7 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
         f"payload_files={summary.get('payload_files_present', 0)} "
         f"oversized={summary.get('payload_files_oversized', 0)} "
         f"candidates={summary.get('candidate_count', 0)} "
+        f"shape={summary.get('payload_shape_status') or 'unknown'} "
         f"policy_configured={summary.get('intent_policy_configured')} "
         f"policy_valid={summary.get('intent_policy_valid')} "
         f"ready_for_decode={summary.get('ready_for_decode')}"
@@ -46663,6 +46941,29 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
             review.get("payload_shape_guidance", {}),
             top=args.top,
         )
+    shape_review = review.get("payload_shape_review") if isinstance(review.get("payload_shape_review"), dict) else {}
+    if args.show_commands and shape_review and shape_review.get("status") not in {"no-payload-sidecars"}:
+        shape_summary = shape_review.get("summary", {}) if isinstance(shape_review.get("summary"), dict) else {}
+        print(
+            "Payload shape review: "
+            f"status={shape_review.get('status')} "
+            f"kinds={json.dumps(shape_summary.get('kind_counts', {}), sort_keys=True)}"
+        )
+        for file_row in (shape_review.get("files", []) or [])[: max(0, int(args.top))]:
+            if not isinstance(file_row, dict):
+                continue
+            print(
+                f"- {file_row.get('source')} status={file_row.get('status')} "
+                f"configured_hits={file_row.get('configured_candidate_path_hits', 0)}"
+            )
+            for record in (file_row.get("records", []) or [])[:2]:
+                if not isinstance(record, dict):
+                    continue
+                print(
+                    "  shape="
+                    f"{record.get('kind')} path={record.get('json_path')} "
+                    f"type={record.get('payload_type') or '-'} chain={record.get('chain') or '-'}"
+                )
     print(f"Next: {inline_summary_text(review.get('next_step'), max_chars=260)}")
     if no_write:
         print("No files written (--no-write).")
