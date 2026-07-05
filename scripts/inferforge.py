@@ -15486,11 +15486,13 @@ def validation_allowed_commands(
 
 def validation_item_from_hypothesis(
     *,
+    target: str,
     artifact_dir: Path,
     profile: dict[str, Any] | None,
     hypothesis: dict[str, Any],
     verification_queue: dict[str, Any],
     rewrite_review_item: dict[str, Any] | None = None,
+    current_resource_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     commands = validation_allowed_commands(
         artifact_dir=artifact_dir,
@@ -15537,6 +15539,25 @@ def validation_item_from_hypothesis(
     rewrite_review_context = validation_rewrite_review_context(rewrite_review_item)
     if rewrite_review_context and rewrite_review_context.get("read_only_path_candidates"):
         preconditions.append("Review rewrite_review.read_only_path_candidates and choose at most one no-write promotion preview.")
+    transaction_approval_packet = None
+    if hypothesis.get("type") == "transaction-flow-review" or hypothesis.get("impact") == "transaction-integrity":
+        transaction_corpus_checklist = load_optional_json(artifact_dir / TRANSACTION_CORPUS_CHECKLIST_ARTIFACT)
+        if not isinstance(transaction_corpus_checklist, dict) or not isinstance(
+            transaction_corpus_checklist.get("transaction_corpus_approval_packet"),
+            dict,
+        ):
+            transaction_corpus_checklist = build_transaction_corpus_checklist(
+                target=target,
+                profile=profile,
+                artifact_dir=artifact_dir,
+                quote_collection=load_optional_json(artifact_dir / "quote-collection.json"),
+                transaction_intent=load_optional_json(artifact_dir / "transaction-intent.json"),
+                burp_transaction_candidates=load_optional_json(artifact_dir / "burp-transaction-candidates.json"),
+                current_resource_snapshot=current_resource_snapshot,
+            )
+        transaction_approval_packet = quote_transaction_corpus_approval_review_candidate(
+            transaction_corpus_checklist,
+        )
 
     return {
         "id": f"VAL-{safe_hypothesis_id(hypothesis.get('id'))}",
@@ -15555,6 +15576,7 @@ def validation_item_from_hypothesis(
         "command_replacements": command_replacements,
         "rewrite_review": rewrite_review_context,
         "transaction_flow_review": hypothesis.get("transaction_flow_review"),
+        "transaction_corpus_approval_packet": transaction_approval_packet,
         "resource_abuse_review": hypothesis.get("resource_abuse_review"),
         "credential_proxy_review": hypothesis.get("credential_proxy_review"),
         "command_safety": command_summary,
@@ -15646,11 +15668,13 @@ def build_validation_plan_run(
     )
     items = [
         validation_item_from_hypothesis(
+            target=target,
             artifact_dir=artifact_dir,
             profile=profile,
             hypothesis=hypothesis,
             verification_queue=verification_queue,
             rewrite_review_item=find_rewrite_review_item_for_hypothesis(hypothesis, rewrite_review),
+            current_resource_snapshot=current_resource_snapshot,
         )
         for hypothesis in hypotheses
     ]
@@ -47848,6 +47872,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and "counter-evidence-reviewed" not in rewrite_fixed_upstream_lead_blocking
             and "concrete-impact-evidence" in rewrite_fixed_upstream_lead_blocking
         )
+        rewrite_transaction_validation_packet = (
+            rewrite_transaction_validation_item.get("transaction_corpus_approval_packet")
+            if isinstance(rewrite_transaction_validation_item, dict)
+            and isinstance(rewrite_transaction_validation_item.get("transaction_corpus_approval_packet"), dict)
+            else {}
+        )
+        rewrite_transaction_validation_packet_quote = (
+            rewrite_transaction_validation_packet.get("recommended_quote")
+            if isinstance(rewrite_transaction_validation_packet.get("recommended_quote"), dict)
+            else {}
+        )
         rewrite_resource_evidence_gaps = build_evidence_gaps(
             rewrite_clusters,
             [],
@@ -48743,6 +48778,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             )
             == "needs-cost-abuse-review"
             and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
+            and rewrite_transaction_validation_packet.get("status") == "ready-offline-approval"
+            and rewrite_transaction_validation_packet_quote.get("method") == "POST"
+            and rewrite_transaction_validation_packet_quote.get("direction") in {"buy", "sell"}
+            and rewrite_transaction_validation_packet.get("finding_gate_blocker_count", 0) >= 4
             and any(
                 TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND in str(ref.get("command") or "")
                 for ref in rewrite_transaction_validation_item.get("allowed_now", []) or []
@@ -56520,6 +56559,26 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         f"payload_path={transaction_flow.get('quote_expected_transaction_path') or 'missing'} "
                         f"credential_proxy={transaction_flow.get('server_credential_proxy_status', 'missing')} "
                         f"provider={transaction_flow.get('deployment_credential_provider_status', 'missing')}"
+                    )
+                transaction_packet = (
+                    item.get("transaction_corpus_approval_packet")
+                    if isinstance(item.get("transaction_corpus_approval_packet"), dict)
+                    else {}
+                )
+                if transaction_packet:
+                    recommended_quote = (
+                        transaction_packet.get("recommended_quote")
+                        if isinstance(transaction_packet.get("recommended_quote"), dict)
+                        else {}
+                    )
+                    print(
+                        "  transaction_approval_packet="
+                        f"{transaction_packet.get('status') or 'unknown'} "
+                        f"recommended={recommended_quote.get('method') or '-'} {recommended_quote.get('path') or '-'} "
+                        f"direction={recommended_quote.get('direction') or '-'} "
+                        f"payload={transaction_packet.get('payload_sidecar') or '-'} "
+                        f"policy={transaction_packet.get('intent_policy_sidecar') or '-'} "
+                        f"blockers={transaction_packet.get('finding_gate_blocker_count', 0)}"
                     )
                 resource_review = (
                     item.get("resource_abuse_review")
