@@ -24507,6 +24507,179 @@ def transaction_corpus_capture_gate(resource_snapshot: dict[str, Any] | None) ->
     }
 
 
+def transaction_corpus_approval_packet(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    policy_templates: list[dict[str, Any]],
+    capture_gate: dict[str, Any],
+    payload_shape_guidance: dict[str, Any],
+    summary: dict[str, Any],
+    max_input_bytes: int = DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+) -> dict[str, Any]:
+    templates = [row for row in policy_templates if isinstance(row, dict)]
+    ready_templates = [row for row in templates if row.get("status") == "ready"]
+
+    def template_rank(row: dict[str, Any]) -> tuple[int, int, str]:
+        direction = str(row.get("direction") or "")
+        direction_rank = {"buy": 0, "sell": 1}.get(direction, 2)
+        return (0 if row.get("status") == "ready" else 1, direction_rank, direction)
+
+    selected_template = sorted(ready_templates or templates, key=template_rank)[0] if templates else {}
+    direction = str(selected_template.get("direction") or "")
+    quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
+    payload_sidecar = repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl")
+    intent_policy_sidecar = repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json")
+    assessment_policy = assessment_mode_policy(profile)
+
+    evidence_contracts = transaction_sidecar_evidence_contracts(
+        profile=profile,
+        artifact_dir=artifact_dir,
+        max_input_bytes=max_input_bytes,
+        limit=max(1, min(len(templates) or 1, 4)),
+    )
+    matching_contract = None
+    for contract in evidence_contracts:
+        if isinstance(contract, dict) and str(contract.get("direction") or "") == direction:
+            matching_contract = contract
+            break
+    if matching_contract is None and evidence_contracts:
+        matching_contract = evidence_contracts[0]
+    contract_commands = (
+        matching_contract.get("commands", [])
+        if isinstance(matching_contract, dict) and isinstance(matching_contract.get("commands"), list)
+        else []
+    )
+
+    def contract_step(command_id: str) -> dict[str, Any]:
+        for row in contract_commands:
+            if isinstance(row, dict) and row.get("id") == command_id:
+                return row
+        return {}
+
+    step_statuses = {
+        "payload-template-preview": "ready",
+        "intent-policy-preview": "ready",
+        "intent-policy-write": "manual-after-preview",
+        "resource-gate": "blocked-until-healthy-resource-snapshot",
+        "single-approved-quote-capture": "blocked-until-resource-gate-and-manual-approval",
+        "burp-history-import": "blocked-until-latest-approved-quote-response",
+        "sidecar-review": "ready-after-import",
+        "decode-preview": "ready-after-sidecar-and-policy",
+        "finding-gate-preview": "ready-after-decoded-impact",
+    }
+    approval_sequence = []
+    for command_id, default_status in step_statuses.items():
+        step = contract_step(command_id)
+        row = {
+            "id": command_id,
+            "status": default_status if step else "waiting",
+        }
+        if step.get("risk"):
+            row["risk"] = step.get("risk")
+        if step.get("command"):
+            row["command"] = step.get("command")
+        if step.get("action"):
+            row["action"] = step.get("action")
+        if step.get("command_safety_ref"):
+            row["command_safety_ref"] = step.get("command_safety_ref")
+        approval_sequence.append(row)
+
+    has_payload_corpus = bool(summary.get("quote_collection_success")) or int(
+        summary.get("transaction_intent_candidates") or 0
+    ) > 0 or int(summary.get("burp_transaction_candidates") or 0) > 0
+    has_payload_candidate = int(summary.get("transaction_intent_candidates") or 0) > 0 or int(
+        summary.get("burp_transaction_candidates") or 0
+    ) > 0
+    policy_status = str(summary.get("intent_policy_status") or "not-configured")
+    decoded_transactions = int(summary.get("decoded_transactions") or 0)
+    ready_for_finding_gate = bool(summary.get("ready_for_finding_gate"))
+    blockers = []
+    if not has_payload_corpus:
+        blockers.append("No approved quote payload sidecar is present yet.")
+    if not has_payload_candidate:
+        blockers.append("No transaction payload candidate is extractable yet.")
+    if policy_status not in {"passed", "review-required"}:
+        blockers.append("No valid intent policy is present yet.")
+    if decoded_transactions <= 0:
+        blockers.append("No decoded transaction mismatch has been reviewed yet.")
+    elif not ready_for_finding_gate:
+        blockers.append("Decoded transaction review has not shown a concrete signer/account/mint/amount/program mismatch yet.")
+    if not ready_for_finding_gate:
+        blockers.append("Finding-gate/adjudication has not accepted concrete user-funds impact.")
+
+    if not selected_template:
+        packet_status = "waiting-for-policy-template"
+    elif selected_template.get("status") != "ready":
+        packet_status = "waiting-for-ready-policy-template"
+    else:
+        packet_status = "ready-offline-approval"
+
+    expected_payload_type = payload_shape_guidance.get("expected_payload_type") or quote_response_expected_payload_type(profile)
+    return {
+        "status": packet_status,
+        "assessment": {
+            "mode": assessment_policy.get("mode"),
+            "optimization_goal": assessment_policy.get("optimization_goal"),
+            "transaction_lead_bias": (
+                "coverage-first: collect enough approved corpus to close the dangerous transaction-intent surface."
+                if assessment_policy.get("mode") == "greybox"
+                else "bounty-first: collect the shortest valid corpus that can prove high-impact user-funds impact."
+            ),
+        },
+        "recommended_quote": {
+            "method": "POST" if direction else None,
+            "path": quote_path if direction else None,
+            "direction": direction or None,
+            "sourceMint": selected_template.get("sourceMint"),
+            "destinationMint": selected_template.get("destinationMint"),
+            "expectedPayloadType": expected_payload_type,
+            "programAllowlistStatus": selected_template.get("programAllowlistStatus") or "unknown",
+            "allowedPrograms_count": len(selected_template.get("allowedPrograms", []) or []),
+        },
+        "payload_sidecar": payload_sidecar,
+        "accepted_payload_sidecars": payload_shape_guidance.get("accepted_sidecars", []),
+        "intent_policy_sidecar": intent_policy_sidecar,
+        "resource_capture_gate": {
+            "status": capture_gate.get("status"),
+            "resource_status": (
+                capture_gate.get("resource_preflight", {}).get("status")
+                if isinstance(capture_gate.get("resource_preflight"), dict)
+                else None
+            ),
+        },
+        "redacted_sidecar_required_fields": [
+            f"exactly one approved POST {quote_path} response body or extracted base64 transaction payload",
+            f"payloads[*].data.type matching {expected_payload_type or 'the reviewed profile payload type'} when JSON sidecars are used",
+            "payloads[*].data.transaction or an extracted transaction payload accepted by decode-transactions",
+            "intent policy fields: direction, wallet, amountIn, sourceMint, destinationMint",
+            "reviewed allowedPrograms or an explicit manual program-allowlist review note",
+            "no raw Burp history, cookies, bearer tokens, wallet secrets, private keys, seed phrases, signatures, or signed transactions",
+        ],
+        "offline_commands": [
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "transaction-corpus-checklist --no-write --show-commands --show-steps --show-payload-template-json --skip-current-resource-check",
+                profile=profile,
+            ),
+        ],
+        "approval_sequence": approval_sequence,
+        "finding_gate_blockers": blockers
+        or [
+            "Finding-gate/adjudication must still accept concrete user-funds impact before any report.",
+        ],
+        "safety": (
+            "Offline approval packet only. It prints the single-corpus quote approval and decode sequence; it sends no "
+            "requests, reads no raw Burp history, invokes no wallet, signs nothing, and submits no transaction."
+        ),
+    }
+
+
 def build_transaction_corpus_checklist(
     *,
     target: str,
@@ -24743,6 +24916,42 @@ def build_transaction_corpus_checklist(
     else:
         next_step = "Prepare one approved quote response sidecar and matching intent policy values."
 
+    summary = {
+        "policy_templates": len(policy_templates),
+        "ready_policy_templates": len(ready_policy_templates),
+        "program_allowlist_status": program_allowlist_status,
+        "program_allowlist_missing_directions": program_allowlist_missing_directions,
+        "intent_policy_sidecar_templates": len(intent_policy_sidecar_templates),
+        "quote_collection_status": quote_collection.get("status") or "missing",
+        "quote_collection_classification": quote_diagnosis.get("classification") or "missing",
+        "quote_collection_success": quote_success,
+        "payload_sidecar_files_present": len(present_payload_sidecar_files),
+        "payload_sidecar_placeholders": len(placeholder_payload_sidecar_files),
+        "burp_transaction_candidates": burp_candidate_count,
+        "transaction_intent_candidates": candidates_seen,
+        "decoded_transactions": decoded_transactions,
+        "intent_policy_status": policy_status,
+        "reportability_status": reportability_status,
+        "candidate_severity": reportability_review.get("candidate_severity") or "none",
+        "ready_for_finding_gate": bool(reportability_review.get("ready_for_finding_gate")),
+    }
+    approval_packet = transaction_corpus_approval_packet(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        policy_templates=policy_templates,
+        capture_gate=capture_gate,
+        payload_shape_guidance=payload_shape_guidance,
+        summary=summary,
+    )
+    recommended_quote = (
+        approval_packet.get("recommended_quote")
+        if isinstance(approval_packet.get("recommended_quote"), dict)
+        else {}
+    )
+    summary["approval_packet_status"] = approval_packet.get("status")
+    summary["recommended_quote_direction"] = recommended_quote.get("direction")
+    summary["recommended_quote_path"] = recommended_quote.get("path")
+
     return {
         "generated_at": utc_now(),
         "status": status,
@@ -24754,26 +24963,9 @@ def build_transaction_corpus_checklist(
             "transaction_candidate_paths": candidate_paths,
         },
         "resource_capture_gate": capture_gate,
-        "summary": {
-            "policy_templates": len(policy_templates),
-            "ready_policy_templates": len(ready_policy_templates),
-            "program_allowlist_status": program_allowlist_status,
-            "program_allowlist_missing_directions": program_allowlist_missing_directions,
-            "intent_policy_sidecar_templates": len(intent_policy_sidecar_templates),
-            "quote_collection_status": quote_collection.get("status") or "missing",
-            "quote_collection_classification": quote_diagnosis.get("classification") or "missing",
-            "quote_collection_success": quote_success,
-            "payload_sidecar_files_present": len(present_payload_sidecar_files),
-            "payload_sidecar_placeholders": len(placeholder_payload_sidecar_files),
-            "burp_transaction_candidates": burp_candidate_count,
-            "transaction_intent_candidates": candidates_seen,
-            "decoded_transactions": decoded_transactions,
-            "intent_policy_status": policy_status,
-            "reportability_status": reportability_status,
-            "candidate_severity": reportability_review.get("candidate_severity") or "none",
-            "ready_for_finding_gate": bool(reportability_review.get("ready_for_finding_gate")),
-        },
+        "summary": summary,
         "policy_templates": policy_templates,
+        "transaction_corpus_approval_packet": approval_packet,
         "capture_steps": capture_steps,
         "payload_sidecars": payload_sidecars,
         "payload_sidecar_files": payload_sidecar_files,
@@ -42136,6 +42328,49 @@ def build_transaction_decoder_selftest(
         and "Do not approve wallet signing prompts." in sidecar_contract_text
         and payload["base64"] not in sidecar_contract_text
     )
+    sidecar_empty_approval_packet = (
+        sidecar_empty_corpus_checklist.get("transaction_corpus_approval_packet")
+        if isinstance(sidecar_empty_corpus_checklist.get("transaction_corpus_approval_packet"), dict)
+        else {}
+    )
+    sidecar_empty_approval_quote = (
+        sidecar_empty_approval_packet.get("recommended_quote")
+        if isinstance(sidecar_empty_approval_packet.get("recommended_quote"), dict)
+        else {}
+    )
+    sidecar_empty_approval_text = json.dumps(sidecar_empty_approval_packet, sort_keys=True)
+    sidecar_empty_approval_sequence_text = json.dumps(
+        sidecar_empty_approval_packet.get("approval_sequence", []),
+        sort_keys=True,
+    )
+    sidecar_empty_approval_required_text = json.dumps(
+        sidecar_empty_approval_packet.get("redacted_sidecar_required_fields", []),
+        sort_keys=True,
+    )
+    sidecar_empty_approval_blockers_text = json.dumps(
+        sidecar_empty_approval_packet.get("finding_gate_blockers", []),
+        sort_keys=True,
+    )
+    sidecar_empty_approval_packet_passed = (
+        sidecar_empty_approval_packet.get("status") == "ready-offline-approval"
+        and sidecar_empty_corpus_checklist.get("summary", {}).get("approval_packet_status") == "ready-offline-approval"
+        and sidecar_empty_corpus_checklist.get("summary", {}).get("recommended_quote_direction") in {"buy", "sell"}
+        and sidecar_empty_approval_quote.get("method") == "POST"
+        and sidecar_empty_approval_quote.get("path") == "/api/quote"
+        and sidecar_empty_approval_quote.get("direction") in {"buy", "sell"}
+        and str(sidecar_empty_approval_packet.get("payload_sidecar") or "").endswith("transaction-payloads.jsonl")
+        and str(sidecar_empty_approval_packet.get("intent_policy_sidecar") or "").endswith(
+            "transaction-intent-policy.json"
+        )
+        and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict"
+        in sidecar_empty_approval_sequence_text
+        and "burp-sync --replace --count 1" in sidecar_empty_approval_sequence_text
+        and "No approved quote payload sidecar is present yet." in sidecar_empty_approval_blockers_text
+        and "payloads[*].data.transaction" in sidecar_empty_approval_required_text
+        and "intent policy fields" in sidecar_empty_approval_required_text
+        and "maximize-dangerous-surface-coverage" in sidecar_empty_approval_text
+        and payload["base64"] not in sidecar_empty_approval_text
+    )
     status = (
         "passed"
         if decoded_count == 1
@@ -42152,6 +42387,7 @@ def build_transaction_decoder_selftest(
         and sidecar_empty_passed
         and sidecar_evm_passed
         and sidecar_contract_passed
+        and sidecar_empty_approval_packet_passed
         else "failed"
     )
     return {
@@ -42239,6 +42475,10 @@ def build_transaction_decoder_selftest(
         "sidecar_evidence_contract": {
             "status": "passed" if sidecar_contract_passed else "failed",
             "contracts": sidecar_contracts,
+        },
+        "transaction_corpus_approval_packet": {
+            "status": "passed" if sidecar_empty_approval_packet_passed else "failed",
+            "packet": sidecar_empty_approval_packet,
         },
         "transactions": transactions,
         "note": "This self-test proves decoder mechanics only; it does not satisfy GAP-quote-transaction-corpus.",
@@ -55857,6 +56097,26 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
         f"status={summary.get('program_allowlist_status') or 'unknown'} "
         f"missing={','.join(str(item) for item in missing_program_directions) if missing_program_directions else 'none'}"
     )
+    approval_packet = (
+        checklist.get("transaction_corpus_approval_packet")
+        if isinstance(checklist.get("transaction_corpus_approval_packet"), dict)
+        else {}
+    )
+    approval_quote = (
+        approval_packet.get("recommended_quote")
+        if isinstance(approval_packet.get("recommended_quote"), dict)
+        else {}
+    )
+    if approval_packet:
+        print(
+            "Approval packet: "
+            f"status={approval_packet.get('status')} "
+            f"recommended={approval_quote.get('method') or '-'} {approval_quote.get('path') or '-'} "
+            f"direction={approval_quote.get('direction') or '-'} "
+            f"payload={approval_packet.get('payload_sidecar') or '-'} "
+            f"policy={approval_packet.get('intent_policy_sidecar') or '-'} "
+            f"blockers={len(approval_packet.get('finding_gate_blockers', []) or [])}"
+        )
     policy_sidecar = (
         checklist.get("intent_policy_sidecar")
         if isinstance(checklist.get("intent_policy_sidecar"), dict)

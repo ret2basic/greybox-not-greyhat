@@ -1087,6 +1087,12 @@ and decoding. It reads the current quote collection, Burp transaction candidate,
 transaction intent, profile, and resource snapshot artifacts, then prints the
 minimal approved quote-response corpus needed for `decode-transactions`. It does
 not send requests, read raw Burp history, sign wallets, or submit transactions.
+It also emits `transaction_corpus_approval_packet`, a compact offline packet
+that names the recommended single `POST /api/quote` direction, the payload and
+intent-policy sidecar paths, required redacted fields, the gated approval
+sequence, and the current finding-gate blockers. In `greybox` mode this packet
+helps close the dangerous transaction-intent surface; in `blackbox` mode it keeps
+the evidence path focused on the shortest valid high-impact bounty candidate.
 When the resource gate is degraded or critical, it keeps capture steps marked as
 blocked and only prints sidecar formats plus decode commands:
 
