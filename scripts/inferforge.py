@@ -164,6 +164,7 @@ CLAIM_EVIDENCE_REQUESTS_ARTIFACT = "claim-evidence-requests.json"
 SECRET_EXPOSURE_REVIEW_ARTIFACT = "secret-exposure-review.json"
 BOUNTY_FRONTIER_ARTIFACT = "bounty-frontier.json"
 BOUNTY_VALIDATION_GATES_ARTIFACT = "bounty-validation-gates.json"
+BOUNTY_INVALIDITY_REVIEW_ARTIFACT = "bounty-invalidity-review.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -275,6 +276,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     SECRET_EXPOSURE_REVIEW_ARTIFACT,
     BOUNTY_FRONTIER_ARTIFACT,
     BOUNTY_VALIDATION_GATES_ARTIFACT,
+    BOUNTY_INVALIDITY_REVIEW_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -23159,6 +23161,253 @@ def build_bounty_validation_gates(
     }
 
 
+BOUNTY_INVALIDITY_CATEGORY_RANK = {
+    "missing-official-evidence": 0,
+    "finding-gate-not-accepted": 1,
+    "static-or-draft-only-evidence": 2,
+    "impact-not-proven": 3,
+    "reachability-not-proven": 4,
+    "unsafe-validation-required": 5,
+    "environment-not-witness": 6,
+    "e2e-proof-incomplete": 7,
+    "lane-specific-reject-condition": 8,
+}
+
+
+def bounty_invalidity_reason_category(text: str) -> str:
+    lowered = str(text or "").lower()
+    if "stress" in lowered or "flood" in lowered or "destructive" in lowered or "signing" in lowered or "submission" in lowered:
+        return "unsafe-validation-required"
+    if "only" in lowered or "static" in lowered or "source" in lowered or "template" in lowered or "draft" in lowered:
+        return "static-or-draft-only-evidence"
+    if "official" in lowered or "sidecar" in lowered or "payload" in lowered or "provenance" in lowered:
+        return "missing-official-evidence"
+    if "impact" in lowered or "billing" in lowered or "quota" in lowered or "availability" in lowered:
+        return "impact-not-proven"
+    if "reach" in lowered or "entry" in lowered or "origin" in lowered or "host" in lowered:
+        return "reachability-not-proven"
+    return "lane-specific-reject-condition"
+
+
+def bounty_invalidity_minimum_fix(gate: dict[str, Any]) -> str:
+    lane = str(gate.get("bounty_lane") or "")
+    evidence = bounty_validation_evidence_labels(gate.get("required_official_evidence"), limit=3)
+    evidence_text = ", ".join(evidence) if evidence else "the lane-specific official evidence"
+    if lane == "transaction-integrity":
+        return (
+            f"Provide {evidence_text}, decode exactly one approved quote transaction offline, "
+            "and let finding-gate accept a concrete intent mismatch."
+        )
+    if lane == "build-secret-exposure":
+        return (
+            "Provide redacted build provenance showing real secret retention/disclosure; "
+            "static Dockerfile patterns alone remain invalid."
+        )
+    if lane == "credentialed-provider-impact":
+        return (
+            f"Provide {evidence_text} proving provider quota, billing, rate-limit, monitoring, "
+            "or account impact without quota-depletion traffic."
+        )
+    if lane == "resource-control":
+        return (
+            f"Provide {evidence_text} proving attacker-influenced resource identity/routing/control "
+            "and non-stress operator-visible impact."
+        )
+    if lane == "sensitive-response-impact":
+        return (
+            f"Provide {evidence_text} with one approved redacted response proving concrete sensitive-data, "
+            "authorization, or path-confusion impact."
+        )
+    if lane == "websocket-header-trust":
+        return (
+            f"Provide {evidence_text} proving a sensitive forwarded header reaches an upstream trust, "
+            "logging, billing, auth, or quota boundary."
+        )
+    return f"Provide {evidence_text}, rerun the lane validation commands, and require final adjudication acceptance."
+
+
+def bounty_invalidity_gate_review(gate: dict[str, Any]) -> dict[str, Any]:
+    reasons: list[dict[str, Any]] = []
+
+    def add(category: str, reason: str, *, source: str) -> None:
+        if not reason:
+            return
+        reasons.append(
+            {
+                "category": category,
+                "source": source,
+                "reason": reason,
+            }
+        )
+
+    gate_status = str(gate.get("gate_status") or "unknown")
+    invalid_now = not bool(gate.get("reportable_now")) or gate_status != "reportable-needs-final-adjudication"
+    missing_evidence = bounty_validation_evidence_labels(gate.get("required_official_evidence"), limit=6)
+    missing_count = int(gate.get("missing_or_invalid_evidence_count") or 0)
+    if gate_status.startswith("blocked") or missing_count > 0:
+        evidence_text = ", ".join(missing_evidence) if missing_evidence else "official evidence"
+        add(
+            "missing-official-evidence",
+            f"Required official evidence is missing or invalid: {evidence_text}.",
+            source="required_official_evidence",
+        )
+    if not gate.get("finding_gate_ready"):
+        add(
+            "finding-gate-not-accepted",
+            "Finding-gate has not accepted concrete mechanism, reachability, impact, and terminal-state evidence.",
+            source="finding_gate_ready",
+        )
+    if gate.get("environment_discovery_is_not_witness"):
+        add(
+            "environment-not-witness",
+            "Environment setup, browser/Burp readiness, source discovery, and helper command success are not witness evidence.",
+            source="methodology",
+        )
+    if gate.get("e2e_required") and not gate.get("reportable_now"):
+        add(
+            "e2e-proof-incomplete",
+            "Medium+ promotion still requires an end-to-end or lane-equivalent no-assumptions proof.",
+            source="e2e_required",
+        )
+    for reason in normalize_string_list(gate.get("reject_if"))[:8]:
+        add(bounty_invalidity_reason_category(reason), reason, source="reject_if")
+    for reason in normalize_string_list(gate.get("forbidden_shortcuts"))[:6]:
+        add("unsafe-validation-required", reason, source="forbidden_shortcuts")
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for reason in reasons:
+        key = (str(reason.get("category") or ""), str(reason.get("reason") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(reason)
+    deduped.sort(
+        key=lambda item: (
+            BOUNTY_INVALIDITY_CATEGORY_RANK.get(str(item.get("category") or ""), 99),
+            str(item.get("reason") or ""),
+        )
+    )
+    categories = ordered_unique_strings([str(item.get("category")) for item in deduped if item.get("category")])
+    return {
+        "id": f"INVALIDITY-{safe_probe_id(str(gate.get('id') or gate.get('frontier_id') or 'gate'))}",
+        "gate_id": gate.get("id"),
+        "frontier_id": gate.get("frontier_id"),
+        "claim_id": gate.get("claim_id"),
+        "entrypoint": gate.get("entrypoint"),
+        "bounty_lane": gate.get("bounty_lane"),
+        "expected_severity": gate.get("expected_severity"),
+        "gate_status": gate_status,
+        "gate_type": gate.get("gate_type"),
+        "invalid_if_reported_now": bool(invalid_now and deduped),
+        "primary_invalidity_category": categories[0] if categories else None,
+        "invalidity_categories": categories,
+        "reasons": deduped[:16],
+        "required_official_evidence": normalize_string_list(gate.get("required_official_evidence")),
+        "minimum_fix": bounty_invalidity_minimum_fix(gate),
+        "validation_commands": normalize_string_list(gate.get("validation_commands"))[:6],
+        "reportability_boundary": gate.get("validity_boundary"),
+    }
+
+
+def build_bounty_invalidity_review(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    bounty_validation_gates: dict[str, Any] | None,
+    adjudication: dict[str, Any] | None,
+) -> dict[str, Any]:
+    gates = (
+        bounty_validation_gates.get("gates", [])
+        if isinstance(bounty_validation_gates, dict) and isinstance(bounty_validation_gates.get("gates"), list)
+        else []
+    )
+    rows = [
+        bounty_invalidity_gate_review(gate)
+        for gate in gates
+        if isinstance(gate, dict)
+    ]
+    rows.sort(
+        key=lambda item: (
+            0 if item.get("invalid_if_reported_now") else 1,
+            BOUNTY_FRONTIER_SEVERITY_RANK.get(str(item.get("expected_severity") or "info"), 9),
+            BOUNTY_INVALIDITY_CATEGORY_RANK.get(str(item.get("primary_invalidity_category") or ""), 99),
+            str(item.get("bounty_lane") or ""),
+            str(item.get("id") or ""),
+        )
+    )
+    category_counts: dict[str, int] = {}
+    lane_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    for row in rows:
+        increment_count(lane_counts, str(row.get("bounty_lane") or "unknown"))
+        increment_count(status_counts, str(row.get("gate_status") or "unknown"))
+        for category in row.get("invalidity_categories", []) or []:
+            increment_count(category_counts, str(category))
+    invalid_now = sum(1 for row in rows if row.get("invalid_if_reported_now"))
+    reportable_now = sum(1 for row in rows if not row.get("invalid_if_reported_now"))
+    adjudication_summary = (
+        adjudication.get("summary")
+        if isinstance(adjudication, dict) and isinstance(adjudication.get("summary"), dict)
+        else {}
+    )
+    adjudication_findings = int(adjudication_summary.get("findings") or 0)
+    if not rows:
+        status = "no-validation-gates"
+    elif adjudication_findings:
+        status = "adjudicated-findings-present-review-invalidity-residuals"
+    elif invalid_now:
+        status = "invalid-if-reported-now"
+    else:
+        status = "no-invalidity-blockers"
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-invalidity-review-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "methodology": {
+            "finder_triager_split": "Finder output is only an allegation; invalidity review prevents allegation-to-report promotion without evidence.",
+            "reviewer_lens": "Model-assisted reports are treated as invalid unless official evidence proves mechanism, reachability, concrete impact, and safe reproduction.",
+            "source_research": [
+                "https://x.com/pkqs91/status/2070157806104457395",
+                "https://arxiv.org/abs/2511.18608",
+            ],
+        },
+        "summary": {
+            "gates": len(rows),
+            "invalid_if_reported_now": invalid_now,
+            "not_invalid_now": reportable_now,
+            "adjudicated_findings": adjudication_findings,
+            "category_counts": dict(sorted(category_counts.items())),
+            "lane_counts": dict(sorted(lane_counts.items())),
+            "gate_status_counts": dict(sorted(status_counts.items())),
+            "bounty_validation_gates_status": artifact_summary_status(bounty_validation_gates),
+            "adjudication_status": artifact_summary_status(adjudication),
+            "top_invalidity_category": rows[0].get("primary_invalidity_category") if rows else None,
+            "top_invalidity_lane": rows[0].get("bounty_lane") if rows else None,
+        },
+        "invalidity_rows": rows,
+        "reportability_rule": (
+            "Do not report any row with invalid_if_reported_now=true. Close the minimum_fix, rerun the lane verifier, "
+            "then require finding-gate/adjudication acceptance before treating it as Medium+."
+        ),
+        "next_step": (
+            "Close the top invalidity row's minimum_fix using official evidence; do not submit a report from static or draft artifacts."
+            if invalid_now
+            else "Rerun bounty-validation-gates and adjudicate before preparing a report."
+            if rows
+            else "Build bounty-validation-gates first."
+        ),
+        "safety": (
+            "Offline reportability audit only. It sends no target traffic, calls no Burp tool, starts no browser, "
+            "signs no wallet, submits no transaction, and creates no official evidence sidecars."
+        ),
+    }
+
+
 RPC_PROXY_HTTP_SOURCE = Path("src/app/api/rpc/_shared.ts")
 RPC_PROXY_WS_SOURCE = Path("server.js")
 
@@ -24206,6 +24455,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     SECRET_EXPOSURE_REVIEW_ARTIFACT: "secret-exposure-review",
     BOUNTY_FRONTIER_ARTIFACT: "bounty-frontier",
     BOUNTY_VALIDATION_GATES_ARTIFACT: "bounty-validation-gates",
+    BOUNTY_INVALIDITY_REVIEW_ARTIFACT: "bounty-invalidity-review",
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
     ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT: "oracle-plan --write-sidecar-template",
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT: "rewrite-response-review --write-sidecar-template",
@@ -24249,6 +24499,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "secret-exposure-review",
     "bounty-frontier",
     "bounty-validation-gates",
+    "bounty-invalidity-review",
     "transaction-intent-boundary",
     "rewrite-response-review --write-sidecar-template",
     "report",
@@ -24277,6 +24528,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "secret-exposure-review": "secret-exposure-review --no-write",
     "bounty-frontier": "bounty-frontier --no-write",
     "bounty-validation-gates": "bounty-validation-gates --no-write",
+    "bounty-invalidity-review": "bounty-invalidity-review --no-write",
     "transaction-intent-boundary": "transaction-intent-boundary --no-write",
     "rewrite-response-review --write-sidecar-template": (
         "rewrite-response-review --no-write --show-sidecar-template-json"
@@ -48648,6 +48900,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("secret-exposure-review", "run_secret_exposure_review"),
         refresh_expectation("bounty-frontier", "run_bounty_frontier"),
         refresh_expectation("bounty-validation-gates", "run_bounty_validation_gates"),
+        refresh_expectation("bounty-invalidity-review", "run_bounty_invalidity_review"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-intent-boundary", "run_transaction_intent_boundary"),
         refresh_expectation("transaction-sidecar-review", "run_transaction_sidecar_review"),
@@ -72331,6 +72584,148 @@ def run_bounty_validation_gates(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_or_load_bounty_validation_gates_for_run(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    source_root: Path,
+) -> dict[str, Any]:
+    gates = load_optional_json(artifact_dir / BOUNTY_VALIDATION_GATES_ARTIFACT)
+    if isinstance(gates, dict):
+        return gates
+    frontier = load_optional_json(artifact_dir / BOUNTY_FRONTIER_ARTIFACT)
+    if not isinstance(frontier, dict):
+        claim_requests = load_optional_json(artifact_dir / CLAIM_EVIDENCE_REQUESTS_ARTIFACT)
+        if not isinstance(claim_requests, dict):
+            claim_requests = build_claim_evidence_requests(
+                target=target,
+                profile=profile,
+                artifact_dir=artifact_dir,
+                package_path=artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT,
+                ladder_doc=load_optional_json(artifact_dir / CLAIM_WITNESS_LADDER_ARTIFACT),
+                draft_doc=load_optional_json(artifact_dir / EVIDENCE_SIDECAR_DRAFTS_ARTIFACT),
+            )
+        secret_review = load_optional_json(artifact_dir / SECRET_EXPOSURE_REVIEW_ARTIFACT)
+        if not isinstance(secret_review, dict):
+            secret_review = build_secret_exposure_review(
+                source_root=source_root,
+                profile=profile,
+                max_file_bytes=DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES,
+                max_files=64,
+            )
+        frontier = build_bounty_frontier(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            claim_requests=claim_requests,
+            secret_review=secret_review,
+            review_blockers=load_optional_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT),
+            evidence_gaps=load_optional_json(artifact_dir / "evidence-gaps.json"),
+            transaction_flow_review=load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT),
+            adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+        )
+    return build_bounty_validation_gates(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_frontier=frontier,
+        transaction_boundary=load_optional_json(artifact_dir / TRANSACTION_INTENT_BOUNDARY_ARTIFACT),
+        adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+    )
+
+
+def run_bounty_invalidity_review(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    gates = build_or_load_bounty_validation_gates_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    review = build_bounty_invalidity_review(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_validation_gates=gates,
+        adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / BOUNTY_INVALIDITY_REVIEW_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(review))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-invalidity-review",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = review.get("summary", {}) if isinstance(review.get("summary"), dict) else {}
+    print(f"Bounty invalidity review: {review.get('status')}")
+    print(
+        "Invalidity: "
+        f"gates={summary.get('gates', 0)} "
+        f"invalid_now={summary.get('invalid_if_reported_now', 0)} "
+        f"not_invalid_now={summary.get('not_invalid_now', 0)} "
+        f"adjudicated_findings={summary.get('adjudicated_findings', 0)}"
+    )
+    print(
+        "Inputs: "
+        f"gates={summary.get('bounty_validation_gates_status') or '-'} "
+        f"adjudication={summary.get('adjudication_status') or '-'} "
+        f"top_category={summary.get('top_invalidity_category') or '-'} "
+        f"top_lane={summary.get('top_invalidity_lane') or '-'}"
+    )
+    print(f"Categories: {json.dumps(summary.get('category_counts', {}), sort_keys=True)}")
+    if getattr(args, "show_reasons", False):
+        display_limit = max(0, int(args.top))
+        print("Invalidity rows:")
+        for row in (review.get("invalidity_rows", []) or [])[:display_limit]:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('gate_id')}: invalid_now={row.get('invalid_if_reported_now')} "
+                f"{row.get('expected_severity')} lane={row.get('bounty_lane')} "
+                f"category={row.get('primary_invalidity_category') or '-'}"
+            )
+            reasons = [reason for reason in row.get("reasons", []) or [] if isinstance(reason, dict)]
+            for reason in reasons[: max(1, min(3, int(args.reasons_per_gate)))]:
+                print(
+                    f"  reason[{reason.get('category')}]="
+                    f"{inline_summary_text(reason.get('reason'), max_chars=260)}"
+                )
+            print(f"  fix={inline_summary_text(row.get('minimum_fix'), max_chars=320)}")
+            commands = normalize_string_list(row.get("validation_commands"))
+            if commands:
+                print(f"  command={inline_summary_text(commands[0], max_chars=420)}")
+        remaining = len(review.get("invalidity_rows", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more invalidity row(s); rerun without --no-write to write the full artifact")
+            else:
+                print(f"- {remaining} more invalidity row(s) in {output_path}")
+    print(f"Rule: {inline_summary_text(review.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(review.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and review.get("status") == "invalid-if-reported-now":
+        return 1
+    return 0
+
+
 def run_rpc_proxy_parity_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -75256,6 +75651,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless validation gates are indexed for current bounty frontiers.",
     )
     bounty_validation_gates.set_defaults(func=run_bounty_validation_gates)
+
+    bounty_invalidity_review = sub.add_parser(
+        "bounty-invalidity-review",
+        help="Audit why current Medium+ bounty frontiers would be invalid if reported now",
+    )
+    bounty_invalidity_review.add_argument(
+        "--output",
+        help=(
+            f"Where to write {BOUNTY_INVALIDITY_REVIEW_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{BOUNTY_INVALIDITY_REVIEW_ARTIFACT}."
+        ),
+    )
+    bounty_invalidity_review.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of invalidity rows to print with --show-reasons.",
+    )
+    bounty_invalidity_review.add_argument(
+        "--reasons-per-gate",
+        type=positive_int,
+        default=2,
+        help="Number of rejection reasons to print per invalidity row.",
+    )
+    bounty_invalidity_review.add_argument(
+        "--show-reasons",
+        action="store_true",
+        help="Print invalidity rows, rejection reasons, minimum fixes, and first validation command.",
+    )
+    bounty_invalidity_review.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print bounty invalidity review only; do not write {BOUNTY_INVALIDITY_REVIEW_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    bounty_invalidity_review.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero when any current Medium+ frontier would be invalid if reported now.",
+    )
+    bounty_invalidity_review.set_defaults(func=run_bounty_invalidity_review)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
