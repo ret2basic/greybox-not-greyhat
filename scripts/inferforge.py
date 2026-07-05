@@ -9996,6 +9996,7 @@ def build_transaction_evidence_closure(
     sidecar_checks = methodology_check_statuses(sidecar_review)
     corpus_status = str(corpus_checklist.get("status") or "missing")
     gate_ready = corpus_status == "decoded-intent-mismatch-review"
+    approval_packet = quote_transaction_corpus_approval_review_candidate(corpus_checklist)
     requirements = [
         methodology_requirement(
             "approved-transaction-payload-sidecar",
@@ -10062,6 +10063,7 @@ def build_transaction_evidence_closure(
             if req.get("status") not in {"passed", "ready-offline", "ready-after-resource-check"}
         ],
         "next_safe_commands": commands[:6],
+        "transaction_corpus_approval_packet": approval_packet,
         "finding_gate_entry_condition": (
             "Only enter finding-gate after decoded transaction evidence shows a signer, wallet, account, mint, amount, "
             "or program mismatch with concrete user-funds impact."
@@ -11735,6 +11737,7 @@ def build_lead_dossier(
                 "required_evidence": thread.get("required_evidence", []),
                 "missing_requirements": closure.get("missing_requirements", []) if closure else [],
                 "artifact_statuses": closure.get("artifact_statuses", {}) if closure else {},
+                "approval_packet": closure.get("transaction_corpus_approval_packet") if closure else None,
                 "next_offline_command": next_command,
                 "next_safe_commands": closure.get("next_safe_commands", [])[:6] if closure else [],
                 "minimal_poc_plan": thread.get("minimal_poc_plan"),
@@ -47790,6 +47793,19 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 else []
             )
         ]
+        rewrite_transaction_lead_packet = next(
+            (
+                item.get("approval_packet")
+                for item in rewrite_transaction_leads
+                if isinstance(item.get("approval_packet"), dict)
+            ),
+            {},
+        )
+        rewrite_transaction_lead_packet_quote = (
+            rewrite_transaction_lead_packet.get("recommended_quote")
+            if isinstance(rewrite_transaction_lead_packet.get("recommended_quote"), dict)
+            else {}
+        )
         rewrite_transaction_lead_contract_passed = (
             bool(rewrite_transaction_leads)
             and any(
@@ -47798,6 +47814,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             )
             and "counter-evidence-reviewed" not in rewrite_transaction_lead_blocking
             and "concrete-impact-evidence" in rewrite_transaction_lead_blocking
+            and rewrite_transaction_lead_packet.get("status") == "ready-offline-approval"
+            and rewrite_transaction_lead_packet_quote.get("method") == "POST"
+            and rewrite_transaction_lead_packet_quote.get("direction") in {"buy", "sell"}
+            and rewrite_transaction_lead_packet.get("finding_gate_blocker_count", 0) >= 4
         )
         rewrite_fixed_upstream_leads = [
             item
@@ -54640,6 +54660,26 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
         blocker = lead.get("current_blocker")
         if blocker:
             print(f"  blocker={inline_summary_text(blocker, max_chars=260)}")
+        approval_packet = (
+            lead.get("approval_packet")
+            if isinstance(lead.get("approval_packet"), dict)
+            else {}
+        )
+        if approval_packet:
+            recommended_quote = (
+                approval_packet.get("recommended_quote")
+                if isinstance(approval_packet.get("recommended_quote"), dict)
+                else {}
+            )
+            print(
+                "  approval_packet="
+                f"{approval_packet.get('status') or 'unknown'} "
+                f"recommended={recommended_quote.get('method') or '-'} {recommended_quote.get('path') or '-'} "
+                f"direction={recommended_quote.get('direction') or '-'} "
+                f"payload={approval_packet.get('payload_sidecar') or '-'} "
+                f"policy={approval_packet.get('intent_policy_sidecar') or '-'} "
+                f"blockers={approval_packet.get('finding_gate_blocker_count', 0)}"
+            )
         if args.show_evidence:
             for evidence in (lead.get("required_evidence", []) or [])[:3]:
                 print(f"    evidence={inline_summary_text(evidence, max_chars=260)}")
