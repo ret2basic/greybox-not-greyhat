@@ -451,6 +451,16 @@ contracts. The credential contract spells out provider quota/rate-limit/billing
 impact gates; the RPC contract spells out which operator decisions must be
 proven, which header-trust/fallback conditions are reportable, and which safe
 evidence sources can support the claim without traffic volume.
+`operator-evidence-review` also emits `resource_control_approval_packet`, a
+compact offline packet for the RPC/resource-control thread. It names the
+resource entrypoint, redacted operator-evidence sidecar, accepted present
+statuses, missing external-store/proxy-trust/IP-key/bounds/monitoring decisions,
+the resource-gated approval sequence, and finding-gate blockers. The packet is
+explicitly non-stress: it never authorizes floods, rate-limit exhaustion,
+Scanner, Intruder, or DoS validation. In `greybox` mode it closes resource
+coverage decisions; in `blackbox` mode it keeps the thread parked unless
+non-stress deployment/operator evidence can support a valid availability,
+quota, or operator-impact report.
 When RPC source shows rate-limit buckets keyed from
 `x-forwarded-for`, that template also includes
 `rpc-client-ip-header-trust-model`, which asks for production edge/header

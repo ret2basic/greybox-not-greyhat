@@ -9915,6 +9915,7 @@ def build_methodology_supporting_reviews(
     resource_snapshot: dict[str, Any] | None,
 ) -> dict[str, Any]:
     reviews: dict[str, Any] = {
+        "current_resource_snapshot": resource_snapshot if isinstance(resource_snapshot, dict) else {"status": "not-run"},
         "transaction_sidecar_review": build_transaction_sidecar_review(
             target=target,
             profile=profile,
@@ -10188,6 +10189,28 @@ def build_resource_evidence_closure(
         if isinstance(operator_review.get("resource_evidence_contract"), dict)
         else {}
     )
+    current_resource_snapshot = (
+        supporting_reviews.get("current_resource_snapshot")
+        if isinstance(supporting_reviews.get("current_resource_snapshot"), dict)
+        else {"status": "not-run"}
+    )
+    resource_packet_full = resource_control_approval_packet(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        operator_review=operator_review,
+        deployment_review=deployment_review,
+        resource_review=resource_review,
+        resource_preflight=validation_resource_preflight_summary(current_resource_snapshot),
+    )
+    approval_packet = quote_resource_control_approval_review_candidate(
+        {
+            "status": operator_review.get("status") or deployment_review.get("status") or "missing",
+            "next_step": (
+                "Collect deployment/operator resource-control evidence before finding-gate review."
+            ),
+            "resource_control_approval_packet": resource_packet_full,
+        }
+    )
 
     def decision_status(decision_id: str) -> str:
         if review_missing:
@@ -10266,6 +10289,7 @@ def build_resource_evidence_closure(
         ],
         "next_safe_commands": commands[:6],
         "evidence_contract": evidence_contract,
+        "resource_control_approval_packet": approval_packet,
         "finding_gate_entry_condition": (
             "Only enter finding-gate after deployment/operator evidence proves attacker-controlled key growth or "
             "connection sharding plus concrete availability impact, without rate/DoS testing."
@@ -11742,6 +11766,7 @@ def build_lead_dossier(
                 "approval_packet": (
                     closure.get("transaction_corpus_approval_packet")
                     or closure.get("credential_impact_approval_packet")
+                    or closure.get("resource_control_approval_packet")
                     if closure
                     else None
                 ),
@@ -15615,6 +15640,67 @@ def validation_item_from_hypothesis(
         credential_approval_packet = quote_credential_impact_approval_review_candidate(
             credential_impact_checklist,
         )
+    resource_approval_packet = None
+    if hypothesis.get("type") == "resource-abuse-review" or hypothesis.get("impact") == "resource-exhaustion":
+        resource_review = (
+            hypothesis.get("resource_abuse_review")
+            if isinstance(hypothesis.get("resource_abuse_review"), dict)
+            else {}
+        )
+        operator_evidence = load_optional_json(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
+        deployment_review = load_optional_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT)
+        operator_review = load_optional_json(artifact_dir / OPERATOR_EVIDENCE_REVIEW_ARTIFACT)
+        profile_doc = profile if isinstance(profile, dict) else {}
+        source_root_value = str(profile_doc.get("default_source_root") or DEFAULT_SOURCE_ROOT)
+        source_root = resolve_repo_path(source_root_value)
+        source_available = source_root.exists() and not is_blackbox_profile_like(profile_doc)
+        if source_available and (
+            not isinstance(deployment_review, dict)
+            or not isinstance(deployment_review.get("decisions"), list)
+        ):
+            deployment_review = build_deployment_resource_review(
+                source_root,
+                profile,
+                operator_evidence=operator_evidence,
+            )
+        if (
+            not isinstance(operator_review, dict)
+            or not isinstance(operator_review.get("resource_control_approval_packet"), dict)
+        ):
+            rpc_method_policy, _rpc_method_policy_source = rpc_method_policy_for_hypothesis_matrix(
+                profile=profile,
+                artifact_dir=artifact_dir,
+            )
+            operator_review = build_operator_evidence_review(
+                target=target,
+                artifact_dir=artifact_dir,
+                operator_evidence=operator_evidence,
+                deployment_review=deployment_review if isinstance(deployment_review, dict) else {},
+                rpc_method_policy=rpc_method_policy,
+                profile=profile,
+            )
+        if isinstance(operator_review, dict) or isinstance(deployment_review, dict) or resource_review:
+            resource_packet_full = resource_control_approval_packet(
+                artifact_dir=artifact_dir,
+                profile=profile,
+                operator_review=operator_review if isinstance(operator_review, dict) else {},
+                deployment_review=deployment_review if isinstance(deployment_review, dict) else {},
+                resource_review=resource_review,
+                resource_preflight=validation_resource_preflight_summary(current_resource_snapshot),
+            )
+            resource_approval_packet = quote_resource_control_approval_review_candidate(
+                {
+                    "status": (
+                        operator_review.get("status")
+                        if isinstance(operator_review, dict)
+                        else deployment_review.get("status")
+                        if isinstance(deployment_review, dict)
+                        else "missing"
+                    ),
+                    "next_step": "Collect deployment/operator resource-control evidence before finding-gate review.",
+                    "resource_control_approval_packet": resource_packet_full,
+                }
+            )
 
     return {
         "id": f"VAL-{safe_hypothesis_id(hypothesis.get('id'))}",
@@ -15637,6 +15723,7 @@ def validation_item_from_hypothesis(
         "resource_abuse_review": hypothesis.get("resource_abuse_review"),
         "credential_proxy_review": hypothesis.get("credential_proxy_review"),
         "credential_impact_approval_packet": credential_approval_packet,
+        "resource_control_approval_packet": resource_approval_packet,
         "command_safety": command_summary,
         "blocked_command_safety": blocked_command_summary,
         "required_evidence": required_evidence_for_hypothesis(hypothesis),
@@ -16273,6 +16360,7 @@ def build_iteration_decision_from_plan(
         for packet_key, packet_type in [
             ("transaction_corpus_approval_packet", "transaction-corpus"),
             ("credential_impact_approval_packet", "credential-impact"),
+            ("resource_control_approval_packet", "resource-control"),
         ]:
             packet = item.get(packet_key) if isinstance(item.get(packet_key), dict) else {}
             if not packet:
@@ -22009,6 +22097,249 @@ def operator_evidence_closure_contracts(
     return contracts
 
 
+def resource_control_approval_packet(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    operator_review: dict[str, Any],
+    deployment_review: dict[str, Any],
+    resource_review: dict[str, Any],
+    resource_preflight: dict[str, Any],
+) -> dict[str, Any]:
+    assessment_policy = assessment_mode_policy(profile)
+    summary = operator_review.get("summary", {}) if isinstance(operator_review.get("summary"), dict) else {}
+    deployment_summary = deployment_review.get("summary", {}) if isinstance(deployment_review.get("summary"), dict) else {}
+    evidence_contract = (
+        resource_review.get("evidence_contract")
+        if isinstance(resource_review.get("evidence_contract"), dict)
+        else operator_review.get("resource_evidence_contract")
+        if isinstance(operator_review.get("resource_evidence_contract"), dict)
+        else {}
+    )
+    resource_contract = {}
+    for contract in operator_review.get("closure_contracts", []) or []:
+        if isinstance(contract, dict) and contract.get("id") == "rpc-resource-exhaustion":
+            resource_contract = contract
+            break
+
+    entrypoint = str(
+        resource_contract.get("entrypoint")
+        or evidence_contract.get("entrypoint")
+        or "POST /api/rpc/solana/{cluster}"
+    )
+    required_decision_ids = [
+        str(item)
+        for item in (
+            evidence_contract.get("required_operator_decision_ids")
+            if isinstance(evidence_contract.get("required_operator_decision_ids"), list)
+            else sorted(OPERATOR_RESOURCE_CONTROL_DECISION_IDS)
+        )
+        if str(item).strip()
+    ]
+    contract_missing = [
+        str(item)
+        for item in resource_contract.get("required_decision_ids", []) or []
+        if str(item).strip()
+    ]
+    if contract_missing:
+        missing_decision_ids = contract_missing
+    else:
+        missing_decision_ids = ordered_unique_strings(
+            [
+                str(item)
+                for item in [
+                    *(summary.get("missing_decisions", []) or []),
+                    *(summary.get("critical_missing", []) or []),
+                ]
+                if str(item) in OPERATOR_RESOURCE_CONTROL_DECISION_IDS
+            ]
+        )
+    if not missing_decision_ids and resource_review and not resource_contract:
+        missing_decision_ids = ordered_unique_strings(
+            [
+                decision_id
+                for decision_id in required_decision_ids
+                if decision_id in OPERATOR_RESOURCE_CONTROL_DECISION_IDS
+            ]
+        )
+
+    sidecar_path = str(
+        operator_review.get("sidecar_path")
+        or resource_contract.get("sidecar_path")
+        or repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
+    )
+    accepted_present_statuses = sorted(
+        operator_review.get("accepted_present_statuses")
+        if isinstance(operator_review.get("accepted_present_statuses"), list)
+        else OPERATOR_EVIDENCE_PRESENT_STATUSES
+    )
+    preflight = resource_preflight if isinstance(resource_preflight, dict) else {"status": "not-run"}
+    resource_status = str(preflight.get("status") or "not-run")
+    budget = preflight.get("resource_budget") if isinstance(preflight.get("resource_budget"), dict) else {}
+    active_blocked = resource_status not in {"healthy", "not-run"} or budget.get("active_target_traffic") == "blocked"
+    has_resource_context = bool(resource_review) or bool(evidence_contract) or bool(resource_contract)
+    evidence_ready = has_resource_context and not missing_decision_ids and not deployment_summary.get("critical_missing")
+    if not has_resource_context:
+        packet_status = "waiting-resource-review-context"
+    elif missing_decision_ids:
+        packet_status = (
+            "blocked-resource-waiting-deployment-operator-evidence"
+            if active_blocked
+            else "waiting-deployment-operator-evidence"
+        )
+    elif evidence_ready and active_blocked:
+        packet_status = "ready-offline-gate-review-blocked-active-validation"
+    elif evidence_ready:
+        packet_status = "ready-offline-gate-review"
+    else:
+        packet_status = "partial-deployment-operator-evidence"
+
+    def command(subcommand: str) -> str:
+        return validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile)
+
+    contract_commands = [
+        row for row in resource_contract.get("commands", []) or [] if isinstance(row, dict)
+    ]
+
+    def contract_command(command_id: str) -> dict[str, Any]:
+        for row in contract_commands:
+            if row.get("id") == command_id:
+                return row
+        return {}
+
+    sequence_specs = [
+        (
+            "operator-template-preview",
+            "ready",
+            "offline-local-template",
+            command("operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract"),
+            None,
+        ),
+        (
+            "operator-evidence-review",
+            "ready-after-sidecar-edit",
+            "offline-redacted-sidecar-review",
+            command("operator-evidence-review --no-write --show-evidence --show-missing --show-closure-contract"),
+            None,
+        ),
+        (
+            "deployment-context",
+            "ready",
+            "offline-local-deployment-review",
+            command("deployment-review --no-write --top 8"),
+            None,
+        ),
+        (
+            "resource-gate",
+            "blocked-until-healthy-resource-snapshot" if active_blocked else "ready-before-active-validation",
+            "offline-local-resource-check",
+            command("resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict"),
+            None,
+        ),
+        (
+            "single-request-validation",
+            "blocked-until-evidence-and-resource-gate"
+            if active_blocked or not evidence_ready
+            else "pending-manual-approval",
+            "single-approved-target-request",
+            None,
+            (
+                "Use at most one approved reachability request only if needed after deployment/operator evidence is complete; "
+                "do not test rate limits, exhaust buckets, or create resource pressure."
+            ),
+        ),
+        (
+            "finding-gate-preview",
+            "ready-after-non-stress-impact-evidence" if evidence_ready else "waiting-deployment-operator-evidence",
+            "offline-manual-gate-preview",
+            command("gate --no-write --show-items"),
+            None,
+        ),
+    ]
+    approval_sequence = []
+    for command_id, status, risk, fallback_command, fallback_action in sequence_specs:
+        contract_row = contract_command(command_id)
+        row = {
+            "id": command_id,
+            "status": status,
+            "risk": contract_row.get("risk") or risk,
+        }
+        if contract_row.get("command") or fallback_command:
+            row["command"] = contract_row.get("command") or fallback_command
+        if contract_row.get("action") or fallback_action:
+            row["action"] = contract_row.get("action") or fallback_action
+        if contract_row.get("command_safety_ref"):
+            row["command_safety_ref"] = contract_row.get("command_safety_ref")
+        approval_sequence.append(row)
+
+    blocker_by_decision = {
+        "external-rate-limit-store-config": "No production external rate-limit store configuration/health evidence is present.",
+        "proxy-header-trust-model": "No production proxy/header trust evidence is present.",
+        "rpc-client-ip-header-trust-model": "No direct-to-app or client-controlled rate-limit key evidence is present.",
+        "rate-limit-bounds": "No rate-limit key TTL, eviction, burst, sustained, or connection-bound evidence is present.",
+        "fallback-monitoring-alerts": "No fallback monitoring or alerting evidence is present.",
+    }
+    blockers = [
+        blocker_by_decision.get(decision_id, f"No deployment/operator evidence is present for {decision_id}.")
+        for decision_id in missing_decision_ids
+    ]
+    if active_blocked:
+        blockers.append("Current resource gate is not healthy; even a single reachability request remains blocked.")
+    if not evidence_ready:
+        blockers.append("No non-stress availability, quota, or operator-impact evidence is present.")
+        blockers.append("Finding-gate has not accepted a concrete resource-control impact claim.")
+    else:
+        blockers.append(
+            "Finding-gate/adjudication still must accept non-stress availability or operator-impact evidence before reporting."
+        )
+    finding_gate_blockers = ordered_unique_strings(blockers)
+
+    return {
+        "status": packet_status,
+        "packet_type": "resource-control-approval-packet",
+        "assessment": {
+            "mode": assessment_policy.get("mode"),
+            "optimization_goal": assessment_policy.get("optimization_goal"),
+            "resource_lead_bias": (
+                "coverage-first: close every deployment/operator decision for resource-control surfaces."
+                if assessment_policy.get("mode") == "greybox"
+                else "bounty-first: continue only if non-stress evidence can support a valid high-impact availability or quota report."
+            ),
+        },
+        "recommended_evidence": {
+            "entrypoint": entrypoint,
+            "provider": "deployment/operator",
+            "missing_decision_ids": missing_decision_ids,
+            "required_decision_ids": required_decision_ids,
+            "operator_review_status": operator_review.get("status") or "missing",
+            "deployment_review_status": deployment_review.get("status") or "missing",
+            "rpc_client_ip_trust_status": summary.get("rpc_client_ip_trust_status") or "missing",
+        },
+        "operator_evidence_sidecar": sidecar_path,
+        "accepted_present_statuses": accepted_present_statuses,
+        "redacted_sidecar_required_fields": [
+            "one evidence_items[] row per missing resource-control decision id",
+            "status must stay pending/needs-review until reviewed evidence justifies an accepted_present_statuses value",
+            "summary must be short, non-placeholder, and redacted",
+            "source_ref should identify a reviewed deployment config, operator note, ticket, dashboard excerpt, log summary, or equivalent source without raw secrets",
+            "no provider API keys, bearer tokens, cookies, billing account IDs, raw dashboards, private keys, seed phrases, wallet signatures, raw Burp history, or stress-test output",
+        ],
+        "offline_commands": [
+            command("operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract"),
+            command("deployment-review --no-write --top 8"),
+            command("validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check"),
+        ],
+        "approval_sequence": approval_sequence,
+        "finding_gate_blockers": finding_gate_blockers,
+        "finding_gate_blocker_count": len(finding_gate_blockers),
+        "safety": (
+            "Offline resource-control approval packet only. It describes deployment/operator evidence and a gated "
+            "single-request ceiling; it sends no target traffic, performs no rate-limit validation, invokes no Burp "
+            "tools, signs no wallets, and submits no transactions."
+        ),
+    }
+
+
 def build_operator_evidence_review(
     *,
     target: str,
@@ -22187,6 +22518,22 @@ def build_operator_evidence_review(
     )
     summary["closure_contracts"] = len(closure_contracts)
     summary["credential_provider_contract"] = credential_evidence_contract.get("id") or "missing"
+    resource_control_packet = resource_control_approval_packet(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        operator_review={
+            "status": status,
+            "summary": summary,
+            "sidecar_path": sidecar_path,
+            "accepted_present_statuses": accepted_present_statuses,
+            "closure_contracts": closure_contracts,
+            "resource_evidence_contract": resource_evidence_contract,
+        },
+        deployment_review=deployment_review if isinstance(deployment_review, dict) else {},
+        resource_review=rate_limit_review,
+        resource_preflight={"status": "not-run"},
+    )
+    summary["resource_approval_packet_status"] = resource_control_packet.get("status")
     return {
         "generated_at": utc_now(),
         "status": status,
@@ -22200,6 +22547,7 @@ def build_operator_evidence_review(
         "closure_contracts": closure_contracts,
         "credential_evidence_contract": credential_evidence_contract,
         "resource_evidence_contract": resource_evidence_contract,
+        "resource_control_approval_packet": resource_control_packet,
         "sidecar_template": sidecar_template,
         "accepted_present_statuses": accepted_present_statuses,
         "reportability_gate": (
@@ -26970,6 +27318,58 @@ def quote_credential_impact_approval_review_candidate(
     }
 
 
+def quote_resource_control_approval_review_candidate(
+    resource_review_container: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(resource_review_container, dict):
+        return None
+    approval_packet = (
+        resource_review_container.get("resource_control_approval_packet")
+        if isinstance(resource_review_container.get("resource_control_approval_packet"), dict)
+        else {}
+    )
+    if not approval_packet:
+        return None
+    approval_sequence = []
+    for step in approval_packet.get("approval_sequence", []) or []:
+        if not isinstance(step, dict):
+            continue
+        approval_sequence.append(
+            {
+                "id": step.get("id"),
+                "status": step.get("status"),
+                "risk": step.get("risk"),
+                "has_command": bool(step.get("command")),
+                "has_action": bool(step.get("action")),
+            }
+        )
+    blockers = [
+        str(item)
+        for item in approval_packet.get("finding_gate_blockers", []) or []
+        if str(item).strip()
+    ]
+    recommended_evidence = (
+        approval_packet.get("recommended_evidence")
+        if isinstance(approval_packet.get("recommended_evidence"), dict)
+        else {}
+    )
+    return {
+        "id": "review_resource_control_approval_packet",
+        "type": "resource-control-approval-packet",
+        "status": approval_packet.get("status"),
+        "checklist_status": resource_review_container.get("status"),
+        "assessment": approval_packet.get("assessment", {}),
+        "recommended_evidence": recommended_evidence,
+        "operator_evidence_sidecar": approval_packet.get("operator_evidence_sidecar"),
+        "accepted_present_statuses": approval_packet.get("accepted_present_statuses", []),
+        "approval_sequence": approval_sequence,
+        "finding_gate_blockers": blockers[:8],
+        "finding_gate_blocker_count": len(blockers),
+        "next_step": resource_review_container.get("next_step"),
+        "safety": approval_packet.get("safety"),
+    }
+
+
 def format_approval_packet_inline(
     packet: dict[str, Any],
     *,
@@ -27004,7 +27404,14 @@ def format_approval_packet_inline(
     if recommended_evidence:
         missing = recommended_evidence.get("missing_decision_ids", [])
         missing_count = len(missing) if isinstance(missing, list) else 0
-        kind_text = "type=credential-impact " if include_kind else ""
+        raw_kind = str(packet.get("packet_type") or packet.get("type") or "")
+        if "resource-control" in raw_kind:
+            kind_label = "resource-control"
+        elif "credential" in raw_kind:
+            kind_label = "credential-impact"
+        else:
+            kind_label = "evidence"
+        kind_text = f"type={kind_label} " if include_kind else ""
         return (
             f"{status_text} "
             f"{kind_text}"
@@ -38887,6 +39294,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Operator evidence review:" in operator_evidence_review_stdout_text
                 and "Coverage:" in operator_evidence_review_stdout_text
                 and "contracts=" in operator_evidence_review_stdout_text
+                and "Approval packet: status=" in operator_evidence_review_stdout_text
+                and "type=resource-control" in operator_evidence_review_stdout_text
                 and "Sidecar template:" in operator_evidence_review_stdout_text
                 and "Sidecar template JSON:" in operator_evidence_review_stdout_text
                 and "Closure contracts:" in operator_evidence_review_stdout_text
@@ -48352,6 +48761,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             if isinstance(rewrite_credential_validation_packet.get("recommended_evidence"), dict)
             else {}
         )
+        rewrite_resource_validation_packet = (
+            rewrite_resource_validation_item.get("resource_control_approval_packet")
+            if isinstance(rewrite_resource_validation_item, dict)
+            and isinstance(rewrite_resource_validation_item.get("resource_control_approval_packet"), dict)
+            else {}
+        )
+        rewrite_resource_validation_packet_evidence = (
+            rewrite_resource_validation_packet.get("recommended_evidence")
+            if isinstance(rewrite_resource_validation_packet.get("recommended_evidence"), dict)
+            else {}
+        )
         rewrite_resource_evidence_gaps = build_evidence_gaps(
             rewrite_clusters,
             [],
@@ -49364,6 +49784,15 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             == "needs-deployment-review"
             and rewrite_resource_validation_item.get("resource_abuse_review", {}).get("client_ip_trust_status")
             == "needs-proxy-trust-evidence"
+            and rewrite_resource_validation_packet.get("status") == "waiting-deployment-operator-evidence"
+            and rewrite_resource_validation_packet.get("type") == "resource-control-approval-packet"
+            and rewrite_resource_validation_packet_evidence.get("entrypoint") == "POST /api/rpc/solana/{cluster}"
+            and rewrite_resource_validation_packet_evidence.get("provider") == "deployment/operator"
+            and "rpc-client-ip-header-trust-model"
+            in (rewrite_resource_validation_packet_evidence.get("missing_decision_ids") or [])
+            and rewrite_resource_validation_packet.get("operator_evidence_sidecar")
+            == repo_relative_or_absolute(rewrite_transaction_matrix_dir / OPERATOR_EVIDENCE_ARTIFACT)
+            and rewrite_resource_validation_packet.get("finding_gate_blocker_count", 0) >= 5
             and rewrite_resource_gap is not None
             and rewrite_resource_gap.get("priority") == "medium"
             and rewrite_resource_queue_item is not None
@@ -55991,6 +56420,13 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
         f"rpc_client_ip_trust={summary.get('rpc_client_ip_trust_status') or 'missing'} "
         f"contracts={summary.get('closure_contracts', 0)}"
     )
+    resource_packet = (
+        review.get("resource_control_approval_packet")
+        if isinstance(review.get("resource_control_approval_packet"), dict)
+        else {}
+    )
+    if resource_packet:
+        print(f"Approval packet: {format_approval_packet_inline(resource_packet, status_key=True)}")
     top_count = max(0, int(args.top))
     if top_count:
         print("Evidence items:")
@@ -57052,6 +57488,13 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         f"client_ip_trust={resource_review.get('client_ip_trust_status') or 'missing'} "
                         f"xff_refs={resource_review.get('client_ip_forwarded_for_ref_count', 0)}"
                     )
+                resource_packet = (
+                    item.get("resource_control_approval_packet")
+                    if isinstance(item.get("resource_control_approval_packet"), dict)
+                    else {}
+                )
+                if resource_packet:
+                    print(f"  resource_approval_packet={format_approval_packet_inline(resource_packet)}")
                 credential_review = (
                     item.get("credential_proxy_review")
                     if isinstance(item.get("credential_proxy_review"), dict)
