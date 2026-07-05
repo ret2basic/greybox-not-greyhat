@@ -10237,17 +10237,24 @@ def build_methodology_supporting_reviews(
         profile,
         operator_evidence=operator_evidence,
     )
+    rpc_proxy_parity_review = load_or_build_rpc_proxy_parity_review(
+        source_root=source_root,
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
     operator_evidence_review = build_operator_evidence_review(
         target=target,
         artifact_dir=artifact_dir,
         operator_evidence=operator_evidence,
         deployment_review=deployment_review,
         rpc_method_policy=rpc_method_policy,
+        rpc_proxy_parity_review=rpc_proxy_parity_review,
         profile=profile,
     )
     reviews.update(
         {
             "rpc_method_policy": rpc_method_policy,
+            "rpc_proxy_parity_review": rpc_proxy_parity_review or {},
             "transaction_flow_review": transaction_flow_review,
             "deployment_review": deployment_review,
             "operator_evidence_review": operator_evidence_review,
@@ -19095,12 +19102,18 @@ def validation_item_from_hypothesis(
                 profile=profile,
                 artifact_dir=artifact_dir,
             )
+            rpc_proxy_parity_review = load_or_build_rpc_proxy_parity_review(
+                source_root=source_root if source_available else None,
+                profile=profile,
+                artifact_dir=artifact_dir,
+            )
             operator_review = build_operator_evidence_review(
                 target=target,
                 artifact_dir=artifact_dir,
                 operator_evidence=operator_evidence,
                 deployment_review=deployment_review if isinstance(deployment_review, dict) else {},
                 rpc_method_policy=rpc_method_policy,
+                rpc_proxy_parity_review=rpc_proxy_parity_review,
                 profile=profile,
             )
         if isinstance(operator_review, dict) or isinstance(deployment_review, dict) or resource_review:
@@ -19148,12 +19161,18 @@ def validation_item_from_hypothesis(
                 operator_evidence=operator_evidence,
             )
         if not isinstance(operator_review, dict) or not isinstance(operator_review.get("summary"), dict):
+            rpc_proxy_parity_review = load_or_build_rpc_proxy_parity_review(
+                source_root=source_root if source_available else None,
+                profile=profile,
+                artifact_dir=artifact_dir,
+            )
             operator_review = build_operator_evidence_review(
                 target=target,
                 artifact_dir=artifact_dir,
                 operator_evidence=operator_evidence,
                 deployment_review=deployment_review if isinstance(deployment_review, dict) else {},
                 rpc_method_policy=rpc_method_policy,
+                rpc_proxy_parity_review=rpc_proxy_parity_review,
                 profile=profile,
             )
         rpc_proxy_approval_packet = rpc_proxy_abuse_approval_packet(
@@ -19984,6 +20003,7 @@ def evidence_prep_supporting_reviews(
             operator_evidence_file=operator_file,
             deployment_review=load_optional_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT) or {},
             rpc_method_policy=load_optional_json(artifact_dir / "rpc-method-policy.json") or {},
+            rpc_proxy_parity_review=load_optional_json(artifact_dir / RPC_PROXY_PARITY_REVIEW_ARTIFACT),
             profile=profile,
         )
     return reviews
@@ -20506,6 +20526,7 @@ def evidence_sidecar_draft_content(
                 operator_evidence_file=operator_file,
                 deployment_review=load_optional_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT) or {},
                 rpc_method_policy=load_optional_json(artifact_dir / "rpc-method-policy.json") or {},
+                rpc_proxy_parity_review=load_optional_json(artifact_dir / RPC_PROXY_PARITY_REVIEW_ARTIFACT),
                 profile=profile,
             )
             reviews["operator_evidence_review"] = operator_review
@@ -23653,6 +23674,124 @@ def build_rpc_proxy_parity_review(
             "and does not read runtime secrets."
         ),
     }
+
+
+def load_or_build_rpc_proxy_parity_review(
+    *,
+    source_root: Path | None,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    max_file_bytes: int = DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES,
+) -> dict[str, Any] | None:
+    review = load_optional_json(artifact_dir / RPC_PROXY_PARITY_REVIEW_ARTIFACT)
+    if isinstance(review, dict):
+        return review
+    if source_root is None or is_blackbox_assessment(profile) or not source_root.exists():
+        return None
+    return build_rpc_proxy_parity_review(
+        source_root=source_root,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        max_file_bytes=max_file_bytes,
+    )
+
+
+def rpc_proxy_parity_operator_evidence_decisions(
+    rpc_proxy_parity_review: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not isinstance(rpc_proxy_parity_review, dict):
+        return []
+    checks = [
+        check
+        for check in rpc_proxy_parity_review.get("checks", []) or []
+        if isinstance(check, dict)
+        and str(check.get("id") or "").strip()
+        and str(check.get("status") or "") == "review"
+    ]
+    check_by_id = {str(check.get("id")): check for check in checks}
+    decisions: list[dict[str, Any]] = []
+
+    def check_refs(check: dict[str, Any]) -> list[dict[str, Any]]:
+        refs = check.get("evidence_refs") if isinstance(check.get("evidence_refs"), list) else []
+        return ordered_unique_ref_dicts([ref for ref in refs if isinstance(ref, dict)])[:8]
+
+    def source_review(check: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "artifact": RPC_PROXY_PARITY_REVIEW_ARTIFACT,
+            "check_id": check.get("id"),
+            "status": check.get("status"),
+            "severity": check.get("severity"),
+            "http_signals": normalize_string_list(check.get("http_signals")),
+            "ws_signals": normalize_string_list(check.get("ws_signals")),
+            "promotion_gate": check.get("promotion_gate"),
+            "reject_if": normalize_string_list(check.get("reject_if"))[:4],
+        }
+
+    def add(check_id: str, decision_id: str, needed: list[str]) -> None:
+        check = check_by_id.get(check_id)
+        if not check:
+            return
+        decisions.append(
+            {
+                "id": decision_id,
+                "deployment_status": "missing-evidence",
+                "operator_evidence_needed": needed,
+                "source": "rpc-proxy-parity-review",
+                "source_check_id": check_id,
+                "source_review": source_review(check),
+                "evidence_refs": check_refs(check),
+            }
+        )
+
+    add(
+        "host-derived-origin-trust-boundary",
+        "edge-host-canonicalization-policy",
+        [
+            "Confirm whether the public edge, platform router, or load balancer canonicalizes Host before the application receives it.",
+            "Confirm whether requests with untrusted Host values are rejected before reaching HTTP and WebSocket RPC proxy code.",
+        ],
+    )
+    add(
+        "host-derived-origin-trust-boundary",
+        "host-origin-pair-reachability",
+        [
+            "Confirm whether an attacker-controlled Host plus matching Origin pair can reach the public RPC proxy entrypoints.",
+            "Confirm whether direct-to-app traffic can bypass canonical target hostnames or edge Host validation.",
+        ],
+    )
+    add(
+        "host-derived-origin-trust-boundary",
+        "cors-origin-reflection-impact",
+        [
+            "Confirm whether host-derived origins affect CORS, browser trust, credentialed RPC access, logs, quota attribution, or similar impact boundaries.",
+            "Confirm that any accepted Host/Origin pair creates concrete impact beyond passing a local source-derived origin check.",
+        ],
+    )
+    add(
+        "upstream-header-forwarding-parity",
+        "websocket-upstream-header-receipt-policy",
+        [
+            "Confirm which caller request headers reach the credentialed upstream WebSocket provider after proxy filtering.",
+            "Confirm whether Authorization, Cookie, Host, Origin, x-forwarded-* or equivalent sensitive headers are stripped or forwarded.",
+        ],
+    )
+    add(
+        "upstream-header-forwarding-parity",
+        "websocket-upstream-header-trust-or-logging-policy",
+        [
+            "Confirm whether the upstream WebSocket provider trusts, logs, bills, attributes quota, authorizes, or alerts on forwarded caller headers.",
+            "Confirm whether forwarded headers are inert metadata or can create disclosure, trust-boundary confusion, or account-impact evidence.",
+        ],
+    )
+    add(
+        "rate-and-connection-parity",
+        "websocket-connection-quota-impact",
+        [
+            "Confirm production WebSocket connection, subscription, pending-message, and upstream-provider quota or billing limits without stress testing.",
+            "Confirm whether the configured WebSocket limits can create concrete app availability, provider quota, billing, or operator-impact evidence.",
+        ],
+    )
+    return decisions
 
 
 VALIDATION_APPROVAL_PACKET_KEYS = [
@@ -29955,11 +30094,17 @@ OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS = {
 }
 
 OPERATOR_RESOURCE_CONTROL_DECISION_IDS = {
+    "cors-origin-reflection-impact",
+    "edge-host-canonicalization-policy",
     "external-rate-limit-store-config",
     "proxy-header-trust-model",
     "rate-limit-bounds",
     "fallback-monitoring-alerts",
+    "host-origin-pair-reachability",
     "rpc-client-ip-header-trust-model",
+    "websocket-connection-quota-impact",
+    "websocket-upstream-header-receipt-policy",
+    "websocket-upstream-header-trust-or-logging-policy",
 }
 
 
@@ -30553,7 +30698,7 @@ def operator_evidence_closure_contracts(
                 "command_safety": command_safety(commands),
                 "required_order": [
                     "Fill only redacted deployment/operator evidence for the required resource-control decisions.",
-                    "Run operator-evidence-review until external store, proxy trust, bounds, fallback monitoring, and IP trust decisions are present or explicitly not applicable.",
+                    "Run operator-evidence-review until external store, proxy/IP/Host trust, bounds, fallback monitoring, WebSocket header, and quota-impact decisions are present or explicitly not applicable.",
                     "Run deployment-context to align sidecar statements with local deployment/source evidence.",
                     "Run resource-gate before any approved single-request validation; stop unless it is healthy.",
                     "Run finding-gate-preview only with non-stress evidence tying missing controls to availability impact.",
@@ -30775,6 +30920,12 @@ def resource_control_approval_packet(
         "rpc-client-ip-header-trust-model": "No direct-to-app or client-controlled rate-limit key evidence is present.",
         "rate-limit-bounds": "No rate-limit key TTL, eviction, burst, sustained, or connection-bound evidence is present.",
         "fallback-monitoring-alerts": "No fallback monitoring or alerting evidence is present.",
+        "edge-host-canonicalization-policy": "No edge/platform Host canonicalization or rejection policy evidence is present.",
+        "host-origin-pair-reachability": "No public-entry evidence shows whether attacker-controlled Host/Origin pairs can reach the RPC proxy.",
+        "cors-origin-reflection-impact": "No evidence ties host-derived origins to concrete CORS, browser trust, quota, logging, or provider impact.",
+        "websocket-upstream-header-receipt-policy": "No upstream/operator evidence shows which WebSocket caller headers are received after proxy filtering.",
+        "websocket-upstream-header-trust-or-logging-policy": "No evidence shows whether forwarded WebSocket headers are trusted, logged, billed, or otherwise impactful upstream.",
+        "websocket-connection-quota-impact": "No non-stress operator evidence ties WebSocket connection limits to quota, billing, provider, or availability impact.",
     }
     blockers = [
         blocker_by_decision.get(decision_id, f"No deployment/operator evidence is present for {decision_id}.")
@@ -30845,6 +30996,7 @@ def build_operator_evidence_review(
     operator_evidence_file: dict[str, Any] | None = None,
     deployment_review: dict[str, Any] | None = None,
     rpc_method_policy: dict[str, Any] | None = None,
+    rpc_proxy_parity_review: dict[str, Any] | None = None,
     profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     raw_items = operator_evidence_items(operator_evidence)
@@ -30935,6 +31087,53 @@ def build_operator_evidence_review(
             }
         )
 
+    rpc_proxy_parity_decisions = rpc_proxy_parity_operator_evidence_decisions(rpc_proxy_parity_review)
+    rpc_proxy_parity_decision_ids = ordered_unique_strings(
+        [
+            str(item.get("id"))
+            for item in rpc_proxy_parity_decisions
+            if str(item.get("id") or "").strip()
+        ]
+    )
+    if rpc_proxy_parity_decision_ids:
+        resource_evidence_contract = (
+            json_clone(resource_evidence_contract)
+            if isinstance(resource_evidence_contract, dict)
+            else {}
+        )
+        resource_evidence_contract.setdefault("id", "rpc-resource-exhaustion-evidence-contract")
+        resource_evidence_contract.setdefault("entrypoint", "POST /api/rpc/solana/{cluster}")
+        resource_evidence_contract["required_operator_decision_ids"] = ordered_unique_strings(
+            [
+                *normalize_string_list(resource_evidence_contract.get("required_operator_decision_ids")),
+                *rpc_proxy_parity_decision_ids,
+            ]
+        )
+        resource_evidence_contract["rpc_proxy_parity_operator_decision_ids"] = rpc_proxy_parity_decision_ids
+        resource_evidence_contract["rpc_proxy_parity_reportable_only_if"] = [
+            "Edge/operator evidence proves the Host, Origin, WebSocket header, or connection-quota boundary is attacker-influenceable in production.",
+            "Upstream/operator evidence ties that boundary to concrete CORS, auth, logging, quota, billing, provider, or availability impact.",
+            "Any active validation stays within an approved single-observation or non-stress evidence path.",
+        ]
+    for decision in rpc_proxy_parity_decisions:
+        decision_id = str(decision.get("id") or "").strip()
+        if not decision_id:
+            continue
+        refs = operator_evidence_refs_for_decision(operator_evidence, decision_id)
+        decision_coverage.append(
+            {
+                "id": decision_id,
+                "deployment_status": decision.get("deployment_status") or "missing-evidence",
+                "operator_evidence_status": "present" if refs else "missing",
+                "operator_evidence_refs": refs,
+                "operator_evidence_needed": decision.get("operator_evidence_needed", []),
+                "source": decision.get("source") or "rpc-proxy-parity-review",
+                "source_check_id": decision.get("source_check_id"),
+                "source_review": decision.get("source_review"),
+                "evidence_refs": decision.get("evidence_refs", []),
+            }
+        )
+
     missing_decisions = [
         item
         for item in decision_coverage
@@ -30979,6 +31178,9 @@ def build_operator_evidence_review(
             "id": item.get("id"),
             "deployment_status": item.get("deployment_status"),
             "operator_evidence_needed": item.get("operator_evidence_needed", []),
+            "source": item.get("source"),
+            "source_check_id": item.get("source_check_id"),
+            "evidence_refs": item.get("evidence_refs", []),
         }
         for item in missing_decisions
     ]
@@ -31001,6 +31203,13 @@ def build_operator_evidence_review(
         "rpc_client_ip_trust_status": client_ip_trust_review.get("status") or "missing",
         "rpc_client_ip_trust_missing": bool(rpc_client_ip_trust_missing),
         "rpc_resource_contract": resource_evidence_contract.get("id") or "missing",
+        "rpc_proxy_parity_review_status": (
+            rpc_proxy_parity_review.get("status")
+            if isinstance(rpc_proxy_parity_review, dict)
+            else "missing"
+        ),
+        "rpc_proxy_parity_operator_decisions": rpc_proxy_parity_decision_ids,
+        "rpc_proxy_parity_operator_decision_count": len(rpc_proxy_parity_decisions),
     }
     accepted_present_statuses = sorted(OPERATOR_EVIDENCE_PRESENT_STATUSES)
     sidecar_path = repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
@@ -42862,6 +43071,28 @@ def operator_evidence_decision_requirement_hints(decision_id: str) -> list[str]:
         ],
         "rpc-client-ip-header-trust-model": [
             "Confirm whether direct-to-app traffic can bypass the trusted edge or whether the selected client IP key can be attacker-controlled.",
+        ],
+        "edge-host-canonicalization-policy": [
+            "Confirm whether the public edge, platform router, or load balancer canonicalizes Host before the app receives it.",
+            "Confirm whether untrusted Host values are rejected before reaching HTTP or WebSocket RPC proxy code.",
+        ],
+        "host-origin-pair-reachability": [
+            "Confirm whether an attacker-controlled Host plus matching Origin pair can reach the public RPC proxy entrypoints.",
+            "Confirm whether direct-to-app traffic can bypass canonical hostnames or edge Host validation.",
+        ],
+        "cors-origin-reflection-impact": [
+            "Confirm whether host-derived origins affect CORS, browser trust, credentialed RPC access, logs, quota attribution, or equivalent impact boundaries.",
+        ],
+        "websocket-upstream-header-receipt-policy": [
+            "Confirm which caller request headers reach the credentialed upstream WebSocket provider after proxy filtering.",
+            "Confirm whether Authorization, Cookie, Host, Origin, x-forwarded-* or equivalent sensitive headers are stripped or forwarded.",
+        ],
+        "websocket-upstream-header-trust-or-logging-policy": [
+            "Confirm whether the upstream WebSocket provider trusts, logs, bills, attributes quota, authorizes, or alerts on forwarded caller headers.",
+        ],
+        "websocket-connection-quota-impact": [
+            "Confirm production WebSocket connection, subscription, pending-message, and upstream-provider quota or billing limits without stress testing.",
+            "Confirm whether configured WebSocket limits can create concrete app availability, provider quota, billing, or operator-impact evidence.",
         ],
         "sensitive-app-auth-material-presence": [
             "Confirm whether application-origin WebSocket requests carry sensitive cookies, session tokens, Authorization material, or equivalent credentials.",
@@ -69939,6 +70170,12 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
         profile=profile,
         artifact_dir=artifact_dir,
     )
+    rpc_proxy_parity_review = load_or_build_rpc_proxy_parity_review(
+        source_root=source_root,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        max_file_bytes=args.max_file_bytes,
+    )
     review = build_operator_evidence_review(
         target=target,
         artifact_dir=artifact_dir,
@@ -69946,6 +70183,7 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
         operator_evidence_file=operator_evidence_file,
         deployment_review=deployment_review,
         rpc_method_policy=rpc_method_policy,
+        rpc_proxy_parity_review=rpc_proxy_parity_review,
         profile=profile,
     )
     output_path = (
@@ -69978,6 +70216,8 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
         f"missing={','.join(summary.get('missing_decisions', []) or []) or 'none'} "
         f"provider_missing={','.join(summary.get('provider_missing', []) or []) or 'none'} "
         f"rpc_client_ip_trust={summary.get('rpc_client_ip_trust_status') or 'missing'} "
+        f"rpc_proxy_parity={summary.get('rpc_proxy_parity_review_status') or 'missing'} "
+        f"rpc_proxy_operator_decisions={summary.get('rpc_proxy_parity_operator_decision_count', 0)} "
         f"contracts={summary.get('closure_contracts', 0)}"
     )
     resource_packet = (
