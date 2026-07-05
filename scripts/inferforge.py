@@ -12512,6 +12512,74 @@ def apply_assessment_relative_focus_policy(
         }
 
 
+def assessment_objective_satisfaction_summary(
+    items: list[dict[str, Any]],
+    assessment_policy: dict[str, Any],
+) -> dict[str, Any]:
+    objective_model = assessment_policy_objective_model(assessment_policy)
+    strategy = lead_dossier_ranking_strategy(assessment_policy)
+    scored_items = [
+        item
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("assessment_rank"), dict)
+    ]
+    satisfied_items = []
+    open_items = []
+    blocker_counts: dict[str, int] = {}
+    for item in scored_items:
+        assessment = item.get("assessment_rank") if isinstance(item.get("assessment_rank"), dict) else {}
+        alignment = (
+            assessment.get("objective_alignment")
+            if isinstance(assessment.get("objective_alignment"), dict)
+            else {}
+        )
+        if alignment.get("lead_satisfies_objective") is True:
+            satisfied_items.append(item)
+            continue
+        open_items.append(item)
+        blocker = str(alignment.get("objective_blocker") or "objective-not-satisfied")
+        increment_count(blocker_counts, blocker)
+
+    if not scored_items:
+        status = "no-objective-candidates"
+        next_step = "Generate high-value leads before evaluating the active assessment objective."
+    elif strategy == "blackbox-bounty-first":
+        if satisfied_items:
+            status = "objective-satisfied"
+            next_step = (
+                "One gate-ready Medium/High/Critical report path satisfies the blackbox objective; "
+                "run finding-gate/adjudication previews before writing a report."
+            )
+        else:
+            status = "needs-valid-medium-plus-report"
+            next_step = (
+                "Keep broad coverage parked and close evidence only for the strongest valid Medium/High/Critical bounty path."
+            )
+    elif not open_items:
+        status = "objective-satisfied"
+        next_step = "All ranked dangerous surfaces satisfy the greybox coverage objective."
+    else:
+        status = "needs-dangerous-surface-coverage-closure"
+        next_step = "Close or explicitly accept every remaining dangerous-surface evidence gap before declaring greybox coverage complete."
+
+    return {
+        "status": status,
+        "mode": assessment_policy.get("mode"),
+        "strategy": strategy,
+        "primary_objective": objective_model.get("primary_objective"),
+        "completion_unit": objective_model.get("completion_unit"),
+        "coverage_policy": objective_model.get("coverage_policy"),
+        "lead_parking_policy": objective_model.get("lead_parking_policy"),
+        "candidate_items": len(scored_items),
+        "satisfied_items": len(satisfied_items),
+        "open_items": len(open_items),
+        "top_satisfied_id": assessment_item_identity(satisfied_items[0]) if satisfied_items else None,
+        "top_open_id": assessment_item_identity(open_items[0]) if open_items else None,
+        "objective_blocker_counts": dict(sorted(blocker_counts.items())),
+        "next_step": next_step,
+    }
+
+
 def lead_dossier_assessment_rank_key(
     lead: dict[str, Any],
     *,
@@ -12742,6 +12810,7 @@ def build_bounty_harness_alignment(
         )
     )
     apply_assessment_relative_focus_policy(candidate_leads, assessment_policy)
+    objective_satisfaction = assessment_objective_satisfaction_summary(candidate_leads, assessment_policy)
     top_candidate = candidate_leads[0] if candidate_leads else {}
 
     def command(subcommand: str, *, source: str) -> dict[str, Any] | None:
@@ -12813,6 +12882,7 @@ def build_bounty_harness_alignment(
             {
                 "high_value_threads": len(high_value_threads),
                 "ranking_strategy": ranking_strategy,
+                "objective_satisfaction": objective_satisfaction,
                 "top_candidate": {
                     "id": top_candidate.get("id"),
                     "priority": top_candidate.get("priority"),
@@ -12918,6 +12988,9 @@ def build_bounty_harness_alignment(
             "assessment_mode": assessment_policy.get("mode"),
             "optimization_goal": assessment_policy.get("optimization_goal"),
             "objective_model": objective_model,
+            "objective_status": objective_satisfaction.get("status"),
+            "objective_satisfied_items": objective_satisfaction.get("satisfied_items", 0),
+            "objective_open_items": objective_satisfaction.get("open_items", 0),
             "lead_selection_strategy": ranking_strategy,
             "high_value_threads": len(high_value_threads),
             "gate_ready_threads": gate_ready_threads,
@@ -12925,6 +12998,7 @@ def build_bounty_harness_alignment(
             "top_candidate_id": top_candidate.get("id"),
             "top_candidate_decision": (top_candidate.get("assessment_rank") or {}).get("decision") if top_candidate else None,
         },
+        "objective_satisfaction": objective_satisfaction,
         "components": components,
         "candidate_focus": candidate_leads[:5],
         "research_sources": [
@@ -14063,6 +14137,7 @@ def build_lead_dossier(
         assessment_policy,
     )
     leads = ranked_candidates[:requested_limit]
+    objective_satisfaction = assessment_objective_satisfaction_summary(ranked_candidates, assessment_policy)
     priority_counts: dict[str, int] = {}
     status_counts: dict[str, int] = {}
     gate_ready = 0
@@ -14087,6 +14162,10 @@ def build_lead_dossier(
             "leads": len(leads),
             "selection_pool_leads": len(ranked_candidates),
             "lead_selection_strategy": ranking_strategy,
+            "objective_status": objective_satisfaction.get("status"),
+            "objective_completion_unit": objective_satisfaction.get("completion_unit"),
+            "objective_satisfied_leads": objective_satisfaction.get("satisfied_items", 0),
+            "objective_open_leads": objective_satisfaction.get("open_items", 0),
             "gate_ready_leads": gate_ready,
             "relative_parked_leads": relative_parked,
             "priority_counts": dict(sorted(priority_counts.items())),
@@ -14095,6 +14174,7 @@ def build_lead_dossier(
         },
         "research_alignment": {
             "assessment_policy": assessment_policy,
+            "objective_satisfaction": objective_satisfaction,
             "source_note": (
                 "Lead dossier applies the observed Codex bug-bounty harness pattern: read code, use scope/docs "
                 "as constraints, create candidate paths, and keep leads tied to evidence and validation gates."
@@ -18949,6 +19029,7 @@ def build_iteration_decision_from_plan(
     artifact_health_needs_review = artifact_health_status == "needs-human-review"
     resource_blocks_active = bool(active_after_gate and resource_status not in {"healthy", "not-run"})
     iteration_focus = build_iteration_assessment_focus(validation_plan, assessment_policy)
+    objective_satisfaction = assessment_objective_satisfaction_summary(iteration_focus, assessment_policy)
     assessment_by_item_id = {
         str(item.get("validation_item_id")): item.get("assessment_rank")
         for item in iteration_focus
@@ -19086,6 +19167,10 @@ def build_iteration_decision_from_plan(
             "assessment_mode": assessment_policy.get("mode"),
             "optimization_goal": assessment_policy.get("optimization_goal"),
             "lead_selection_strategy": lead_selection_strategy,
+            "objective_status": objective_satisfaction.get("status"),
+            "objective_completion_unit": objective_satisfaction.get("completion_unit"),
+            "objective_satisfied_items": objective_satisfaction.get("satisfied_items", 0),
+            "objective_open_items": objective_satisfaction.get("open_items", 0),
             "success_metric": assessment_policy.get("success_metric"),
             "stop_condition": assessment_policy.get("stop_condition"),
             "offline_command_preview_limit": offline_preview_limit,
@@ -19131,6 +19216,7 @@ def build_iteration_decision_from_plan(
                 else None
             ),
         },
+        "objective_satisfaction": objective_satisfaction,
         "resource_preflight": resource_preflight,
         "artifact_health": {
             "status": artifact_health_status,
@@ -40807,6 +40893,14 @@ def build_no_write_selftest() -> dict[str, Any]:
             json_clone(ranking_sample_leads),
             blackbox_assessment_policy,
         )
+        greybox_objective_satisfaction_sample = assessment_objective_satisfaction_summary(
+            greybox_ranked_sample,
+            greybox_assessment_policy,
+        )
+        blackbox_objective_satisfaction_sample = assessment_objective_satisfaction_summary(
+            blackbox_ranked_sample,
+            blackbox_assessment_policy,
+        )
         mode_strict_thread = {
             "id": "mode-strict-selftest",
             "status": "ready-for-offline-review",
@@ -42026,11 +42120,20 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "assessment-mode-objective-satisfied"
                 not in (blackbox_ready_mode_strict_validation.get("blocking_questions", []) or [])
                 and blackbox_ready_mode_strict_validation.get("total") == 8
+                and greybox_objective_satisfaction_sample.get("status")
+                == "needs-dangerous-surface-coverage-closure"
+                and greybox_objective_satisfaction_sample.get("completion_unit")
+                == "all-dangerous-source-derived-surfaces"
+                and blackbox_objective_satisfaction_sample.get("status") == "objective-satisfied"
+                and blackbox_objective_satisfaction_sample.get("completion_unit")
+                == "one-valid-medium-high-critical-report"
             ),
             "expected": "greybox optimizes coverage while blackbox optimizes one valid high-bounty finding, including strict checklist gates",
             "actual": {
                 "greybox_policy": greybox_assessment_policy,
                 "blackbox_policy": blackbox_assessment_policy,
+                "greybox_objective_satisfaction": greybox_objective_satisfaction_sample,
+                "blackbox_objective_satisfaction": blackbox_objective_satisfaction_sample,
                 "greybox_mode_strict_blocking": greybox_mode_strict_validation.get("blocking_questions", []),
                 "blackbox_waiting_mode_strict_blocking": blackbox_waiting_mode_strict_validation.get(
                     "blocking_questions",
@@ -42087,6 +42190,12 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "lead_satisfies_objective"
                 )
                 is False
+                and greybox_objective_satisfaction_sample.get("satisfied_items") == 1
+                and greybox_objective_satisfaction_sample.get("open_items") == 2
+                and greybox_objective_satisfaction_sample.get("top_open_id") == "coverage-resource-exhaustion"
+                and blackbox_objective_satisfaction_sample.get("satisfied_items") == 1
+                and blackbox_objective_satisfaction_sample.get("top_satisfied_id") == "gate-ready-sensitive-data"
+                and blackbox_objective_satisfaction_sample.get("open_items") == 2
                 and (
                     blackbox_ranked_sample[0].get("assessment_rank", {}).get("bounty_pressure", {}).get("score", 0)
                     >= blackbox_ranked_sample[0].get("assessment_rank", {}).get("coverage_pressure", {}).get("score", 0)
@@ -42104,6 +42213,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                     lead.get("relative_focus", {}).get("role")
                     for lead in blackbox_ranked_sample
                 ],
+                "greybox_objective_satisfaction": greybox_objective_satisfaction_sample,
+                "blackbox_objective_satisfaction": blackbox_objective_satisfaction_sample,
             },
         },
         {
@@ -42485,6 +42596,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Evidence closure:" in methodology_review_stdout_text
                 and "Bounty harness:" in methodology_review_stdout_text
                 and "selection=greybox-coverage-first" in methodology_review_stdout_text
+                and "objective=" in methodology_review_stdout_text
                 and "- bounty system-context-threat-model:" in methodology_review_stdout_text
                 and "High-value threads:" in methodology_review_stdout
                 and "poc_plan=" in methodology_review_stdout_text
@@ -42514,6 +42626,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 lead_dossier_return_code == 0
                 and "Lead dossier:" in lead_dossier_stdout_text
                 and "Leads:" in lead_dossier_stdout_text
+                and "Objective satisfaction:" in lead_dossier_stdout_text
                 and "strict_validation=blocked-before-finding-gate" in lead_dossier_stdout_text
                 and "question=waiting concrete-impact-evidence" in lead_dossier_stdout_text
                 and "No files written (--no-write)." in lead_dossier_stdout
@@ -52099,6 +52212,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         == "maximize-valid-high-bounty-finding"
         and blackbox_iteration_decision_sample.get("summary", {}).get("lead_selection_strategy")
         == "blackbox-bounty-first"
+        and blackbox_iteration_decision_sample.get("summary", {}).get("objective_completion_unit")
+        == "one-valid-medium-high-critical-report"
+        and blackbox_iteration_decision_sample.get("objective_satisfaction", {}).get("completion_unit")
+        == "one-valid-medium-high-critical-report"
+        and blackbox_iteration_decision_sample.get("objective_satisfaction", {}).get("candidate_items", 0) > 0
+        and blackbox_iteration_decision_sample.get("objective_satisfaction", {}).get("status")
+        in {"objective-satisfied", "needs-valid-medium-plus-report"}
         and blackbox_iteration_decision_sample.get("summary", {}).get("focus_items", 0) > 0
         and blackbox_iteration_decision_sample.get("summary", {}).get("top_focus_role")
         in {"dominant-bounty-focus", "top-bounty-candidate"}
@@ -59812,6 +59932,7 @@ def run_methodology_review(args: argparse.Namespace) -> int:
             "Bounty harness: "
             f"{bounty_alignment.get('status')} "
             f"selection={bounty_summary.get('lead_selection_strategy') or '-'} "
+            f"objective={bounty_summary.get('objective_status') or '-'} "
             f"top={bounty_summary.get('top_candidate_id') or '-'} "
             f"gate_ready={bounty_summary.get('gate_ready_threads', 0)} "
             f"resource={bounty_summary.get('resource_status') or '-'} "
@@ -59933,10 +60054,25 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
         f"total={summary.get('leads', 0)} "
         f"pool={summary.get('selection_pool_leads', summary.get('leads', 0))} "
         f"selection={summary.get('lead_selection_strategy') or '-'} "
+        f"objective={summary.get('objective_status') or '-'} "
         f"gate_ready={summary.get('gate_ready_leads', 0)} "
         f"priorities={json.dumps(summary.get('priority_counts', {}), sort_keys=True)} "
         f"closures={json.dumps(summary.get('closure_status_counts', {}), sort_keys=True)}"
     )
+    objective_satisfaction = (
+        alignment.get("objective_satisfaction")
+        if isinstance(alignment.get("objective_satisfaction"), dict)
+        else {}
+    )
+    if objective_satisfaction:
+        print(
+            "Objective satisfaction: "
+            f"status={objective_satisfaction.get('status') or '-'} "
+            f"unit={objective_satisfaction.get('completion_unit') or '-'} "
+            f"satisfied={objective_satisfaction.get('satisfied_items', 0)} "
+            f"open={objective_satisfaction.get('open_items', 0)} "
+            f"top_open={objective_satisfaction.get('top_open_id') or '-'}"
+        )
     if assessment_policy:
         objective_model = (
             assessment_policy.get("objective_model")
@@ -62129,6 +62265,20 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
             f"goal={assessment_policy.get('optimization_goal') or '-'} "
             f"selection={summary.get('lead_selection_strategy') or '-'} "
             f"success={inline_summary_text(assessment_policy.get('success_metric'), max_chars=180)}"
+        )
+    objective_satisfaction = (
+        decision.get("objective_satisfaction")
+        if isinstance(decision.get("objective_satisfaction"), dict)
+        else {}
+    )
+    if objective_satisfaction:
+        print(
+            "Objective: "
+            f"status={objective_satisfaction.get('status') or '-'} "
+            f"unit={objective_satisfaction.get('completion_unit') or '-'} "
+            f"satisfied={objective_satisfaction.get('satisfied_items', 0)} "
+            f"open={objective_satisfaction.get('open_items', 0)} "
+            f"top_open={objective_satisfaction.get('top_open_id') or '-'}"
         )
     if resource_preflight and resource_preflight.get("status") != "not-run":
         warnings = resource_preflight.get("warnings", []) or []

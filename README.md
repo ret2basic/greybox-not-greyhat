@@ -351,12 +351,15 @@ unit, and whether that lead satisfies the current mode's success condition, plus
 a strict validation checklist status for scope, attacker control, concrete
 impact, minimal evidence, safe reproduction, counter-evidence,
 severity/report path, and the active `assessment_mode` objective. The lead stays
-blocked before finding
-gate until all eight questions are satisfied. Transaction leads also print a
-`transaction-evidence-closure` plan
-that turns payload sidecar, candidate extraction, payload contract, intent
-policy, decode review, and finding-gate blockers into ordered, redacted artifact
-steps:
+blocked before finding gate until all eight questions are satisfied. Transaction
+leads also print a `transaction-evidence-closure` plan that turns payload
+sidecar, candidate extraction, payload contract, intent policy, decode review,
+and finding-gate blockers into ordered, redacted artifact steps. The dossier
+also emits `objective_satisfaction`, a run-level rollup of the same model. In
+greybox mode it stays open until every ranked dangerous surface is covered or
+closed; in blackbox mode it becomes satisfied as soon as one gate-ready
+Medium/High/Critical report path exists, while weaker broad-coverage leads can
+remain parked.
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
@@ -633,7 +636,9 @@ stronger valid high-impact report path exists. The artifact includes
 decision fields as `lead-dossier`. Blackbox focus rows also carry
 `relative_focus` so an unattended loop can park broad coverage work behind the
 dominant bounty candidate; approval packets also carry the matching assessment
-scorecard for the validation item that produced them.
+scorecard for the validation item that produced them. The iteration summary also
+includes `objective_satisfaction`, so unattended runs can tell whether the
+active mode still needs coverage closure or a valid Medium+ bounty report path.
 
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:
