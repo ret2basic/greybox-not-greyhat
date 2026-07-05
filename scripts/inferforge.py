@@ -43808,8 +43808,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and all(command.count("--profile") <= 1 for command in rewrite_queue_commands)
             and all(command.count("--artifact-dir") == 1 for command in rewrite_queue_commands)
             and rewrite_queue_command_counts.get("manual-template") == 2
-            and rewrite_queue_command_counts.get("review-gated") == 2
-            and rewrite_queue_command_counts.get("ready") == 2
+            and rewrite_queue_command_counts.get("review-gated") == 4
+            and rewrite_queue_command_counts.get("ready", 0) == 0
             and rewrite_queue_command_safety.get("unsafe_template_count") == 0
             and rewrite_queue_global_command_safety.get("unsafe_template_count") == 0
             and unsafe_command_classification.get("classification") == "unsafe-template"
