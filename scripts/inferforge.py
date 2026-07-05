@@ -17375,45 +17375,67 @@ def grouped_source_references(
     *,
     max_file_bytes: int = DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES,
     max_files: int = 256,
+    extra_source_files: list[Path] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     refs_by_group: dict[str, list[dict[str, Any]]] = {key: [] for key in pattern_groups}
     source_dir = source_root / "src"
-    if not source_dir.exists():
-        return refs_by_group
     scanned = 0
-    for dirpath, dirnames, filenames in os.walk(source_dir):
-        dirnames[:] = sorted(
-            dirname
-            for dirname in dirnames
-            if dirname not in SOURCE_SCAN_SKIP_DIRS and not dirname.startswith(".")
-        )
-        for filename in sorted(filenames):
-            path = Path(dirpath) / filename
-            if path.suffix not in SOURCE_SCAN_SUFFIXES or path.name.endswith(".d.ts"):
-                continue
-            if scanned >= max(1, max_files):
-                return refs_by_group
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            if stat.st_size > max_file_bytes:
-                continue
-            try:
-                lines = path.read_text(encoding="utf-8").splitlines()
-            except (UnicodeDecodeError, OSError):
-                continue
-            scanned += 1
-            for index, line in enumerate(lines, start=1):
-                for group, patterns in pattern_groups.items():
-                    if any(pattern in line for pattern in patterns):
-                        refs_by_group[group].append(
-                            {
-                                "file": source_root_relative_or_repo(path, source_root),
-                                "line": index,
-                                "sample": redact_text(line.strip(), max_chars=180) or "",
-                            }
-                        )
+    seen_source_files: set[str] = set()
+
+    def source_file_key(path: Path) -> str:
+        try:
+            return str(path.resolve())
+        except OSError:
+            return str(path)
+
+    def scan_file(path: Path) -> bool:
+        nonlocal scanned
+        key = source_file_key(path)
+        if key in seen_source_files:
+            return False
+        if path.suffix not in SOURCE_SCAN_SUFFIXES or path.name.endswith(".d.ts"):
+            return False
+        if scanned >= max(1, max_files):
+            return True
+        try:
+            stat = path.stat()
+        except OSError:
+            return False
+        if stat.st_size > max_file_bytes:
+            return False
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (UnicodeDecodeError, OSError):
+            return False
+        seen_source_files.add(key)
+        scanned += 1
+        for index, line in enumerate(lines, start=1):
+            for group, patterns in pattern_groups.items():
+                if any(pattern in line for pattern in patterns):
+                    refs_by_group[group].append(
+                        {
+                            "file": source_root_relative_or_repo(path, source_root),
+                            "line": index,
+                            "sample": redact_text(line.strip(), max_chars=180) or "",
+                        }
+                    )
+        return False
+
+    for path in extra_source_files or []:
+        if not path.exists() or not path.is_file():
+            continue
+        if scan_file(path):
+            return refs_by_group
+    if source_dir.exists():
+        for dirpath, dirnames, filenames in os.walk(source_dir):
+            dirnames[:] = sorted(
+                dirname
+                for dirname in dirnames
+                if dirname not in SOURCE_SCAN_SKIP_DIRS and not dirname.startswith(".")
+            )
+            for filename in sorted(filenames):
+                if scan_file(Path(dirpath) / filename):
+                    return refs_by_group
     return refs_by_group
 
 
@@ -17602,6 +17624,14 @@ def build_rate_limit_resource_review(
         for ref in client_ip_header_refs
         if client_ip_ref_token(ref) in {"cf-connecting-ip", "x-real-ip"}
     ]
+    websocket_connection_limit_refs = [
+        ref
+        for ref in [*memory_rate_limit_refs, *rate_limit_guard_refs]
+        if any(
+            token in str(ref.get("sample") or "")
+            for token in ["wsConnectionsByIp", "MAX_WS_CONNECTIONS_PER_IP", "activeConnections"]
+        )
+    ]
 
     def add_signal(signal_id: str, summary: str, refs: list[dict[str, Any]], review_question: str) -> None:
         signals.append(
@@ -17627,6 +17657,13 @@ def build_rate_limit_resource_review(
             "The in-memory rate-limit key can depend on x-forwarded-for before deployment proxy trust is proven.",
             [*forwarded_header_refs[:3], *memory_rate_limit_refs[:3]],
             "Does the production edge overwrite x-forwarded-for, or can clients shard rate-limit buckets with spoofed header values?",
+        )
+    if websocket_connection_limit_refs and client_ip_header_refs:
+        add_signal(
+            "client-keyed-websocket-connection-limit-review",
+            "A WebSocket RPC connection cap is keyed from client IP header material in custom server code.",
+            [*websocket_connection_limit_refs[:4], *client_ip_header_refs[:4]],
+            "Can clients spoof the IP key or open enough upstream WebSocket RPC connections to create provider or app availability impact?",
         )
     if memory_rate_limit_refs and external_rate_limit_store_refs:
         add_signal(
@@ -17656,6 +17693,7 @@ def build_rate_limit_resource_review(
         "forwarded_for_ref_count": len(forwarded_header_refs),
         "edge_header_ref_count": len(edge_header_refs),
         "memory_fallback_ref_count": len(memory_rate_limit_refs),
+        "websocket_connection_limit_ref_count": len(websocket_connection_limit_refs),
         "evidence": [*forwarded_header_refs[:4], *edge_header_refs[:4], *memory_rate_limit_refs[:4]],
         "operator_evidence_needed": [
             "Confirm whether the production edge overwrites x-forwarded-for before the application receives it.",
@@ -20918,7 +20956,13 @@ def build_rpc_method_policy(
                 "ALLOW_MISSING_ORIGIN",
                 "SOLANA_RPC_PROXY_ALLOWED_ORIGINS",
             ],
-            "memory_rate_limit_refs": ["memoryRateLimits", "incrementWithMemory", "new Map<string"],
+            "memory_rate_limit_refs": [
+                "memoryRateLimits",
+                "incrementWithMemory",
+                "new Map<string",
+                "wsConnectionsByIp",
+                "activeConnections",
+            ],
             "client_ip_header_refs": ["x-forwarded-for", "cf-connecting-ip", "x-real-ip", "getClientIp"],
             "external_rate_limit_store_refs": ["UPSTASH_REDIS_REST_URL", "KV_REST_API_URL", "incrementWithUpstash"],
             "rate_limit_guard_refs": [
@@ -20926,8 +20970,13 @@ def build_rpc_method_policy(
                 "SUSTAINED_LIMIT",
                 "checkRateLimit",
                 "!IS_PRODUCTION",
+                "MAX_WS_CONNECTIONS_PER_IP",
+                "MAX_PENDING_WS_MESSAGES",
+                "MAX_WS_MESSAGE_BYTES",
+                "MAX_WS_BATCH_SIZE",
             ],
         },
+        extra_source_files=[source_root / "server.js"],
     )
     frontend_transaction_refs = source_ref_groups["frontend_transaction_refs"]
     remote_transaction_material_refs = source_ref_groups["remote_transaction_material_refs"]

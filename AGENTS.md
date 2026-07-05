@@ -11,6 +11,8 @@ Hard rule:
 - Do not use `2455` as a memory-reclaim candidate.
 - Do not add `2455` to watch-port lists, health checks, readiness checks,
   resource checks, or active probes.
+- Do not run commands, tests, examples, or automation that pass `2455` as an
+  argument, even if the code is expected to block it safely.
 - If `2455` appears unhealthy, report it to the user and wait for explicit
   authorization before taking any action.
 

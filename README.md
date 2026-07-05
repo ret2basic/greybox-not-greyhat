@@ -353,8 +353,11 @@ transactions.
 When RPC source shows client-keyed in-memory rate-limit fallback behavior, the
 matrix can add a `resource-abuse-review` hypothesis. This is also offline-only:
 review deployment proxy header trust, external rate-limit store configuration,
-and bounded key/TTL evidence. Do not validate it with rate-limit stress, flood,
-or DoS testing.
+and bounded key/TTL evidence. Custom-server WebSocket RPC handlers are included
+in this offline source review, so client-IP-keyed connection caps, pending
+message queues, message-size limits, and batch-size limits can become resource
+review signals without opening sockets. Do not validate it with rate-limit
+stress, flood, or DoS testing.
 
 Use `deployment-review` to collect that deployment/resource-control context
 without traffic:
