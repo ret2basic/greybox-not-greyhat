@@ -127,6 +127,7 @@ REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT = "deployment-resource-review.json"
 TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
 TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
+CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT = "credential-impact-checklist.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -214,6 +215,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
+    CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT,
     "artifact-health.json",
     "regression-suite.json",
     "orca-baseline.json",
@@ -305,6 +307,7 @@ INDEX_ARTIFACT_ORDER = [
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
+    CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT,
     "response-delta-analysis.json",
     "warmup-results.json",
     "traffic-index.json",
@@ -7855,6 +7858,7 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
         "methodology-review --no-write --limit 8",
         "evidence-gaps --no-write",
         "validation-plan --no-write --limit 8 --show-commands",
+        "credential-impact-checklist --no-write --show-commands --show-evidence",
         "transaction-corpus-checklist --no-write --show-commands",
         "deployment-review --no-write --top 8",
         "transaction-flow-review --no-write --top 8",
@@ -8388,10 +8392,9 @@ def methodology_next_command_for_hypothesis(
     hypothesis_type = str(item.get("type") or item.get("hypothesis_type") or "")
     if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
         subcommand = "transaction-corpus-checklist --no-write --show-commands"
-    elif impact in {"credentialed-upstream-cost-abuse", "resource-exhaustion"} or hypothesis_type in {
-        "credential-proxy-review",
-        "resource-abuse-review",
-    }:
+    elif impact == "credentialed-upstream-cost-abuse" or hypothesis_type == "credential-proxy-review":
+        subcommand = "credential-impact-checklist --no-write --show-commands --show-evidence"
+    elif impact == "resource-exhaustion" or hypothesis_type == "resource-abuse-review":
         subcommand = "deployment-review --no-write --top 8"
     elif impact == "fixed-upstream-proxy-confusion":
         subcommand = "rewrite-review --no-write --show-next"
@@ -10633,8 +10636,14 @@ def validation_allowed_commands(
         allowed_now_commands.insert(3, command("transaction-flow-review --no-write --top 8"))
         allowed_now_commands.insert(3, command("transaction-corpus-checklist --no-write --show-commands"))
     if hypothesis.get("type") == "credential-proxy-review" or hypothesis.get("impact") == "credentialed-upstream-cost-abuse":
-        allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
-        allowed_now_commands.insert(3, command("transaction-flow-review --no-write --top 8"))
+        for subcommand in reversed(
+            [
+                "credential-impact-checklist --no-write --show-commands --show-evidence",
+                "deployment-review --no-write --top 8",
+                "transaction-flow-review --no-write --top 8",
+            ]
+        ):
+            allowed_now_commands.insert(3, command(subcommand))
     allowed_after_gate_commands = [
         command("resource-snapshot --max-processes 8 --watch-port 3100 --watch-port 2455 --no-write --strict")
     ]
@@ -18160,6 +18169,193 @@ def build_transaction_corpus_checklist(
         "safety": (
             "Offline checklist only. It reads local artifacts and /proc resource state, sends no requests, reads no raw Burp "
             "history, invokes no wallet, and submits no transaction."
+        ),
+    }
+
+
+def credential_provider_review_from_artifacts(
+    transaction_flow_review: dict[str, Any] | None,
+    deployment_review: dict[str, Any] | None,
+) -> dict[str, Any]:
+    flow_review = transaction_flow_review if isinstance(transaction_flow_review, dict) else {}
+    credential_proxy = (
+        flow_review.get("server_credential_proxy_review")
+        if isinstance(flow_review.get("server_credential_proxy_review"), dict)
+        else {}
+    )
+    provider_review = (
+        credential_proxy.get("deployment_credential_provider_review")
+        if isinstance(credential_proxy.get("deployment_credential_provider_review"), dict)
+        else {}
+    )
+    if provider_review:
+        return provider_review
+    deployment = deployment_review if isinstance(deployment_review, dict) else {}
+    provider_review = deployment.get("credential_provider_review")
+    return provider_review if isinstance(provider_review, dict) else {}
+
+
+def build_credential_impact_checklist(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    transaction_flow_review: dict[str, Any] | None = None,
+    deployment_review: dict[str, Any] | None = None,
+    current_resource_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    flow_review = transaction_flow_review if isinstance(transaction_flow_review, dict) else {}
+    credential_proxy = (
+        flow_review.get("server_credential_proxy_review")
+        if isinstance(flow_review.get("server_credential_proxy_review"), dict)
+        else {}
+    )
+    provider_review = credential_provider_review_from_artifacts(flow_review, deployment_review)
+    provider_summary = provider_review.get("summary", {}) if isinstance(provider_review.get("summary"), dict) else {}
+    missing_provider_evidence = [str(item) for item in provider_summary.get("missing_provider_evidence", []) or []]
+    files_needing_review = [
+        row
+        for row in credential_proxy.get("files", []) or []
+        if isinstance(row, dict) and row.get("status") == "needs-cost-abuse-review"
+    ]
+    resource_preflight = validation_resource_preflight_summary(current_resource_snapshot)
+    resource_status = str(resource_preflight.get("status") or "not-run")
+    budget = resource_preflight.get("resource_budget", {}) if isinstance(resource_preflight.get("resource_budget"), dict) else {}
+    active_blocked = resource_status not in {"healthy", "not-run"} or budget.get("active_target_traffic") == "blocked"
+
+    evidence_requests = []
+    for decision in provider_review.get("decisions", []) or []:
+        if not isinstance(decision, dict) or decision.get("id") == "credentialed-upstream-secret-injection":
+            continue
+        evidence_requests.append(
+            {
+                "id": decision.get("id"),
+                "status": decision.get("status"),
+                "operator_evidence_needed": decision.get("operator_evidence_needed", []),
+                "evidence": decision.get("evidence", []),
+            }
+        )
+
+    provider_evidence_ready = bool(provider_review) and not missing_provider_evidence and bool(files_needing_review)
+    if not credential_proxy:
+        status = "no-credential-proxy-context"
+    elif not files_needing_review:
+        status = "no-route-needing-cost-review"
+    elif not provider_review or missing_provider_evidence:
+        status = "needs-provider-impact-evidence"
+    elif provider_review.get("status") == "provider-evidence-indexed":
+        status = "provider-impact-ready-for-gate"
+    else:
+        status = "partial-provider-impact-evidence"
+    if active_blocked and status in {"needs-provider-impact-evidence", "partial-provider-impact-evidence"}:
+        status = f"blocked-resource-{status}"
+
+    route_reviews = []
+    for row in files_needing_review:
+        route_reviews.append(
+            {
+                "file": row.get("file"),
+                "path": app_route_path_from_source_file(str(row.get("file") or "")),
+                "credential_refs": row.get("credential_refs", []),
+                "external_upstream_refs": row.get("external_upstream_refs", []),
+                "auth_guard_refs": row.get("auth_guard_refs", []),
+                "rate_limit_guard_refs": row.get("rate_limit_guard_refs", []),
+                "request_validation_refs": row.get("request_validation_refs", []),
+                "review_question": row.get("review_question"),
+            }
+        )
+
+    safe_validation_steps = [
+        {
+            "id": "provider-impact-evidence",
+            "status": "passed" if provider_evidence_ready else "waiting",
+            "action": "Collect provider/operator evidence for quota, rate limits, billing/credits, and usage monitoring without exposing secret values.",
+        },
+        {
+            "id": "resource-preflight",
+            "status": "blocked-resource" if active_blocked else "ready-after-final-resource-check",
+            "action": "Run resource-snapshot --strict before any single approved request; do not proceed while resource budget is degraded or critical.",
+        },
+        {
+            "id": "single-request-validation",
+            "status": "blocked-resource" if active_blocked else "pending-approval",
+            "action": "If provider evidence shows material impact, use at most one approved unauthenticated quote request to confirm route reachability.",
+        },
+        {
+            "id": "finding-gate-review",
+            "status": "ready-offline" if provider_evidence_ready else "waiting",
+            "action": "Run gate/adjudicate only after provider impact evidence is present; static key injection alone is not reportable.",
+        },
+    ]
+
+    followup_commands = [
+        validation_command_for_artifact_dir(artifact_dir, "deployment-review --no-write --top 8", profile=profile),
+        validation_command_for_artifact_dir(artifact_dir, "transaction-flow-review --no-write --top 8", profile=profile),
+    ]
+    if provider_evidence_ready:
+        followup_commands.extend(
+            [
+                validation_command_for_artifact_dir(artifact_dir, "gate --no-write", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "evidence-chain --no-write", profile=profile),
+            ]
+        )
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "summary": {
+            "credential_proxy_status": credential_proxy.get("status") or "missing",
+            "provider_review_status": provider_review.get("status") or "missing",
+            "files_needing_cost_review": len(files_needing_review),
+            "missing_provider_evidence": missing_provider_evidence,
+            "resource_status": resource_status,
+            "resource_budget_mode": budget.get("mode") or "unknown",
+        },
+        "resource_preflight": resource_preflight,
+        "route_reviews": route_reviews,
+        "provider_evidence_requests": evidence_requests,
+        "safe_validation_steps": safe_validation_steps,
+        "followup_commands": followup_commands,
+        "acceptance_checks": [
+            {
+                "id": "route-credentialed-upstream-without-controls",
+                "status": "passed" if files_needing_review else "waiting",
+                "evidence": [row.get("file") for row in files_needing_review],
+            },
+            {
+                "id": "provider-impact-evidence-complete",
+                "status": "passed" if provider_evidence_ready else "waiting",
+                "evidence": missing_provider_evidence,
+            },
+            {
+                "id": "resource-safe-for-single-request",
+                "status": "blocked-resource" if active_blocked else "ready-after-resource-check",
+                "evidence": resource_preflight,
+            },
+        ],
+        "reportability_gate": (
+            "Credentialed upstream proxy evidence only becomes reportable with concrete quota, billing, credit, "
+            "availability, or account-abuse impact evidence. Do not validate by flooding, stress testing, brute force, "
+            "or repeated provider requests."
+        ),
+        "forbidden": [
+            "Do not run high-volume quote requests, rate-limit stress, or DoS testing.",
+            "Do not expose provider secret values.",
+            "Do not sign wallets, submit transactions, or place trades.",
+            "Do not treat server-side credential use as reportable without concrete provider/operator impact evidence.",
+        ],
+        "next_step": (
+            "Collect missing provider/operator evidence before any active validation."
+            if not provider_evidence_ready
+            else "Use gate --no-write and adjudicate --no-write to review provider impact evidence before reporting."
+        ),
+        "safety": (
+            "Offline provider-impact checklist only. It reads local review artifacts and /proc resource state, sends no "
+            "requests, does not query providers, and does not expose secret values."
         ),
     }
 
@@ -28305,6 +28501,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("deployment-review", "run_deployment_review"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-corpus-checklist", "run_transaction_corpus_checklist"),
+        refresh_expectation("credential-impact-checklist", "run_credential_impact_checklist"),
         refresh_expectation("validation-plan", "run_validation_plan"),
         refresh_expectation("iteration-decision", "run_iteration_decision"),
         refresh_expectation("collect", "run_collect"),
@@ -28312,7 +28509,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("burp-sync", "run_burp_sync", min_refreshes=4, min_prints=4),
         refresh_expectation("import-burp-history", "run_import_burp_history", min_refreshes=2, min_prints=2),
         refresh_expectation("attack-strategy", "run_attack_strategy"),
-        refresh_expectation("gate", "run_gate", min_refreshes=2, min_prints=2),
+        refresh_expectation("gate", "run_gate"),
         refresh_expectation("coverage", "run_coverage"),
         refresh_expectation("burp-observation-coverage", "run_burp_observation_coverage"),
         refresh_expectation("discovery-coverage", "run_discovery_coverage"),
@@ -28547,6 +28744,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         report_output_dir = root / "report-output"
         methodology_review_output_dir = root / "methodology-review-output"
         transaction_corpus_checklist_output_dir = root / "transaction-corpus-checklist-output"
+        credential_impact_checklist_output_dir = root / "credential-impact-checklist-output"
         decode_transactions_output_dir = root / "decode-transactions-output"
         promote_output_dir = root / "promote-output"
         invalid_promote_output_dir = root / "invalid-promote-output"
@@ -28729,6 +28927,23 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--skip-current-resource-check",
                 ]
             )
+            credential_impact_checklist_return_code, credential_impact_checklist_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(credential_impact_checklist_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "credential-impact-checklist",
+                    "--no-write",
+                    "--show-commands",
+                    "--show-evidence",
+                    "--skip-current-resource-check",
+                ]
+            )
             decode_transactions_return_code, decode_transactions_stdout = run_cli(
                 [
                     "--profile",
@@ -28881,6 +29096,16 @@ def build_no_write_selftest() -> dict[str, Any]:
             "transaction_corpus_checklist_manifest": (
                 transaction_corpus_checklist_output_dir / MANIFEST_NAME
             ).exists(),
+            "credential_impact_checklist_dir": credential_impact_checklist_output_dir.exists(),
+            "credential_impact_checklist_target_profile_json": (
+                credential_impact_checklist_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "credential_impact_checklist_json": (
+                credential_impact_checklist_output_dir / CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT
+            ).exists(),
+            "credential_impact_checklist_manifest": (
+                credential_impact_checklist_output_dir / MANIFEST_NAME
+            ).exists(),
             "decode_transactions_dir": decode_transactions_output_dir.exists(),
             "decode_transactions_target_profile_json": (
                 decode_transactions_output_dir / TARGET_PROFILE_ARTIFACT
@@ -28923,6 +29148,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     report_stdout_text = "\n".join(report_stdout)
     methodology_review_stdout_text = "\n".join(methodology_review_stdout)
     transaction_corpus_checklist_stdout_text = "\n".join(transaction_corpus_checklist_stdout)
+    credential_impact_checklist_stdout_text = "\n".join(credential_impact_checklist_stdout)
     decode_transactions_stdout_text = "\n".join(decode_transactions_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
     invalid_promote_stdout_text = "\n".join(invalid_promote_stdout)
@@ -29510,6 +29736,32 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": transaction_corpus_checklist_return_code,
                 "stdout": transaction_corpus_checklist_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "credential-impact-checklist-no-write-skips-artifacts",
+            "passed": (
+                credential_impact_checklist_return_code == 0
+                and "Credential impact checklist:" in credential_impact_checklist_stdout_text
+                and "Credential proxy:" in credential_impact_checklist_stdout_text
+                and "Provider missing:" in credential_impact_checklist_stdout_text
+                and "No files written (--no-write)." in credential_impact_checklist_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "credential_impact_checklist_dir",
+                        "credential_impact_checklist_target_profile_json",
+                        "credential_impact_checklist_json",
+                        "credential_impact_checklist_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in credential_impact_checklist_stdout)
+            ),
+            "expected": "credential-impact-checklist --no-write prints provider-impact guidance without writing artifacts or manifests",
+            "actual": {
+                "return_code": credential_impact_checklist_return_code,
+                "stdout": credential_impact_checklist_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -42479,6 +42731,97 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_credential_impact_checklist(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    current_resource_snapshot = None
+    if not getattr(args, "skip_current_resource_check", False):
+        current_resource_snapshot = build_default_resource_snapshot(max_processes=8)
+    transaction_flow_review = load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT)
+    deployment_review = load_optional_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT)
+    if not isinstance(transaction_flow_review, dict) or not isinstance(
+        transaction_flow_review.get("server_credential_proxy_review"),
+        dict,
+    ):
+        transaction_flow_review = build_transaction_flow_review(
+            source_root,
+            profile,
+            transaction_intent=load_optional_json(artifact_dir / "transaction-intent.json") or {},
+            rpc_method_policy=load_optional_json(artifact_dir / "rpc-method-policy.json") or {},
+        )
+    if not isinstance(deployment_review, dict) or not isinstance(
+        deployment_review.get("credential_provider_review"),
+        dict,
+    ):
+        deployment_review = build_deployment_resource_review(source_root, profile)
+
+    checklist = build_credential_impact_checklist(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        transaction_flow_review=transaction_flow_review,
+        deployment_review=deployment_review,
+        current_resource_snapshot=current_resource_snapshot,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT
+    )
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(checklist))
+
+    summary = checklist.get("summary", {}) or {}
+    print(f"Credential impact checklist: {checklist['status']}")
+    print(
+        "Credential proxy: "
+        f"status={summary.get('credential_proxy_status')} "
+        f"provider={summary.get('provider_review_status')} "
+        f"files={summary.get('files_needing_cost_review', 0)} "
+        f"resource={summary.get('resource_budget_mode') or summary.get('resource_status') or 'unknown'}"
+    )
+    missing = summary.get("missing_provider_evidence", []) or []
+    print(f"Provider missing: {','.join(str(item) for item in missing) if missing else 'none'}")
+    top_count = max(0, int(args.top))
+    if top_count:
+        print("Evidence requests:")
+        for request in (checklist.get("provider_evidence_requests", []) or [])[:top_count]:
+            print(
+                f"- {request.get('status')} {request.get('id')} "
+                f"evidence={len(request.get('evidence', []) or [])}"
+            )
+            if args.show_evidence:
+                for needed in (request.get("operator_evidence_needed", []) or [])[:2]:
+                    print(f"  needed={inline_summary_text(needed, max_chars=180)}")
+    if args.show_commands:
+        print("Follow-up commands:")
+        for command_text in (checklist.get("followup_commands", []) or [])[:5]:
+            print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    print(f"Next: {inline_summary_text(checklist.get('next_step'), max_chars=260)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="credential-impact-checklist",
+                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+            )
+        )
+    if args.strict and checklist["status"] not in {
+        "provider-impact-ready-for-gate",
+        "partial-provider-impact-evidence",
+    }:
+        return 1
+    return 0
+
+
 def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -44893,6 +45236,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless a payload corpus is ready to decode or already decoded.",
     )
     transaction_corpus_checklist.set_defaults(func=run_transaction_corpus_checklist)
+
+    credential_impact_checklist = sub.add_parser(
+        "credential-impact-checklist",
+        help="Plan offline evidence needed for credentialed upstream quota, billing, or availability impact",
+    )
+    credential_impact_checklist.add_argument(
+        "--output",
+        help=(
+            f"Where to write {CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT}."
+        ),
+    )
+    credential_impact_checklist.add_argument(
+        "--top",
+        type=positive_int,
+        default=4,
+        help="Number of provider evidence requests to print.",
+    )
+    credential_impact_checklist.add_argument(
+        "--show-evidence",
+        action="store_true",
+        help="Print operator/provider evidence requirements for each request.",
+    )
+    credential_impact_checklist.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print safe offline follow-up commands.",
+    )
+    credential_impact_checklist.add_argument(
+        "--skip-current-resource-check",
+        action="store_true",
+        help="Use only existing artifacts instead of checking current /proc memory and watched ports.",
+    )
+    credential_impact_checklist.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print credential impact checklist only; do not write {CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    credential_impact_checklist.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless provider impact evidence is ready or partially indexed.",
+    )
+    credential_impact_checklist.set_defaults(func=run_credential_impact_checklist)
 
     validation_plan = sub.add_parser(
         "validation-plan",
