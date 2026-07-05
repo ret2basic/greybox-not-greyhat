@@ -18233,6 +18233,22 @@ def build_transaction_corpus_checklist(
         repo_relative_or_absolute(artifact_dir / "transaction-payloads.txt"),
         repo_relative_or_absolute(artifact_dir / "burp-transaction-candidates.json"),
     ]
+    intent_policy_sidecar_path = repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json")
+    intent_policy_sidecar_templates = [
+        {
+            "direction": row.get("direction"),
+            "status": row.get("status"),
+            "path": intent_policy_sidecar_path,
+            "policy": row.get("intent_policy_sidecar_template", {}),
+            "notes": [
+                "Copy exactly one policy object to transaction-intent-policy.json for the approved quote direction.",
+                "Replace wallet and amountIn placeholders with the real approved quote request values before decoding.",
+                "Add allowedPrograms only when the program allowlist has been reviewed; otherwise keep program checks as manual review.",
+            ],
+        }
+        for row in policy_templates
+        if row.get("intent_policy_sidecar_template")
+    ]
     sidecar_example = {
         "direction": "buy",
         "wallet": PLACEHOLDER_REAL_WALLET,
@@ -18270,6 +18286,14 @@ def build_transaction_corpus_checklist(
             ),
         },
         {
+            "id": "intent-policy-sidecar",
+            "status": "ready-template" if intent_policy_sidecar_templates else "waiting",
+            "action": (
+                "Write one matching transaction-intent-policy.json sidecar with direction, wallet, amountIn, "
+                "sourceMint, destinationMint, and reviewed allowedPrograms before decode-transactions."
+            ),
+        },
+        {
             "id": "program-policy-review",
             "status": "passed" if program_allowlist_status == "configured" else "manual-review-required",
             "action": (
@@ -18295,6 +18319,14 @@ def build_transaction_corpus_checklist(
             "evidence": {
                 "status": program_allowlist_status,
                 "missing_directions": program_allowlist_missing_directions,
+            },
+        },
+        {
+            "id": "intent-policy-sidecar-template",
+            "status": "passed" if intent_policy_sidecar_templates else "waiting",
+            "evidence": {
+                "path": intent_policy_sidecar_path,
+                "templates": len(intent_policy_sidecar_templates),
             },
         },
         {
@@ -18360,6 +18392,7 @@ def build_transaction_corpus_checklist(
             "ready_policy_templates": len(ready_policy_templates),
             "program_allowlist_status": program_allowlist_status,
             "program_allowlist_missing_directions": program_allowlist_missing_directions,
+            "intent_policy_sidecar_templates": len(intent_policy_sidecar_templates),
             "quote_collection_status": quote_collection.get("status") or "missing",
             "quote_collection_classification": quote_diagnosis.get("classification") or "missing",
             "quote_collection_success": quote_success,
@@ -18374,6 +18407,11 @@ def build_transaction_corpus_checklist(
         "policy_templates": policy_templates,
         "capture_steps": capture_steps,
         "payload_sidecars": payload_sidecars,
+        "intent_policy_sidecar": {
+            "path": intent_policy_sidecar_path,
+            "templates": intent_policy_sidecar_templates,
+            "redaction_gate": "Do not include wallet private keys, signatures, seed phrases, or signed transactions.",
+        },
         "sidecar_jsonl_example": sidecar_example,
         "acceptance_checks": acceptance_checks,
         "decode_commands": [row.get("decode_command") for row in policy_templates if row.get("decode_command")],
@@ -38180,9 +38218,26 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
     transaction_corpus_gate_commands = "\n".join(
         str(command) for command in transaction_corpus_gate_checklist.get("post_decode_commands", [])
     )
+    transaction_policy_sidecar = transaction_corpus_gate_checklist.get("intent_policy_sidecar", {})
+    transaction_policy_sidecar_templates = (
+        transaction_policy_sidecar.get("templates", [])
+        if isinstance(transaction_policy_sidecar, dict)
+        else []
+    )
+    transaction_policy_template_fields = {
+        key
+        for template in transaction_policy_sidecar_templates
+        if isinstance(template, dict) and isinstance(template.get("policy"), dict)
+        for key in template.get("policy", {})
+    }
     transaction_corpus_gate_checklist_passed = (
         transaction_corpus_gate_checklist.get("status") == "decoded-intent-mismatch-review"
         and transaction_corpus_gate_checklist.get("summary", {}).get("ready_for_finding_gate") is True
+        and transaction_corpus_gate_checklist.get("summary", {}).get("intent_policy_sidecar_templates") == 2
+        and str(transaction_policy_sidecar.get("path") or "").endswith("transaction-intent-policy.json")
+        and {"direction", "wallet", "amountIn", "sourceMint", "destinationMint"}.issubset(
+            transaction_policy_template_fields
+        )
         and " gate --no-write" in transaction_corpus_gate_commands
         and " adjudicate --no-write" in transaction_corpus_gate_commands
         and " evidence-chain --no-write" in transaction_corpus_gate_commands
@@ -43251,6 +43306,17 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
         f"status={summary.get('program_allowlist_status') or 'unknown'} "
         f"missing={','.join(str(item) for item in missing_program_directions) if missing_program_directions else 'none'}"
     )
+    policy_sidecar = (
+        checklist.get("intent_policy_sidecar")
+        if isinstance(checklist.get("intent_policy_sidecar"), dict)
+        else {}
+    )
+    if policy_sidecar and (args.show_steps or args.show_commands):
+        print(
+            "Intent policy sidecar: "
+            f"path={policy_sidecar.get('path')} "
+            f"templates={len(policy_sidecar.get('templates', []) or [])}"
+        )
     for row in (checklist.get("policy_templates", []) or [])[: max(0, int(args.top))]:
         print(
             f"- {row.get('status')} direction={row.get('direction')} "
