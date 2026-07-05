@@ -161,6 +161,7 @@ CLAIM_EVIDENCE_LEDGER_ARTIFACT = "claim-evidence-ledger.json"
 CLAIM_WITNESS_LADDER_ARTIFACT = "claim-witness-ladder.json"
 CLAIM_EVIDENCE_REQUESTS_ARTIFACT = "claim-evidence-requests.json"
 SECRET_EXPOSURE_REVIEW_ARTIFACT = "secret-exposure-review.json"
+BOUNTY_FRONTIER_ARTIFACT = "bounty-frontier.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -268,6 +269,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     CLAIM_WITNESS_LADDER_ARTIFACT,
     CLAIM_EVIDENCE_REQUESTS_ARTIFACT,
     SECRET_EXPOSURE_REVIEW_ARTIFACT,
+    BOUNTY_FRONTIER_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -367,6 +369,7 @@ INDEX_ARTIFACT_ORDER = [
     CLAIM_WITNESS_LADDER_ARTIFACT,
     CLAIM_EVIDENCE_REQUESTS_ARTIFACT,
     SECRET_EXPOSURE_REVIEW_ARTIFACT,
+    BOUNTY_FRONTIER_ARTIFACT,
     "config.json",
     "collection-summary.json",
     "endpoint-clusters.json",
@@ -22327,6 +22330,349 @@ def build_secret_exposure_review(
     }
 
 
+BOUNTY_FRONTIER_SEVERITY_RANK = {
+    "critical-candidate": 0,
+    "high-candidate": 1,
+    "medium-candidate": 2,
+    "low-candidate": 3,
+    "info": 4,
+}
+
+
+def bounty_frontier_lane(oracle_type: str, impact_claim: str) -> tuple[str, str, str]:
+    oracle = str(oracle_type or "").lower()
+    impact = str(impact_claim or "").lower()
+    if "transaction" in oracle or "transaction" in impact:
+        return (
+            "transaction-integrity",
+            "high-candidate",
+            "Decode an approved quote transaction and prove a concrete mismatch between user intent and signed transaction effects.",
+        )
+    if "single-response" in oracle or "rewrite" in impact:
+        return (
+            "sensitive-response-impact",
+            "medium-candidate",
+            "Provide one approved response sidecar that proves concrete sensitive data, authorization, or path-confusion impact.",
+        )
+    if "resource" in oracle or "resource" in impact or "availability" in impact:
+        return (
+            "resource-control",
+            "medium-candidate",
+            "Provide operator/deployment evidence that attacker-controlled routing or identity material creates concrete non-stress availability impact.",
+        )
+    if "provider" in oracle or "quota" in impact or "billing" in impact or "cost" in impact:
+        return (
+            "credentialed-provider-impact",
+            "medium-candidate",
+            "Provide provider/operator evidence for account-level quota, billing, rate-limit, monitoring, or credentialed upstream impact.",
+        )
+    if "websocket" in oracle or "header" in impact:
+        return (
+            "websocket-header-trust",
+            "medium-candidate",
+            "Prove a sensitive browser-controlled header reaches an upstream that trusts, logs, bills, or authorizes based on it.",
+        )
+    return (
+        "evidence-closed-impact",
+        "medium-candidate",
+        "Provide official sidecar evidence that closes the claim's finding-gate contract.",
+    )
+
+
+def bounty_frontier_request_summary(request: dict[str, Any]) -> dict[str, Any]:
+    official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
+    draft = request.get("draft_assist") if isinstance(request.get("draft_assist"), dict) else {}
+    commands = normalize_string_list(request.get("verification_commands"))
+    if not commands:
+        commands = normalize_string_list(draft.get("after_filling_validation_commands"))
+    return {
+        "request_id": request.get("id"),
+        "status": request.get("request_status") or official.get("status") or "unknown",
+        "artifact": official.get("artifact") or official.get("path"),
+        "name": official.get("name"),
+        "category": official.get("category"),
+        "file_status": official.get("file_status"),
+        "validator_status": official.get("validator_status"),
+        "draft_path": draft.get("draft_path"),
+        "draft_status": draft.get("draft_status"),
+        "verification_commands": commands[:3],
+        "details": normalize_string_list(request.get("missing_or_invalid_details"))[:6],
+    }
+
+
+def bounty_frontier_request_blocks(request_summary: dict[str, Any]) -> bool:
+    status = str(request_summary.get("status") or "").lower()
+    file_status = str(request_summary.get("file_status") or "").lower()
+    validator_status = str(request_summary.get("validator_status") or "").lower()
+    return (
+        status in {"missing-official-evidence", "missing-evidence", "invalid-evidence"}
+        or file_status in {"missing", "invalid"}
+        or validator_status in {"missing", "invalid"}
+    )
+
+
+def build_bounty_frontier(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    claim_requests: dict[str, Any] | None,
+    secret_review: dict[str, Any] | None,
+    review_blockers: dict[str, Any] | None,
+    evidence_gaps: dict[str, Any] | None,
+    transaction_flow_review: dict[str, Any] | None,
+    adjudication: dict[str, Any] | None,
+) -> dict[str, Any]:
+    frontier_by_claim: dict[str, dict[str, Any]] = {}
+    request_rows = (
+        claim_requests.get("requests", [])
+        if isinstance(claim_requests, dict) and isinstance(claim_requests.get("requests"), list)
+        else []
+    )
+    for request in request_rows:
+        if not isinstance(request, dict):
+            continue
+        request_summary = bounty_frontier_request_summary(request)
+        unblocks_claims = [
+            claim for claim in (request.get("unblocks_claims", []) or []) if isinstance(claim, dict)
+        ]
+        if not unblocks_claims:
+            continue
+        for claim in unblocks_claims:
+            claim_id = str(claim.get("claim_id") or "").strip()
+            if not claim_id:
+                continue
+            lane, severity, proof_goal = bounty_frontier_lane(
+                str(claim.get("oracle_type") or ""),
+                str(claim.get("impact_claim") or ""),
+            )
+            item = frontier_by_claim.setdefault(
+                claim_id,
+                {
+                    "id": f"FRONTIER-{safe_probe_id(claim_id)}",
+                    "source": CLAIM_EVIDENCE_REQUESTS_ARTIFACT,
+                    "claim_id": claim_id,
+                    "entrypoint": claim.get("entrypoint"),
+                    "oracle_type": claim.get("oracle_type"),
+                    "impact_claim": claim.get("impact_claim"),
+                    "bounty_lane": lane,
+                    "expected_severity": severity,
+                    "proof_goal": proof_goal,
+                    "claim_readiness": claim.get("claim_readiness"),
+                    "next_stage": claim.get("next_stage"),
+                    "top_blocker": claim.get("top_blocker"),
+                    "required_evidence_requests": [],
+                    "acceptance_criteria": [],
+                    "reject_if": [],
+                    "verification_commands": [],
+                    "finding_gate_ready": False,
+                    "reportable_now": False,
+                    "validity_boundary": (
+                        "A bounty frontier is not a finding. It becomes reportable only after official evidence "
+                        "proves concrete impact and adjudication accepts it."
+                    ),
+                },
+            )
+            item["required_evidence_requests"].append(request_summary)
+            item["acceptance_criteria"].extend(normalize_string_list(request.get("acceptance_criteria"))[:8])
+            item["reject_if"].extend(normalize_string_list(request.get("reject_if"))[:8])
+            item["verification_commands"].extend(normalize_string_list(request_summary.get("verification_commands"))[:3])
+
+    frontiers = []
+    for item in frontier_by_claim.values():
+        request_summaries = [
+            request for request in item.get("required_evidence_requests", []) if isinstance(request, dict)
+        ]
+        missing_requests = [request for request in request_summaries if bounty_frontier_request_blocks(request)]
+        draft_ready = [
+            request for request in request_summaries if str(request.get("draft_status") or "") == "draft-ready"
+        ]
+        item["required_evidence_count"] = len(request_summaries)
+        item["missing_or_invalid_evidence_count"] = len(missing_requests)
+        item["draft_ready_count"] = len(draft_ready)
+        item["evidence_distance"] = len(missing_requests)
+        item["required_artifacts"] = ordered_unique_strings(
+            [
+                str(request.get("artifact") or "")
+                for request in request_summaries
+                if request.get("artifact")
+            ]
+        )
+        item["draft_paths"] = ordered_unique_strings(
+            [
+                str(request.get("draft_path") or "")
+                for request in request_summaries
+                if request.get("draft_path")
+            ]
+        )
+        item["verification_commands"] = ordered_unique_strings(normalize_string_list(item.get("verification_commands")))[:6]
+        item["acceptance_criteria"] = ordered_unique_strings(normalize_string_list(item.get("acceptance_criteria")))[:12]
+        item["reject_if"] = ordered_unique_strings(normalize_string_list(item.get("reject_if")))[:12]
+        if missing_requests:
+            item["status"] = "blocked-missing-official-evidence"
+            item["next_step"] = (
+                f"Fill and validate {len(missing_requests)} official evidence artifact(s): "
+                f"{', '.join(Path(str(request.get('artifact'))).name for request in missing_requests if request.get('artifact'))}."
+            )
+        else:
+            item["status"] = "ready-for-evidence-verification"
+            item["next_step"] = "Rerun the listed verifier commands, then adjudicate; do not report until the finding gate accepts concrete impact."
+        frontiers.append(item)
+
+    secret_actionables = []
+    if isinstance(secret_review, dict):
+        secret_actionables = [
+            item
+            for item in (secret_review.get("actionable_review_items", []) or [])
+            if isinstance(item, dict)
+            and str(item.get("status") or "") == "needs-build-provenance-review"
+        ]
+    if secret_actionables:
+        frontiers.append(
+            {
+                "id": "FRONTIER-secret-build-provenance",
+                "source": SECRET_EXPOSURE_REVIEW_ARTIFACT,
+                "claim_id": None,
+                "entrypoint": "Docker build / image provenance",
+                "oracle_type": "secret-exposure",
+                "impact_claim": "build-secret-retention-or-disclosure",
+                "bounty_lane": "build-secret-exposure",
+                "expected_severity": "medium-candidate",
+                "status": "blocked-build-provenance-evidence",
+                "proof_goal": (
+                    "Prove a real secret value is retained or disclosed through image metadata, layers, remote cache, build logs, "
+                    "registry artifacts, or equivalent provenance evidence."
+                ),
+                "required_evidence_count": 1,
+                "missing_or_invalid_evidence_count": 1,
+                "draft_ready_count": 0,
+                "evidence_distance": 1,
+                "required_artifacts": [
+                    "redacted build provenance: image history/config, cache/log excerpt, registry artifact, or builder attestation"
+                ],
+                "static_risk_items": [
+                    {
+                        "kind": item.get("kind"),
+                        "file": item.get("file"),
+                        "line": item.get("line"),
+                        "name": item.get("name"),
+                        "severity": item.get("severity"),
+                        "next_step": item.get("next_step"),
+                    }
+                    for item in secret_actionables[:8]
+                ],
+                "finding_gate_ready": False,
+                "reportable_now": False,
+                "validity_boundary": (
+                    "Static Docker ARG/ENV/.npmrc patterns are not Medium+ by themselves; the frontier needs concrete "
+                    "secret retention or disclosure evidence before reportability."
+                ),
+                "next_step": "Collect redacted build provenance evidence, or close this lane if the secret is never passed and no cache/log/image retention exists.",
+                "acceptance_criteria": [
+                    "A real non-placeholder secret was passed to the build or written during the build.",
+                    "A build artifact, image layer/config/history, cache, registry object, or log exposes enough proof of retention/disclosure.",
+                    "Evidence is redacted and does not include the raw secret value.",
+                ],
+                "reject_if": [
+                    "Only static Dockerfile source is available.",
+                    "Only placeholder, runtime reference, or template values are present.",
+                    "The relevant builder stage, cache, logs, and pushed image are proven unavailable or not retained.",
+                ],
+                "verification_commands": [
+                    validation_command_for_artifact_dir(
+                        artifact_dir,
+                        "secret-exposure-review --no-write --show-findings",
+                        profile=profile,
+                    )
+                ],
+            }
+        )
+
+    severity_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    lane_counts: dict[str, int] = {}
+    for item in frontiers:
+        increment_count(severity_counts, str(item.get("expected_severity") or "unknown"))
+        increment_count(status_counts, str(item.get("status") or "unknown"))
+        increment_count(lane_counts, str(item.get("bounty_lane") or "unknown"))
+
+    frontiers.sort(
+        key=lambda item: (
+            BOUNTY_FRONTIER_SEVERITY_RANK.get(str(item.get("expected_severity") or "info"), 9),
+            int(item.get("evidence_distance") or 99),
+            str(item.get("bounty_lane") or ""),
+            str(item.get("id") or ""),
+        )
+    )
+    quick_wins = sorted(
+        frontiers,
+        key=lambda item: (
+            int(item.get("evidence_distance") or 99),
+            BOUNTY_FRONTIER_SEVERITY_RANK.get(str(item.get("expected_severity") or "info"), 9),
+            str(item.get("id") or ""),
+        ),
+    )
+    reportable_now = sum(1 for item in frontiers if item.get("reportable_now"))
+    ready_for_gate = sum(1 for item in frontiers if item.get("finding_gate_ready"))
+    if reportable_now:
+        status = "reportable-frontier-present"
+    elif ready_for_gate:
+        status = "ready-for-finding-gate-review"
+    elif frontiers:
+        status = "blocked-missing-bounty-evidence"
+    else:
+        status = "no-bounty-frontiers"
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-frontier-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "methodology": {
+            "greybox": "coverage-first: keep dangerous surfaces tracked until evidence-closed.",
+            "blackbox": "validity-and-payout-first: rank the shortest path to one valid Medium+ bounty-worthy issue.",
+            "reportability_boundary": "Frontiers are not findings; only adjudication/finding-gate acceptance can produce reportable findings.",
+        },
+        "summary": {
+            "frontiers": len(frontiers),
+            "reportable_now": reportable_now,
+            "ready_for_finding_gate": ready_for_gate,
+            "blocked": sum(1 for item in frontiers if str(item.get("status") or "").startswith("blocked")),
+            "severity_counts": dict(sorted(severity_counts.items())),
+            "status_counts": dict(sorted(status_counts.items())),
+            "lane_counts": dict(sorted(lane_counts.items())),
+            "top_bounty_frontier": frontiers[0].get("id") if frontiers else None,
+            "shortest_evidence_frontier": quick_wins[0].get("id") if quick_wins else None,
+            "claim_request_status": artifact_summary_status(claim_requests),
+            "secret_review_status": artifact_summary_status(secret_review),
+            "review_blockers_status": artifact_summary_status(review_blockers),
+            "evidence_gaps_status": artifact_summary_status(evidence_gaps),
+            "transaction_flow_status": artifact_summary_status(transaction_flow_review),
+            "adjudication_status": artifact_summary_status(adjudication),
+        },
+        "top_bounty_frontiers": frontiers[:12],
+        "shortest_evidence_frontiers": quick_wins[:8],
+        "inputs": {
+            CLAIM_EVIDENCE_REQUESTS_ARTIFACT: artifact_summary_status(claim_requests),
+            SECRET_EXPOSURE_REVIEW_ARTIFACT: artifact_summary_status(secret_review),
+            REVIEW_BLOCKERS_ARTIFACT: artifact_summary_status(review_blockers),
+            "evidence-gaps.json": artifact_summary_status(evidence_gaps),
+            TRANSACTION_FLOW_REVIEW_ARTIFACT: artifact_summary_status(transaction_flow_review),
+            "adjudication.json": artifact_summary_status(adjudication),
+        },
+        "next_step": (
+            "Work the top bounty frontier only until official evidence proves or closes it; keep coverage blockers visible separately."
+            if frontiers
+            else "No bounty frontier could be derived from current evidence requests."
+        ),
+        "safety": (
+            "Offline artifact synthesis only. It does not send target traffic, call Burp, sign wallets, submit transactions, "
+            "or create official evidence sidecars."
+        ),
+    }
+
+
 VALIDATION_APPROVAL_PACKET_KEYS = [
     ("transaction_corpus_approval_packet", "transaction-corpus"),
     ("credential_impact_approval_packet", "credential-impact"),
@@ -22736,6 +23082,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     CLAIM_WITNESS_LADDER_ARTIFACT: "claim-witness-ladder",
     CLAIM_EVIDENCE_REQUESTS_ARTIFACT: "claim-evidence-requests",
     SECRET_EXPOSURE_REVIEW_ARTIFACT: "secret-exposure-review",
+    BOUNTY_FRONTIER_ARTIFACT: "bounty-frontier",
     ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT: "oracle-plan --write-sidecar-template",
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT: "rewrite-response-review --write-sidecar-template",
     "finding-gate.json": "gate",
@@ -22775,6 +23122,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "claim-witness-ladder",
     "claim-evidence-requests",
     "secret-exposure-review",
+    "bounty-frontier",
     "rewrite-response-review --write-sidecar-template",
     "report",
     "transaction-corpus-checklist --write-policy-template --skip-current-resource-check",
@@ -22799,6 +23147,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "claim-witness-ladder": "claim-witness-ladder --no-write",
     "claim-evidence-requests": "claim-evidence-requests --no-write",
     "secret-exposure-review": "secret-exposure-review --no-write",
+    "bounty-frontier": "bounty-frontier --no-write",
     "rewrite-response-review --write-sidecar-template": (
         "rewrite-response-review --no-write --show-sidecar-template-json"
     ),
@@ -46755,6 +47104,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("deployment-review", "run_deployment_review"),
         refresh_expectation("operator-evidence-review", "run_operator_evidence_review"),
         refresh_expectation("secret-exposure-review", "run_secret_exposure_review"),
+        refresh_expectation("bounty-frontier", "run_bounty_frontier"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-sidecar-review", "run_transaction_sidecar_review"),
         refresh_expectation("transaction-corpus-checklist", "run_transaction_corpus_checklist"),
@@ -70095,6 +70445,114 @@ def run_secret_exposure_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_bounty_frontier(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    claim_requests = load_optional_json(artifact_dir / CLAIM_EVIDENCE_REQUESTS_ARTIFACT)
+    if not isinstance(claim_requests, dict):
+        claim_requests = build_claim_evidence_requests(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            package_path=artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT,
+            ladder_doc=load_optional_json(artifact_dir / CLAIM_WITNESS_LADDER_ARTIFACT),
+            draft_doc=load_optional_json(artifact_dir / EVIDENCE_SIDECAR_DRAFTS_ARTIFACT),
+        )
+    secret_review = load_optional_json(artifact_dir / SECRET_EXPOSURE_REVIEW_ARTIFACT)
+    if not isinstance(secret_review, dict):
+        secret_review = build_secret_exposure_review(
+            source_root=source_root,
+            profile=profile,
+            max_file_bytes=DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES,
+            max_files=64,
+        )
+    frontier = build_bounty_frontier(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        claim_requests=claim_requests,
+        secret_review=secret_review,
+        review_blockers=load_optional_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT),
+        evidence_gaps=load_optional_json(artifact_dir / "evidence-gaps.json"),
+        transaction_flow_review=load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT),
+        adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+    )
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / BOUNTY_FRONTIER_ARTIFACT
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(frontier))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-frontier",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = frontier.get("summary", {}) if isinstance(frontier.get("summary"), dict) else {}
+    print(f"Bounty frontier: {frontier.get('status')}")
+    print(
+        "Frontiers: "
+        f"total={summary.get('frontiers', 0)} "
+        f"reportable_now={summary.get('reportable_now', 0)} "
+        f"ready_for_gate={summary.get('ready_for_finding_gate', 0)} "
+        f"blocked={summary.get('blocked', 0)}"
+    )
+    print(
+        "Top: "
+        f"bounty={summary.get('top_bounty_frontier') or '-'} "
+        f"shortest={summary.get('shortest_evidence_frontier') or '-'} "
+        f"severities={json.dumps(summary.get('severity_counts', {}), sort_keys=True)}"
+    )
+    print(
+        "Inputs: "
+        f"claims={summary.get('claim_request_status') or '-'} "
+        f"secret={summary.get('secret_review_status') or '-'} "
+        f"blockers={summary.get('review_blockers_status') or '-'} "
+        f"adjudication={summary.get('adjudication_status') or '-'}"
+    )
+    if getattr(args, "show_frontiers", False):
+        display_limit = max(0, int(args.top))
+        for item in (frontier.get("top_bounty_frontiers", []) or [])[:display_limit]:
+            if not isinstance(item, dict):
+                continue
+            print(
+                f"- {item.get('id')}: {item.get('expected_severity')} "
+                f"{item.get('status')} lane={item.get('bounty_lane')} "
+                f"distance={item.get('evidence_distance')} entrypoint={item.get('entrypoint') or '-'}"
+            )
+            required = ", ".join(
+                Path(str(path)).name for path in normalize_string_list(item.get("required_artifacts"))[:4]
+            )
+            if required:
+                print(f"  needs={inline_summary_text(required, max_chars=260)}")
+            if item.get("proof_goal"):
+                print(f"  proof={inline_summary_text(item.get('proof_goal'), max_chars=260)}")
+            if item.get("next_step"):
+                print(f"  next={inline_summary_text(item.get('next_step'), max_chars=300)}")
+        remaining = len(frontier.get("top_bounty_frontiers", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more frontier(s); rerun without --no-write to write the full artifact")
+            else:
+                print(f"- {remaining} more frontier(s) in {output_path}")
+    print(f"Next: {inline_summary_text(frontier.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and frontier.get("status") not in {
+        "reportable-frontier-present",
+        "ready-for-finding-gate-review",
+    }:
+        return 1
+    return 0
+
+
 def run_iteration_decision(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -72825,6 +73283,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero only when a potential concrete static secret exposure is found.",
     )
     secret_exposure_review.set_defaults(func=run_secret_exposure_review)
+
+    bounty_frontier = sub.add_parser(
+        "bounty-frontier",
+        help="Rank claim and evidence blockers by bounty-valid Medium+ frontier without sending traffic",
+    )
+    bounty_frontier.add_argument(
+        "--output",
+        help=f"Where to write {BOUNTY_FRONTIER_ARTIFACT}. Defaults to --artifact-dir/{BOUNTY_FRONTIER_ARTIFACT}.",
+    )
+    bounty_frontier.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of frontiers to print with --show-frontiers.",
+    )
+    bounty_frontier.add_argument(
+        "--show-frontiers",
+        action="store_true",
+        help="Print ranked bounty frontier rows, required evidence, and proof goals.",
+    )
+    bounty_frontier.add_argument(
+        "--no-write",
+        action="store_true",
+        help=f"Print bounty frontier only; do not write {BOUNTY_FRONTIER_ARTIFACT} or refreshed manifests.",
+    )
+    bounty_frontier.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless at least one frontier is reportable or ready for finding-gate review.",
+    )
+    bounty_frontier.set_defaults(func=run_bounty_frontier)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
