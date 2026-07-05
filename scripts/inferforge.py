@@ -10398,6 +10398,311 @@ def credential_impact_evidence_closure_plan(
     }
 
 
+def resource_approval_sequence_step(approval_packet: dict[str, Any], step_id: str) -> dict[str, Any]:
+    for step in approval_packet.get("approval_sequence", []) or []:
+        if isinstance(step, dict) and step.get("id") == step_id:
+            return step
+    return {}
+
+
+def resource_control_evidence_closure_plan(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    requirements: list[dict[str, Any]],
+    deployment_review: dict[str, Any],
+    operator_review: dict[str, Any],
+    resource_review: dict[str, Any],
+    approval_packet: dict[str, Any],
+    resource_preflight: dict[str, Any],
+    gate_ready: bool,
+) -> dict[str, Any]:
+    requirement_by_id = {
+        str(requirement.get("id") or ""): requirement
+        for requirement in requirements
+        if isinstance(requirement, dict)
+    }
+    deployment_summary = (
+        deployment_review.get("summary")
+        if isinstance(deployment_review.get("summary"), dict)
+        else {}
+    )
+    operator_summary = (
+        operator_review.get("summary")
+        if isinstance(operator_review.get("summary"), dict)
+        else {}
+    )
+    recommended_evidence = (
+        approval_packet.get("recommended_evidence")
+        if isinstance(approval_packet.get("recommended_evidence"), dict)
+        else {}
+    )
+    evidence_contract = (
+        resource_review.get("evidence_contract")
+        if isinstance(resource_review.get("evidence_contract"), dict)
+        else operator_review.get("resource_evidence_contract")
+        if isinstance(operator_review.get("resource_evidence_contract"), dict)
+        else {}
+    )
+    sidecar_path = (
+        approval_packet.get("operator_evidence_sidecar")
+        or operator_review.get("sidecar_path")
+        or repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
+    )
+    missing_decision_ids = ordered_unique_strings(
+        [
+            item
+            for item in [
+                *normalize_string_list(recommended_evidence.get("missing_decision_ids")),
+                *normalize_string_list(operator_summary.get("missing_decisions")),
+                *normalize_string_list(deployment_summary.get("critical_missing")),
+            ]
+            if item in OPERATOR_RESOURCE_CONTROL_DECISION_IDS
+        ]
+    )
+    finding_gate_blockers = normalize_string_list(approval_packet.get("finding_gate_blockers"))
+
+    def requirement_status(requirement_id: str) -> str:
+        requirement = requirement_by_id.get(requirement_id, {})
+        return str(requirement.get("status") or "waiting")
+
+    def requirement_next(requirement_id: str, fallback: str) -> str:
+        requirement = requirement_by_id.get(requirement_id, {})
+        return str(requirement.get("next_step") or fallback)
+
+    def offline_command(subcommand: str, source: str) -> dict[str, Any] | None:
+        return methodology_command_ref(artifact_dir, profile, subcommand, source=source)
+
+    def packet_step_summary(step_id: str) -> dict[str, Any]:
+        step = resource_approval_sequence_step(approval_packet, step_id)
+        if not step:
+            return {}
+        return {
+            key: step.get(key)
+            for key in ["id", "status", "risk", "action", "command"]
+            if step.get(key) is not None
+        }
+
+    external_status = requirement_status("external-rate-limit-store-config")
+    proxy_status = requirement_status("proxy-header-trust-model")
+    rpc_client_status = requirement_status("rpc-client-ip-header-trust-model")
+    bounds_status = requirement_status("rate-limit-bounds")
+    fallback_status = requirement_status("fallback-monitoring-alerts")
+    availability_status = requirement_status("availability-impact-without-stress")
+    deployment_ready = external_status == "passed" and proxy_status == "passed" and bounds_status == "passed"
+    operator_ready = rpc_client_status == "passed" and fallback_status == "passed" and not missing_decision_ids
+    resource_context_ready = bool(resource_review) or bool(evidence_contract)
+    resource_status = str(resource_preflight.get("status") or "not-run")
+    resource_budget = (
+        resource_preflight.get("resource_budget")
+        if isinstance(resource_preflight.get("resource_budget"), dict)
+        else {}
+    )
+    resource_blocked = (
+        resource_status not in {"healthy", "not-run"}
+        or resource_budget.get("active_target_traffic") == "blocked"
+    )
+    review_ready = deployment_ready and operator_ready
+    header_trust = (
+        evidence_contract.get("header_trust")
+        if isinstance(evidence_contract.get("header_trust"), dict)
+        else {}
+    )
+    client_ip_trust_status = resource_review.get("client_ip_trust_status") or header_trust.get("status")
+    single_request_status = (
+        "blocked-resource"
+        if resource_blocked
+        else "ready-after-resource-check"
+        if review_ready and availability_status == "passed"
+        else "waiting"
+    )
+    source_status = "passed" if resource_context_ready else "waiting"
+    steps = [
+        {
+            "id": "resource-signal-context",
+            "requirement": "resource-abuse-review-context",
+            "status": source_status,
+            "artifact": HYPOTHESIS_MATRIX_ARTIFACT,
+            "evidence": {
+                "entrypoint": recommended_evidence.get("entrypoint") or evidence_contract.get("entrypoint"),
+                "resource_review_status": resource_review.get("status"),
+                "static_signal_count": resource_review.get("signal_count", 0),
+                "client_ip_trust_status": client_ip_trust_status,
+                "evidence_contract": evidence_contract.get("id"),
+            },
+            "offline_command": offline_command(
+                "hypothesis-matrix --no-write --show-next",
+                "resource-closure-plan:resource-signal-context",
+            ),
+            "next_step": (
+                "Index the local resource-abuse review before treating rate-limit or header-keyed behavior as a validation lead."
+            ),
+        },
+        {
+            "id": "deployment-context",
+            "requirement": "deployment-resource-control-evidence",
+            "status": "passed" if deployment_ready else "waiting",
+            "artifact": DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
+            "evidence": {
+                "deployment_review_status": deployment_review.get("status") or "missing",
+                "critical_missing": [
+                    item
+                    for item in normalize_string_list(deployment_summary.get("critical_missing"))
+                    if item in OPERATOR_RESOURCE_CONTROL_DECISION_IDS
+                ],
+                "decision_status_counts": deployment_summary.get("decision_status_counts", {}),
+            },
+            "packet_steps": [packet_step_summary("deployment-context")],
+            "offline_command": offline_command(
+                "deployment-review --no-write --top 8",
+                "resource-closure-plan:deployment-context",
+            ),
+            "next_step": (
+                "Confirm production external store, trusted proxy/header overwrite, and bounded rate-limit behavior."
+            ),
+        },
+        {
+            "id": "operator-evidence-sidecar",
+            "requirement": "operator-resource-control-evidence",
+            "status": "passed" if operator_ready else "waiting",
+            "artifact": sidecar_path,
+            "required_decision_ids": sorted(OPERATOR_RESOURCE_CONTROL_DECISION_IDS),
+            "missing_decision_ids": missing_decision_ids,
+            "required_fields": normalize_string_list(approval_packet.get("redacted_sidecar_required_fields"))[:5],
+            "packet_steps": [
+                packet_step_summary("operator-template-preview"),
+                packet_step_summary("operator-evidence-review"),
+            ],
+            "offline_command": offline_command(
+                "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
+                "resource-closure-plan:operator-evidence-sidecar",
+            ),
+            "next_step": (
+                "Collect redacted deployment/operator evidence for external store, proxy trust, IP-key trust, bounds, and fallback monitoring."
+            ),
+        },
+        {
+            "id": "resource-control-review",
+            "requirement": "resource-control-decision-review",
+            "status": "passed" if review_ready else "waiting",
+            "artifact": OPERATOR_EVIDENCE_REVIEW_ARTIFACT,
+            "evidence": {
+                "operator_evidence_review_status": operator_review.get("status") or "missing",
+                "rpc_client_ip_trust_status": operator_summary.get("rpc_client_ip_trust_status") or "missing",
+                "approval_packet_status": approval_packet.get("status"),
+                "packet_blocker_count": approval_packet.get("finding_gate_blocker_count"),
+            },
+            "packet_steps": [packet_step_summary("operator-evidence-review")],
+            "offline_command": offline_command(
+                "operator-evidence-review --no-write --show-evidence --show-missing --show-closure-contract",
+                "resource-closure-plan:resource-control-review",
+            ),
+            "next_step": (
+                "Review the resource-control approval packet only after required deployment/operator decisions are present."
+            ),
+        },
+        {
+            "id": "non-stress-impact-evidence",
+            "requirement": "availability-impact-without-stress",
+            "status": availability_status,
+            "artifact": "finding-gate.json",
+            "evidence": {
+                "finding_gate_blockers": finding_gate_blockers[:6],
+                "resource_control_ready": review_ready,
+            },
+            "packet_steps": [packet_step_summary("finding-gate-preview")],
+            "offline_command": offline_command(
+                "gate --no-write --show-items",
+                "resource-closure-plan:non-stress-impact-evidence",
+            ),
+            "next_step": requirement_next(
+                "availability-impact-without-stress",
+                "Prove concrete app availability, quota, or operator impact from configuration, logs, dashboards, or reviewed statements without traffic volume.",
+            ),
+        },
+        {
+            "id": "single-request-resource-gate",
+            "requirement": "resource-safe-for-single-request",
+            "status": single_request_status,
+            "artifact": RESOURCE_SNAPSHOT_ARTIFACT,
+            "evidence": {
+                "resource_status": resource_status,
+                "resource_budget": resource_budget,
+            },
+            "packet_steps": [
+                packet_step_summary("resource-gate"),
+                packet_step_summary("single-request-validation"),
+            ],
+            "offline_command": offline_command(
+                "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict",
+                "resource-closure-plan:resource-gate",
+            ),
+            "next_step": (
+                "Run only a final resource gate before any single approved request; never validate by exhausting rate limits."
+            ),
+        },
+        {
+            "id": "finding-gate-entry",
+            "requirement": "finding-gate-impact",
+            "status": "ready-offline" if gate_ready else "waiting",
+            "artifact": "finding-gate.json",
+            "evidence": {
+                "finding_gate_blockers": [] if gate_ready else finding_gate_blockers[:6],
+                "resource_control_ready": review_ready,
+                "availability_impact_ready": availability_status == "passed",
+            },
+            "packet_steps": [packet_step_summary("finding-gate-preview")],
+            "offline_command": offline_command(
+                "gate --no-write --show-items",
+                "resource-closure-plan:finding-gate-entry",
+            ),
+            "next_step": (
+                "Enter finding-gate only after non-stress evidence ties attacker-controlled key material or fallback behavior to concrete impact."
+            ),
+        },
+    ]
+    incomplete_steps = [
+        step
+        for step in steps
+        if step.get("status") not in {"passed", "ready-offline", "ready-after-resource-check"}
+    ]
+    active_step = incomplete_steps[0] if incomplete_steps else {}
+    if gate_ready:
+        status = "ready-for-finding-gate-review"
+    elif not resource_context_ready:
+        status = "needs-resource-signal-context"
+    elif not deployment_ready:
+        status = "needs-deployment-resource-control-evidence"
+    elif not operator_ready:
+        status = "needs-operator-resource-control-evidence"
+    elif availability_status != "passed":
+        status = "needs-non-stress-impact-evidence"
+    elif resource_blocked:
+        status = "blocked-resource-before-single-request"
+    else:
+        status = "needs-finding-gate-review"
+
+    return {
+        "id": "resource-control-evidence-closure",
+        "status": status,
+        "active_step": active_step.get("id"),
+        "operator_evidence_sidecar": sidecar_path,
+        "recommended_evidence": recommended_evidence,
+        "steps": steps,
+        "finding_gate_blockers": [] if gate_ready else finding_gate_blockers,
+        "reportability_gate": (
+            "A resource-control lead is reportable only after deployment/operator evidence proves attacker-controlled "
+            "key material or unsafe fallback behavior and non-stress evidence shows concrete availability, quota, "
+            "or operator impact. Static rate-limit source alone is not enough."
+        ),
+        "safety": (
+            "Offline closure plan only. It emits deployment/operator sidecar requirements, resource gates, and "
+            "finding-gate blockers; it sends no target/provider traffic, invokes no Burp tools, performs no floods, "
+            "does not test rate limits, and submits no transactions."
+        ),
+    }
+
+
 def transaction_approval_sequence_step(approval_packet: dict[str, Any], step_id: str) -> dict[str, Any]:
     for step in approval_packet.get("approval_sequence", []) or []:
         if isinstance(step, dict) and step.get("id") == step_id:
@@ -10862,13 +11167,14 @@ def build_resource_evidence_closure(
         if isinstance(supporting_reviews.get("current_resource_snapshot"), dict)
         else {"status": "not-run"}
     )
+    resource_preflight = validation_resource_preflight_summary(current_resource_snapshot)
     resource_packet_full = resource_control_approval_packet(
         artifact_dir=artifact_dir,
         profile=profile,
         operator_review=operator_review,
         deployment_review=deployment_review,
         resource_review=resource_review,
-        resource_preflight=validation_resource_preflight_summary(current_resource_snapshot),
+        resource_preflight=resource_preflight,
     )
     approval_packet = quote_resource_control_approval_review_candidate(
         {
@@ -10923,6 +11229,18 @@ def build_resource_evidence_closure(
             "Prove concrete provider/app availability impact without flooding, rate testing, or DoS validation.",
         ),
     ]
+    gate_ready = False
+    closure_plan = resource_control_evidence_closure_plan(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        requirements=requirements,
+        deployment_review=deployment_review,
+        operator_review=operator_review,
+        resource_review=resource_review,
+        approval_packet=approval_packet or {},
+        resource_preflight=resource_preflight,
+        gate_ready=gate_ready,
+    )
     commands = []
     for source, subcommand in [
         ("deployment", "deployment-review --no-write --top 8"),
@@ -10942,7 +11260,7 @@ def build_resource_evidence_closure(
             commands.append(ref)
     return {
         "status": methodology_closure_status(requirements),
-        "gate_ready": False,
+        "gate_ready": gate_ready,
         "impact": item.get("impact"),
         "artifact_statuses": {
             "deployment_review": deployment_review.get("status") or "missing",
@@ -10958,6 +11276,7 @@ def build_resource_evidence_closure(
         "next_safe_commands": commands[:6],
         "evidence_contract": evidence_contract,
         "resource_control_approval_packet": approval_packet,
+        "closure_plan": closure_plan,
         "finding_gate_entry_condition": (
             "Only enter finding-gate after deployment/operator evidence proves attacker-controlled key growth or "
             "connection sharding plus concrete availability impact, without rate/DoS testing."
@@ -24372,7 +24691,28 @@ def resource_control_approval_packet(
                 if str(item) in OPERATOR_RESOURCE_CONTROL_DECISION_IDS
             ]
         )
-    if not missing_decision_ids and resource_review and not resource_contract:
+    present_resource_decision_ids = {
+        str(item)
+        for item in summary.get("present_decision_ids", []) or []
+        if str(item) in OPERATOR_RESOURCE_CONTROL_DECISION_IDS
+    }
+    deployment_decisions = (
+        deployment_review.get("decisions")
+        if isinstance(deployment_review.get("decisions"), list)
+        else []
+    )
+    deployment_resource_decision_ids = {
+        str(decision.get("id") or "")
+        for decision in deployment_decisions
+        if isinstance(decision, dict)
+        and str(decision.get("id") or "") in OPERATOR_RESOURCE_CONTROL_DECISION_IDS
+    }
+    has_resource_decision_context = bool(
+        present_resource_decision_ids
+        or missing_decision_ids
+        or deployment_resource_decision_ids
+    )
+    if not missing_decision_ids and resource_review and not resource_contract and not has_resource_decision_context:
         missing_decision_ids = ordered_unique_strings(
             [
                 decision_id
@@ -50574,6 +50914,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         operator_placeholder_credential_checklist: dict[str, Any] = {}
         operator_sidecar_credential_closure: dict[str, Any] = {}
         operator_placeholder_credential_closure: dict[str, Any] = {}
+        operator_sidecar_resource_closure: dict[str, Any] = {}
+        operator_placeholder_resource_closure: dict[str, Any] = {}
         with tempfile.TemporaryDirectory(prefix="inferforge-operator-evidence-selftest-") as operator_temp_dir:
             operator_sidecar_source_root = Path(operator_temp_dir) / "operator-sidecar-source"
             operator_sidecar_source_root.mkdir()
@@ -50630,6 +50972,28 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                         }
                     ],
                 )
+            }
+            operator_resource_sidecar = {
+                "schema": "inferforge-operator-evidence-v1",
+                "evidence_items": [
+                    {
+                        "id": decision_id,
+                        "status": "confirmed",
+                        "summary": f"Redacted resource-control evidence confirms {decision_id}.",
+                        "source_ref": "redacted-resource-selftest-reference",
+                    }
+                    for decision_id in sorted(OPERATOR_RESOURCE_CONTROL_DECISION_IDS)
+                ],
+            }
+            operator_resource_placeholder = {
+                "schema": "inferforge-operator-evidence-v1",
+                "evidence_items": [
+                    {
+                        "id": "external-rate-limit-store-config",
+                        "status": "pending",
+                        "summary": "REPLACE_WITH_REDACTED_OPERATOR_OR_PROVIDER_EVIDENCE_SUMMARY",
+                    }
+                ],
             }
             operator_sidecar_review = build_deployment_resource_review(
                 operator_sidecar_source_root,
@@ -50713,6 +51077,37 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 },
                 deployment_review=operator_placeholder_review,
             )
+            operator_resource_review = build_deployment_resource_review(
+                operator_sidecar_source_root,
+                test_profile,
+                operator_evidence=operator_resource_sidecar,
+            )
+            operator_resource_evidence_review = build_operator_evidence_review(
+                target=DEFAULT_TARGET,
+                artifact_dir=operator_sidecar_source_root,
+                operator_evidence=operator_resource_sidecar,
+                deployment_review=operator_resource_review,
+                rpc_method_policy=operator_rpc_method_policy,
+                profile=test_profile,
+            )
+            operator_placeholder_resource_review = build_deployment_resource_review(
+                operator_sidecar_source_root,
+                test_profile,
+                operator_evidence=operator_resource_placeholder,
+            )
+            operator_placeholder_resource_evidence_review = build_operator_evidence_review(
+                target=DEFAULT_TARGET,
+                artifact_dir=operator_sidecar_source_root,
+                operator_evidence=operator_resource_placeholder,
+                deployment_review=operator_placeholder_resource_review,
+                rpc_method_policy=operator_rpc_method_policy,
+                profile=test_profile,
+            )
+            operator_resource_item = {
+                "type": "resource-abuse-review",
+                "impact": "resource-exhaustion",
+                "resource_abuse_review": operator_rpc_method_policy.get("rate_limit_resource_review", {}),
+            }
             operator_sidecar_credential_closure = build_credential_evidence_closure(
                 artifact_dir=operator_sidecar_source_root,
                 profile=test_profile,
@@ -50724,6 +51119,26 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 profile=test_profile,
                 item={"impact": "credentialed-upstream-cost-abuse"},
                 supporting_reviews={"credential_impact_checklist": operator_placeholder_credential_checklist},
+            )
+            operator_sidecar_resource_closure = build_resource_evidence_closure(
+                artifact_dir=operator_sidecar_source_root,
+                profile=test_profile,
+                item=operator_resource_item,
+                supporting_reviews={
+                    "deployment_review": operator_resource_review,
+                    "operator_evidence_review": operator_resource_evidence_review,
+                    "current_resource_snapshot": {"status": "not-run"},
+                },
+            )
+            operator_placeholder_resource_closure = build_resource_evidence_closure(
+                artifact_dir=operator_sidecar_source_root,
+                profile=test_profile,
+                item=operator_resource_item,
+                supporting_reviews={
+                    "deployment_review": operator_placeholder_resource_review,
+                    "operator_evidence_review": operator_placeholder_resource_evidence_review,
+                    "current_resource_snapshot": {"status": "not-run"},
+                },
             )
         operator_evidence_sidecar_passed = (
             operator_sidecar_provider.get("status") == "provider-evidence-indexed"
@@ -50829,6 +51244,60 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and "provider API keys" in operator_credential_closure_plan_text
             and "M0_ORCHESTRATION_API_KEY=" not in operator_credential_closure_plan_text
             and len(operator_ready_closure_steps) == 5
+        )
+        operator_ready_resource_closure_plan = (
+            operator_sidecar_resource_closure.get("closure_plan")
+            if isinstance(operator_sidecar_resource_closure.get("closure_plan"), dict)
+            else {}
+        )
+        operator_placeholder_resource_closure_plan = (
+            operator_placeholder_resource_closure.get("closure_plan")
+            if isinstance(operator_placeholder_resource_closure.get("closure_plan"), dict)
+            else {}
+        )
+        operator_ready_resource_steps = [
+            item
+            for item in (operator_ready_resource_closure_plan.get("steps", []) or [])
+            if isinstance(item, dict)
+        ]
+        operator_placeholder_resource_steps = [
+            item
+            for item in (operator_placeholder_resource_closure_plan.get("steps", []) or [])
+            if isinstance(item, dict)
+        ]
+        operator_resource_closure_plan_text = json.dumps(
+            {
+                "ready": operator_ready_resource_closure_plan,
+                "placeholder": operator_placeholder_resource_closure_plan,
+            },
+            sort_keys=True,
+        )
+        operator_resource_closure_plan_passed = (
+            operator_ready_resource_closure_plan.get("id") == "resource-control-evidence-closure"
+            and operator_ready_resource_closure_plan.get("status") == "needs-non-stress-impact-evidence"
+            and operator_ready_resource_closure_plan.get("active_step") == "non-stress-impact-evidence"
+            and operator_placeholder_resource_closure_plan.get("id") == "resource-control-evidence-closure"
+            and operator_placeholder_resource_closure_plan.get("status") == "needs-deployment-resource-control-evidence"
+            and operator_placeholder_resource_closure_plan.get("active_step") == "deployment-context"
+            and [item.get("id") for item in operator_ready_resource_steps[:5]]
+            == [
+                "resource-signal-context",
+                "deployment-context",
+                "operator-evidence-sidecar",
+                "resource-control-review",
+                "non-stress-impact-evidence",
+            ]
+            and operator_ready_resource_steps[1].get("status") == "passed"
+            and operator_ready_resource_steps[2].get("status") == "passed"
+            and operator_ready_resource_steps[3].get("status") == "passed"
+            and operator_ready_resource_steps[4].get("status") == "waiting"
+            and operator_placeholder_resource_steps[1].get("status") == "waiting"
+            and "rpc-client-ip-header-trust-model" in operator_resource_closure_plan_text
+            and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict"
+            in operator_resource_closure_plan_text
+            and "floods" in operator_resource_closure_plan_text
+            and "M0_ORCHESTRATION_API_KEY=" not in operator_resource_closure_plan_text
+            and len(operator_ready_resource_steps) == 7
         )
     websocket_header_forwarding_bad_review: dict[str, Any] = {}
     websocket_header_forwarding_filtered_review: dict[str, Any] = {}
@@ -54491,6 +54960,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and resource_release_candidates_passed
         and operator_evidence_sidecar_passed
         and operator_closure_contract_passed
+        and operator_resource_closure_plan_passed
         and websocket_header_forwarding_passed
         and transaction_gate_ingestion_passed
         and transaction_corpus_gate_checklist_passed
@@ -54807,6 +55277,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and operator_evidence_checklist_gate_passed
             and operator_closure_contract_passed
             and operator_credential_closure_plan_passed
+            and operator_resource_closure_plan_passed
             else "failed",
             "provider_review": operator_sidecar_provider,
             "placeholder_provider_review": operator_placeholder_review.get("credential_provider_review", {}),
@@ -54818,6 +55289,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "status": "passed" if operator_credential_closure_plan_passed else "failed",
                 "ready_plan": operator_ready_closure_plan,
                 "placeholder_plan": operator_placeholder_closure_plan,
+            },
+            "resource_closure_plan": {
+                "status": "passed" if operator_resource_closure_plan_passed else "failed",
+                "ready_plan": operator_ready_resource_closure_plan,
+                "placeholder_plan": operator_placeholder_resource_closure_plan,
             },
             "credential_checklist": {
                 "status": operator_sidecar_credential_checklist.get("status"),

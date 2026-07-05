@@ -487,6 +487,12 @@ Scanner, Intruder, or DoS validation. In `greybox` mode it closes resource
 coverage decisions; in `blackbox` mode it keeps the thread parked unless
 non-stress deployment/operator evidence can support a valid availability,
 quota, or operator-impact report.
+Resource-exhaustion leads also expose a `resource-control-evidence-closure`
+plan through `lead-dossier --show-evidence`: resource signal context,
+deployment review, redacted operator sidecar, resource-control review,
+non-stress impact evidence, single-request resource gate, and finding-gate entry
+stay ordered and blocked until concrete deployment/operator impact evidence
+exists.
 RPC proxy abuse leads also emit `rpc_proxy_abuse_approval_packet` through
 `validation-plan`, `lead-dossier`, and `iteration-decision`. This packet is
 separate from resource exhaustion: it records the exact RPC proxy entrypoint,
