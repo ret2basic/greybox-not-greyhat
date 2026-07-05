@@ -9130,6 +9130,16 @@ def current_verification_queue_for_artifact_dir(
     )
 
 
+def current_response_deltas_for_artifact_dir(artifact_dir: Path, endpoint_clusters: dict[str, Any]) -> dict[str, Any]:
+    artifact = load_optional_json(artifact_dir / "response-delta-analysis.json")
+    if isinstance(artifact, dict) and artifact:
+        return artifact
+    return build_response_delta_analysis(
+        endpoint_clusters if isinstance(endpoint_clusters, dict) else {},
+        load_jsonl(artifact_dir / "probe-results.jsonl"),
+    )
+
+
 def build_harness_loop_run(
     *,
     target: str,
@@ -9148,7 +9158,7 @@ def build_harness_loop_run(
     source_peek_requests = load_optional_json(artifact_dir / "source-peek-requests.json") or {}
     asset_candidates = load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT) or {}
     lead_portfolio = load_optional_json(artifact_dir / LEAD_PORTFOLIO_ARTIFACT) or {}
-    response_deltas = load_optional_json(artifact_dir / "response-delta-analysis.json") or {}
+    response_deltas = current_response_deltas_for_artifact_dir(artifact_dir, endpoint_clusters)
     suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
     finding_gate = load_optional_json(artifact_dir / "finding-gate.json") or {}
     adjudication = load_optional_json(artifact_dir / "adjudication.json") or {}
@@ -9450,8 +9460,12 @@ def methodology_gap_lines(stage: dict[str, Any], resource_status: str) -> list[s
         gaps.append(f"{summary.get('evidence_gaps')} evidence gap(s) remain")
     if stage.get("stage") == "lead-generation" and int(summary.get("external_probe_commands", 0) or 0):
         gaps.append(f"{summary.get('external_probe_commands')} external probe command(s) require gating")
-    if stage.get("stage") == "finding-identification" and str(summary.get("response_deltas") or "") in {"missing", "no-probe-results"}:
-        gaps.append("response deltas are not available for anomaly-based finding identification")
+    if stage.get("stage") == "finding-identification":
+        response_delta_status = str(summary.get("response_deltas") or "")
+        if response_delta_status == "missing":
+            gaps.append("response delta artifact is missing; refresh response-deltas from current probe results")
+        elif response_delta_status == "no-probe-results":
+            gaps.append("no probe rows are available for response-delta anomaly grouping")
     if stage.get("stage") == "poc-reporting" and status == "report-artifacts-present":
         gaps.append("report artifacts exist, but no Medium/High/Critical reportable finding is validated yet")
     if resource_status not in {"healthy", "not-run"}:
