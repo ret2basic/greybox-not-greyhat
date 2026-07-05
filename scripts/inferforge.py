@@ -107,6 +107,7 @@ DEFAULT_RESOURCE_WARNING_BURP_HISTORY_INPUT_BYTES = 1 * 1024 * 1024
 DEFAULT_RESOURCE_CRITICAL_BURP_HISTORY_INPUT_BYTES = 256 * 1024
 DEFAULT_BURP_SYNC_COUNT = 20
 DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT = 5
+DEFAULT_SINGLE_REVIEWED_OBSERVATION_BURP_SYNC_COUNT = 1
 DEFAULT_RESOURCE_WARNING_BURP_SYNC_COUNT = 10
 DEFAULT_RESOURCE_CRITICAL_BURP_SYNC_COUNT = 3
 DEFAULT_RESOURCE_DEGRADED_OFFLINE_COMMAND_LIMIT = 4
@@ -4829,6 +4830,7 @@ def promote_review_observation_candidate(
     method: str | None = None,
     expected_statuses: list[int] | None = None,
     note: str | None = None,
+    single_observation_plan: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     candidate = find_review_observation_candidate(profile, candidate_id, extra_candidates=extra_candidates)
     if candidate is None:
@@ -4853,7 +4855,7 @@ def promote_review_observation_candidate(
 
     promoted_profile = public_profile(profile)
     promoted_profile["review_observation_candidates"] = merged_review_observation_candidates(profile, extra_candidates)
-    plan = [json_clone(item) for item in promoted_profile.get("burp_observation_plan", []) or []]
+    plan = [] if single_observation_plan else [json_clone(item) for item in promoted_profile.get("burp_observation_plan", []) or []]
     for item in plan:
         if item.get("id") != observation["id"]:
             continue
@@ -4873,6 +4875,7 @@ def promote_review_observation_candidate(
             "cluster": observation["cluster"],
             "method": observation["method"],
             "note": note,
+            "single_observation_plan": bool(single_observation_plan),
             "safety": "Profile edit only. Promotion does not send HTTP traffic; run burp-sync --observe separately to collect evidence.",
         }
     )
@@ -12968,6 +12971,7 @@ def rewrite_review_promotion_preview_commands(
                     f"--candidate-id {shlex.quote(candidate_id)} "
                     f"--path {shlex.quote(local_path)} "
                     f"--output {shlex.quote(reviewed_profile)} "
+                    "--single-observation-plan "
                     "--no-write"
                 ),
                 profile=profile,
@@ -13242,7 +13246,8 @@ def rewrite_response_observation_contracts(
             "promote-observation-candidate "
             f"--candidate-id {shlex.quote(candidate_id)} "
             f"--path {shlex.quote(local_path)} "
-            f"--output {shlex.quote(reviewed_profile)}"
+            f"--output {shlex.quote(reviewed_profile)} "
+            "--single-observation-plan"
         )
         commands = [
             {
@@ -13274,11 +13279,11 @@ def rewrite_response_observation_contracts(
             },
             {
                 "id": "single-burp-observe",
-                "risk": "active-single-approved-request",
+                "risk": "active-single-approved-http-request",
                 "command": verification_command_for_profile(
                     reviewed_profile,
                     artifact_dir,
-                    f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}",
+                    f"burp-sync --observe --replace --count {DEFAULT_SINGLE_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}",
                 ),
             },
             {
@@ -13317,13 +13322,15 @@ def rewrite_response_observation_contracts(
                 "required_order": [
                     "Run promotion-preview and review the generated profile diff.",
                     "Run promotion-write only after the path is approved.",
+                    "Confirm the reviewed profile has a single burp_observation_plan item.",
                     "Run resource-gate and stop unless it is healthy.",
-                    "Run single-burp-observe at most once for this reviewed profile.",
+                    "Run single-burp-observe at most once for this reviewed HTTP-only profile.",
                     "Run response-review and continue to finding-gate only if concrete impact evidence is present.",
                 ],
                 "stop_conditions": [
                     "Do not enumerate catch-all paths.",
                     "Do not observe dynamic wallet/project/template paths.",
+                    "Do not run WebSocket upgrade observation for this HTTP rewrite contract.",
                     "Do not keep raw Burp history in artifacts.",
                     "Do not report 2xx status or fixed-upstream routing alone as a vulnerability.",
                 ],
@@ -28410,6 +28417,7 @@ def review_candidate_command_templates(
                     f"--candidate-id {shlex.quote(candidate_id)} "
                     f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH} "
                     f"--output {shlex.quote(reviewed_profile)} "
+                    "--single-observation-plan "
                     "--no-write"
                 ),
             ),
@@ -28420,7 +28428,8 @@ def review_candidate_command_templates(
                     "promote-observation-candidate "
                     f"--candidate-id {shlex.quote(candidate_id)} "
                     f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH} "
-                    f"--output {shlex.quote(reviewed_profile)}"
+                    f"--output {shlex.quote(reviewed_profile)} "
+                    "--single-observation-plan"
                 ),
             ),
             verification_command_for_profile(
@@ -28431,7 +28440,7 @@ def review_candidate_command_templates(
             verification_command_for_profile(
                 reviewed_profile,
                 artifact_dir,
-                f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}",
+                f"burp-sync --observe --replace --count {DEFAULT_SINGLE_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}",
             ),
             verification_command_for_profile(
                 reviewed_profile,
@@ -28453,8 +28462,14 @@ def promoted_observation_followup_commands(
     artifact_dir: Path | None,
     *,
     source_profile: dict[str, Any] | None = None,
+    single_observation_plan: bool = False,
 ) -> list[str]:
     reviewed_profile = repo_relative_or_absolute(output_path)
+    observe_subcommand = (
+        f"burp-sync --observe --replace --count {DEFAULT_SINGLE_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}"
+        if single_observation_plan
+        else f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}"
+    )
     return [
         verification_command_for_profile(
             reviewed_profile,
@@ -28464,7 +28479,7 @@ def promoted_observation_followup_commands(
         verification_command_for_profile(
             reviewed_profile,
             artifact_dir,
-            f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}",
+            observe_subcommand,
         ),
         verification_command_for_profile(
             reviewed_profile,
@@ -30518,12 +30533,13 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "--artifact-dir .greybox/regression-discovered promote-observation-candidate "
                 "--candidate-id review_observe_route_api_proxy_path_approved_path "
                 f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH} "
-                "--output .greybox/regression-discovered/reviewed-profile.json"
+                "--output .greybox/regression-discovered/reviewed-profile.json "
+                "--single-observation-plan"
             ),
             (
                 "python3 scripts/inferforge.py --profile .greybox/regression-discovered/reviewed-profile.json "
                 "--artifact-dir .greybox/regression-discovered "
-                f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}"
+                f"burp-sync --observe --replace --count {DEFAULT_SINGLE_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}"
             ),
         ],
     }
@@ -34368,6 +34384,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "review_no_write_candidate",
                     "--path",
                     "/api/no-write/status",
+                    "--single-observation-plan",
                     "--no-write",
                 ]
             )
@@ -34889,6 +34906,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "[manual-template]" in review_candidates_stdout_text
                 and "[review-gated]" in review_candidates_stdout_text
                 and "promote-observation-candidate" in review_candidates_stdout_text
+                and "--single-observation-plan" in review_candidates_stdout_text
                 and "--no-write" in review_candidates_stdout_text
                 and "No files written (--no-write)." in review_candidates_stdout
                 and not any(
@@ -34949,9 +34967,12 @@ def build_no_write_selftest() -> dict[str, Any]:
                 promote_return_code == 0
                 and "Promotion preview: review_no_write_candidate" in promote_stdout
                 and "Observation: GET /api/no-write/status cluster=no-write" in promote_stdout
+                and "Observation plan: single-approved-observation" in promote_stdout
                 and "Profile validation:" in promote_stdout_text
                 and "Next commands:" in promote_stdout
                 and "burp-sync --observe" in promote_stdout_text
+                and "burp-sync --observe --replace --count 1" in promote_stdout_text
+                and "--ws-upgrade" not in promote_stdout_text
                 and REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND in promote_stdout_text
                 and REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND in promote_stdout_text
                 and "No files written (--no-write)." in promote_stdout
@@ -36076,9 +36097,12 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                 and "promotion-write" in no_history_contract_text
                 and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict"
                 in no_history_contract_text
-                and "burp-sync --observe --ws-upgrade --replace" in no_history_contract_text
+                and "--single-observation-plan" in no_history_contract_text
+                and "burp-sync --observe --replace --count 1" in no_history_contract_text
+                and "--ws-upgrade" not in no_history_contract_text
                 and REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND in no_history_contract_text
                 and "Do not enumerate catch-all paths." in no_history_contract_text
+                and "Do not run WebSocket upgrade observation for this HTTP rewrite contract." in no_history_contract_text
             ),
             "expected": "missing approved rewrite responses expose a single-path observation contract with gated observe/review steps",
             "actual": {
@@ -44843,14 +44867,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and "promote-observation-candidate" in rewrite_queue_commands[0]
             and f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH}" in rewrite_queue_commands[0]
             and "reviewed-profile.json" in rewrite_queue_commands[0]
+            and "--single-observation-plan" in rewrite_queue_commands[0]
             and "--no-write" in rewrite_queue_commands[0]
             and "promote-observation-candidate" in rewrite_queue_commands[1]
             and f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH}" in rewrite_queue_commands[1]
             and "reviewed-profile.json" in rewrite_queue_commands[1]
+            and "--single-observation-plan" in rewrite_queue_commands[1]
             and "--no-write" not in rewrite_queue_commands[1]
             and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict" in rewrite_queue_commands[2]
             and "burp-sync --observe" in rewrite_queue_commands[3]
-            and f"--count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}" in rewrite_queue_commands[3]
+            and "--ws-upgrade" not in rewrite_queue_commands[3]
+            and f"--count {DEFAULT_SINGLE_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}" in rewrite_queue_commands[3]
             and REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND in rewrite_queue_commands[4]
             and REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND in rewrite_queue_commands[5]
             and all(command.count("--profile") <= 1 for command in rewrite_queue_commands)
@@ -49455,6 +49482,7 @@ def run_promote_observation_candidate(args: argparse.Namespace) -> int:
             method=args.method,
             expected_statuses=expected_statuses,
             note=args.note,
+            single_observation_plan=bool(args.single_observation_plan),
         )
     except ValueError as error:
         print(f"Could not promote candidate: {error}")
@@ -49468,10 +49496,19 @@ def run_promote_observation_candidate(args: argparse.Namespace) -> int:
     )
     clusters = build_clusters(normalized, source_root)
     validation = build_profile_validation_artifact(normalized, clusters, source_root)
-    followup_commands = promoted_observation_followup_commands(output_path, artifact_dir, source_profile=profile)
+    followup_commands = promoted_observation_followup_commands(
+        output_path,
+        artifact_dir,
+        source_profile=profile,
+        single_observation_plan=bool(args.single_observation_plan),
+    )
     if no_write:
         print(f"Promotion preview: {args.candidate_id}")
         print(f"Observation: {observation['method']} {observation['path']} cluster={observation['cluster']}")
+        print(
+            "Observation plan: "
+            f"{'single-approved-observation' if args.single_observation_plan else 'append-to-existing-profile-plan'}"
+        )
         print(f"Profile validation: {validation['status']}")
         validation_issues = validation.get("issues", []) or []
         if validation_issues:
@@ -49502,12 +49539,17 @@ def run_promote_observation_candidate(args: argparse.Namespace) -> int:
             "output_profile": repo_relative_or_absolute(output_path),
             "candidate_id": args.candidate_id,
             "observation": observation,
+            "single_observation_plan": bool(args.single_observation_plan),
             "validation_status": validation["status"],
             "safety": "Profile edit only. No HTTP request was sent; use the output profile with burp-sync --observe after review.",
         },
     )
     print(f"Promoted candidate: {args.candidate_id}")
     print(f"Observation: {observation['method']} {observation['path']} cluster={observation['cluster']}")
+    print(
+        "Observation plan: "
+        f"{'single-approved-observation' if args.single_observation_plan else 'append-to-existing-profile-plan'}"
+    )
     print(f"Profile validation: {validation['status']}")
     print(f"Wrote {output_path}")
     print(f"Wrote {artifact_dir / 'reviewed-profile-validation.json'}")
@@ -53421,6 +53463,11 @@ def build_parser() -> argparse.ArgumentParser:
     promote_candidate.add_argument("--force", action="store_true", help="Allow overwriting the output profile")
     promote_candidate.add_argument("--observation-id", help="Override the generated burp_observation_plan id")
     promote_candidate.add_argument("--method", choices=sorted(HTTP_METHODS), help="Override the observation HTTP method")
+    promote_candidate.add_argument(
+        "--single-observation-plan",
+        action="store_true",
+        help="Write the reviewed profile with only this approved Burp observation plan item.",
+    )
     promote_candidate.add_argument(
         "--expected-status",
         action="append",
