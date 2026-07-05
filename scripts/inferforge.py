@@ -170,6 +170,7 @@ BOUNTY_READINESS_ROLLUP_ARTIFACT = "bounty-readiness-rollup.json"
 BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT = "bounty-evidence-workorders.json"
 BOUNTY_SOURCE_INVARIANTS_ARTIFACT = "bounty-source-invariants.json"
 BOUNTY_LANE_PRIORITIES_ARTIFACT = "bounty-lane-priorities.json"
+BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT = "bounty-evidence-authorization.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -290,6 +291,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT,
     BOUNTY_SOURCE_INVARIANTS_ARTIFACT,
     BOUNTY_LANE_PRIORITIES_ARTIFACT,
+    BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -25053,6 +25055,369 @@ def build_bounty_lane_priorities(
     }
 
 
+BOUNTY_AUTHORIZATION_GLOBAL_FORBIDDEN_ACTIONS = [
+    "Do not create official evidence sidecars from synthetic, placeholder, stale, draft, or unreviewed raw history.",
+    "Do not collect raw secrets, bearer tokens, cookies, private keys, seed phrases, signed transactions, or unredacted logs.",
+    "Do not sign wallet prompts, submit transactions, transfer assets, or rely on a wallet side effect as proof.",
+    "Do not run stress, flood, quota-depletion, load, subscription fanout, or availability-impact tests.",
+    "Do not act as another user, bypass account ownership, or collect cross-tenant data without explicit approval.",
+    "Do not probe unmanaged services, change infrastructure state, restart services, or manage unrelated processes.",
+]
+
+
+BOUNTY_AUTHORIZATION_REDACTION_REQUIREMENTS = [
+    "Replace secrets, tokens, cookies, account identifiers, billing identifiers, and wallet signatures with stable redaction markers.",
+    "Keep only the minimum fields needed to prove request intent, decoded effect, response impact, or operator/provider impact.",
+    "Prefer field names, JSON paths, counts, hashes, timestamps, source references, and short redacted excerpts over full raw bodies.",
+    "Attach an approval reference or reviewer note for every official-evidence artifact.",
+    "Record why the evidence is in-scope, approved for use, and safe to store in the artifact directory.",
+]
+
+
+def bounty_authorization_allowed_actions(lane: str) -> list[str]:
+    if lane == "transaction-integrity":
+        return [
+            "Use one approved in-scope POST /api/quote capture from a controlled session.",
+            "Extract the unsigned transaction payload or base64 transaction field for offline decoding.",
+            "Write a matching transaction intent policy that describes the approved user intent.",
+            "Run local sidecar review, offline decode, validation gates, and adjudication after the evidence exists.",
+        ]
+    if lane == "build-secret-exposure":
+        return [
+            "Review redacted build provenance supplied by the operator or build owner.",
+            "Record the source line, build step, evidence kind, retention/disclosure summary, and redaction note.",
+            "Use image metadata, cache/log excerpts, registry artifacts, or attestations only after they are approved for review.",
+            "Run local build provenance readiness, validation gates, and adjudication after the evidence exists.",
+        ]
+    if lane == "sensitive-response-impact":
+        return [
+            "Use exactly one approved redacted read-only response observation.",
+            "Record method, path, status, content type, sensitive field paths, and a short impact summary.",
+            "Keep response evidence redacted and bounded to the minimum reviewer-approved fields.",
+            "Run local response evidence readiness, validation gates, and adjudication after the evidence exists.",
+        ]
+    if lane in {"credentialed-provider-impact", "resource-control", "websocket-header-trust"}:
+        return [
+            "Use redacted operator or provider evidence supplied by an authorized owner.",
+            "Record the matching decision id, accepted present status, impact class, and short evidence summary.",
+            "Use dashboard, billing, quota, monitoring, routing, or upstream trust observations only in redacted form.",
+            "Run local operator impact readiness, validation gates, and adjudication after the evidence exists.",
+        ]
+    return [
+        "Use only approved, redacted, in-scope evidence supplied for this workorder.",
+        "Run local readiness, validation gates, and adjudication after the evidence exists.",
+    ]
+
+
+def bounty_authorization_lane_forbidden_actions(lane: str) -> list[str]:
+    if lane == "transaction-integrity":
+        return [
+            "Do not sign, broadcast, simulate asset movement, or depend on a wallet prompt as the only proof.",
+            "Do not use a transaction payload without a matching intent policy for the same approved request.",
+            "Do not promote decimals, blockhash refresh, address lookup, routing, or approved program behavior as impact.",
+        ]
+    if lane == "build-secret-exposure":
+        return [
+            "Do not store raw secret values, full credential files, or unredacted build logs.",
+            "Do not infer a real secret from Dockerfile source, placeholder values, or local template configuration alone.",
+            "Do not pull registry artifacts, inspect private images, or query build systems unless the operator has approved that evidence path.",
+        ]
+    if lane == "sensitive-response-impact":
+        return [
+            "Do not store full raw response bodies, raw Burp history, cookies, bearer tokens, or private account data.",
+            "Do not use more than one response row for the single-response impact lane.",
+            "Do not promote path reachability or nonempty responses without concrete sensitive-data, auth, tenant, wallet/account, or path-confusion impact.",
+        ]
+    if lane in {"credentialed-provider-impact", "resource-control", "websocket-header-trust"}:
+        return [
+            "Do not prove impact by draining quota, creating load, opening subscriptions at scale, or stressing upstream services.",
+            "Do not store raw provider keys, billing account identifiers, dashboard screenshots with secrets, cookies, or bearer tokens.",
+            "Do not infer provider impact from source reachability without an operator/provider-visible consequence.",
+        ]
+    return [
+        "Do not collect data outside the approved scope.",
+        "Do not promote source-only or environment-only observations as Medium+ evidence.",
+    ]
+
+
+def bounty_authorization_handoff_fields(lane: str) -> list[str]:
+    if lane == "transaction-integrity":
+        return [
+            "approval_reference",
+            "request_method",
+            "request_path",
+            "request_timestamp",
+            "direction",
+            "wallet_or_test_wallet_marker",
+            "raw_amount_in",
+            "response_transaction_payload_or_extract",
+            "intent_policy_file",
+            "redaction_notes",
+        ]
+    if lane == "build-secret-exposure":
+        return [
+            "approval_reference",
+            "source_file",
+            "source_line",
+            "build_step",
+            "evidence_kind",
+            "redacted_retention_or_disclosure_summary",
+            "impact_summary",
+            "redaction_notes",
+        ]
+    if lane == "sensitive-response-impact":
+        return [
+            "approval_reference",
+            "request_method",
+            "request_path",
+            "status_code",
+            "content_type",
+            "sensitive_field_paths_or_markers",
+            "redacted_impact_summary",
+            "redaction_notes",
+        ]
+    if lane in {"credentialed-provider-impact", "resource-control", "websocket-header-trust"}:
+        return [
+            "approval_reference",
+            "decision_id",
+            "accepted_present_status",
+            "impact_class",
+            "redacted_operator_or_provider_summary",
+            "scope_or_deployment_note",
+            "redaction_notes",
+        ]
+    return [
+        "approval_reference",
+        "evidence_kind",
+        "redacted_summary",
+        "scope_note",
+        "redaction_notes",
+    ]
+
+
+def bounty_authorization_question(workorder: dict[str, Any], priority: dict[str, Any]) -> str:
+    lane = str(workorder.get("lane") or priority.get("lane") or "unknown")
+    action = str(workorder.get("first_human_action") or "Provide approved redacted official evidence for this lane.")
+    evidence = ", ".join(normalize_string_list(workorder.get("required_official_evidence_labels"))[:4])
+    if evidence:
+        return f"Can the operator approve and provide {evidence} for {lane}? {action}"
+    return f"Can the operator approve and provide official redacted evidence for {lane}? {action}"
+
+
+def bounty_authorization_request_for_workorder(
+    workorder: dict[str, Any],
+    *,
+    priority: dict[str, Any],
+    rank: int,
+) -> dict[str, Any]:
+    lane = str(workorder.get("lane") or priority.get("lane") or "unknown")
+    reject_if = ordered_unique_strings(
+        [
+            *normalize_string_list(workorder.get("lane_reject_if")),
+            str(priority.get("close_or_park_condition") or ""),
+        ]
+    )
+    preview_commands = normalize_string_list(workorder.get("template_preview_commands"))
+    after_commands = normalize_string_list(workorder.get("after_evidence_validation_commands"))
+    return {
+        "id": f"AUTHZ-{safe_probe_id(str(workorder.get('id') or priority.get('id') or lane))}",
+        "rank": rank,
+        "workorder_id": workorder.get("id"),
+        "gate_id": workorder.get("gate_id"),
+        "lane": lane,
+        "entrypoint": workorder.get("entrypoint"),
+        "expected_severity": workorder.get("expected_severity"),
+        "priority_score": priority.get("score"),
+        "priority_decision": priority.get("decision"),
+        "priority_reason": priority.get("reason"),
+        "authorization_status": (
+            "requires-human-approval"
+            if workorder.get("operator_input_required") or workorder.get("official_evidence_missing")
+            else "ready-for-local-validation"
+        ),
+        "question": bounty_authorization_question(workorder, priority),
+        "requested_official_evidence": normalize_string_list(workorder.get("required_official_evidence")),
+        "requested_official_evidence_labels": normalize_string_list(workorder.get("required_official_evidence_labels")),
+        "handoff_fields": bounty_authorization_handoff_fields(lane),
+        "allowed_actions": bounty_authorization_allowed_actions(lane),
+        "forbidden_actions": ordered_unique_strings(
+            [
+                *BOUNTY_AUTHORIZATION_GLOBAL_FORBIDDEN_ACTIONS,
+                *bounty_authorization_lane_forbidden_actions(lane),
+            ]
+        ),
+        "must_capture": normalize_string_list(workorder.get("must_capture")),
+        "must_not_capture": ordered_unique_strings(
+            [
+                *normalize_string_list(workorder.get("must_not_capture")),
+                *BOUNTY_WORKORDER_GLOBAL_FORBIDDEN_FIELDS,
+            ]
+        ),
+        "redaction_requirements": BOUNTY_AUTHORIZATION_REDACTION_REQUIREMENTS,
+        "acceptance_checklist": normalize_string_list(workorder.get("acceptance_checklist")),
+        "reject_if": reject_if,
+        "preview_commands": preview_commands[:4],
+        "after_evidence_validation_commands": after_commands[:8],
+        "recommended_preview_command": preview_commands[0] if preview_commands else workorder.get("recommended_preview_command"),
+        "recommended_after_evidence_command": after_commands[0] if after_commands else "",
+        "invalid_if_reported_now": bool(workorder.get("invalid_if_reported_now")),
+        "evidence_distance": int(workorder.get("evidence_distance") or 0),
+        "sidecar_creation_rule": (
+            "Do not create official sidecars until the evidence is approved, redacted, in scope, and reviewed against this request."
+        ),
+        "no_report_until": [
+            "The requested official evidence exists in the expected artifact shape.",
+            "The lane readiness command accepts the evidence.",
+            "finding-gate accepts concrete impact.",
+            "adjudication agrees the finding is reportable at Medium or higher.",
+        ],
+        "reportability_boundary": workorder.get("reportability_boundary") or priority.get("reportability_boundary"),
+    }
+
+
+def build_bounty_evidence_authorization(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    bounty_evidence_workorders: dict[str, Any] | None,
+    bounty_lane_priorities: dict[str, Any] | None,
+) -> dict[str, Any]:
+    workorders = (
+        bounty_evidence_workorders.get("workorders", [])
+        if isinstance(bounty_evidence_workorders, dict)
+        and isinstance(bounty_evidence_workorders.get("workorders"), list)
+        else []
+    )
+    priority_rows = (
+        bounty_lane_priorities.get("lane_priorities", [])
+        if isinstance(bounty_lane_priorities, dict)
+        and isinstance(bounty_lane_priorities.get("lane_priorities"), list)
+        else []
+    )
+    workorder_by_id = {
+        str(row.get("id")): row
+        for row in workorders
+        if isinstance(row, dict) and row.get("id")
+    }
+    priority_by_workorder = {
+        str(row.get("workorder_id")): row
+        for row in priority_rows
+        if isinstance(row, dict) and row.get("workorder_id")
+    }
+    ordered_workorders: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    seen_workorders: set[str] = set()
+    for priority in priority_rows:
+        if not isinstance(priority, dict):
+            continue
+        workorder_id = str(priority.get("workorder_id") or "")
+        workorder = workorder_by_id.get(workorder_id)
+        if not isinstance(workorder, dict):
+            continue
+        ordered_workorders.append((workorder, priority))
+        seen_workorders.add(workorder_id)
+    remaining = [
+        row
+        for row in workorders
+        if isinstance(row, dict) and str(row.get("id") or "") not in seen_workorders
+    ]
+    remaining.sort(
+        key=lambda row: (
+            BOUNTY_FRONTIER_SEVERITY_RANK.get(str(row.get("expected_severity") or "info"), 9),
+            int(row.get("evidence_distance") or 99),
+            str(row.get("lane") or ""),
+            str(row.get("id") or ""),
+        )
+    )
+    for workorder in remaining:
+        ordered_workorders.append((workorder, priority_by_workorder.get(str(workorder.get("id") or ""), {})))
+
+    requests = [
+        bounty_authorization_request_for_workorder(workorder, priority=priority, rank=index)
+        for index, (workorder, priority) in enumerate(ordered_workorders, start=1)
+    ]
+    pursue = [
+        row
+        for row in requests
+        if str(row.get("priority_decision") or "").startswith("pursue")
+    ]
+    approval_required = [
+        row
+        for row in requests
+        if row.get("authorization_status") == "requires-human-approval"
+    ]
+    parked = [
+        row
+        for row in requests
+        if str(row.get("priority_decision") or "").startswith("park")
+    ]
+    invalid_now = sum(1 for row in requests if row.get("invalid_if_reported_now"))
+    status = (
+        "authorization-required-before-evidence-collection"
+        if requests and any(row.get("authorization_status") == "requires-human-approval" for row in requests)
+        else "ready-without-human-authorization"
+        if requests
+        else "no-bounty-evidence-authorization-requests"
+    )
+    top = requests[0] if requests else {}
+    questions = ordered_unique_strings(
+        [
+            str(row.get("question") or "")
+            for row in [*pursue, *approval_required]
+            if row.get("question")
+        ]
+    )
+    commands = ordered_unique_strings(
+        [
+            str(row.get("recommended_preview_command") or "")
+            for row in requests
+            if row.get("recommended_preview_command")
+        ]
+    )
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-evidence-authorization-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "requests": len(requests),
+            "pursue_requests": len(pursue),
+            "actionable_requests": len(pursue),
+            "approval_required": len(approval_required),
+            "parked_requests": len(parked),
+            "invalid_if_reported_now": invalid_now,
+            "top_request": top.get("id"),
+            "top_lane": top.get("lane"),
+            "top_priority_decision": top.get("priority_decision"),
+            "top_requested_evidence": normalize_string_list(top.get("requested_official_evidence_labels")),
+            "bounty_evidence_workorders_status": artifact_summary_status(bounty_evidence_workorders),
+            "bounty_lane_priorities_status": artifact_summary_status(bounty_lane_priorities),
+        },
+        "authorization_requests": requests,
+        "pursue_requests": pursue[:8],
+        "actionable_requests": pursue[:8],
+        "approval_required_requests": approval_required[:8],
+        "parked_requests": parked[:8],
+        "operator_questions": questions[:12],
+        "commands": commands[:12],
+        "reportability_rule": (
+            "This authorization packet is not evidence. It defines what a human/operator may approve and what must stay forbidden. "
+            "A Medium+ finding still requires approved evidence, lane validation, finding-gate acceptance, and adjudication."
+        ),
+        "next_step": (
+            questions[0]
+            if questions
+            else "Build bounty evidence workorders and lane priorities first."
+        ),
+        "safety": (
+            "Offline authorization synthesis only. It reads local JSON artifacts, sends no requests, calls no Burp tool, "
+            "starts no browser, creates no evidence sidecars, signs no wallet, submits no transaction, and changes no infrastructure."
+        ),
+    }
+
+
 def build_provenance_invalidity_row(invalidity_review: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(invalidity_review, dict):
         return {}
@@ -26377,6 +26742,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT: "bounty-evidence-workorders",
     BOUNTY_SOURCE_INVARIANTS_ARTIFACT: "bounty-source-invariants",
     BOUNTY_LANE_PRIORITIES_ARTIFACT: "bounty-lane-priorities",
+    BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT: "bounty-evidence-authorization",
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
     TRANSACTION_EVIDENCE_READINESS_ARTIFACT: "transaction-evidence-readiness",
     OPERATOR_IMPACT_READINESS_ARTIFACT: "operator-impact-readiness",
@@ -26429,6 +26795,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "bounty-evidence-workorders",
     "bounty-source-invariants",
     "bounty-lane-priorities",
+    "bounty-evidence-authorization",
     "transaction-intent-boundary",
     "transaction-evidence-readiness",
     "operator-impact-readiness",
@@ -26466,6 +26833,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "bounty-evidence-workorders": "bounty-evidence-workorders --no-write",
     "bounty-source-invariants": "bounty-source-invariants --no-write",
     "bounty-lane-priorities": "bounty-lane-priorities --no-write",
+    "bounty-evidence-authorization": "bounty-evidence-authorization --no-write",
     "transaction-intent-boundary": "transaction-intent-boundary --no-write",
     "transaction-evidence-readiness": "transaction-evidence-readiness --no-write",
     "operator-impact-readiness": "operator-impact-readiness --no-write",
@@ -51550,6 +51918,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("bounty-evidence-workorders", "run_bounty_evidence_workorders"),
         refresh_expectation("bounty-source-invariants", "run_bounty_source_invariants"),
         refresh_expectation("bounty-lane-priorities", "run_bounty_lane_priorities"),
+        refresh_expectation("bounty-evidence-authorization", "run_bounty_evidence_authorization"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-intent-boundary", "run_transaction_intent_boundary"),
         refresh_expectation("transaction-evidence-readiness", "run_transaction_evidence_readiness"),
@@ -76553,6 +76922,160 @@ def run_bounty_lane_priorities(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_or_load_bounty_lane_priorities_for_run(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    source_root: Path,
+) -> dict[str, Any]:
+    priorities = load_optional_json(artifact_dir / BOUNTY_LANE_PRIORITIES_ARTIFACT)
+    if isinstance(priorities, dict):
+        return priorities
+    rollup = build_or_load_bounty_readiness_rollup_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    workorders = build_or_load_bounty_evidence_workorders_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    invariants = build_or_load_bounty_source_invariants_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    return build_bounty_lane_priorities(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_evidence_workorders=workorders,
+        bounty_source_invariants=invariants,
+        bounty_readiness_rollup=rollup,
+    )
+
+
+def run_bounty_evidence_authorization(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    workorders = build_or_load_bounty_evidence_workorders_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    priorities = build_or_load_bounty_lane_priorities_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    authorization = build_bounty_evidence_authorization(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_evidence_workorders=workorders,
+        bounty_lane_priorities=priorities,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(authorization))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-evidence-authorization",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = authorization.get("summary", {}) if isinstance(authorization.get("summary"), dict) else {}
+    print(f"Bounty evidence authorization: {authorization.get('status')}")
+    print(
+        "Authorization: "
+        f"requests={summary.get('requests', 0)} "
+        f"pursue={summary.get('pursue_requests', 0)} "
+        f"approval_required={summary.get('approval_required', 0)} "
+        f"parked={summary.get('parked_requests', 0)} "
+        f"invalid_now={summary.get('invalid_if_reported_now', 0)} "
+        f"top={summary.get('top_lane') or '-'} "
+        f"decision={summary.get('top_priority_decision') or '-'}"
+    )
+    print(
+        "Inputs: "
+        f"workorders={summary.get('bounty_evidence_workorders_status') or '-'} "
+        f"priorities={summary.get('bounty_lane_priorities_status') or '-'}"
+    )
+    top_evidence = normalize_string_list(summary.get("top_requested_evidence"))
+    if top_evidence:
+        print("Top requested evidence: " + ", ".join(top_evidence[: max(1, min(6, int(args.top)))]))
+    display_limit = max(0, int(args.top))
+    if getattr(args, "show_requests", False):
+        print("Authorization requests:")
+        for row in (authorization.get("authorization_requests", []) or [])[:display_limit]:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('id')}: {row.get('expected_severity')} lane={row.get('lane')} "
+                f"status={row.get('authorization_status')} decision={row.get('priority_decision')} "
+                f"invalid_now={row.get('invalid_if_reported_now')}"
+            )
+            print(f"  question={inline_summary_text(row.get('question'), max_chars=360)}")
+            evidence = ", ".join(normalize_string_list(row.get("requested_official_evidence_labels"))[:4])
+            if evidence:
+                print(f"  needs={inline_summary_text(evidence, max_chars=300)}")
+            if getattr(args, "show_contract", False):
+                for allowed in normalize_string_list(row.get("allowed_actions"))[: max(1, min(3, int(args.contract_items)))]:
+                    print(f"  allowed={inline_summary_text(allowed, max_chars=280)}")
+                for forbidden in normalize_string_list(row.get("forbidden_actions"))[: max(1, min(3, int(args.contract_items)))]:
+                    print(f"  forbidden={inline_summary_text(forbidden, max_chars=280)}")
+                for field in normalize_string_list(row.get("handoff_fields"))[: max(1, min(8, int(args.contract_items) * 2))]:
+                    print(f"  field={inline_summary_text(field, max_chars=120)}")
+            if getattr(args, "show_commands", False):
+                command_text = row.get("recommended_preview_command")
+                if command_text:
+                    print(f"  preview={inline_summary_text(command_text, max_chars=420)}")
+                after = row.get("recommended_after_evidence_command")
+                if after:
+                    print(f"  after={inline_summary_text(after, max_chars=420)}")
+        remaining = len(authorization.get("authorization_requests", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more authorization request(s); rerun without --no-write to write the full artifact")
+            else:
+                print(f"- {remaining} more authorization request(s) in {output_path}")
+    if getattr(args, "show_questions", False):
+        print("Operator questions:")
+        for question in normalize_string_list(authorization.get("operator_questions"))[:display_limit]:
+            print(f"- {inline_summary_text(question, max_chars=420)}")
+    if getattr(args, "show_commands", False) and not getattr(args, "show_requests", False):
+        print("Commands:")
+        for command_text in normalize_string_list(authorization.get("commands"))[:display_limit]:
+            print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    print(f"Rule: {inline_summary_text(authorization.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(authorization.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and summary.get("pursue_requests", 0) <= 0:
+        return 1
+    return 0
+
+
 def run_rpc_proxy_parity_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -79914,6 +80437,64 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless at least one lane is worth pursuing from the current priority model.",
     )
     bounty_lane_priorities.set_defaults(func=run_bounty_lane_priorities)
+
+    bounty_evidence_authorization = sub.add_parser(
+        "bounty-evidence-authorization",
+        help="Build an offline human/operator authorization packet for prioritized bounty evidence requests",
+    )
+    bounty_evidence_authorization.add_argument(
+        "--output",
+        help=(
+            f"Where to write {BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT}."
+        ),
+    )
+    bounty_evidence_authorization.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of authorization requests, questions, or commands to print.",
+    )
+    bounty_evidence_authorization.add_argument(
+        "--contract-items",
+        type=positive_int,
+        default=3,
+        help="Number of allowed, forbidden, and handoff contract items to print per request.",
+    )
+    bounty_evidence_authorization.add_argument(
+        "--show-requests",
+        action="store_true",
+        help="Print authorization requests for prioritized official evidence lanes.",
+    )
+    bounty_evidence_authorization.add_argument(
+        "--show-contract",
+        action="store_true",
+        help="Print allowed actions, forbidden actions, and handoff fields for each shown request.",
+    )
+    bounty_evidence_authorization.add_argument(
+        "--show-questions",
+        action="store_true",
+        help="Print concise operator approval questions.",
+    )
+    bounty_evidence_authorization.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print safe offline preview and after-evidence validation commands.",
+    )
+    bounty_evidence_authorization.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print bounty evidence authorization only; do not write {BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    bounty_evidence_authorization.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless at least one actionable authorization request exists.",
+    )
+    bounty_evidence_authorization.set_defaults(func=run_bounty_evidence_authorization)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
