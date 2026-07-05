@@ -175,6 +175,7 @@ BOUNTY_EVIDENCE_INTAKE_ARTIFACT = "bounty-evidence-intake.json"
 BOUNTY_ACTION_QUEUE_ARTIFACT = "bounty-action-queue.json"
 BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT = "bounty-evidence-request.md"
 BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT = "bounty-evidence-templates.json"
+BOUNTY_TEMPLATE_SAFETY_ARTIFACT = "bounty-template-safety.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -300,6 +301,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     BOUNTY_ACTION_QUEUE_ARTIFACT,
     BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT,
     BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT,
+    BOUNTY_TEMPLATE_SAFETY_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -26616,6 +26618,211 @@ def build_bounty_evidence_templates(
     }
 
 
+BOUNTY_OFFICIAL_EVIDENCE_FILENAMES = {
+    REWRITE_RESPONSE_SIDECAR_ARTIFACT,
+    "transaction-payloads.jsonl",
+    "transaction-intent-policy.json",
+    OPERATOR_EVIDENCE_ARTIFACT,
+}
+
+
+def bounty_template_path_for_target(value: Any, *, artifact_dir: Path) -> Path | None:
+    text = str(value or "").strip()
+    if not text or text.startswith("redacted build provenance"):
+        return None
+    path = Path(text)
+    if path.is_absolute() or "/" in text or text.startswith("."):
+        return resolve_repo_path(text)
+    return (artifact_dir / text).resolve()
+
+
+def bounty_template_content_has_placeholder(value: Any) -> bool:
+    text = json.dumps(value, sort_keys=True)
+    return bool(COMMAND_PLACEHOLDER_RE.search(text) or "REPLACE_WITH_" in text)
+
+
+def bounty_template_content_has_draft_marker(value: Any) -> bool:
+    if isinstance(value, dict):
+        if value.get("draft_only") is True:
+            return True
+        for child in value.values():
+            if bounty_template_content_has_draft_marker(child):
+                return True
+    elif isinstance(value, list):
+        for child in value:
+            if bounty_template_content_has_draft_marker(child):
+                return True
+    return False
+
+
+def bounty_template_content_approved_true(value: Any) -> bool:
+    if isinstance(value, dict):
+        if value.get("approved") is True:
+            return True
+        for child in value.values():
+            if bounty_template_content_approved_true(child):
+                return True
+    elif isinstance(value, list):
+        for child in value:
+            if bounty_template_content_approved_true(child):
+                return True
+    return False
+
+
+def bounty_template_file_marker_status(path: Path, *, max_file_bytes: int) -> dict[str, Any]:
+    rel = repo_relative_or_absolute(path)
+    if not path.exists():
+        return {
+            "path": rel,
+            "status": "missing",
+            "contains_template_marker": False,
+            "contains_placeholder": False,
+            "size_bytes": None,
+        }
+    if not path.is_file():
+        return {
+            "path": rel,
+            "status": "not-a-file",
+            "contains_template_marker": False,
+            "contains_placeholder": False,
+            "size_bytes": None,
+        }
+    size = path.stat().st_size
+    if size > max_file_bytes:
+        return {
+            "path": rel,
+            "status": "too-large-for-safety-scan",
+            "contains_template_marker": False,
+            "contains_placeholder": False,
+            "size_bytes": size,
+        }
+    text = path.read_text(encoding="utf-8", errors="replace")
+    contains_template_marker = "\"draft_only\"" in text or "draft_only" in text
+    contains_placeholder = "REPLACE_WITH_" in text or bool(COMMAND_PLACEHOLDER_RE.search(text))
+    return {
+        "path": rel,
+        "status": "present",
+        "contains_template_marker": contains_template_marker,
+        "contains_placeholder": contains_placeholder,
+        "size_bytes": size,
+    }
+
+
+def bounty_template_safety_review_row(template: dict[str, Any], *, artifact_dir: Path, max_file_bytes: int) -> dict[str, Any]:
+    content = template.get("draft_content")
+    target_path = bounty_template_path_for_target(template.get("target_evidence_path"), artifact_dir=artifact_dir)
+    issues = []
+    warnings = []
+    has_draft_marker = bounty_template_content_has_draft_marker(content)
+    has_placeholder = bounty_template_content_has_placeholder(content)
+    approved_true = bounty_template_content_approved_true(content)
+    if not has_draft_marker:
+        issues.append("template-missing-draft-only-marker")
+    if not has_placeholder:
+        warnings.append("template-has-no-placeholder-marker")
+    if approved_true:
+        issues.append("template-contains-approved-true")
+    if target_path is not None and target_path.name in BOUNTY_OFFICIAL_EVIDENCE_FILENAMES:
+        file_status = bounty_template_file_marker_status(target_path, max_file_bytes=max_file_bytes)
+        if file_status.get("contains_template_marker") or file_status.get("contains_placeholder"):
+            issues.append("official-evidence-path-contains-template-marker")
+    else:
+        file_status = {
+            "path": template.get("target_evidence_path"),
+            "status": "non-file-handoff" if template.get("target_evidence_path") else "missing-target",
+            "contains_template_marker": False,
+            "contains_placeholder": False,
+            "size_bytes": None,
+        }
+    status = "blocked-template-safety" if issues else "passed"
+    return {
+        "id": f"SAFETY-{safe_probe_id(str(template.get('id') or template.get('lane') or 'template'))}",
+        "template_id": template.get("id"),
+        "lane": template.get("lane"),
+        "template_kind": template.get("template_kind"),
+        "target_evidence_path": template.get("target_evidence_path"),
+        "status": status,
+        "issues": issues,
+        "warnings": warnings,
+        "has_draft_marker": has_draft_marker,
+        "has_placeholder": has_placeholder,
+        "approved_true": approved_true,
+        "target_file": file_status,
+        "reportability_boundary": "Template safety can only reject unsafe templates; it cannot validate evidence or promote findings.",
+    }
+
+
+def build_bounty_template_safety(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    bounty_evidence_templates: dict[str, Any] | None,
+    max_file_bytes: int,
+) -> dict[str, Any]:
+    templates = (
+        bounty_evidence_templates.get("templates", [])
+        if isinstance(bounty_evidence_templates, dict) and isinstance(bounty_evidence_templates.get("templates"), list)
+        else []
+    )
+    rows = [
+        bounty_template_safety_review_row(template, artifact_dir=artifact_dir, max_file_bytes=max_file_bytes)
+        for template in templates
+        if isinstance(template, dict)
+    ]
+    status_counts: dict[str, int] = {}
+    issue_counts: dict[str, int] = {}
+    for row in rows:
+        increment_count(status_counts, str(row.get("status") or "unknown"))
+        for issue in normalize_string_list(row.get("issues")):
+            increment_count(issue_counts, issue)
+    blocked = [row for row in rows if row.get("status") == "blocked-template-safety"]
+    warnings = [row for row in rows if row.get("warnings")]
+    if blocked:
+        status = "blocked-template-safety"
+    elif rows:
+        status = "template-safety-passed"
+    else:
+        status = "no-templates-to-review"
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-template-safety-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "templates": len(rows),
+            "passed": sum(1 for row in rows if row.get("status") == "passed"),
+            "blocked": len(blocked),
+            "warning_templates": len(warnings),
+            "status_counts": dict(sorted(status_counts.items())),
+            "issue_counts": dict(sorted(issue_counts.items())),
+            "bounty_evidence_templates_status": artifact_summary_status(bounty_evidence_templates),
+            "max_file_bytes": max_file_bytes,
+        },
+        "template_reviews": rows,
+        "blocked_templates": blocked,
+        "warning_templates": warnings[:8],
+        "reportability_rule": (
+            "Template safety is a negative-control guard only. Passing means templates look draft-only; it is not evidence, "
+            "not lane validation, not finding-gate acceptance, and not adjudication."
+        ),
+        "next_step": (
+            "Fix blocked templates before sharing or using the workbook."
+            if blocked
+            else "Share the draft-only templates for approved redacted evidence collection, then run bounty-evidence-intake."
+            if rows
+            else "Build bounty-evidence-templates first."
+        ),
+        "safety": (
+            "Offline template safety review only. It reads local templates and bounded local evidence paths, sends no requests, "
+            "calls no Burp tool, starts no browser, creates no evidence sidecars, signs no wallet, submits no transaction, "
+            "and changes no infrastructure."
+        ),
+    }
+
+
 def build_provenance_invalidity_row(invalidity_review: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(invalidity_review, dict):
         return {}
@@ -27945,6 +28152,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     BOUNTY_ACTION_QUEUE_ARTIFACT: "bounty-action-queue",
     BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT: "bounty-evidence-request",
     BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT: "bounty-evidence-templates",
+    BOUNTY_TEMPLATE_SAFETY_ARTIFACT: "bounty-template-safety",
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
     TRANSACTION_EVIDENCE_READINESS_ARTIFACT: "transaction-evidence-readiness",
     OPERATOR_IMPACT_READINESS_ARTIFACT: "operator-impact-readiness",
@@ -28002,6 +28210,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "bounty-action-queue",
     "bounty-evidence-request",
     "bounty-evidence-templates",
+    "bounty-template-safety",
     "transaction-intent-boundary",
     "transaction-evidence-readiness",
     "operator-impact-readiness",
@@ -28044,6 +28253,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "bounty-action-queue": "bounty-action-queue --no-write",
     "bounty-evidence-request": "bounty-evidence-request --no-write",
     "bounty-evidence-templates": "bounty-evidence-templates --no-write",
+    "bounty-template-safety": "bounty-template-safety --no-write",
     "transaction-intent-boundary": "transaction-intent-boundary --no-write",
     "transaction-evidence-readiness": "transaction-evidence-readiness --no-write",
     "operator-impact-readiness": "operator-impact-readiness --no-write",
@@ -53133,6 +53343,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("bounty-action-queue", "run_bounty_action_queue"),
         refresh_expectation("bounty-evidence-request", "run_bounty_evidence_request"),
         refresh_expectation("bounty-evidence-templates", "run_bounty_evidence_templates"),
+        refresh_expectation("bounty-template-safety", "run_bounty_template_safety"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-intent-boundary", "run_transaction_intent_boundary"),
         refresh_expectation("transaction-evidence-readiness", "run_transaction_evidence_readiness"),
@@ -78783,6 +78994,123 @@ def run_bounty_evidence_templates(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_or_load_bounty_evidence_templates_for_run(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    source_root: Path,
+    max_file_bytes: int,
+    top: int,
+) -> dict[str, Any]:
+    templates = load_optional_json(artifact_dir / BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT)
+    if isinstance(templates, dict):
+        return templates
+    queue = build_or_load_bounty_action_queue_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+        max_file_bytes=max_file_bytes,
+    )
+    return build_bounty_evidence_templates(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_action_queue=queue,
+        top=top,
+    )
+
+
+def run_bounty_template_safety(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    templates = build_or_load_bounty_evidence_templates_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+        max_file_bytes=int(args.max_file_bytes),
+        top=int(args.top),
+    )
+    safety = build_bounty_template_safety(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_evidence_templates=templates,
+        max_file_bytes=int(args.max_file_bytes),
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / BOUNTY_TEMPLATE_SAFETY_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(safety))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-template-safety",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = safety.get("summary", {}) if isinstance(safety.get("summary"), dict) else {}
+    print(f"Bounty template safety: {safety.get('status')}")
+    print(
+        "Template safety: "
+        f"templates={summary.get('templates', 0)} "
+        f"passed={summary.get('passed', 0)} "
+        f"blocked={summary.get('blocked', 0)} "
+        f"warnings={summary.get('warning_templates', 0)} "
+        f"templates_status={summary.get('bounty_evidence_templates_status') or '-'}"
+    )
+    print(f"Issues: {json.dumps(summary.get('issue_counts', {}), sort_keys=True)}")
+    display_limit = max(0, int(args.top))
+    if getattr(args, "show_templates", False):
+        print("Template reviews:")
+        for row in (safety.get("template_reviews", []) or [])[:display_limit]:
+            if not isinstance(row, dict):
+                continue
+            target_file = row.get("target_file") if isinstance(row.get("target_file"), dict) else {}
+            print(
+                f"- {row.get('id')}: lane={row.get('lane')} kind={row.get('template_kind')} "
+                f"status={row.get('status')} target_status={target_file.get('status') or '-'}"
+            )
+            issues = ", ".join(normalize_string_list(row.get("issues"))[:4])
+            warnings = ", ".join(normalize_string_list(row.get("warnings"))[:4])
+            if issues:
+                print(f"  issues={inline_summary_text(issues, max_chars=260)}")
+            if warnings:
+                print(f"  warnings={inline_summary_text(warnings, max_chars=260)}")
+            if getattr(args, "show_files", False):
+                print(
+                    f"  target={target_file.get('path') or row.get('target_evidence_path')} "
+                    f"template_marker={target_file.get('contains_template_marker')} "
+                    f"placeholder={target_file.get('contains_placeholder')}"
+                )
+        remaining = len(safety.get("template_reviews", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more template review(s); rerun without --no-write to write the full artifact")
+            else:
+                print(f"- {remaining} more template review(s) in {output_path}")
+    print(f"Rule: {inline_summary_text(safety.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(safety.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and summary.get("blocked", 0) > 0:
+        return 1
+    return 0
+
+
 def run_rpc_proxy_parity_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -82416,6 +82744,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless at least one draft-only evidence template can be rendered.",
     )
     bounty_evidence_templates.set_defaults(func=run_bounty_evidence_templates)
+
+    bounty_template_safety = sub.add_parser(
+        "bounty-template-safety",
+        help="Verify bounty evidence templates are draft-only and not copied into official evidence paths",
+    )
+    bounty_template_safety.add_argument(
+        "--output",
+        help=(
+            f"Where to write {BOUNTY_TEMPLATE_SAFETY_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{BOUNTY_TEMPLATE_SAFETY_ARTIFACT}."
+        ),
+    )
+    bounty_template_safety.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of template reviews to print or include when templates must be built.",
+    )
+    bounty_template_safety.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=262144,
+        help="Maximum bytes to read from official evidence paths during safety checks. Defaults to 262144.",
+    )
+    bounty_template_safety.add_argument(
+        "--show-templates",
+        action="store_true",
+        help="Print per-template draft marker and safety review status.",
+    )
+    bounty_template_safety.add_argument(
+        "--show-files",
+        action="store_true",
+        help="Print official evidence target path marker status for each shown template.",
+    )
+    bounty_template_safety.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print bounty template safety only; do not write {BOUNTY_TEMPLATE_SAFETY_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    bounty_template_safety.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero when any template safety blocker is present.",
+    )
+    bounty_template_safety.set_defaults(func=run_bounty_template_safety)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
