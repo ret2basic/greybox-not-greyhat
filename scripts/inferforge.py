@@ -41250,6 +41250,32 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             },
         )
         finding_gate = build_finding_gate([], [], {}, review)
+        blocked_preview_gate = build_finding_gate(
+            [],
+            [],
+            {},
+            {},
+            {
+                "items": [
+                    {
+                        "id": "VAL-blocked-rewrite-response",
+                        "priority": "high",
+                        "path": approved_path,
+                        "impact": "fixed-upstream-proxy-confusion",
+                        "reportability_gate": "Blocked preview self-test gate.",
+                        "rewrite_response_approval_packet": no_history_approval_packet,
+                    }
+                ]
+            },
+        )
+        blocked_preview_item = next(
+            (
+                item
+                for item in blocked_preview_gate.get("blocked_gate_previews", []) or []
+                if item.get("packet_type") == "rewrite-response"
+            ),
+            None,
+        )
         rewrite_gate_item = next(
             (
                 item
@@ -41262,6 +41288,7 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
         sidecar_review_text = json.dumps(sidecar_review, sort_keys=True)
         closure_text = json.dumps(closure, sort_keys=True)
         finding_gate_text = json.dumps(finding_gate, sort_keys=True)
+        blocked_preview_gate_text = json.dumps(blocked_preview_gate, sort_keys=True)
         followup_command_text = "\n".join(str(command) for command in review.get("followup_commands", []) or [])
         closure_command_text = "\n".join(
             str(command.get("command") or command)
@@ -41511,6 +41538,23 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             "actual": {
                 "gate_item": rewrite_gate_item,
                 "finding_gate_contains_sentinel": "should-not-appear" in finding_gate_text,
+            },
+        },
+        {
+            "id": "finding-gate-blocked-previews-explain-approval-packet-gaps",
+            "passed": (
+                blocked_preview_item is not None
+                and blocked_preview_item.get("gate_status") == "blocked-before-finding-gate"
+                and blocked_preview_item.get("classification") == "blocked-rewrite-response-finding-gate-preview"
+                and not blocked_preview_gate.get("gates")
+                and (blocked_preview_gate.get("summary") or {}).get("blocked_gate_previews") == 1
+                and "No approved redacted response observation" in blocked_preview_gate_text
+                and "not a finding" in blocked_preview_gate_text
+            ),
+            "expected": "approval-packet blockers are visible as blocked previews without creating reportable gate items",
+            "actual": {
+                "blocked_preview": blocked_preview_item,
+                "summary": blocked_preview_gate.get("summary"),
             },
         },
         {
@@ -44741,11 +44785,95 @@ def rewrite_response_review_finding_gate_items(
     return gate_items
 
 
+def approval_packet_finding_gate_entrypoint(packet: dict[str, Any]) -> str:
+    recommended_quote = packet.get("recommended_quote") if isinstance(packet.get("recommended_quote"), dict) else {}
+    if recommended_quote:
+        method = str(recommended_quote.get("method") or "POST").upper()
+        path = str(recommended_quote.get("path") or "-")
+        return f"{method} {path}"
+    recommended_request = (
+        packet.get("recommended_request")
+        if isinstance(packet.get("recommended_request"), dict)
+        else {}
+    )
+    if recommended_request:
+        method = str(recommended_request.get("method") or "GET").upper()
+        path = str(recommended_request.get("path") or "-")
+        return f"{method} {path}"
+    recommended_evidence = (
+        packet.get("recommended_evidence")
+        if isinstance(packet.get("recommended_evidence"), dict)
+        else {}
+    )
+    if recommended_evidence.get("entrypoint"):
+        return str(recommended_evidence.get("entrypoint"))
+    return str(packet.get("entrypoint") or "-")
+
+
+def validation_plan_blocked_finding_gate_previews(
+    validation_plan: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not isinstance(validation_plan, dict):
+        return []
+    previews = []
+    for item in validation_plan.get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id") or item.get("hypothesis_id") or "validation-item"
+        for packet_key, packet_type, packet in validation_item_approval_packets(item):
+            blockers = normalize_string_list(packet.get("finding_gate_blockers"))
+            blocker_count = packet.get("finding_gate_blocker_count")
+            try:
+                blocker_count_int = int(blocker_count)
+            except (TypeError, ValueError):
+                blocker_count_int = len(blockers)
+            if blocker_count_int <= 0 and not blockers:
+                continue
+            previews.append(
+                {
+                    "suspicion_id": f"BLOCKED-{safe_probe_id(item_id)}-{safe_probe_id(packet_type)}",
+                    "validation_item_id": item_id,
+                    "entrypoint": approval_packet_finding_gate_entrypoint(packet),
+                    "classification": f"blocked-{packet_type}-finding-gate-preview",
+                    "gate_status": "blocked-before-finding-gate",
+                    "severity": item.get("priority") or "needs-triage",
+                    "packet_key": packet_key,
+                    "packet_type": packet_type,
+                    "packet_status": packet.get("status"),
+                    "title": "Approval packet is not ready for finding-gate review",
+                    "checks": [
+                        {
+                            "id": "approval-packet-present",
+                            "passed": True,
+                            "evidence": packet_key,
+                        },
+                        {
+                            "id": "finding-gate-blockers-cleared",
+                            "passed": False,
+                            "evidence": blockers[:8],
+                            "blocker_count": blocker_count_int,
+                        },
+                        {
+                            "id": "concrete-impact-evidence",
+                            "passed": False,
+                            "evidence": item.get("reportability_gate")
+                            or "Concrete impact evidence has not passed finding-gate.",
+                        },
+                    ],
+                    "safety": (
+                        "Blocked preview only. This is not a finding and must not be reported until a real gate item passes."
+                    ),
+                }
+            )
+    return previews[:12]
+
+
 def build_finding_gate(
     suspicions: list[dict[str, Any]],
     burp_history: list[dict[str, Any]],
     transaction_intent: dict[str, Any] | None = None,
     rewrite_response_review: dict[str, Any] | None = None,
+    validation_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     gates = []
     burp_paths = {row.get("path") for row in burp_history}
@@ -44808,16 +44936,23 @@ def build_finding_gate(
     if tx_gate:
         gates.append(tx_gate)
     gates.extend(rewrite_response_review_finding_gate_items(rewrite_response_review))
+    blocked_previews = validation_plan_blocked_finding_gate_previews(validation_plan)
 
     return {
         "generated_at": utc_now(),
+        "summary": {
+            "gates": len(gates),
+            "blocked_gate_previews": len(blocked_previews),
+        },
         "policy": [
             "valid-finding requires black-box reproduction, source context when needed, explicit attacker model, impact, and counter-evidence review.",
             "hardening-note may pass with controlled probe reproduction plus source context, but must not be reported as an exploitable vulnerability.",
             "decoded transaction intent mismatches enter finding-gate as manual-review candidates and are not reportable until impact is proven.",
             "rewrite response candidate impacts enter finding-gate as manual-review candidates and are not reportable until concrete unauthorized impact is proven.",
+            "blocked_gate_previews explain missing evidence for approval packets but are never reportable findings.",
         ],
         "gates": gates,
+        "blocked_gate_previews": blocked_previews,
     }
 
 
@@ -53571,14 +53706,32 @@ def run_gate(args: argparse.Namespace) -> int:
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
     transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {}
     rewrite_response_review = load_optional_json(artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT) or {}
+    validation_plan = load_optional_json(artifact_dir / VALIDATION_PLAN_ARTIFACT)
+    validation_plan_source = VALIDATION_PLAN_ARTIFACT
+    if not isinstance(validation_plan, dict):
+        validation_plan = build_validation_plan_run(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            limit=max(1, int(args.top)),
+            current_resource_snapshot={"status": "not-run"},
+        )
+        validation_plan_source = "built-preview-no-write"
     suspicions_path = artifact_dir / "suspicions.json"
     suspicions_doc = json.loads(read_text(suspicions_path)) if suspicions_path.exists() else {}
     suspicions = suspicions_doc.get("suspicions", [])
-    gate = build_finding_gate(suspicions, burp_history, transaction_intent, rewrite_response_review)
+    gate = build_finding_gate(
+        suspicions,
+        burp_history,
+        transaction_intent,
+        rewrite_response_review,
+        validation_plan,
+    )
     output_path = artifact_dir / "finding-gate.json"
     print(f"Gated {len(gate['gates'])} item(s)")
     if args.show_items:
         gate_items = gate.get("gates", []) or []
+        blocked_previews = gate.get("blocked_gate_previews", []) or []
         print("Gate items:" if gate_items else "Gate items: none")
         for item in gate_items[: max(0, int(args.top))]:
             checks = [check for check in item.get("checks", []) or [] if isinstance(check, dict)]
@@ -53592,8 +53745,26 @@ def run_gate(args: argparse.Namespace) -> int:
             )
             for check in checks[:3]:
                 print(f"  check={check.get('id')} passed={check.get('passed')}")
+        print("Blocked gate previews:" if blocked_previews else "Blocked gate previews: none")
+        for item in blocked_previews[: max(0, int(args.top))]:
+            checks = [check for check in item.get("checks", []) or [] if isinstance(check, dict)]
+            blocker_check = next(
+                (check for check in checks if check.get("id") == "finding-gate-blockers-cleared"),
+                {},
+            )
+            print(
+                f"- {item.get('gate_status')} {item.get('classification')} "
+                f"severity={item.get('severity') or '-'} "
+                f"entrypoint={item.get('entrypoint') or '-'} "
+                f"blockers={blocker_check.get('blocker_count', 0)} "
+                f"id={item.get('suspicion_id') or '-'}"
+            )
+            for blocker in normalize_string_list(blocker_check.get("evidence"))[:3]:
+                print(f"  blocker={inline_summary_text(blocker, max_chars=180)}")
     if not suspicions_path.exists():
         print("No suspicions.json found; built gate from other eligible artifacts.")
+    if validation_plan_source == "built-preview-no-write":
+        print("No validation-plan.json found; built an in-memory no-write validation-plan preview for blocked gate previews.")
     if no_write:
         print("No files written (--no-write).")
     else:

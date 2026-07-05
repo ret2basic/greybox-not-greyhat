@@ -540,7 +540,10 @@ store cookies, bearer tokens, API keys, private keys, seed phrases, signatures,
 raw Burp history, or full response bodies.
 If candidate impact is present, `gate --no-write --show-items` imports it as a
 redacted manual-review gate item; it does not mark the issue reportable by
-itself.
+itself. When no evidence is ready for gate review, the same command prints
+`blocked_gate_previews` from validation-plan approval packets. These previews
+list the missing evidence and finding-gate blockers, but they are explicitly not
+findings and never appear in `findings.json`.
 For source-backed fixed-upstream API routes, it also scans the referenced route
 source for fixed upstream fetches, positive route-parameter guards, query
 forwarding, credential/header forwarding, upstream status forwarding, and cache
