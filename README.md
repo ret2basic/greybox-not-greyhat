@@ -318,6 +318,12 @@ planning view only, not an exploit script or approval to run active traffic.
 With `--skip-current-resource-check`, `methodology-review` stays fully offline
 and reports resource status as `not-run` instead of reading current `/proc`
 resource state.
+`methodology-review` also emits `bounty_harness_alignment`, a compact
+bug-bounty readiness check derived from the harness pattern of building system
+context, ranking high-value leads, validating impact with a concrete oracle,
+assembling the minimal PoC/report package, and keeping feedback/resource gates
+closed. This is stricter than broad audit coverage: a lead is still blocked
+until the validation oracle and finding gate prove concrete impact.
 
 Use `lead-dossier` when you want the same evidence closure in a tighter
 bug-bounty style lead file. It applies the “read code, constrain by

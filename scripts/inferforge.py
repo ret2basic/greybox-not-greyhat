@@ -9196,6 +9196,20 @@ METHODOLOGY_RESEARCH_SOURCES = [
         "takeaway": "Keep repository state, feedback loops, and legible artifacts as the system of record while humans steer and agents execute.",
     },
     {
+        "id": "openai-codex-security",
+        "title": "Codex Security: now in research preview",
+        "url": "https://openai.com/index/codex-security-now-in-research-preview/",
+        "role": "security-agent-validation-reference",
+        "takeaway": "Build project context, prioritize by real-world impact, validate in the system context, and avoid low-confidence triage noise.",
+    },
+    {
+        "id": "poco-agentic-poc-generation",
+        "title": "PoCo: Agentic Proof-of-Concept Exploit Generation for Smart Contracts",
+        "url": "https://arxiv.org/html/2511.02780v3",
+        "role": "poc-validation-reference",
+        "takeaway": "A useful PoC must be executable, logically correct, and tied to a concrete security violation under controlled conditions.",
+    },
+    {
         "id": "anthropic-effective-agents",
         "title": "Building effective agents",
         "url": "https://www.anthropic.com/engineering/building-effective-agents",
@@ -11575,6 +11589,260 @@ def build_business_logic_methodology_map(
     }
 
 
+def bounty_harness_thread_lead(
+    thread: dict[str, Any],
+    *,
+    original_rank: int,
+) -> dict[str, Any]:
+    closure = thread.get("evidence_closure") if isinstance(thread.get("evidence_closure"), dict) else {}
+    missing = [str(item) for item in closure.get("missing_requirements", []) or [] if str(item or "").strip()]
+    gate_ready = bool(closure.get("gate_ready"))
+    return {
+        "id": thread.get("id") or f"thread-{original_rank}",
+        "rank": original_rank,
+        "priority": thread.get("priority") or "info",
+        "impact": thread.get("impact"),
+        "closure_status": closure.get("status") or thread.get("status") or "unknown",
+        "gate_ready": gate_ready,
+        "missing_requirements": missing,
+        "strict_validation": {
+            "blocking_questions": [] if gate_ready else missing,
+        },
+    }
+
+
+def build_bounty_harness_alignment(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    harness_loop: dict[str, Any],
+    hypothesis_matrix: dict[str, Any],
+    validation_plan: dict[str, Any],
+    business_logic_map: dict[str, Any],
+    high_value_threads: list[dict[str, Any]],
+    evidence_closure_summary: dict[str, Any],
+    resource_snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    assessment_policy = assessment_mode_policy(profile)
+    ranking_strategy = lead_dossier_ranking_strategy(assessment_policy)
+    resource_status = artifact_summary_status(resource_snapshot)
+    hypothesis_summary = hypothesis_matrix.get("summary", {}) if isinstance(hypothesis_matrix.get("summary"), dict) else {}
+    validation_summary = validation_plan.get("summary", {}) if isinstance(validation_plan.get("summary"), dict) else {}
+    business_summary = business_logic_map.get("summary", {}) if isinstance(business_logic_map.get("summary"), dict) else {}
+    focus = harness_loop.get("focus") if isinstance(harness_loop.get("focus"), dict) else {}
+
+    candidate_leads = []
+    for index, thread in enumerate(high_value_threads, start=1):
+        lead = bounty_harness_thread_lead(thread, original_rank=index)
+        lead["assessment_rank"] = lead_dossier_assessment_scorecard(
+            lead,
+            assessment_policy=assessment_policy,
+        )
+        candidate_leads.append(lead)
+    candidate_leads.sort(
+        key=lambda lead: lead_dossier_assessment_rank_key(
+            lead,
+            assessment_policy=assessment_policy,
+            original_index=int(lead.get("rank") or 0),
+        )
+    )
+    apply_assessment_relative_focus_policy(candidate_leads, assessment_policy)
+    top_candidate = candidate_leads[0] if candidate_leads else {}
+
+    def command(subcommand: str, *, source: str) -> dict[str, Any] | None:
+        return methodology_command_ref(artifact_dir, profile, subcommand, source=source)
+
+    def component(
+        component_id: str,
+        title: str,
+        status: str,
+        objective: str,
+        evidence: dict[str, Any],
+        next_step: str,
+        commands: list[dict[str, Any] | None],
+    ) -> dict[str, Any]:
+        safe_commands = [ref for ref in commands if isinstance(ref, dict)]
+        return {
+            "id": component_id,
+            "title": title,
+            "status": status,
+            "objective": objective,
+            "evidence": evidence,
+            "next_step": next_step,
+            "offline_commands": safe_commands,
+            "command_safety": command_safety_summary(safe_commands),
+        }
+
+    threat_context_ready = bool(
+        int(hypothesis_summary.get("hypotheses", 0) or 0)
+        and int(business_summary.get("threads", 0) or 0)
+    )
+    lead_ready = bool(high_value_threads)
+    gate_ready_threads = int(evidence_closure_summary.get("gate_ready_threads", 0) or 0)
+    minimal_poc_ready = any(
+        str((thread.get("minimal_poc_plan") or {}).get("status") or "") in {"ready-for-gate-review", "ready-for-finding-gate-review"}
+        for thread in high_value_threads
+        if isinstance(thread, dict)
+    )
+    reportable = str(harness_loop.get("status") or "") == "reportable-findings"
+    resource_blocks_active = resource_status not in {"healthy", "not-run"}
+
+    components = [
+        component(
+            "system-context-threat-model",
+            "System context and threat model",
+            "passed" if threat_context_ready else "waiting",
+            "Build a repo-specific security model before chasing candidates.",
+            {
+                "hypotheses": hypothesis_summary.get("hypotheses", 0),
+                "business_logic_threads": business_summary.get("threads", 0),
+                "assessment_mode": assessment_policy.get("mode"),
+                "optimization_goal": assessment_policy.get("optimization_goal"),
+            },
+            (
+                "Refresh hypothesis-matrix and business-logic methodology mapping from current local artifacts."
+                if not threat_context_ready
+                else "Threat-model context exists; keep it current as evidence changes."
+            ),
+            [
+                command("hypothesis-matrix --no-write --show-next", source="bounty-harness:threat-model:hypothesis-matrix"),
+                command("methodology-review --no-write --limit 8 --skip-current-resource-check", source="bounty-harness:threat-model:methodology-review"),
+            ],
+        ),
+        component(
+            "high-value-lead-selection",
+            "High-value lead selection",
+            "passed" if lead_ready else "waiting",
+            "Prioritize the strongest Medium/High/Critical path instead of broad low-impact coverage.",
+            {
+                "high_value_threads": len(high_value_threads),
+                "ranking_strategy": ranking_strategy,
+                "top_candidate": {
+                    "id": top_candidate.get("id"),
+                    "priority": top_candidate.get("priority"),
+                    "impact": top_candidate.get("impact"),
+                    "decision": (top_candidate.get("assessment_rank") or {}).get("decision"),
+                    "score": (top_candidate.get("assessment_rank") or {}).get("composite_score"),
+                    "relative_role": (top_candidate.get("relative_focus") or {}).get("role"),
+                }
+                if top_candidate
+                else {},
+            },
+            (
+                "Generate or refresh lead-dossier until at least one high-value lead is ranked."
+                if not lead_ready
+                else "Pursue the top ranked lead until it stalls, closes, or is displaced by stronger evidence."
+            ),
+            [
+                command("lead-dossier --no-write --show-commands --show-evidence --skip-current-resource-check", source="bounty-harness:lead-selection:lead-dossier"),
+                command("validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check", source="bounty-harness:lead-selection:validation-plan"),
+            ],
+        ),
+        component(
+            "impact-validation-oracle",
+            "Impact validation oracle",
+            "passed" if gate_ready_threads else "waiting",
+            "Attach a deterministic evidence oracle before any bounty/reportability claim.",
+            {
+                "gate_ready_threads": gate_ready_threads,
+                "closure_status_counts": evidence_closure_summary.get("status_counts", {}),
+                "validation_items": validation_summary.get("items", 0),
+            },
+            (
+                "Close the top lead's missing sidecar, decoded corpus, response observation, or operator evidence contract."
+                if not gate_ready_threads
+                else "Run finding-gate and adjudication no-write before writing reports."
+            ),
+            [
+                command("review-blockers --no-write --top 6", source="bounty-harness:validation:review-blockers"),
+                command("gate --no-write --show-items", source="bounty-harness:validation:gate"),
+                command("adjudicate --no-write", source="bounty-harness:validation:adjudicate"),
+            ],
+        ),
+        component(
+            "minimal-poc-report-package",
+            "Minimal PoC and report package",
+            "passed" if minimal_poc_ready or reportable else "waiting",
+            "Prepare only the smallest reproducible evidence package needed for a valid Medium/High/Critical report.",
+            {
+                "minimal_poc_ready": minimal_poc_ready,
+                "reportable_findings": reportable,
+                "harness_status": harness_loop.get("status"),
+            },
+            (
+                "Do not write a report yet; first satisfy the impact validation oracle and finding gate."
+                if not (minimal_poc_ready or reportable)
+                else "Preview report and evidence-chain without writing or sending traffic."
+            ),
+            [
+                command("evidence-chain --no-write", source="bounty-harness:poc:evidence-chain"),
+                command("report --no-write", source="bounty-harness:poc:report"),
+            ],
+        ),
+        component(
+            "feedback-loop-and-resource-control",
+            "Feedback loop and resource control",
+            "blocked-resource" if resource_blocks_active else "passed",
+            "Keep the loop safe, resource-aware, and evidence-driven across unattended iterations.",
+            {
+                "resource_status": resource_status,
+                "harness_focus_stage": focus.get("stage"),
+                "harness_focus_status": focus.get("status"),
+                "blocked_gate_previews": (harness_loop.get("summary") or {}).get("blocked_gate_previews"),
+            },
+            (
+                "Run only capped no-write/offline commands until resource-snapshot --strict is healthy."
+                if resource_blocks_active
+                else "Resource gate allows active steps only when each command's own scope and safety gate passes."
+            ),
+            [
+                command("resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict", source="bounty-harness:feedback:resource-snapshot"),
+                command("iteration-decision --no-write --show-commands --skip-current-resource-check", source="bounty-harness:feedback:iteration-decision"),
+            ],
+        ),
+    ]
+
+    status_counts: dict[str, int] = {}
+    for row in components:
+        increment_count(status_counts, str(row.get("status") or "unknown"))
+    if reportable:
+        status = "bounty-reportable-finding-ready"
+    elif status_counts.get("blocked-resource"):
+        status = "offline-only-resource-gated"
+    elif status_counts.get("waiting"):
+        status = "needs-validation-evidence"
+    else:
+        status = "ready-for-finding-gate-review"
+
+    return {
+        "status": status,
+        "summary": {
+            "components": len(components),
+            "status_counts": dict(sorted(status_counts.items())),
+            "assessment_mode": assessment_policy.get("mode"),
+            "optimization_goal": assessment_policy.get("optimization_goal"),
+            "lead_selection_strategy": ranking_strategy,
+            "high_value_threads": len(high_value_threads),
+            "gate_ready_threads": gate_ready_threads,
+            "resource_status": resource_status,
+            "top_candidate_id": top_candidate.get("id"),
+            "top_candidate_decision": (top_candidate.get("assessment_rank") or {}).get("decision") if top_candidate else None,
+        },
+        "components": components,
+        "candidate_focus": candidate_leads[:5],
+        "research_sources": [
+            "pkqs91-codex-web3-bounty",
+            "openai-harness-engineering",
+            "openai-codex-security",
+            "poco-agentic-poc-generation",
+        ],
+        "safety": (
+            "Offline bounty-harness alignment only. It reads local artifacts and resource status; it sends no requests, "
+            "invokes no Burp tools, reads no raw Burp history, signs no wallets, submits no transactions, and runs no scanners."
+        ),
+    }
+
+
 def build_methodology_review(
     *,
     target: str,
@@ -11687,6 +11955,17 @@ def build_methodology_review(
         high_value_threads,
         limit=max(1, int(limit)),
     )
+    bounty_harness_alignment = build_bounty_harness_alignment(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        harness_loop=harness_loop,
+        hypothesis_matrix=hypothesis_matrix,
+        validation_plan=validation_plan,
+        business_logic_map=business_logic_map,
+        high_value_threads=high_value_threads,
+        evidence_closure_summary=evidence_closure_summary,
+        resource_snapshot=resource_snapshot,
+    )
 
     focus = harness_loop.get("focus") if isinstance(harness_loop.get("focus"), dict) else {}
     resource_budget = resource_budget_for_snapshot(resource_snapshot)
@@ -11707,6 +11986,8 @@ def build_methodology_review(
         "minimal_poc_plans": len(high_value_threads),
         "evidence_closure_status_counts": evidence_closure_summary.get("status_counts", {}),
         "evidence_closure_gate_ready_threads": evidence_closure_summary.get("gate_ready_threads", 0),
+        "bounty_harness_alignment": bounty_harness_alignment.get("status"),
+        "bounty_harness_top_candidate": (bounty_harness_alignment.get("summary", {}) or {}).get("top_candidate_id"),
     }
     status = "has-reportable-finding" if harness_loop.get("status") == "reportable-findings" else "needs-methodology-deepening"
     if resource_status not in {"healthy", "not-run"}:
@@ -11722,6 +12003,7 @@ def build_methodology_review(
         "assessment_policy": assessment_policy,
         "research_sources": METHODOLOGY_RESEARCH_SOURCES,
         "stage_reviews": stage_reviews,
+        "bounty_harness_alignment": bounty_harness_alignment,
         "business_logic_map": business_logic_map,
         "evidence_closure": evidence_closure_summary,
         "supporting_review_statuses": {
@@ -40950,6 +41232,9 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Methodology review:" in methodology_review_stdout_text
                 and "resource=not-run" in methodology_review_stdout_text
                 and "Evidence closure:" in methodology_review_stdout_text
+                and "Bounty harness:" in methodology_review_stdout_text
+                and "selection=greybox-coverage-first" in methodology_review_stdout_text
+                and "- bounty system-context-threat-model:" in methodology_review_stdout_text
                 and "High-value threads:" in methodology_review_stdout
                 and "poc_plan=" in methodology_review_stdout_text
                 and "input=" in methodology_review_stdout_text
@@ -57915,6 +58200,41 @@ def run_methodology_review(args: argparse.Namespace) -> int:
             f"gate_ready={evidence_closure.get('gate_ready_threads', 0)} "
             f"statuses={json.dumps(evidence_closure.get('status_counts', {}), sort_keys=True)}"
         )
+    bounty_alignment = (
+        review.get("bounty_harness_alignment")
+        if isinstance(review.get("bounty_harness_alignment"), dict)
+        else {}
+    )
+    if bounty_alignment:
+        bounty_summary = (
+            bounty_alignment.get("summary")
+            if isinstance(bounty_alignment.get("summary"), dict)
+            else {}
+        )
+        print(
+            "Bounty harness: "
+            f"{bounty_alignment.get('status')} "
+            f"selection={bounty_summary.get('lead_selection_strategy') or '-'} "
+            f"top={bounty_summary.get('top_candidate_id') or '-'} "
+            f"gate_ready={bounty_summary.get('gate_ready_threads', 0)} "
+            f"resource={bounty_summary.get('resource_status') or '-'} "
+            f"components={json.dumps(bounty_summary.get('status_counts', {}), sort_keys=True)}"
+        )
+        for component in (bounty_alignment.get("components", []) or [])[:3]:
+            if not isinstance(component, dict):
+                continue
+            print(
+                f"- bounty {component.get('id')}: {component.get('status')} "
+                f"next={inline_summary_text(component.get('next_step'), max_chars=220)}"
+            )
+            if args.show_commands:
+                for ref in (component.get("offline_commands", []) or [])[:2]:
+                    if isinstance(ref, dict):
+                        print(
+                            "    - bounty "
+                            f"{format_command_ref_label(ref)} "
+                            f"{inline_summary_text(ref.get('command'), max_chars=420)}"
+                        )
     print("High-value threads:")
     for thread in (review.get("high_value_threads", []) or [])[: max(0, int(args.limit))]:
         closure = thread.get("evidence_closure") if isinstance(thread.get("evidence_closure"), dict) else {}
