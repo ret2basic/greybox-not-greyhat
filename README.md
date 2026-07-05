@@ -286,12 +286,12 @@ The business-logic map is still a prioritization aid, not a finding. A
 Medium/High/Critical claim still requires endpoint-specific evidence proving a
 data validation failure, forged request impact, transaction/upstream integrity
 mismatch, workflow bypass, or quota/provider/resource misuse. The closure view
-is conservative: transaction-integrity and fixed-upstream threads get
-lead-level evidence contracts but still need decoded corpus/intent review or
-one approved read-only response with concrete impact, credentialed-upstream
-threads need redacted provider/operator impact evidence, and
-resource-exhaustion threads need deployment/proxy trust evidence plus non-stress
-availability impact evidence.
+is conservative: transaction-integrity, fixed-upstream, RPC-proxy, and
+unauthorized-state-change threads get lead-level evidence contracts but still
+need decoded corpus/intent review, one approved read-only/RPC observation, or
+protected-action impact evidence. Credentialed-upstream threads need redacted
+provider/operator impact evidence, and resource-exhaustion threads need
+deployment/proxy trust evidence plus non-stress availability impact evidence.
 `--show-poc-plan` expands each high-value thread into a minimal reproduction
 evidence package: required sidecars or operator inputs, missing evidence,
 offline no-write commands, gate entry conditions, and forbidden actions. It is a

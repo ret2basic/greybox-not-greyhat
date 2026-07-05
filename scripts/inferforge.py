@@ -10339,6 +10339,11 @@ def build_generic_evidence_closure(
         "requirements": requirements,
         "missing_requirements": [req.get("id") for req in requirements],
         "next_safe_commands": commands[:6],
+        "evidence_contract": generic_impact_lead_evidence_contract(
+            thread=item,
+            profile=profile,
+            artifact_dir=artifact_dir,
+        ),
         "finding_gate_entry_condition": "Collect concrete impact evidence and refresh finding-gate/adjudication.",
     }
 
@@ -11090,6 +11095,161 @@ def fixed_upstream_proxy_confusion_lead_evidence_contract(
     }
 
 
+def rpc_proxy_abuse_lead_evidence_contract(
+    *,
+    thread: dict[str, Any],
+    profile: dict[str, Any] | None,
+    artifact_dir: Path | None,
+) -> dict[str, Any]:
+    path_options = lead_dossier_path_options(thread)
+    entrypoint_path = str(thread.get("path") or "")
+    if not entrypoint_path and path_options:
+        entrypoint_path = str(path_options[0].get("path") or "")
+    if not entrypoint_path:
+        entrypoint_path = probe_target_path(profile, "solana-rpc-http", "path", "/api/rpc/solana/{cluster}")
+    rpc_policy_ref = (
+        repo_relative_or_absolute(artifact_dir / "rpc-method-policy.json")
+        if artifact_dir is not None
+        else "rpc-method-policy.json"
+    )
+    return {
+        "id": "rpc-proxy-abuse-evidence-contract",
+        "entrypoint": f"POST {entrypoint_path}",
+        "method": "POST",
+        "path": entrypoint_path,
+        "required_operator_decision_ids": [],
+        "path_options": path_options[:5],
+        "rpc_method_policy": rpc_policy_ref,
+        "required_evidence": [
+            "Exact RPC method, origin, auth, rate-control, or allowlist boundary expected to reject or constrain the request.",
+            "One approved redacted observation or offline RPC policy/source artifact for the exact in-scope RPC proxy path.",
+            "Evidence that a disallowed or sensitive RPC method is reachable, or that origin/rate controls are bypassed.",
+            "Concrete non-DoS impact: user funds, sensitive data, upstream quota, availability budget, or equivalent operator impact.",
+            "Finding-gate/adjudication evidence proving impact without floods, stress, provider depletion, wallet signing, or transaction submission.",
+        ],
+        "reportable_only_if": [
+            "The exact RPC proxy path and method/control boundary are in scope and attacker-controlled.",
+            "Approved evidence shows a disallowed/sensitive RPC method is reachable or a real origin/rate/auth boundary is bypassed.",
+            "The behavior creates concrete user-funds, sensitive-data, upstream-quota, availability-budget, or operator impact without DoS testing.",
+            "The finding-gate decision separates concrete impact from generic RPC proxy exposure or static source suspicion.",
+        ],
+        "not_reportable_when": [
+            "The only evidence is that an application exposes a Solana JSON-RPC proxy or forwards allowed read-only methods.",
+            "The RPC method is intentionally allowed, read-only, scoped to public chain data, and has no concrete user/operator impact.",
+            "Origin, auth, method allowlist, rate, or upstream controls reject the sensitive behavior under the real deployment model.",
+            "Impact would require request floods, rate-limit stress, provider quota depletion, broad method enumeration, or DoS testing.",
+            "The claim depends on wallet signing, transaction submission, trading, or state mutation rather than safe evidence.",
+        ],
+        "safe_evidence_sources": [
+            "rpc-method-policy and source refs showing allowed, blocked, sensitive, and high-impact RPC method decisions.",
+            "deployment/operator evidence for origin, proxy, rate, and upstream quota boundaries with secrets redacted.",
+            "One approved redacted RPC observation only after healthy resource and scope gates, if offline policy evidence is insufficient.",
+            "Logs, metrics, provider documentation, or operator statements summarized without raw secrets or raw identifiers.",
+            "Finding-gate and adjudication records summarizing method/control impact without raw Burp history.",
+        ],
+        "forbidden_validation": [
+            "No floods, rate-limit stress, DoS testing, broad RPC method enumeration, Burp Scanner, Intruder, or brute force.",
+            "No wallet signing, sendTransaction submission, trading, fund movement, or real user/account state mutation.",
+            "No provider quota depletion, upstream abuse, private keys, seed phrases, bearer tokens, cookies, or raw Burp history.",
+            "No RPC proxy report based only on source configuration, public chain reads, or generic upstream reachability.",
+        ],
+        "safety": (
+            "Lead-level evidence contract only. It describes offline RPC policy review and at most one approved redacted observation; "
+            "it sends no requests, invokes no Burp tools, signs no wallets, submits no transactions, and runs no stress traffic."
+        ),
+    }
+
+
+def unauthorized_state_change_lead_evidence_contract(
+    *,
+    thread: dict[str, Any],
+    profile: dict[str, Any] | None,
+    artifact_dir: Path | None,
+) -> dict[str, Any]:
+    path_options = lead_dossier_path_options(thread)
+    entrypoint_method = lead_dossier_thread_method(thread)
+    entrypoint_path = str(thread.get("path") or "")
+    if path_options:
+        entrypoint_method = str(path_options[0].get("method") or entrypoint_method or "POST").upper()
+        if not entrypoint_path:
+            entrypoint_path = str(path_options[0].get("path") or "")
+    if not entrypoint_path:
+        entrypoint_path = "/api/{action}"
+    evidence_gap_ref = (
+        repo_relative_or_absolute(artifact_dir / "evidence-gaps.json")
+        if artifact_dir is not None
+        else "evidence-gaps.json"
+    )
+    return {
+        "id": "unauthorized-state-change-evidence-contract",
+        "entrypoint": f"{entrypoint_method} {entrypoint_path}",
+        "method": entrypoint_method,
+        "path": entrypoint_path,
+        "required_operator_decision_ids": [],
+        "path_options": path_options[:5],
+        "evidence_gap_ref": evidence_gap_ref,
+        "required_evidence": [
+            "Exact protected action, order, account state, workflow boundary, or server action expected to require authorization.",
+            "Authorization context and expected denial condition for the acting user/session/origin state.",
+            "One approved source contract, operator artifact, or redacted observation showing the action can be accepted unexpectedly.",
+            "Concrete user, account, funds, order, business, or workflow impact without real user-state mutation.",
+            "Finding-gate/adjudication evidence proving unauthorized state-change impact and excluding intended public/preview behavior.",
+        ],
+        "reportable_only_if": [
+            "The exact state-changing route/action is in scope and should require a specific auth, ownership, or workflow precondition.",
+            "Evidence shows an attacker-controlled request can bypass that precondition or skip the expected workflow boundary.",
+            "The accepted action creates concrete user, account, funds, order, business, or equivalent state-change impact.",
+            "Validation is limited to offline source/operator evidence or a single approved non-mutating/redacted observation path.",
+        ],
+        "not_reportable_when": [
+            "The endpoint is intentionally public, read-only, quote/preview-only, idempotent, or does not mutate protected state.",
+            "Source guards, route auth, ownership checks, CSRF/origin controls, or workflow checks enforce the expected denial.",
+            "The only evidence is a POST/PUT/PATCH/DELETE method or generic state-changing route shape without accepted unauthorized behavior.",
+            "Impact would require real account mutation, trading, wallet signing, transaction submission, credential use, or destructive testing.",
+            "The observation is from an authorized user performing an intended action with no privilege, ownership, or workflow bypass.",
+        ],
+        "safe_evidence_sources": [
+            "Source refs for route handlers, server actions, auth/ownership guards, workflow checks, and state-write sinks.",
+            "evidence-gaps and source-peek artifacts identifying the protected boundary and expected denial condition.",
+            "Redacted operator statements, tests, logs, or fixtures proving expected authorization behavior without exposing secrets.",
+            "One approved observation only when it is non-destructive, redacted, in scope, and resource gates are healthy.",
+            "Finding-gate and adjudication records summarizing the accepted unauthorized action without raw secrets or raw Burp history.",
+        ],
+        "forbidden_validation": [
+            "No real user/account mutation, destructive state changes, order placement, trading, wallet signing, or transaction submission.",
+            "No credential theft/use, session hijacking, private keys, seed phrases, bearer tokens, cookies, or raw Burp history.",
+            "No CSRF blasts, brute force, crawling, broad replay, Scanner, Intruder, fuzzing, rate-limit stress, or DoS testing.",
+            "No unauthorized-state-change report based only on HTTP method, source suspicion, or an authorized intended workflow.",
+        ],
+        "safety": (
+            "Lead-level evidence contract only. It describes source/operator evidence and non-destructive validation constraints; "
+            "it sends no requests, invokes no Burp tools, signs no wallets, submits no transactions, and mutates no state."
+        ),
+    }
+
+
+def generic_impact_lead_evidence_contract(
+    *,
+    thread: dict[str, Any],
+    profile: dict[str, Any] | None,
+    artifact_dir: Path | None,
+) -> dict[str, Any]:
+    impact = str(thread.get("impact") or "")
+    if impact == "rpc-proxy-abuse":
+        return rpc_proxy_abuse_lead_evidence_contract(
+            thread=thread,
+            profile=profile,
+            artifact_dir=artifact_dir,
+        )
+    if impact == "unauthorized-state-change":
+        return unauthorized_state_change_lead_evidence_contract(
+            thread=thread,
+            profile=profile,
+            artifact_dir=artifact_dir,
+        )
+    return {}
+
+
 def lead_dossier_evidence_contract(
     thread: dict[str, Any],
     *,
@@ -11118,6 +11278,13 @@ def lead_dossier_evidence_contract(
             profile=profile,
             artifact_dir=artifact_dir,
         )
+    generic_contract = generic_impact_lead_evidence_contract(
+        thread=thread,
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
+    if generic_contract:
+        return generic_contract
     resource_review = (
         thread.get("resource_abuse_review")
         if isinstance(thread.get("resource_abuse_review"), dict)
@@ -36767,27 +36934,71 @@ def build_no_write_selftest() -> dict[str, Any]:
         [DEFAULT_RESOURCE_WATCH_PORTS[0], synthetic_control_plane_port],
         protected_ports={synthetic_control_plane_port},
     )
+    rpc_generic_item = {
+        "id": "HYP-selftest-rpc-proxy-abuse",
+        "status": "ready-for-offline-review",
+        "priority": "high",
+        "type": "cluster-strategy",
+        "host": "127.0.0.1",
+        "path": "/api/rpc/solana/{cluster}",
+        "impact": "rpc-proxy-abuse",
+        "validation_question": "Can a disallowed or sensitive RPC method create concrete non-DoS impact?",
+        "required_evidence": required_evidence_for_hypothesis({"impact": "rpc-proxy-abuse"}),
+    }
     rpc_generic_closure = build_generic_evidence_closure(
         artifact_dir=root / "semantic-closure-output",
         profile=profile,
-        item={
-            "id": "HYP-selftest-rpc-proxy-abuse",
-            "impact": "rpc-proxy-abuse",
-            "required_evidence": required_evidence_for_hypothesis({"impact": "rpc-proxy-abuse"}),
-        },
+        item=rpc_generic_item,
     )
     rpc_generic_missing = [str(item) for item in rpc_generic_closure.get("missing_requirements", []) or []]
+    rpc_generic_contract = (
+        rpc_generic_closure.get("evidence_contract")
+        if isinstance(rpc_generic_closure.get("evidence_contract"), dict)
+        else {}
+    )
+    rpc_generic_strict_validation = lead_dossier_strict_validation_checklist(
+        {**rpc_generic_item, "evidence_closure": rpc_generic_closure},
+        target=target,
+        profile=profile,
+        artifact_dir=root / "semantic-closure-output",
+    )
+    rpc_generic_strict_blocking = [
+        str(item)
+        for item in rpc_generic_strict_validation.get("blocking_questions", []) or []
+    ]
+    unauthorized_generic_item = {
+        "id": "HYP-selftest-unauthorized-state-change",
+        "status": "ready-for-offline-review",
+        "priority": "high",
+        "type": "cluster-strategy",
+        "host": "127.0.0.1",
+        "path": "/api/protected/action",
+        "impact": "unauthorized-state-change",
+        "validation_question": "Can a protected action be accepted without the expected authorization denial?",
+        "required_evidence": required_evidence_for_hypothesis({"impact": "unauthorized-state-change"}),
+    }
     unauthorized_generic_closure = build_generic_evidence_closure(
         artifact_dir=root / "semantic-closure-output",
         profile=profile,
-        item={
-            "id": "HYP-selftest-unauthorized-state-change",
-            "impact": "unauthorized-state-change",
-            "required_evidence": required_evidence_for_hypothesis({"impact": "unauthorized-state-change"}),
-        },
+        item=unauthorized_generic_item,
     )
     unauthorized_generic_missing = [
         str(item) for item in unauthorized_generic_closure.get("missing_requirements", []) or []
+    ]
+    unauthorized_generic_contract = (
+        unauthorized_generic_closure.get("evidence_contract")
+        if isinstance(unauthorized_generic_closure.get("evidence_contract"), dict)
+        else {}
+    )
+    unauthorized_generic_strict_validation = lead_dossier_strict_validation_checklist(
+        {**unauthorized_generic_item, "evidence_closure": unauthorized_generic_closure},
+        target=target,
+        profile=profile,
+        artifact_dir=root / "semantic-closure-output",
+    )
+    unauthorized_generic_strict_blocking = [
+        str(item)
+        for item in unauthorized_generic_strict_validation.get("blocking_questions", []) or []
     ]
     assertions = [
         {
@@ -36797,9 +37008,16 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "rpc-user-funds-availability-or-sensitive-data-impact" in rpc_generic_missing
                 and "rpc-policy-observation-or-artifact-reference" in rpc_generic_missing
                 and not any(item.startswith("required-evidence-") for item in rpc_generic_missing)
+                and rpc_generic_contract.get("id") == "rpc-proxy-abuse-evidence-contract"
+                and "counter-evidence-reviewed" not in rpc_generic_strict_blocking
+                and "concrete-impact-evidence" in rpc_generic_strict_blocking
             ),
-            "expected": "rpc-proxy-abuse generic closure uses impact-specific missing evidence IDs",
-            "actual": rpc_generic_missing,
+            "expected": "rpc-proxy-abuse generic closure uses semantic IDs and a lead-level evidence contract",
+            "actual": {
+                "missing": rpc_generic_missing,
+                "contract": rpc_generic_contract,
+                "strict_blocking": rpc_generic_strict_blocking,
+            },
         },
         {
             "id": "generic-unauthorized-state-change-closure-uses-semantic-ids",
@@ -36808,9 +37026,16 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "auth-context-and-expected-denial" in unauthorized_generic_missing
                 and "state-change-observation-or-source-contract" in unauthorized_generic_missing
                 and not any(item.startswith("required-evidence-") for item in unauthorized_generic_missing)
+                and unauthorized_generic_contract.get("id") == "unauthorized-state-change-evidence-contract"
+                and "counter-evidence-reviewed" not in unauthorized_generic_strict_blocking
+                and "concrete-impact-evidence" in unauthorized_generic_strict_blocking
             ),
-            "expected": "unauthorized-state-change generic closure uses impact-specific missing evidence IDs",
-            "actual": unauthorized_generic_missing,
+            "expected": "unauthorized-state-change generic closure uses semantic IDs and a lead-level evidence contract",
+            "actual": {
+                "missing": unauthorized_generic_missing,
+                "contract": unauthorized_generic_contract,
+                "strict_blocking": unauthorized_generic_strict_blocking,
+            },
         },
         {
             "id": "review-candidates-no-write-skips-artifacts",
