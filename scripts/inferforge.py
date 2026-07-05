@@ -1069,6 +1069,14 @@ ASSESSMENT_MODE_POLICIES: dict[str, dict[str, Any]] = {
         "mode": "greybox",
         "optimization_goal": "maximize-dangerous-surface-coverage",
         "success_metric": "High-risk routes, rewrites, actions, RPC methods, transaction flows, and resource-control paths are covered or explicitly closed by evidence.",
+        "objective_model": {
+            "primary_objective": "dangerous-surface-coverage",
+            "completion_unit": "all-dangerous-source-derived-surfaces",
+            "valid_completion_signal": "Every dangerous source-derived surface is covered, evidence-closed, accepted as residual risk, or blocked by scope/resource gates.",
+            "minimum_report_threshold": "evidence-closed-dangerous-surface",
+            "coverage_policy": "continue-after-single-finding",
+            "lead_parking_policy": "do-not-park-dangerous-surfaces-for-payoff-alone",
+        },
         "lead_selection": [
             "Prefer broad dangerous-surface coverage before declaring the project reviewed.",
             "Keep low-volume validation plans for every high-risk source-derived boundary.",
@@ -1081,6 +1089,14 @@ ASSESSMENT_MODE_POLICIES: dict[str, dict[str, Any]] = {
         "mode": "blackbox",
         "optimization_goal": "maximize-valid-high-bounty-finding",
         "success_metric": "At least one in-scope, valid, high-impact, reproducible bounty finding is ready for report submission.",
+        "objective_model": {
+            "primary_objective": "valid-high-impact-bounty-report",
+            "completion_unit": "one-valid-medium-high-critical-report",
+            "valid_completion_signal": "One in-scope gate-ready Medium, High, or Critical report path has concrete reproducible impact evidence.",
+            "minimum_report_threshold": "finding-gate-ready-medium-plus",
+            "coverage_policy": "coverage-secondary-after-dominant-bounty-path",
+            "lead_parking_policy": "park-broad-or-low-validity-work-behind-dominant-bounty-lead",
+        },
         "lead_selection": [
             "Prioritize the highest expected payout and reportability, not complete endpoint coverage.",
             "Prefer leads with concrete user, funds, account, quota, auth, sensitive-data, or takeover impact.",
@@ -1095,6 +1111,16 @@ ASSESSMENT_MODE_POLICIES: dict[str, dict[str, Any]] = {
 def assessment_mode_policy(profile: dict[str, Any] | None) -> dict[str, Any]:
     mode = assessment_mode(profile)
     return json_clone(ASSESSMENT_MODE_POLICIES.get(mode, ASSESSMENT_MODE_POLICIES["greybox"]))
+
+
+def assessment_policy_objective_model(assessment_policy: dict[str, Any]) -> dict[str, Any]:
+    model = assessment_policy.get("objective_model")
+    if isinstance(model, dict):
+        return json_clone(model)
+    mode = str(assessment_policy.get("mode") or "greybox")
+    fallback = ASSESSMENT_MODE_POLICIES.get(mode, ASSESSMENT_MODE_POLICIES["greybox"])
+    fallback_model = fallback.get("objective_model")
+    return json_clone(fallback_model if isinstance(fallback_model, dict) else {})
 
 
 def is_blackbox_assessment(profile: dict[str, Any] | None) -> bool:
@@ -12254,6 +12280,7 @@ def lead_dossier_assessment_scorecard(
     assessment_policy: dict[str, Any],
 ) -> dict[str, Any]:
     strategy = lead_dossier_ranking_strategy(assessment_policy)
+    objective_model = assessment_policy_objective_model(assessment_policy)
     priority = str(lead.get("priority") or "info")
     impact = str(lead.get("impact") or "")
     gate_ready = bool(lead.get("gate_ready"))
@@ -12291,6 +12318,18 @@ def lead_dossier_assessment_scorecard(
 
     if strategy == "blackbox-bounty-first":
         composite_score = bounty_pressure
+        lead_objective_satisfied = gate_ready and priority in {"critical", "high", "medium"} and not blocked
+        objective_role = "bounty-report-candidate"
+        if lead_objective_satisfied:
+            objective_blocker = None
+        elif blocked:
+            objective_blocker = "blocked-by-resource-scope-or-closure-gate"
+        elif not gate_ready:
+            objective_blocker = "not-gate-ready"
+        elif priority not in {"critical", "high", "medium"}:
+            objective_blocker = "below-medium-report-threshold"
+        else:
+            objective_blocker = "needs-bounty-validity-review"
         if blocked:
             decision = "park-until-resource-or-scope-gate-clears"
             parking = "park-blocked"
@@ -12308,6 +12347,18 @@ def lead_dossier_assessment_scorecard(
             parking = "park-behind-stronger-lead"
     else:
         composite_score = coverage_pressure
+        lead_objective_satisfied = not blocked and not missing_count and not blocking_count
+        objective_role = "dangerous-surface-coverage-item"
+        if lead_objective_satisfied:
+            objective_blocker = None
+        elif blocked:
+            objective_blocker = "blocked-by-resource-scope-or-closure-gate"
+        elif missing_count:
+            objective_blocker = "coverage-evidence-gaps-open"
+        elif blocking_count:
+            objective_blocker = "strict-validation-questions-open"
+        else:
+            objective_blocker = "needs-coverage-review"
         if blocked:
             decision = "keep-open-but-blocked"
             parking = "blocked-do-not-close"
@@ -12361,6 +12412,17 @@ def lead_dossier_assessment_scorecard(
             "score": validity_pressure,
             "level": lead_dossier_score_level(validity_pressure),
             "meaning": "How close the lead is to concrete, reproducible finding-gate evidence.",
+        },
+        "objective_alignment": {
+            "primary_objective": objective_model.get("primary_objective"),
+            "completion_unit": objective_model.get("completion_unit"),
+            "valid_completion_signal": objective_model.get("valid_completion_signal"),
+            "minimum_report_threshold": objective_model.get("minimum_report_threshold"),
+            "coverage_policy": objective_model.get("coverage_policy"),
+            "lead_parking_policy": objective_model.get("lead_parking_policy"),
+            "role": objective_role,
+            "lead_satisfies_objective": lead_objective_satisfied,
+            "objective_blocker": objective_blocker,
         },
         "composite_score": composite_score,
         "decision": decision,
@@ -12656,6 +12718,7 @@ def build_bounty_harness_alignment(
     resource_snapshot: dict[str, Any] | None,
 ) -> dict[str, Any]:
     assessment_policy = assessment_mode_policy(profile)
+    objective_model = assessment_policy_objective_model(assessment_policy)
     ranking_strategy = lead_dossier_ranking_strategy(assessment_policy)
     resource_status = artifact_summary_status(resource_snapshot)
     hypothesis_summary = hypothesis_matrix.get("summary", {}) if isinstance(hypothesis_matrix.get("summary"), dict) else {}
@@ -12730,6 +12793,7 @@ def build_bounty_harness_alignment(
                 "business_logic_threads": business_summary.get("threads", 0),
                 "assessment_mode": assessment_policy.get("mode"),
                 "optimization_goal": assessment_policy.get("optimization_goal"),
+                "objective_model": objective_model,
             },
             (
                 "Refresh hypothesis-matrix and business-logic methodology mapping from current local artifacts."
@@ -12853,6 +12917,7 @@ def build_bounty_harness_alignment(
             "status_counts": dict(sorted(status_counts.items())),
             "assessment_mode": assessment_policy.get("mode"),
             "optimization_goal": assessment_policy.get("optimization_goal"),
+            "objective_model": objective_model,
             "lead_selection_strategy": ranking_strategy,
             "high_value_threads": len(high_value_threads),
             "gate_ready_threads": gate_ready_threads,
@@ -13753,6 +13818,7 @@ def lead_dossier_strict_validation_checklist(
     forbidden = normalize_string_list((thread.get("forbidden", []) or []))
     reportability_gate = str(thread.get("reportability_gate") or "")
     assessment_policy = assessment_mode_policy(profile)
+    objective_model = assessment_policy_objective_model(assessment_policy)
     assessment_mode_value = str(assessment_policy.get("mode") or "greybox")
     scope_status = "passed"
     if str(thread.get("status") or "").startswith("needs-scope"):
@@ -13862,6 +13928,7 @@ def lead_dossier_strict_validation_checklist(
                 "assessment_mode": assessment_mode_value,
                 "optimization_goal": assessment_policy.get("optimization_goal"),
                 "success_metric": assessment_policy.get("success_metric"),
+                "objective_model": objective_model,
                 "gate_ready": gate_ready,
                 "missing_requirements": missing_requirements,
                 "priority": thread.get("priority"),
@@ -41931,10 +41998,22 @@ def build_no_write_selftest() -> dict[str, Any]:
             "passed": (
                 greybox_assessment_policy.get("mode") == "greybox"
                 and greybox_assessment_policy.get("optimization_goal") == "maximize-dangerous-surface-coverage"
+                and greybox_assessment_policy.get("objective_model", {}).get("primary_objective")
+                == "dangerous-surface-coverage"
+                and greybox_assessment_policy.get("objective_model", {}).get("completion_unit")
+                == "all-dangerous-source-derived-surfaces"
+                and greybox_assessment_policy.get("objective_model", {}).get("coverage_policy")
+                == "continue-after-single-finding"
                 and "covered or explicitly closed"
                 in str(greybox_assessment_policy.get("success_metric") or "")
                 and blackbox_assessment_policy.get("mode") == "blackbox"
                 and blackbox_assessment_policy.get("optimization_goal") == "maximize-valid-high-bounty-finding"
+                and blackbox_assessment_policy.get("objective_model", {}).get("primary_objective")
+                == "valid-high-impact-bounty-report"
+                and blackbox_assessment_policy.get("objective_model", {}).get("completion_unit")
+                == "one-valid-medium-high-critical-report"
+                and blackbox_assessment_policy.get("objective_model", {}).get("coverage_policy")
+                == "coverage-secondary-after-dominant-bounty-path"
                 and "At least one" in str(blackbox_assessment_policy.get("success_metric") or "")
                 and any(
                     "expected payout" in str(item)
@@ -41992,6 +42071,22 @@ def build_no_write_selftest() -> dict[str, Any]:
                 == "dominant-bounty-focus"
                 and blackbox_ranked_sample[1].get("relative_focus", {}).get("role")
                 == "parked-behind-dominant-bounty-focus"
+                and greybox_ranked_sample[0].get("assessment_rank", {}).get("objective_alignment", {}).get(
+                    "completion_unit"
+                )
+                == "all-dangerous-source-derived-surfaces"
+                and blackbox_ranked_sample[0].get("assessment_rank", {}).get("objective_alignment", {}).get(
+                    "completion_unit"
+                )
+                == "one-valid-medium-high-critical-report"
+                and blackbox_ranked_sample[0].get("assessment_rank", {}).get("objective_alignment", {}).get(
+                    "lead_satisfies_objective"
+                )
+                is True
+                and blackbox_ranked_sample[1].get("assessment_rank", {}).get("objective_alignment", {}).get(
+                    "lead_satisfies_objective"
+                )
+                is False
                 and (
                     blackbox_ranked_sample[0].get("assessment_rank", {}).get("bounty_pressure", {}).get("score", 0)
                     >= blackbox_ranked_sample[0].get("assessment_rank", {}).get("coverage_pressure", {}).get("score", 0)
@@ -59642,10 +59737,16 @@ def run_methodology_review(args: argparse.Namespace) -> int:
         f"high_value_threads={summary.get('high_value_threads', 0)}"
     )
     if assessment_policy:
+        objective_model = (
+            assessment_policy.get("objective_model")
+            if isinstance(assessment_policy.get("objective_model"), dict)
+            else {}
+        )
         print(
             "Assessment policy: "
             f"mode={assessment_policy.get('mode') or '-'} "
             f"goal={assessment_policy.get('optimization_goal') or '-'} "
+            f"unit={objective_model.get('completion_unit') or '-'} "
             f"success={inline_summary_text(assessment_policy.get('success_metric'), max_chars=180)}"
         )
     if resource_preflight and resource_preflight.get("status") != "not-run":
@@ -59837,10 +59938,16 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
         f"closures={json.dumps(summary.get('closure_status_counts', {}), sort_keys=True)}"
     )
     if assessment_policy:
+        objective_model = (
+            assessment_policy.get("objective_model")
+            if isinstance(assessment_policy.get("objective_model"), dict)
+            else {}
+        )
         print(
             "Assessment policy: "
             f"mode={assessment_policy.get('mode') or '-'} "
             f"goal={assessment_policy.get('optimization_goal') or '-'} "
+            f"unit={objective_model.get('completion_unit') or '-'} "
             f"success={inline_summary_text(assessment_policy.get('success_metric'), max_chars=180)}"
         )
     for lead in (dossier.get("leads", []) or [])[: max(0, int(args.limit))]:
@@ -59882,6 +59989,11 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
                 if isinstance(assessment_rank.get("validity_pressure"), dict)
                 else {}
             )
+            objective_alignment = (
+                assessment_rank.get("objective_alignment")
+                if isinstance(assessment_rank.get("objective_alignment"), dict)
+                else {}
+            )
             relative_focus = (
                 lead.get("relative_focus")
                 if isinstance(lead.get("relative_focus"), dict)
@@ -59895,7 +60007,10 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
                 f"relative={relative_focus.get('role') or '-'} "
                 f"coverage={coverage_pressure.get('score')} "
                 f"bounty={bounty_pressure.get('score')} "
-                f"validity={validity_pressure.get('score')}"
+                f"validity={validity_pressure.get('score')} "
+                f"objective={objective_alignment.get('primary_objective') or '-'} "
+                f"unit={objective_alignment.get('completion_unit') or '-'} "
+                f"satisfies={objective_alignment.get('lead_satisfies_objective')}"
             )
         blocker = lead.get("current_blocker")
         if blocker:

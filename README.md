@@ -45,6 +45,10 @@ data-source switch:
   uncertain-scope, or high-traffic leads should be parked when a better
   high-confidence bounty lead exists.
 
+The active policy also carries a machine-readable `objective_model`: greybox's
+completion unit is `all-dangerous-source-derived-surfaces`, while blackbox's
+completion unit is `one-valid-medium-high-critical-report`.
+
 Target-specific routing, source references, Burp observation requests, enabled
 strategy sets, and cluster metadata are described by a target profile. The
 default profile is:
@@ -342,9 +346,12 @@ raises coverage pressure; in blackbox mode, gate-ready validity and expected
 payoff dominate. Blackbox lead sets also include `relative_focus`: when one
 dominant bounty candidate is strong enough, weaker broad-coverage leads are
 parked behind it until that candidate stalls or closes. Each lead also prints a
-strict validation checklist status for scope, attacker control, concrete impact,
-minimal evidence, safe reproduction, counter-evidence, severity/report path, and
-the active `assessment_mode` objective. The lead stays blocked before finding
+machine-readable `objective_alignment` showing the active objective, completion
+unit, and whether that lead satisfies the current mode's success condition, plus
+a strict validation checklist status for scope, attacker control, concrete
+impact, minimal evidence, safe reproduction, counter-evidence,
+severity/report path, and the active `assessment_mode` objective. The lead stays
+blocked before finding
 gate until all eight questions are satisfied. Transaction leads also print a
 `transaction-evidence-closure` plan
 that turns payload sidecar, candidate extraction, payload contract, intent
