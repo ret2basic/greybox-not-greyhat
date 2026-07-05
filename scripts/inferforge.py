@@ -25176,7 +25176,7 @@ def evidence_gap_followup_commands(
         return [
             validation_command_for_artifact_dir(
                 artifact_dir,
-                "burp-observation-coverage --no-write",
+                "burp-observation-coverage --no-write --show-clusters --show-actions",
                 profile=profile,
             )
         ]
@@ -29061,7 +29061,7 @@ def build_verification_queue(
         "ready",
         "medium",
         "Rebuilds the per-cluster view of Burp history coverage, generated observe flows, active observation paths, and review-only observation candidates.",
-        commands=[cmd("burp-observation-coverage --no-write")],
+        commands=[cmd("burp-observation-coverage --no-write --show-clusters --show-actions")],
         evidence_refs=[
             "burp-observation-coverage.json",
             "burp-history-observations.jsonl",
