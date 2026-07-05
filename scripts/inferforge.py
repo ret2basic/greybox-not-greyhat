@@ -159,6 +159,7 @@ EVIDENCE_PREP_STATUS_ARTIFACT = "evidence-prep-status.json"
 EVIDENCE_SIDECAR_DRAFTS_ARTIFACT = "evidence-sidecar-drafts.json"
 CLAIM_EVIDENCE_LEDGER_ARTIFACT = "claim-evidence-ledger.json"
 CLAIM_WITNESS_LADDER_ARTIFACT = "claim-witness-ladder.json"
+CLAIM_EVIDENCE_REQUESTS_ARTIFACT = "claim-evidence-requests.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -264,6 +265,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     EVIDENCE_SIDECAR_DRAFTS_ARTIFACT,
     CLAIM_EVIDENCE_LEDGER_ARTIFACT,
     CLAIM_WITNESS_LADDER_ARTIFACT,
+    CLAIM_EVIDENCE_REQUESTS_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -361,6 +363,7 @@ INDEX_ARTIFACT_ORDER = [
     EVIDENCE_SIDECAR_DRAFTS_ARTIFACT,
     CLAIM_EVIDENCE_LEDGER_ARTIFACT,
     CLAIM_WITNESS_LADDER_ARTIFACT,
+    CLAIM_EVIDENCE_REQUESTS_ARTIFACT,
     "config.json",
     "collection-summary.json",
     "endpoint-clusters.json",
@@ -21632,6 +21635,307 @@ def build_claim_witness_ladder(
     }
 
 
+def claim_evidence_request_key(row: dict[str, Any]) -> str:
+    for field in ["path", "artifact", "name"]:
+        text = str(row.get(field) or "").strip()
+        if text:
+            return repo_relative_or_absolute(evidence_sidecar_draft_output_path(text)) if "/" in text else text
+    return "unknown-evidence"
+
+
+def claim_evidence_request_draft_for_row(
+    row: dict[str, Any],
+    *,
+    draft_index: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    return (
+        draft_index.get(str(row.get("path") or ""))
+        or draft_index.get(str(row.get("artifact") or ""))
+        or draft_index.get(str(row.get("name") or ""))
+        or {}
+    )
+
+
+def claim_evidence_request_missing_details(row: dict[str, Any]) -> list[str]:
+    validation = row.get("validation") if isinstance(row.get("validation"), dict) else {}
+    details = []
+    for key in [
+        "first_missing_field",
+        "first_invalid_field",
+        "payload_contract_status",
+        "payload_contract_allows_decode",
+        "intent_policy_configured",
+        "intent_policy_valid",
+        "ready_for_decode",
+    ]:
+        value = validation.get(key)
+        if value is None or value == "" or value == []:
+            continue
+        details.append(f"{key}: {value}")
+    for key in ["missing_required_decisions", "package_missing_decision_ids", "intent_policy_issues"]:
+        for value in normalize_string_list(validation.get(key))[:8]:
+            details.append(f"{key}: {value}")
+    return ordered_unique_strings(details)
+
+
+def claim_evidence_request_guidance_from_draft(draft: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(draft, dict) or not draft:
+        return {}
+    context = draft.get("context") if isinstance(draft.get("context"), dict) else {}
+    preview = draft.get("content_preview")
+    guidance: dict[str, Any] = {
+        "draft_path": draft.get("draft_path"),
+        "draft_status": draft.get("draft_status"),
+        "content_kind": draft.get("content_kind"),
+        "instructions": normalize_string_list(draft.get("instructions"))[:8],
+        "after_filling_validation_commands": normalize_string_list(
+            draft.get("after_filling_validation_commands")
+        )[:6],
+        "context": context,
+        "finding_gate_boundary": draft.get("finding_gate_boundary"),
+    }
+    if isinstance(preview, dict):
+        evidence_items = preview.get("evidence_items") if isinstance(preview.get("evidence_items"), list) else []
+        if evidence_items:
+            guidance["operator_evidence_items"] = [
+                {
+                    "id": item.get("id"),
+                    "status": item.get("status"),
+                    "evidence_type": item.get("evidence_type"),
+                    "operator_evidence_needed": normalize_string_list(item.get("operator_evidence_needed"))[:4],
+                }
+                for item in evidence_items
+                if isinstance(item, dict)
+            ][:12]
+        for key in ["approval_required", "review_required"]:
+            if preview.get(key):
+                guidance[key] = preview.get(key)
+    elif isinstance(preview, list):
+        first = next((item for item in preview if isinstance(item, dict)), {})
+        if first.get("approval_required"):
+            guidance["approval_required"] = first.get("approval_required")
+        if first.get("review_required"):
+            guidance["review_required"] = first.get("review_required")
+    return guidance
+
+
+def claim_evidence_request_redaction_rules(category: str) -> list[str]:
+    common = [
+        "Do not include raw Burp history, cookies, bearer tokens, API keys, private keys, seed phrases, wallet signatures, or full raw response bodies.",
+        "Use short redacted summaries, field paths, reviewed source references, and non-secret identifiers only.",
+        "Keep placeholders or uncertain rows pending; pending rows do not satisfy finding gates.",
+    ]
+    by_category = {
+        "rewrite-response-sidecar": [
+            "Include one approved read-only response observation only after reviewing scope and impact.",
+            "Record status/content-type, impact indicators, JSON field paths, and a short redacted impact summary.",
+        ],
+        "transaction-payload-sidecar": [
+            "Include exactly one approved quote response or extracted base64 transaction payload for the intended flow.",
+            "Do not include wallet secrets, signatures, unrelated quote responses, or submitted transactions.",
+        ],
+        "transaction-intent-policy": [
+            "Use only the approved public wallet, direction, raw amount, source mint, and destination mint.",
+            "Add allowedPrograms only after explicit program allowlist review.",
+        ],
+        "operator-evidence": [
+            "Use redacted operator, provider, dashboard, ticket, billing, quota, deployment, or monitoring evidence.",
+            "Do not include provider API keys, bearer tokens, raw dashboards, raw logs, raw account identifiers, or secrets.",
+        ],
+    }
+    return ordered_unique_strings([*common, *by_category.get(category, [])])
+
+
+def build_claim_evidence_requests(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    ladder_doc: dict[str, Any] | None = None,
+    draft_doc: dict[str, Any] | None = None,
+    package_doc: dict[str, Any] | None = None,
+    package_path: Path | None = None,
+) -> dict[str, Any]:
+    package_file = package_path or artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT
+    if package_doc is None:
+        package_doc = load_optional_json(package_file) if package_file.exists() else None
+    if not isinstance(package_doc, dict):
+        package_doc = None
+    if ladder_doc is None:
+        ladder_doc = build_claim_witness_ladder(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            package_doc=package_doc,
+            package_path=package_file,
+        )
+    if draft_doc is None:
+        draft_doc = build_evidence_sidecar_drafts(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            package_doc=package_doc,
+            package_path=package_file,
+            draft_dir=artifact_dir / EVIDENCE_SIDECAR_DRAFT_DIR_NAME,
+        )
+    draft_index = claim_witness_ladder_draft_index(draft_doc if isinstance(draft_doc, dict) else {})
+    request_map: dict[str, dict[str, Any]] = {}
+    for ladder in ladder_doc.get("ladders", []) or []:
+        if not isinstance(ladder, dict):
+            continue
+        for evidence in ladder.get("required_evidence", []) or []:
+            if not isinstance(evidence, dict) or not claim_ledger_required_evidence_is_blocking(evidence):
+                continue
+            request_key = claim_evidence_request_key(evidence)
+            request = request_map.get(request_key)
+            draft = claim_evidence_request_draft_for_row(evidence, draft_index=draft_index)
+            category = str(evidence.get("category") or "unknown")
+            if not request:
+                request = {
+                    "id": f"REQ-{len(request_map) + 1:03d}-{safe_probe_id(Path(request_key).name)}",
+                    "official_evidence": {
+                        "artifact": evidence.get("artifact"),
+                        "path": evidence.get("path"),
+                        "name": evidence.get("name"),
+                        "category": category,
+                        "status": evidence.get("status"),
+                        "file_status": evidence.get("file_status"),
+                        "validator_status": evidence.get("validator_status"),
+                        "validation": evidence.get("validation") if isinstance(evidence.get("validation"), dict) else {},
+                    },
+                    "draft_assist": claim_evidence_request_guidance_from_draft(draft),
+                    "unblocks_claims": [],
+                    "entrypoints": [],
+                    "oracle_types": [],
+                    "impact_claims": [],
+                    "acceptance_criteria": [],
+                    "reject_if": [],
+                    "missing_or_invalid_details": [],
+                    "verification_commands": [],
+                    "redaction_rules": claim_evidence_request_redaction_rules(category),
+                    "request_status": "missing-official-evidence"
+                    if evidence.get("status") == "missing-evidence"
+                    else "invalid-official-evidence"
+                    if evidence.get("status") == "invalid-evidence"
+                    else "waiting-official-evidence-review"
+                    if not str(evidence.get("status") or "").startswith("ready-")
+                    else "official-evidence-ready",
+                    "finding_gate_boundary": (
+                        "This is an evidence request only. It is not evidence, not a PoC, and not a finding."
+                    ),
+                }
+                request_map[request_key] = request
+            claim_ref = {
+                "claim_id": ladder.get("claim_id"),
+                "entrypoint": ladder.get("entrypoint"),
+                "oracle_type": ladder.get("oracle_type"),
+                "impact_claim": ladder.get("impact_claim"),
+                "claim_readiness": ladder.get("claim_readiness"),
+                "next_stage": ladder.get("next_stage"),
+                "top_blocker": ladder.get("top_blocker"),
+            }
+            if claim_ref not in request["unblocks_claims"]:
+                request["unblocks_claims"].append(claim_ref)
+            for field, key in [
+                ("entrypoints", "entrypoint"),
+                ("oracle_types", "oracle_type"),
+                ("impact_claims", "impact_claim"),
+            ]:
+                value = str(ladder.get(key) or "").strip()
+                if value:
+                    request[field].append(value)
+            request["acceptance_criteria"].extend(normalize_string_list(ladder.get("acceptance_criteria")))
+            request["reject_if"].extend(normalize_string_list(ladder.get("reject_if")))
+            request["missing_or_invalid_details"].extend(claim_evidence_request_missing_details(evidence))
+            request["verification_commands"].extend(normalize_string_list(evidence.get("verification_commands")))
+
+    requests = []
+    for request in request_map.values():
+        request["entrypoints"] = ordered_unique_strings(request.get("entrypoints", []))
+        request["oracle_types"] = ordered_unique_strings(request.get("oracle_types", []))
+        request["impact_claims"] = ordered_unique_strings(request.get("impact_claims", []))
+        request["acceptance_criteria"] = ordered_unique_strings(request.get("acceptance_criteria", []))[:12]
+        request["reject_if"] = ordered_unique_strings(request.get("reject_if", []))[:12]
+        request["missing_or_invalid_details"] = ordered_unique_strings(request.get("missing_or_invalid_details", []))[:16]
+        request["verification_commands"] = ordered_unique_strings(request.get("verification_commands", []))[:8]
+        request["unblocks_claims"] = sorted(
+            request.get("unblocks_claims", []),
+            key=lambda item: str(item.get("claim_id") or ""),
+        )
+        request["claim_count"] = len(request["unblocks_claims"])
+        request["next_step"] = (
+            "Fill the draft from approved/redacted evidence, copy reviewed content into the official evidence path, "
+            "then run the first verification command."
+            if request.get("draft_assist")
+            else "Create a reviewed official evidence sidecar manually, then run the first verification command."
+        )
+        requests.append(request)
+    requests.sort(
+        key=lambda item: (
+            0 if item.get("request_status") in {"missing-official-evidence", "invalid-official-evidence"} else 1,
+            -int(item.get("claim_count") or 0),
+            str((item.get("official_evidence") or {}).get("name") or ""),
+        )
+    )
+    request_status_counts: dict[str, int] = {}
+    category_counts: dict[str, int] = {}
+    for request in requests:
+        increment_count(request_status_counts, str(request.get("request_status") or "unknown"))
+        official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
+        increment_count(category_counts, str(official.get("category") or "unknown"))
+    if not requests:
+        status = "no-evidence-requests"
+    elif request_status_counts.get("invalid-official-evidence"):
+        status = "ready-invalid-evidence-repair-requests"
+    elif request_status_counts.get("missing-official-evidence"):
+        status = "ready-missing-evidence-requests"
+    elif request_status_counts.get("waiting-official-evidence-review"):
+        status = "waiting-evidence-review"
+    else:
+        status = "official-evidence-ready"
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-claim-evidence-requests-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "assessment_policy": assessment_mode_policy(profile),
+        "finding_gate_ready": False,
+        "summary": {
+            "requests": len(requests),
+            "claims_unblocked": len(
+                {
+                    str(claim.get("claim_id") or "")
+                    for request in requests
+                    for claim in request.get("unblocks_claims", [])
+                    if isinstance(claim, dict)
+                }
+            ),
+            "request_status_counts": dict(sorted(request_status_counts.items())),
+            "category_counts": dict(sorted(category_counts.items())),
+            "draft_ready_requests": sum(1 for request in requests if request.get("draft_assist")),
+            "ladder_status": ladder_doc.get("status"),
+            "draft_status": draft_doc.get("status") if isinstance(draft_doc, dict) else None,
+        },
+        "requests": requests,
+        "claim_witness_ladder_status": ladder_doc.get("status"),
+        "evidence_sidecar_drafts_status": draft_doc.get("status") if isinstance(draft_doc, dict) else None,
+        "next_step": (
+            "Work the top request first; it unlocks the most blocked claims. Keep official sidecars approved and redacted only."
+            if requests
+            else "No evidence requests were produced; refresh claim-witness-ladder and evidence-prep-status."
+        ),
+        "finding_gate_boundary": (
+            "Evidence requests organize collection work only. They are not evidence, not a PoC, and not a finding."
+        ),
+        "safety": (
+            "Offline evidence request pack only. It reads local artifacts and draft metadata, sends no requests, invokes no Burp tools, "
+            "runs no scanners, signs no wallets, submits no transactions, and creates no official evidence sidecars."
+        ),
+    }
+
+
 VALIDATION_APPROVAL_PACKET_KEYS = [
     ("transaction_corpus_approval_packet", "transaction-corpus"),
     ("credential_impact_approval_packet", "credential-impact"),
@@ -22039,6 +22343,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     ORACLE_PLAN_ARTIFACT: "oracle-plan",
     CLAIM_EVIDENCE_LEDGER_ARTIFACT: "claim-evidence-ledger",
     CLAIM_WITNESS_LADDER_ARTIFACT: "claim-witness-ladder",
+    CLAIM_EVIDENCE_REQUESTS_ARTIFACT: "claim-evidence-requests",
     ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT: "oracle-plan --write-sidecar-template",
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT: "rewrite-response-review --write-sidecar-template",
     "finding-gate.json": "gate",
@@ -22076,6 +22381,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "oracle-plan",
     "claim-evidence-ledger",
     "claim-witness-ladder",
+    "claim-evidence-requests",
     "rewrite-response-review --write-sidecar-template",
     "report",
     "transaction-corpus-checklist --write-policy-template --skip-current-resource-check",
@@ -22098,6 +22404,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "oracle-plan": "oracle-plan --no-write",
     "claim-evidence-ledger": "claim-evidence-ledger --no-write",
     "claim-witness-ladder": "claim-witness-ladder --no-write",
+    "claim-evidence-requests": "claim-evidence-requests --no-write",
     "rewrite-response-review --write-sidecar-template": (
         "rewrite-response-review --no-write --show-sidecar-template-json"
     ),
@@ -46072,6 +46379,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("evidence-sidecar-drafts", "run_evidence_sidecar_drafts"),
         refresh_expectation("claim-evidence-ledger", "run_claim_evidence_ledger"),
         refresh_expectation("claim-witness-ladder", "run_claim_witness_ladder"),
+        refresh_expectation("claim-evidence-requests", "run_claim_evidence_requests"),
         refresh_expectation("iteration-decision", "run_iteration_decision"),
         refresh_expectation("collect", "run_collect"),
         refresh_expectation("burp-observe", "run_burp_observe", min_refreshes=3, min_prints=3),
@@ -56838,6 +57146,24 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for row in focused_iteration_claim_witness_ladder.get("ladders", []) or []
             if isinstance(row, dict)
         ]
+        focused_iteration_claim_evidence_requests = build_claim_evidence_requests(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_run_dir,
+            package_doc=focused_iteration_evidence_prep_package,
+            ladder_doc=focused_iteration_claim_witness_ladder,
+            draft_doc=focused_iteration_evidence_sidecar_drafts,
+        )
+        focused_iteration_claim_request_summary = (
+            focused_iteration_claim_evidence_requests.get("summary")
+            if isinstance(focused_iteration_claim_evidence_requests.get("summary"), dict)
+            else {}
+        )
+        focused_iteration_claim_request_rows = [
+            row
+            for row in focused_iteration_claim_evidence_requests.get("requests", []) or []
+            if isinstance(row, dict)
+        ]
         focused_iteration_preview_commands = [
             str(ref.get("command") or "")
             for action in focused_iteration_decision_sample.get("actions", [])
@@ -58152,6 +58478,36 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and all(
             "not a finding" in str(row.get("finding_gate_boundary") or "")
             for row in focused_iteration_claim_witness_rows
+        )
+        and focused_iteration_claim_evidence_requests.get("schema") == "inferforge-claim-evidence-requests-v1"
+        and focused_iteration_claim_evidence_requests.get("status") == "ready-missing-evidence-requests"
+        and focused_iteration_claim_request_summary.get("requests", 0) >= 3
+        and focused_iteration_claim_request_summary.get("claims_unblocked", 0) >= 3
+        and focused_iteration_claim_request_summary.get("draft_ready_requests", 0) >= 3
+        and focused_iteration_claim_evidence_requests.get("finding_gate_ready") is False
+        and any(
+            ((row.get("official_evidence") or {}).get("name") == "transaction-payloads.jsonl")
+            for row in focused_iteration_claim_request_rows
+            if isinstance(row.get("official_evidence"), dict)
+        )
+        and any(
+            ((row.get("official_evidence") or {}).get("name") == "transaction-intent-policy.json")
+            for row in focused_iteration_claim_request_rows
+            if isinstance(row.get("official_evidence"), dict)
+        )
+        and any(
+            ((row.get("official_evidence") or {}).get("name") == OPERATOR_EVIDENCE_ARTIFACT)
+            and int(row.get("claim_count") or 0) >= 1
+            for row in focused_iteration_claim_request_rows
+            if isinstance(row.get("official_evidence"), dict)
+        )
+        and all(
+            row.get("draft_assist") or row.get("verification_commands")
+            for row in focused_iteration_claim_request_rows
+        )
+        and all(
+            "not a finding" in str(row.get("finding_gate_boundary") or "")
+            for row in focused_iteration_claim_request_rows
         )
         and all(
             EVIDENCE_SIDECAR_DRAFT_DIR_NAME in str(row.get("draft_path") or "")
@@ -61569,6 +61925,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     "summary": focused_iteration_claim_witness_summary,
                     "ladders": focused_iteration_claim_witness_rows,
                     "finding_gate_ready": focused_iteration_claim_witness_ladder.get("finding_gate_ready"),
+                },
+                "claim_evidence_requests": {
+                    "status": focused_iteration_claim_evidence_requests.get("status"),
+                    "summary": focused_iteration_claim_request_summary,
+                    "requests": focused_iteration_claim_request_rows,
+                    "finding_gate_ready": focused_iteration_claim_evidence_requests.get("finding_gate_ready"),
                 },
                 "expected_commands": [
                     focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
@@ -69079,6 +69441,112 @@ def run_claim_witness_ladder(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_claim_evidence_requests(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    package_path = (
+        resolve_repo_path(args.package)
+        if getattr(args, "package", None)
+        else artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT
+    )
+    ladder_path = (
+        resolve_repo_path(args.ladder)
+        if getattr(args, "ladder", None)
+        else artifact_dir / CLAIM_WITNESS_LADDER_ARTIFACT
+    )
+    drafts_path = (
+        resolve_repo_path(args.drafts)
+        if getattr(args, "drafts", None)
+        else artifact_dir / EVIDENCE_SIDECAR_DRAFTS_ARTIFACT
+    )
+    ladder_doc = load_optional_json(ladder_path) if ladder_path.exists() else None
+    draft_doc = load_optional_json(drafts_path) if drafts_path.exists() else None
+    request_pack = build_claim_evidence_requests(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        package_path=package_path,
+        ladder_doc=ladder_doc if isinstance(ladder_doc, dict) else None,
+        draft_doc=draft_doc if isinstance(draft_doc, dict) else None,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / CLAIM_EVIDENCE_REQUESTS_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(request_pack))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="claim-evidence-requests",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = request_pack.get("summary", {}) if isinstance(request_pack.get("summary"), dict) else {}
+    print(f"Claim evidence requests: {request_pack.get('status')}")
+    print(
+        "Requests: "
+        f"total={summary.get('requests', 0)} "
+        f"claims_unblocked={summary.get('claims_unblocked', 0)} "
+        f"draft_ready={summary.get('draft_ready_requests', 0)} "
+        f"statuses={json.dumps(summary.get('request_status_counts', {}), sort_keys=True)}"
+    )
+    print(
+        "Inputs: "
+        f"ladder={summary.get('ladder_status') or '-'} "
+        f"drafts={summary.get('draft_status') or '-'} "
+        f"categories={json.dumps(summary.get('category_counts', {}), sort_keys=True)}"
+    )
+    if getattr(args, "show_requests", False):
+        display_limit = max(0, int(args.top))
+        for request in (request_pack.get("requests", []) or [])[:display_limit]:
+            if not isinstance(request, dict):
+                continue
+            official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
+            draft = request.get("draft_assist") if isinstance(request.get("draft_assist"), dict) else {}
+            print(
+                f"- {request.get('id')}: {request.get('request_status')} "
+                f"name={official.get('name') or '-'} "
+                f"category={official.get('category') or '-'} "
+                f"claims={request.get('claim_count', 0)} "
+                f"draft={draft.get('draft_status') or '-'}"
+            )
+            if draft.get("draft_path"):
+                print(f"  draft_path={draft.get('draft_path')}")
+            if request.get("entrypoints"):
+                print(f"  entrypoints={inline_summary_text(', '.join(request.get('entrypoints', [])[:4]), max_chars=260)}")
+            if request.get("missing_or_invalid_details"):
+                print(f"  detail={inline_summary_text(request.get('missing_or_invalid_details')[0], max_chars=260)}")
+            commands = normalize_string_list(request.get("verification_commands"))
+            if commands:
+                print(f"  verify={inline_summary_text(commands[0], max_chars=420)}")
+        remaining = len(request_pack.get("requests", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more request(s); rerun without --no-write to write the full request pack")
+            else:
+                print(f"- {remaining} more request(s) in {output_path}")
+    print(f"Next: {inline_summary_text(request_pack.get('next_step'), max_chars=380)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and request_pack.get("status") not in {
+        "ready-missing-evidence-requests",
+        "ready-invalid-evidence-repair-requests",
+        "waiting-evidence-review",
+    }:
+        return 1
+    return 0
+
+
 def run_iteration_decision(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -72256,6 +72724,61 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless every witness ladder is ready for finding-gate review.",
     )
     claim_witness_ladder.set_defaults(func=run_claim_witness_ladder)
+
+    claim_evidence_requests = sub.add_parser(
+        "claim-evidence-requests",
+        help="Build an offline request pack for the official evidence sidecars blocking claims",
+    )
+    claim_evidence_requests.add_argument(
+        "--package",
+        help=(
+            f"Evidence prep package to read. Defaults to --artifact-dir/{EVIDENCE_PREP_PACKAGE_ARTIFACT}."
+        ),
+    )
+    claim_evidence_requests.add_argument(
+        "--ladder",
+        help=(
+            f"Claim witness ladder to read when present. Defaults to --artifact-dir/{CLAIM_WITNESS_LADDER_ARTIFACT}."
+        ),
+    )
+    claim_evidence_requests.add_argument(
+        "--drafts",
+        help=(
+            f"Evidence sidecar drafts workbook to read when present. Defaults to --artifact-dir/{EVIDENCE_SIDECAR_DRAFTS_ARTIFACT}."
+        ),
+    )
+    claim_evidence_requests.add_argument(
+        "--output",
+        help=(
+            f"Where to write {CLAIM_EVIDENCE_REQUESTS_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{CLAIM_EVIDENCE_REQUESTS_ARTIFACT}."
+        ),
+    )
+    claim_evidence_requests.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of official evidence requests to print with --show-requests.",
+    )
+    claim_evidence_requests.add_argument(
+        "--show-requests",
+        action="store_true",
+        help="Print each official evidence request, draft path, and first verifier command.",
+    )
+    claim_evidence_requests.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print evidence requests only; do not write {CLAIM_EVIDENCE_REQUESTS_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    claim_evidence_requests.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless the evidence request pack has actionable official sidecar requests.",
+    )
+    claim_evidence_requests.set_defaults(func=run_claim_evidence_requests)
 
     iteration_decision = sub.add_parser(
         "iteration-decision",
