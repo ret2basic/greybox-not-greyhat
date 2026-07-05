@@ -16311,6 +16311,8 @@ def build_iteration_decision_from_plan(
     current_resource_snapshot: dict[str, Any] | None,
     limit: int,
 ) -> dict[str, Any]:
+    assessment_policy = assessment_mode_policy(profile)
+    lead_selection_strategy = lead_dossier_ranking_strategy(assessment_policy)
     commands = collect_iteration_command_sets(validation_plan)
     offline = sorted(commands["offline"], key=iteration_offline_command_priority)
     resource_checks = commands["resource_checks"]
@@ -16479,11 +16481,17 @@ def build_iteration_decision_from_plan(
         "profile": profile_summary(profile),
         "artifact_dir": str(artifact_dir),
         "mode": validation_plan.get("mode") or "single-run",
+        "assessment_policy": assessment_policy,
         "summary": {
             "validation_plan": validation_plan.get("status"),
             "artifact_health": artifact_health_status,
             "current_resource_snapshot": resource_status,
             "resource_budget_mode": resource_budget_mode,
+            "assessment_mode": assessment_policy.get("mode"),
+            "optimization_goal": assessment_policy.get("optimization_goal"),
+            "lead_selection_strategy": lead_selection_strategy,
+            "success_metric": assessment_policy.get("success_metric"),
+            "stop_condition": assessment_policy.get("stop_condition"),
             "offline_command_preview_limit": offline_preview_limit,
             "burp_history_count_limit": resource_budget.get("burp_history_count_limit"),
             "validation_items": len(validation_plan.get("items", []) or []),
@@ -48025,6 +48033,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and "top-secret" not in blackbox_validation_plan_text_sample
         and "AbC1234567890Token" not in blackbox_validation_plan_text_sample
         and blackbox_iteration_decision_sample.get("status") == "ready-offline"
+        and blackbox_iteration_decision_sample.get("assessment_policy", {}).get("mode") == "blackbox"
+        and blackbox_iteration_decision_sample.get("summary", {}).get("optimization_goal")
+        == "maximize-valid-high-bounty-finding"
+        and blackbox_iteration_decision_sample.get("summary", {}).get("lead_selection_strategy")
+        == "blackbox-bounty-first"
         and blackbox_iteration_decision_sample.get("summary", {}).get("offline_commands", 0) > 0
         and blackbox_iteration_decision_sample.get("summary", {}).get("active_after_resource_gate_commands", 0) > 0
         and blackbox_iteration_decision_sample.get("summary", {}).get("resource_blocked_active_commands", 0) > 0
@@ -57651,6 +57664,11 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
     resource_preflight = decision.get("resource_preflight", {}) or {}
     command_safety = summary.get("command_safety", {}) or {}
     blocked_command_safety = summary.get("blocked_command_safety", {}) or {}
+    assessment_policy = (
+        decision.get("assessment_policy")
+        if isinstance(decision.get("assessment_policy"), dict)
+        else {}
+    )
     print(f"Iteration decision: {decision['status']}")
     print(
         "Inputs: "
@@ -57659,6 +57677,14 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
         f"resource={summary.get('current_resource_snapshot')} "
         f"budget={summary.get('resource_budget_mode')}"
     )
+    if assessment_policy:
+        print(
+            "Optimization: "
+            f"mode={assessment_policy.get('mode') or '-'} "
+            f"goal={assessment_policy.get('optimization_goal') or '-'} "
+            f"selection={summary.get('lead_selection_strategy') or '-'} "
+            f"success={inline_summary_text(assessment_policy.get('success_metric'), max_chars=180)}"
+        )
     if resource_preflight and resource_preflight.get("status") != "not-run":
         warnings = resource_preflight.get("warnings", []) or []
         budget = resource_preflight.get("resource_budget", {}) or {}

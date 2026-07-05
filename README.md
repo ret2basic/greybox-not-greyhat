@@ -560,7 +560,11 @@ python3 scripts/inferforge.py --artifact-dir .greybox/target-set \
 
 The decision artifact is still read-only. It does not run the commands it
 prints; it exists so unattended loops can choose a safe next action without
-guessing from free-form text.
+guessing from free-form text. It also embeds and prints the active
+`assessment_mode` optimization policy: `greybox` keeps the loop
+coverage-first until dangerous source-derived surfaces are closed, while
+`blackbox` keeps the loop bounty-first and parks broad coverage work once a
+stronger valid high-impact report path exists.
 
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:
