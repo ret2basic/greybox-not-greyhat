@@ -13747,7 +13747,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "evidence-gaps": "evidence-gaps --no-write",
     "evidence-chain": "evidence-chain --no-write",
     "evidence-appendix": "evidence-appendix --no-write",
-    "gate": "gate --no-write",
+    "gate": "gate --no-write --show-items",
     "adjudicate": "adjudicate --no-write",
     "verification-queue": "verification-queue --no-write",
     "review-blockers": "review-blockers --no-write",
@@ -21683,12 +21683,12 @@ def build_transaction_corpus_checklist(
     )
     if reportability_review.get("ready_for_finding_gate"):
         post_decode_commands = [
-            validation_command_for_artifact_dir(artifact_dir, "gate --no-write", profile=profile),
+            validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
             validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
             validation_command_for_artifact_dir(artifact_dir, "evidence-chain --no-write", profile=profile),
         ]
     if reportability_review.get("ready_for_finding_gate"):
-        next_step = "Run gate --no-write to create a manual finding-gate review candidate for the decoded mismatch."
+        next_step = "Run gate --no-write --show-items to create a manual finding-gate review candidate for the decoded mismatch."
     elif status == "ready-to-decode":
         next_step = "Run decode-transactions with the matching policy template."
     elif status == "blocked-resource-needs-corpus":
@@ -21891,7 +21891,7 @@ def build_credential_impact_checklist(
     if provider_evidence_ready:
         followup_commands.extend(
             [
-                validation_command_for_artifact_dir(artifact_dir, "gate --no-write", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
                 validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
                 validation_command_for_artifact_dir(artifact_dir, "evidence-chain --no-write", profile=profile),
             ]
@@ -21961,7 +21961,7 @@ def build_credential_impact_checklist(
         "next_step": (
             "Collect missing provider/operator evidence before any active validation."
             if not provider_evidence_ready
-            else "Use gate --no-write and adjudicate --no-write to review provider impact evidence before reporting."
+            else "Use gate --no-write --show-items and adjudicate --no-write to review provider impact evidence before reporting."
         ),
         "safety": (
             "Offline provider-impact checklist only. It reads local review artifacts and /proc resource state, sends no "
@@ -34400,7 +34400,7 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                 and not gate_output_path_exists
                 and "response_sample" not in "\n".join(gate_stdout)
             ),
-            "expected": "gate --no-write imports rewrite-response-review candidate gates without writing finding-gate.json",
+            "expected": "gate --no-write --show-items imports rewrite-response-review candidate gates without writing finding-gate.json",
             "actual": {
                 "return_code": gate_return_code,
                 "stdout": gate_stdout,
@@ -43687,7 +43687,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and transaction_prepare_policy_sample.get("direction") == "buy"
         and transaction_prepare_policy_sample.get("amountIn") == "1000000"
         and transaction_prepare_policy_sample.get("wallet") == "EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR"
-        and " gate --no-write" in transaction_corpus_gate_commands
+                and " gate --no-write --show-items" in transaction_corpus_gate_commands
         and " adjudicate --no-write" in transaction_corpus_gate_commands
         and " evidence-chain --no-write" in transaction_corpus_gate_commands
     )
