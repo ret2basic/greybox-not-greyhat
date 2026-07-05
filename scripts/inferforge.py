@@ -10781,6 +10781,7 @@ def validation_allowed_commands(
     if hypothesis.get("type") == "transaction-flow-review" or hypothesis.get("impact") == "transaction-integrity":
         allowed_now_commands.insert(3, command("transaction-flow-review --no-write --top 8"))
         allowed_now_commands.insert(3, command("transaction-corpus-checklist --no-write --show-commands"))
+        allowed_now_commands.insert(3, command("transaction-sidecar-review --no-write --show-files --show-commands"))
     if hypothesis.get("type") == "credential-proxy-review" or hypothesis.get("impact") == "credentialed-upstream-cost-abuse":
         for subcommand in reversed(
             [
@@ -38385,6 +38386,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             )
             == "needs-cost-abuse-review"
             and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("static_signal_count", 0) >= 3
+            and any(
+                "transaction-sidecar-review --no-write --show-files --show-commands" in str(ref.get("command") or "")
+                for ref in rewrite_transaction_validation_item.get("allowed_now", []) or []
+                if isinstance(ref, dict)
+            )
             and rewrite_credential_proxy_validation_item is not None
             and rewrite_credential_proxy_validation_item.get("status") == "ready-offline"
             and rewrite_credential_proxy_validation_item.get("impact") == "credentialed-upstream-cost-abuse"
@@ -39384,6 +39390,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "verification_queue": strategy_external_queue,
         },
         sort_keys=True,
+    )
+    provider_neutral_quote_output_blob = provider_neutral_quote_output_blob.replace(
+        repo_relative_or_absolute(queue_artifact_dir),
+        "[artifact-dir]",
     )
     provider_neutral_quote_output_passed = (
         "m0" not in provider_neutral_quote_output_blob.lower()
