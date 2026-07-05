@@ -13654,12 +13654,26 @@ def rewrite_response_sidecar_template(
     profile: dict[str, Any] | None,
     *,
     example_path: str | None = None,
+    path_options: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    safe_path_options = [
+        option
+        for option in (path_options or [])
+        if isinstance(option, dict)
+        and is_safe_concrete_local_path(str(option.get("path") or ""))
+    ]
     template_path = example_path if is_safe_concrete_local_path(str(example_path or "")) else PLACEHOLDER_APPROVED_CONCRETE_PATH
+    if template_path == PLACEHOLDER_APPROVED_CONCRETE_PATH and safe_path_options:
+        template_path = str(safe_path_options[0].get("path") or template_path)
     return {
         "path": repo_relative_or_absolute(rewrite_response_sidecar_path(artifact_dir)),
         "format": "jsonl",
         "max_input_bytes": DEFAULT_REWRITE_RESPONSE_SIDECAR_INPUT_BYTES,
+        "path_options": safe_path_options[:10],
+        "selection_rule": (
+            "Choose exactly one reviewed in-scope read-only path from path_options, "
+            "then set approved=true only for that one response."
+        ),
         "line_template": {
             "approved": True,
             "method": "GET",
@@ -13684,6 +13698,70 @@ def rewrite_response_sidecar_template(
         ],
         "profile": profile_summary(profile),
     }
+
+
+def rewrite_response_sidecar_path_options(items: list[dict[str, Any]], *, limit: int = 10) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_option(
+        *,
+        item: dict[str, Any],
+        path: str,
+        method: str = "GET",
+        source_ref: Any = None,
+        sensitivity: dict[str, Any] | None = None,
+        source: str,
+    ) -> None:
+        if not is_safe_concrete_local_path(path):
+            return
+        key = (method.upper(), path)
+        if key in seen:
+            return
+        seen.add(key)
+        options.append(
+            {
+                "method": method.upper(),
+                "path": path,
+                "priority": item.get("priority"),
+                "cluster_id": item.get("cluster_id"),
+                "rewrite_review_id": item.get("rewrite_review_id"),
+                "source_ref": source_ref,
+                "sensitivity": sensitivity or rewrite_path_candidate_sensitivity(path),
+                "source": source,
+            }
+        )
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for contract in item.get("observation_contracts", []) or []:
+            if not isinstance(contract, dict):
+                continue
+            add_option(
+                item=item,
+                method=str(contract.get("method") or "GET"),
+                path=str(contract.get("path") or ""),
+                source_ref=contract.get("source_ref"),
+                sensitivity=(
+                    contract.get("path_sensitivity")
+                    if isinstance(contract.get("path_sensitivity"), dict)
+                    else None
+                ),
+                source="observation-contract",
+            )
+            if len(options) >= max(1, int(limit)):
+                return options[: max(1, int(limit))]
+        for path in item.get("approved_path_candidates", []) or []:
+            add_option(
+                item=item,
+                path=str(path),
+                source_ref=None,
+                source="approved-path-candidate",
+            )
+            if len(options) >= max(1, int(limit)):
+                return options[: max(1, int(limit))]
+    return options[: max(1, int(limit))]
 
 
 def rewrite_response_sidecar_file_status(path: Path) -> dict[str, Any]:
@@ -14031,6 +14109,7 @@ def build_rewrite_response_review(
             ),
             None,
         )
+    sidecar_path_options = rewrite_response_sidecar_path_options(items)
     return {
         "generated_at": utc_now(),
         "status": status,
@@ -14060,6 +14139,7 @@ def build_rewrite_response_review(
             artifact_dir,
             profile,
             example_path=sidecar_template_path,
+            path_options=sidecar_path_options,
         ),
         "artifact_refs": {
             "burp_history": "burp-history-observations.jsonl",
@@ -36746,6 +36826,16 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             if isinstance(item, dict)
         ]
         no_history_contract_text = json.dumps(no_history_contracts, sort_keys=True)
+        no_history_sidecar_template = (
+            no_history_review.get("sidecar_template")
+            if isinstance(no_history_review.get("sidecar_template"), dict)
+            else {}
+        )
+        no_history_sidecar_path_options = [
+            item
+            for item in no_history_sidecar_template.get("path_options", []) or []
+            if isinstance(item, dict)
+        ]
         precheck_artifact_dir = root / "precheck-artifacts"
         append_jsonl(
             precheck_artifact_dir / "burp-history-observations.jsonl",
@@ -37002,6 +37092,24 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             "expected": "missing approved rewrite responses expose a single-path observation contract with gated observe/review steps",
             "actual": {
                 "contracts": no_history_contracts,
+            },
+        },
+        {
+            "id": "sidecar-template-includes-approved-path-options",
+            "passed": (
+                (no_history_sidecar_template.get("line_template") or {}).get("path") == approved_path
+                and no_history_sidecar_path_options
+                and no_history_sidecar_path_options[0].get("path") == approved_path
+                and no_history_sidecar_path_options[0].get("cluster_id") == "no-write-rewrite"
+                and no_history_sidecar_path_options[0].get("source") == "observation-contract"
+                and "Choose exactly one reviewed in-scope read-only path"
+                in str(no_history_sidecar_template.get("selection_rule") or "")
+            ),
+            "expected": "rewrite response sidecar template lists reviewed path options while defaulting to one approved path",
+            "actual": {
+                "line_template": no_history_sidecar_template.get("line_template"),
+                "path_options": no_history_sidecar_path_options,
+                "selection_rule": no_history_sidecar_template.get("selection_rule"),
             },
         },
         {
