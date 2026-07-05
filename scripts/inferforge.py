@@ -34095,6 +34095,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                     str(root),
                     "source-peek-requests",
                     "--no-write",
+                    "--show-details",
                 ]
             )
             evidence_gaps_return_code, evidence_gaps_stdout = run_cli(
@@ -34125,6 +34126,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                     str(root),
                     "burp-observation-coverage",
                     "--no-write",
+                    "--show-clusters",
+                    "--show-actions",
                 ]
             )
             report_return_code, report_stdout = run_cli(
@@ -35107,6 +35110,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 burp_observation_coverage_return_code in {0, 1}
                 and "Burp observation coverage:" in burp_observation_coverage_stdout_text
                 and "Clusters:" in burp_observation_coverage_stdout_text
+                and "Observation clusters:" in burp_observation_coverage_stdout_text
+                and "next=" in burp_observation_coverage_stdout_text
                 and "No files written (--no-write)." in burp_observation_coverage_stdout
                 and not any(
                     output_paths[key]
@@ -47541,6 +47546,35 @@ def run_burp_observation_coverage(args: argparse.Namespace) -> int:
         f"{coverage['summary']['clusters']} total, "
         f"status_counts={json.dumps(coverage['summary']['status_counts'], sort_keys=True)}"
     )
+    if args.show_clusters:
+        print("Observation clusters:")
+        for row in (coverage.get("clusters", []) or [])[: max(0, int(args.top))]:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('cluster_id')} {row.get('status')} "
+                f"kind={row.get('kind') or '-'} priority={row.get('priority') or '-'} "
+                f"active={row.get('active_observation_count', 0)} "
+                f"review_candidates={row.get('review_candidate_count', 0)}"
+            )
+            if args.show_actions and row.get("next_action"):
+                print(f"  next={inline_summary_text(row.get('next_action'), max_chars=260)}")
+            if args.show_actions and row.get("active_observations"):
+                for observation in (row.get("active_observations", []) or [])[:3]:
+                    if not isinstance(observation, dict):
+                        continue
+                    print(
+                        "  observe="
+                        f"{observation.get('method') or '-'} {observation.get('path') or '-'} "
+                        f"id={observation.get('id') or '-'}"
+                    )
+            if args.show_actions and row.get("review_candidate_ids"):
+                print(f"  review_candidates={','.join(str(item) for item in row.get('review_candidate_ids', [])[:5])}")
+            if args.show_actions and row.get("evidence_gaps"):
+                print(f"  evidence_gaps={','.join(str(item) for item in row.get('evidence_gaps', [])[:5])}")
+        total_clusters = len(coverage.get("clusters", []) or [])
+        if total_clusters > max(0, int(args.top)):
+            print(f"- ... +{total_clusters - max(0, int(args.top))} more cluster(s)")
     if no_write:
         print("No files written (--no-write).")
     else:
@@ -48091,6 +48125,21 @@ def run_source_peek_requests(args: argparse.Namespace) -> int:
             f"clusters={','.join(item.get('cluster_ids', []) or []) or '-'} "
             f"entrypoint={inline_summary_text(item.get('entrypoint'), max_chars=120)}"
         )
+        if args.show_details:
+            if item.get("reason"):
+                print(f"  reason={inline_summary_text(item.get('reason'), max_chars=220)}")
+            questions = [str(value) for value in item.get("questions", []) or [] if str(value).strip()]
+            for question in questions[:3]:
+                print(f"  question={inline_summary_text(question, max_chars=220)}")
+            source_refs = [str(value) for value in item.get("source_refs", []) or [] if str(value).strip()]
+            if source_refs:
+                print(f"  source_refs={','.join(source_refs[:6])}")
+            if item.get("review_candidate_ids"):
+                print(f"  review_candidates={','.join(str(value) for value in item.get('review_candidate_ids', [])[:6])}")
+            if item.get("answer_artifact"):
+                print(f"  answer_artifact={item.get('answer_artifact')}")
+            if item.get("safety"):
+                print(f"  safety={inline_summary_text(item.get('safety'), max_chars=220)}")
     if no_write:
         print("No files written (--no-write).")
     else:
@@ -53749,6 +53798,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recompute Burp browser observation coverage from current artifacts",
     )
     burp_observation_coverage.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of clusters to print when --show-clusters is used.",
+    )
+    burp_observation_coverage.add_argument(
+        "--show-clusters",
+        action="store_true",
+        help="Print per-cluster Burp observation coverage rows.",
+    )
+    burp_observation_coverage.add_argument(
+        "--show-actions",
+        action="store_true",
+        help="Print next actions, active observations, review candidates, and linked evidence gaps.",
+    )
+    burp_observation_coverage.add_argument(
         "--no-write",
         action="store_true",
         help="Print Burp observation coverage only; do not write burp-observation-coverage.json or refreshed manifests.",
@@ -53893,6 +53958,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         default=8,
         help="Number of requests to print in the CLI summary.",
+    )
+    source_peek_requests.add_argument(
+        "--show-details",
+        action="store_true",
+        help="Print request rationale, questions, source refs, answer artifact, and safety notes.",
     )
     source_peek_requests.add_argument(
         "--no-write",
