@@ -461,9 +461,12 @@ a reportable issue.
 `rewrite-response-review --no-write --show-observation-contract --show-sidecar-template-json`
 prints the single approved-path promotion, resource-gate, Burp observe,
 response-review, and finding-gate preview sequence without sending requests.
-It also prints a redacted `rewrite-response-sidecar.jsonl` template for the
-case where a reviewer has one approved response shape but does not want to keep
-raw Burp history or a full response body in artifacts.
+It also prints a compact single-request approval packet with the recommended
+read-only path, sensitivity score, redacted sidecar fields, resource-gated active
+steps, and remaining finding-gate blockers. The same command prints a redacted
+`rewrite-response-sidecar.jsonl` template for the case where a reviewer has one
+approved response shape but does not want to keep raw Burp history or a full
+response body in artifacts.
 If `endpoint-clusters.json` or the target profile does not list a static
 `next.config.*` rewrite, `rewrite-review`, `hypothesis-matrix`, and
 `validation-plan` can still merge source-discovered rewrite-proxy clusters into

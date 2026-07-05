@@ -14774,6 +14774,125 @@ def rewrite_response_sidecar_template(
     }
 
 
+def rewrite_response_single_request_approval_packet(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    path_options: list[dict[str, Any]],
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    safe_options = [
+        option
+        for option in path_options
+        if isinstance(option, dict)
+        and is_safe_concrete_local_path(str(option.get("path") or ""))
+    ]
+    recommended = safe_options[0] if safe_options else {}
+    recommended_path = str(recommended.get("path") or "")
+    matching_contract = None
+    if recommended_path:
+        for item in items:
+            for contract in item.get("observation_contracts", []) or []:
+                if isinstance(contract, dict) and str(contract.get("path") or "") == recommended_path:
+                    matching_contract = contract
+                    break
+            if matching_contract:
+                break
+    contract_commands = (
+        matching_contract.get("commands", [])
+        if isinstance(matching_contract, dict) and isinstance(matching_contract.get("commands"), list)
+        else []
+    )
+
+    def contract_command(command_id: str) -> str | None:
+        for row in contract_commands:
+            if isinstance(row, dict) and row.get("id") == command_id:
+                command = str(row.get("command") or "").strip()
+                if command:
+                    return command
+        return None
+
+    status = "ready-offline-approval" if recommended_path else "waiting-for-reviewed-read-only-path"
+    return {
+        "status": status,
+        "recommended_request": {
+            "method": str(recommended.get("method") or "GET") if recommended else None,
+            "path": recommended_path or None,
+            "source_ref": recommended.get("source_ref") if recommended else None,
+            "source": recommended.get("source") if recommended else None,
+            "sensitivity": recommended.get("sensitivity") if isinstance(recommended.get("sensitivity"), dict) else {},
+        },
+        "path_options_considered": len(safe_options),
+        "sidecar_path": repo_relative_or_absolute(rewrite_response_sidecar_path(artifact_dir)),
+        "redacted_sidecar_required_fields": [
+            "approved=true for exactly one reviewed in-scope read-only path",
+            "method and path matching the recommended request",
+            "HTTP status and content_type",
+            "impact_indicators chosen from the accepted rewrite response indicators",
+            "sensitive_field_markers or json_field_paths with field names only",
+            "short redacted impact_summary with no raw response body",
+            "reviewer/source reference that contains no secrets",
+        ],
+        "offline_commands": [
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND,
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "rewrite-validation-checklist --no-write --show-candidates --show-commands",
+                profile=profile,
+            ),
+        ],
+        "approval_sequence": [
+            {
+                "id": "promotion-preview",
+                "status": "ready" if contract_command("promotion-preview") else "waiting",
+                "command": contract_command("promotion-preview"),
+            },
+            {
+                "id": "promotion-write",
+                "status": "manual-after-preview" if contract_command("promotion-write") else "waiting",
+                "command": contract_command("promotion-write"),
+            },
+            {
+                "id": "resource-gate",
+                "status": "blocked-until-healthy-resource-snapshot"
+                if contract_command("resource-gate")
+                else "waiting",
+                "command": contract_command("resource-gate"),
+            },
+            {
+                "id": "single-burp-observe",
+                "status": "blocked-until-promotion-and-healthy-resource-gate"
+                if contract_command("single-burp-observe")
+                else "waiting",
+                "command": contract_command("single-burp-observe"),
+            },
+            {
+                "id": "response-review",
+                "status": "ready-after-redacted-observation",
+                "command": contract_command("response-review")
+                or validation_command_for_artifact_dir(
+                    artifact_dir,
+                    REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND,
+                    profile=profile,
+                ),
+            },
+        ],
+        "finding_gate_blockers": [
+            "No approved redacted response observation is present yet.",
+            "No concrete sensitive-data, path-confusion, authorization-bypass, tenant-data, or wallet/account-data impact indicator is present yet.",
+            "Finding-gate/adjudication must still accept the concrete impact before any Medium/High/Critical report.",
+        ],
+        "safety": (
+            "Offline approval packet only. It selects one reviewed candidate and prints the exact gated sequence; "
+            "it sends no requests, invokes no Burp tools, reads no raw history, and does not approve active validation."
+        ),
+    }
+
+
 def rewrite_response_sidecar_path_options(items: list[dict[str, Any]], *, limit: int = 10) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -15184,6 +15303,23 @@ def build_rewrite_response_review(
             None,
         )
     sidecar_path_options = rewrite_response_sidecar_path_options(items)
+    sidecar_template = rewrite_response_sidecar_template(
+        artifact_dir,
+        profile,
+        example_path=sidecar_template_path,
+        path_options=sidecar_path_options,
+    )
+    approval_packet = rewrite_response_single_request_approval_packet(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        path_options=sidecar_path_options,
+        items=items,
+    )
+    recommended_request = (
+        approval_packet.get("recommended_request")
+        if isinstance(approval_packet.get("recommended_request"), dict)
+        else {}
+    )
     return {
         "generated_at": utc_now(),
         "status": status,
@@ -15202,6 +15338,8 @@ def build_rewrite_response_review(
             "manual_impact_review_hints": manual_impact_review_hint_count,
             "observation_contracts": observation_contract_count,
             "followup_commands": len(ordered_unique_strings(followup_commands)),
+            "approval_packet_status": approval_packet.get("status"),
+            "recommended_single_request_path": recommended_request.get("path"),
             "endpoint_clusters_source": endpoint_clusters_source,
             "rewrite_review": rewrite_review.get("status"),
         },
@@ -15209,12 +15347,8 @@ def build_rewrite_response_review(
         "followup_commands": ordered_unique_strings(followup_commands),
         "sidecar_path": repo_relative_or_absolute(sidecar_path),
         "sidecar_file": sidecar_status,
-        "sidecar_template": rewrite_response_sidecar_template(
-            artifact_dir,
-            profile,
-            example_path=sidecar_template_path,
-            path_options=sidecar_path_options,
-        ),
+        "sidecar_template": sidecar_template,
+        "single_request_approval_packet": approval_packet,
         "artifact_refs": {
             "burp_history": "burp-history-observations.jsonl",
             "rewrite_response_sidecar": REWRITE_RESPONSE_SIDECAR_ARTIFACT,
@@ -38599,6 +38733,20 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             for item in no_history_sidecar_template.get("path_options", []) or []
             if isinstance(item, dict)
         ]
+        no_history_approval_packet = (
+            no_history_review.get("single_request_approval_packet")
+            if isinstance(no_history_review.get("single_request_approval_packet"), dict)
+            else {}
+        )
+        no_history_approval_request = (
+            no_history_approval_packet.get("recommended_request")
+            if isinstance(no_history_approval_packet.get("recommended_request"), dict)
+            else {}
+        )
+        no_history_approval_sequence_text = json.dumps(
+            no_history_approval_packet.get("approval_sequence", []),
+            sort_keys=True,
+        )
         precheck_artifact_dir = root / "precheck-artifacts"
         append_jsonl(
             precheck_artifact_dir / "burp-history-observations.jsonl",
@@ -38874,6 +39022,30 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                 "path_options": no_history_sidecar_path_options,
                 "selection_rule": no_history_sidecar_template.get("selection_rule"),
             },
+        },
+        {
+            "id": "missing-approved-response-emits-single-request-approval-packet",
+            "passed": (
+                no_history_approval_packet.get("status") == "ready-offline-approval"
+                and no_history_approval_request.get("path") == approved_path
+                and no_history_approval_request.get("method") == "GET"
+                and (no_history_approval_request.get("sensitivity") or {}).get("priority") == "high"
+                and no_history_approval_packet.get("path_options_considered") == 1
+                and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict"
+                in no_history_approval_sequence_text
+                and "burp-sync --observe --replace --count 1" in no_history_approval_sequence_text
+                and any(
+                    "No approved redacted response observation"
+                    in str(item)
+                    for item in no_history_approval_packet.get("finding_gate_blockers", []) or []
+                )
+                and any(
+                    "impact_indicators" in str(item)
+                    for item in no_history_approval_packet.get("redacted_sidecar_required_fields", []) or []
+                )
+            ),
+            "expected": "missing approved rewrite responses expose a compact single-request approval packet with resource-gated active steps",
+            "actual": no_history_approval_packet,
         },
         {
             "id": "approved-sensitive-response-enters-candidate-impact-review",
@@ -54692,6 +54864,29 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
         f"contracts={summary.get('observation_contracts', 0)} "
         f"statuses={json.dumps(summary.get('status_counts', {}), sort_keys=True)}"
     )
+    approval_packet = (
+        review.get("single_request_approval_packet")
+        if isinstance(review.get("single_request_approval_packet"), dict)
+        else {}
+    )
+    approval_request = (
+        approval_packet.get("recommended_request")
+        if isinstance(approval_packet.get("recommended_request"), dict)
+        else {}
+    )
+    if approval_packet:
+        sensitivity = (
+            approval_request.get("sensitivity")
+            if isinstance(approval_request.get("sensitivity"), dict)
+            else {}
+        )
+        print(
+            "Approval packet: "
+            f"status={approval_packet.get('status')} "
+            f"recommended={approval_request.get('method') or '-'} {approval_request.get('path') or '-'} "
+            f"sensitivity={sensitivity.get('priority') or 'unknown'}:{sensitivity.get('score', 0)} "
+            f"blockers={len(approval_packet.get('finding_gate_blockers', []) or [])}"
+        )
     for item in (review.get("items", []) or [])[: max(0, int(args.top))]:
         print(
             f"- {item.get('priority')} {item.get('status')} "
