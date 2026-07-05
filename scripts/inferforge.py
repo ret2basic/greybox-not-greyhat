@@ -91,7 +91,7 @@ TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND = (
 )
 REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND = (
     "rewrite-response-review --no-write --show-observations --show-commands "
-    "--show-observation-contract --show-sidecar-template-json"
+    "--show-observation-contract --show-sidecar-template-json --show-sidecar-validation"
 )
 QUOTE_TRANSACTION_CORPUS_CONTRACT_NEXT_STEP = (
     "Prepare or approve one quote response or extracted transaction payload sidecar, then run "
@@ -12982,7 +12982,7 @@ OBJECTIVE_UNBLOCKER_EVIDENCE_PACKAGES: dict[str, dict[str, Any]] = {
         "id": "single-approved-response-evidence-package",
         "required_artifacts": ["rewrite-response-sidecar.jsonl", "rewrite-response-review.json"],
         "safe_offline_reviews": [
-            "rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract --show-sidecar-template-json",
+            REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND,
             "rewrite-validation-checklist --no-write --show-candidates --show-commands",
         ],
         "active_validation_gate": (
@@ -18166,6 +18166,201 @@ def rewrite_response_sidecar_field_markers(row: dict[str, Any]) -> list[dict[str
     return markers[:20]
 
 
+def rewrite_response_sidecar_raw_field_keys(row: dict[str, Any]) -> list[str]:
+    return [
+        key
+        for key in ["body", "body_sample", "body_text", "raw", "raw_body", "response_sample"]
+        if key in row
+    ]
+
+
+def rewrite_response_sidecar_accepted_indicators(row: dict[str, Any]) -> list[str]:
+    return [
+        indicator
+        for indicator in normalize_string_list(row.get("impact_indicators"))
+        if indicator in REWRITE_RESPONSE_SIDECAR_IMPACT_INDICATORS
+    ]
+
+
+def rewrite_response_sidecar_row_validation(
+    row: dict[str, Any],
+    *,
+    row_index: int,
+    approved_option_keys: set[tuple[str, str]],
+    approved_option_paths: set[str],
+) -> dict[str, Any]:
+    line_number = int(row.get("_sidecar_line") or row_index)
+    error = str(row.get("_sidecar_error") or "")
+    method = str(row.get("method") or "GET").upper()
+    path = str(row.get("path") or "")
+    approved = row.get("approved") is True
+    raw_field_keys = rewrite_response_sidecar_raw_field_keys(row)
+    warnings = [f"remove-raw-response-field:{key}" for key in raw_field_keys]
+    missing_fields: list[str] = []
+    invalid_fields: list[str] = []
+    if error:
+        return {
+            "line": line_number,
+            "status": "invalid-json-row",
+            "approved": approved,
+            "method": method,
+            "path": path,
+            "missing_fields": [],
+            "invalid_fields": [error],
+            "warnings": warnings,
+        }
+    if not approved:
+        return {
+            "line": line_number,
+            "status": "ignored-unapproved-row",
+            "approved": False,
+            "method": method,
+            "path": path,
+            "missing_fields": [],
+            "invalid_fields": [],
+            "warnings": warnings,
+        }
+    if method not in {"GET", "HEAD"}:
+        invalid_fields.append("method must be GET or HEAD for a read-only rewrite response sidecar")
+    if not is_safe_concrete_local_path(path):
+        invalid_fields.append("path must be a concrete safe local path")
+    elif approved_option_keys and (method, path) not in approved_option_keys and path not in approved_option_paths:
+        invalid_fields.append("path must match one reviewed in-scope read-only path option")
+    status = row.get("status")
+    if not isinstance(status, int):
+        missing_fields.append("status integer")
+    elif not 200 <= status < 300:
+        invalid_fields.append("status must be a 2xx response")
+    if not str(row.get("content_type") or "").strip():
+        missing_fields.append("content_type")
+    accepted_indicators = rewrite_response_sidecar_accepted_indicators(row)
+    if not accepted_indicators:
+        missing_fields.append("impact_indicators from accepted rewrite response indicators")
+    field_markers = rewrite_response_sidecar_field_markers(row)
+    json_field_paths = [field for field in normalize_string_list(row.get("json_field_paths")) if field.startswith("$")]
+    if not field_markers and not json_field_paths:
+        missing_fields.append("sensitive_field_markers or json_field_paths with field names only")
+    impact_summary = str(row.get("impact_summary") or "").strip()
+    if not impact_summary:
+        missing_fields.append("impact_summary")
+    elif contains_unredacted_secret_text(impact_summary):
+        warnings.append("redact-secret-like-impact-summary")
+    reviewer_ref = str(row.get("reviewer") or row.get("source") or row.get("ticket") or "").strip()
+    if not reviewer_ref:
+        missing_fields.append("reviewer, source, or ticket reference")
+    elif contains_unredacted_secret_text(reviewer_ref):
+        warnings.append("redact-secret-like-review-reference")
+    return {
+        "line": line_number,
+        "status": "invalid-approved-row" if missing_fields or invalid_fields else "valid-candidate-row",
+        "approved": True,
+        "method": method,
+        "path": path,
+        "missing_fields": missing_fields,
+        "invalid_fields": invalid_fields,
+        "warnings": warnings,
+        "accepted_impact_indicators": accepted_indicators,
+        "field_marker_count": len(field_markers),
+        "json_field_path_count": len(json_field_paths),
+    }
+
+
+def rewrite_response_sidecar_validation_review(
+    *,
+    sidecar_path: Path,
+    sidecar_file: dict[str, Any],
+    sidecar_rows: list[dict[str, Any]],
+    path_options: list[dict[str, Any]],
+) -> dict[str, Any]:
+    file_status = str(sidecar_file.get("status") or "missing")
+    approved_option_keys = {
+        (str(option.get("method") or "GET").upper(), str(option.get("path") or ""))
+        for option in path_options
+        if isinstance(option, dict) and is_safe_concrete_local_path(str(option.get("path") or ""))
+    }
+    approved_option_paths = {path for _method, path in approved_option_keys}
+    if file_status != "present":
+        return {
+            "status": file_status,
+            "path": repo_relative_or_absolute(sidecar_path),
+            "rows": [],
+            "row_count": 0,
+            "approved_rows": 0,
+            "valid_candidate_rows": 0,
+            "invalid_rows": 0,
+            "warning_rows": 0,
+            "path_options": len(path_options),
+            "first_missing_field": "rewrite-response-sidecar.jsonl" if file_status == "missing" else None,
+            "first_invalid_field": None if file_status == "missing" else f"sidecar file status is {file_status}",
+        }
+    row_reviews = [
+        rewrite_response_sidecar_row_validation(
+            row,
+            row_index=index,
+            approved_option_keys=approved_option_keys,
+            approved_option_paths=approved_option_paths,
+        )
+        for index, row in enumerate(sidecar_rows, start=1)
+        if isinstance(row, dict)
+    ]
+    approved_rows = [row for row in row_reviews if row.get("approved")]
+    invalid_rows = [
+        row
+        for row in row_reviews
+        if str(row.get("status") or "").startswith("invalid")
+        or row.get("missing_fields")
+        or row.get("invalid_fields")
+    ]
+    warning_rows = [row for row in row_reviews if row.get("warnings")]
+    valid_candidate_rows = [row for row in row_reviews if row.get("status") == "valid-candidate-row"]
+    global_errors = []
+    if not sidecar_rows:
+        global_errors.append("sidecar has no JSONL rows")
+    if len(approved_rows) != 1:
+        global_errors.append("approved=true must appear on exactly one reviewed row")
+    if invalid_rows or global_errors:
+        status = "invalid"
+    elif valid_candidate_rows:
+        status = "valid-candidate-impact"
+    else:
+        status = "waiting-approved-impact-row"
+    first_missing_field = next(
+        (
+            str(row.get("missing_fields", [])[0])
+            for row in row_reviews
+            if row.get("missing_fields")
+        ),
+        None,
+    )
+    first_invalid_field = global_errors[0] if global_errors else next(
+        (
+            str(row.get("invalid_fields", [])[0])
+            for row in row_reviews
+            if row.get("invalid_fields")
+        ),
+        None,
+    )
+    return {
+        "status": status,
+        "path": repo_relative_or_absolute(sidecar_path),
+        "row_count": len(sidecar_rows),
+        "approved_rows": len(approved_rows),
+        "valid_candidate_rows": len(valid_candidate_rows),
+        "invalid_rows": len(invalid_rows) + len(global_errors),
+        "warning_rows": len(warning_rows),
+        "path_options": len(path_options),
+        "first_missing_field": first_missing_field,
+        "first_invalid_field": first_invalid_field,
+        "global_errors": global_errors,
+        "rows": row_reviews[:20],
+        "accepted_impact_indicators": sorted(REWRITE_RESPONSE_SIDECAR_IMPACT_INDICATORS),
+        "safety": (
+            "Offline sidecar shape validation only. It reads local redacted JSONL sidecar rows and never reads raw "
+            "Burp history, sends requests, or promotes reportability by itself."
+        ),
+    }
+
+
 def rewrite_response_sidecar_observation(
     row: dict[str, Any],
     *,
@@ -18182,16 +18377,8 @@ def rewrite_response_sidecar_observation(
     approved_path = bool(row.get("approved") is True and path in approved_paths)
     sensitivity = rewrite_path_candidate_sensitivity(path)
     field_markers = rewrite_response_sidecar_field_markers(row)
-    raw_field_keys = [
-        key
-        for key in ["body", "body_sample", "body_text", "raw", "raw_body", "response_sample"]
-        if key in row
-    ]
-    sidecar_indicators = [
-        indicator
-        for indicator in normalize_string_list(row.get("impact_indicators"))
-        if indicator in REWRITE_RESPONSE_SIDECAR_IMPACT_INDICATORS
-    ]
+    raw_field_keys = rewrite_response_sidecar_raw_field_keys(row)
+    sidecar_indicators = rewrite_response_sidecar_accepted_indicators(row)
     impact_indicators = []
     if successful:
         impact_indicators.append("successful-response")
@@ -18422,6 +18609,12 @@ def build_rewrite_response_review(
             None,
         )
     sidecar_path_options = rewrite_response_sidecar_path_options(items)
+    sidecar_validation = rewrite_response_sidecar_validation_review(
+        sidecar_path=sidecar_path,
+        sidecar_file=sidecar_status,
+        sidecar_rows=sidecar_rows,
+        path_options=sidecar_path_options,
+    )
     sidecar_template = rewrite_response_sidecar_template(
         artifact_dir,
         profile,
@@ -18451,6 +18644,11 @@ def build_rewrite_response_review(
             "burp_observations": len(burp_history),
             "sidecar_status": sidecar_status.get("status"),
             "sidecar_rows": len(sidecar_rows),
+            "sidecar_validation_status": sidecar_validation.get("status"),
+            "sidecar_validation_invalid_rows": sidecar_validation.get("invalid_rows", 0),
+            "sidecar_validation_warning_rows": sidecar_validation.get("warning_rows", 0),
+            "sidecar_validation_first_missing": sidecar_validation.get("first_missing_field"),
+            "sidecar_validation_first_invalid": sidecar_validation.get("first_invalid_field"),
             "observed_approved_responses": approved_count,
             "candidate_impact_observations": candidate_impact_count,
             "impact_precheck_observations": impact_precheck_count,
@@ -18466,6 +18664,7 @@ def build_rewrite_response_review(
         "followup_commands": ordered_unique_strings(followup_commands),
         "sidecar_path": repo_relative_or_absolute(sidecar_path),
         "sidecar_file": sidecar_status,
+        "sidecar_validation": sidecar_validation,
         "sidecar_template": sidecar_template,
         "single_request_approval_packet": approval_packet,
         "artifact_refs": {
@@ -45044,6 +45243,8 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                         {"field_path": "$.vault.wallet", "matched_keywords": ["vault", "wallet"]},
                     ],
                     "impact_summary": "Approved redacted sidecar: vault balance and wallet metadata exposed.",
+                    "source": "self-test approved redacted sidecar",
+                    "reviewer": "self-test-reviewer",
                     "response_sample": "token=sidecar-raw-should-not-appear",
                 }
             ],
@@ -45060,6 +45261,14 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
         )
         sidecar_observations = [
             item for item in sidecar_response_item.get("observations", []) or [] if isinstance(item, dict)
+        ]
+        sidecar_validation = (
+            sidecar_review.get("sidecar_validation")
+            if isinstance(sidecar_review.get("sidecar_validation"), dict)
+            else {}
+        )
+        sidecar_validation_rows = [
+            item for item in sidecar_validation.get("rows", []) or [] if isinstance(item, dict)
         ]
         sidecar_finding_gate = build_finding_gate([], [], None, sidecar_review)
         sidecar_gate_item = next(
@@ -45388,6 +45597,27 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                 "summary": sidecar_review.get("summary"),
                 "observations": sidecar_observations,
                 "gate_item": sidecar_gate_item,
+            },
+        },
+        {
+            "id": "rewrite-response-sidecar-validator-explains-valid-row-and-raw-warning",
+            "passed": (
+                sidecar_validation.get("status") == "valid-candidate-impact"
+                and sidecar_validation.get("approved_rows") == 1
+                and sidecar_validation.get("valid_candidate_rows") == 1
+                and sidecar_validation.get("invalid_rows") == 0
+                and sidecar_validation.get("warning_rows") == 1
+                and sidecar_validation_rows
+                and sidecar_validation_rows[0].get("status") == "valid-candidate-row"
+                and "remove-raw-response-field:response_sample"
+                in (sidecar_validation_rows[0].get("warnings") or [])
+                and not sidecar_validation_rows[0].get("missing_fields")
+                and not sidecar_validation_rows[0].get("invalid_fields")
+                and "sidecar-raw-should-not-appear" not in json.dumps(sidecar_validation, sort_keys=True)
+            ),
+            "expected": "rewrite-response sidecar validator accepts one approved redacted row while warning about ignored raw fields",
+            "actual": {
+                "sidecar_validation": sidecar_validation,
             },
         },
         {
@@ -62703,6 +62933,7 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
         f"items={summary.get('items', 0)} "
         f"burp_observations={summary.get('burp_observations', 0)} "
         f"sidecar={summary.get('sidecar_status', 'missing')}:{summary.get('sidecar_rows', 0)} "
+        f"sidecar_validation={summary.get('sidecar_validation_status') or '-'} "
         f"approved={summary.get('observed_approved_responses', 0)} "
         f"candidate_impact={summary.get('candidate_impact_observations', 0)} "
         f"precheck={summary.get('impact_precheck_observations', 0)} "
@@ -62733,6 +62964,38 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
             f"sensitivity={sensitivity.get('priority') or 'unknown'}:{sensitivity.get('score', 0)} "
             f"blockers={len(approval_packet.get('finding_gate_blockers', []) or [])}"
         )
+    sidecar_validation = (
+        review.get("sidecar_validation")
+        if isinstance(review.get("sidecar_validation"), dict)
+        else {}
+    )
+    if sidecar_validation:
+        print(
+            "Sidecar validation: "
+            f"status={sidecar_validation.get('status') or '-'} "
+            f"rows={sidecar_validation.get('row_count', 0)} "
+            f"approved_rows={sidecar_validation.get('approved_rows', 0)} "
+            f"valid_candidate_rows={sidecar_validation.get('valid_candidate_rows', 0)} "
+            f"invalid_rows={sidecar_validation.get('invalid_rows', 0)} "
+            f"warning_rows={sidecar_validation.get('warning_rows', 0)} "
+            f"first_missing={sidecar_validation.get('first_missing_field') or '-'} "
+            f"first_invalid={sidecar_validation.get('first_invalid_field') or '-'}"
+        )
+        if args.show_sidecar_validation:
+            for row in (sidecar_validation.get("rows", []) or [])[: max(0, int(args.top))]:
+                if not isinstance(row, dict):
+                    continue
+                print(
+                    "  sidecar_row="
+                    f"line={row.get('line')} "
+                    f"status={row.get('status')} "
+                    f"approved={row.get('approved')} "
+                    f"method={row.get('method') or '-'} "
+                    f"path={row.get('path') or '-'} "
+                    f"missing={','.join(row.get('missing_fields', []) or []) or '-'} "
+                    f"invalid={','.join(row.get('invalid_fields', []) or []) or '-'} "
+                    f"warnings={','.join(row.get('warnings', []) or []) or '-'}"
+                )
     for item in (review.get("items", []) or [])[: max(0, int(args.top))]:
         print(
             f"- {item.get('priority')} {item.get('status')} "
@@ -66591,6 +66854,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-sidecar-template-json",
         action="store_true",
         help="Print a redacted JSONL sidecar template for one manually approved rewrite response.",
+    )
+    rewrite_response_review.add_argument(
+        "--show-sidecar-validation",
+        action="store_true",
+        help="Print field-level validation status for rewrite-response-sidecar.jsonl rows.",
     )
     rewrite_response_review.add_argument(
         "--no-write",
