@@ -654,6 +654,31 @@ def default_target_profile() -> dict[str, Any]:
         },
         "quote_provider": {
             "name": "M0",
+            "public_docs": [
+                {
+                    "id": "m0-orchestration-api-auth",
+                    "title": "M0 API Reference",
+                    "url": "https://docs.m0.org/api-reference/introduction",
+                    "source": "official-docs",
+                    "assertions": [
+                        "M0 Orchestration API is a REST API for stablecoin conversions and order management.",
+                        "The orchestration endpoint is https://gateway.m0.xyz/v1/orchestration.",
+                        "The Orchestration API authenticates with an API key in the x-api-key header.",
+                    ],
+                    "impact_tags": ["credentialed-upstream-authentication", "server-side-api-key"],
+                },
+                {
+                    "id": "m0-quote-transaction-payloads",
+                    "title": "M0 POST /quote",
+                    "url": "https://docs.m0.org/api/orchestration/quote/",
+                    "source": "official-docs",
+                    "assertions": [
+                        "POST /quote returns one or more quotes for a route and amount.",
+                        "Quote responses include transaction payloads ready to be signed and submitted to the blockchain.",
+                    ],
+                    "impact_tags": ["remote-transaction-payload", "transaction-intent-review"],
+                },
+            ],
             "diagnostics": [
                 {
                     "id": "m0-config-missing-or-placeholder",
@@ -1678,15 +1703,68 @@ def quote_provider_public_docs(profile: dict[str, Any] | None) -> list[dict[str,
     return normalized
 
 
+PROVIDER_PUBLIC_DOC_CONTEXT_TAGS = {
+    "credentialed-upstream-authentication",
+    "remote-transaction-payload",
+    "server-side-api-key",
+    "transaction-intent-review",
+}
+
+PROVIDER_PUBLIC_DOC_IMPACT_TAGS = {
+    "account-limit",
+    "billing",
+    "billing-impact",
+    "credit-consumption",
+    "provider-quota",
+    "quota",
+    "rate-limit",
+    "usage-monitoring",
+}
+
+
+def quote_provider_public_doc_evidence_tier(impact_tags: list[str]) -> str:
+    tags = {str(tag) for tag in impact_tags}
+    if tags & PROVIDER_PUBLIC_DOC_IMPACT_TAGS:
+        return "potential-provider-impact-context"
+    if tags & PROVIDER_PUBLIC_DOC_CONTEXT_TAGS:
+        return "provider-auth-or-payload-context"
+    if tags:
+        return "uncategorized-public-context"
+    return "unclassified-public-doc"
+
+
 def build_quote_provider_public_docs_review(profile: dict[str, Any] | None) -> dict[str, Any]:
     docs = quote_provider_public_docs(profile)
     tag_counts: dict[str, int] = {}
+    tier_counts: dict[str, int] = {}
     assertion_count = 0
+    normalized_docs = []
     for doc in docs:
+        tier = quote_provider_public_doc_evidence_tier(normalize_string_list(doc.get("impact_tags")))
+        row = json_clone(doc)
+        row["evidence_tier"] = tier
+        row["gate_effect"] = (
+            "context-only"
+            if tier in {"provider-auth-or-payload-context", "uncategorized-public-context", "unclassified-public-doc"}
+            else "potential-impact-context-requires-operator-confirmation"
+        )
+        normalized_docs.append(row)
         assertion_count += len(doc.get("assertions", []) or [])
         for tag in doc.get("impact_tags", []) or []:
             increment_count(tag_counts, str(tag))
+        increment_count(tier_counts, tier)
     status = "public-docs-indexed" if docs else "no-public-provider-docs"
+    impact_tag_count = sum(
+        count
+        for tag, count in tag_counts.items()
+        if tag in PROVIDER_PUBLIC_DOC_IMPACT_TAGS
+    )
+    if not docs:
+        impact_gate = "no-public-provider-docs"
+    elif impact_tag_count:
+        impact_gate = "operator-confirmation-required"
+    else:
+        impact_gate = "context-only-operator-evidence-required"
     return {
         "status": status,
         "provider": quote_provider_name(profile),
@@ -1694,14 +1772,37 @@ def build_quote_provider_public_docs_review(profile: dict[str, Any] | None) -> d
             "documents": len(docs),
             "assertions": assertion_count,
             "impact_tag_counts": dict(sorted(tag_counts.items())),
+            "evidence_tier_counts": dict(sorted(tier_counts.items())),
+            "provider_impact_tag_count": impact_tag_count,
+            "impact_gate": impact_gate,
         },
-        "documents": docs,
+        "documents": normalized_docs,
+        "decision_support": {
+            "credentialed_upstream_context": tier_counts.get("provider-auth-or-payload-context", 0),
+            "provider_impact_context": tier_counts.get("potential-provider-impact-context", 0),
+            "operator_decisions_still_required": sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS)
+            if docs
+            else [],
+        },
         "reportability_gate": (
             "Public provider documentation can support auth model or transaction-payload context, but it does not "
             "satisfy quota, billing, rate-limit, or account-impact evidence unless the document explicitly proves that impact."
         ),
         "safety": "Offline profile-owned provider documentation index. It performs no network requests.",
     }
+
+
+def quote_provider_public_docs_review_needs_tier_refresh(review: dict[str, Any]) -> bool:
+    if not isinstance(review, dict) or review.get("status") != "public-docs-indexed":
+        return False
+    summary = review.get("summary")
+    if not isinstance(summary, dict):
+        return True
+    return (
+        "evidence_tier_counts" not in summary
+        or "provider_impact_tag_count" not in summary
+        or "impact_gate" not in summary
+    )
 
 
 def normalize_http_status_codes(value: Any) -> list[int]:
@@ -21265,6 +21366,8 @@ def credentialed_upstream_cost_abuse_evidence_contract(
             else "missing"
         ),
         "provider_public_docs_assertions": provider_docs_summary.get("assertions", 0),
+        "provider_public_docs_impact_gate": provider_docs_summary.get("impact_gate"),
+        "provider_public_docs_evidence_tiers": provider_docs_summary.get("evidence_tier_counts", {}),
         "reportable_only_if": [
             "The credentialed upstream route is reachable through attacker-controlled unauthenticated input or an equivalent route-bound auth gap.",
             "Provider/operator evidence shows account-level quota, rate-limit, billing, credit, monitoring, or availability impact for the credentialed upstream.",
@@ -24517,6 +24620,8 @@ def build_credential_impact_checklist(
         if isinstance(flow_review.get("provider_public_docs_review"), dict)
         else build_quote_provider_public_docs_review(profile)
     )
+    if quote_provider_public_docs_review_needs_tier_refresh(provider_public_docs_review):
+        provider_public_docs_review = build_quote_provider_public_docs_review(profile)
     provider_public_docs_summary = (
         provider_public_docs_review.get("summary")
         if isinstance(provider_public_docs_review.get("summary"), dict)
@@ -36124,6 +36229,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 "strategy_sets": ["blackbox-http-observed"],
             }
         )
+        provider_context_docs_review = build_quote_provider_public_docs_review(default_target_profile())
         review_candidates_output_dir = root / "review-candidates-output"
         plan_output_dir = root / "plan-output"
         capabilities_output_dir = root / "capabilities-output"
@@ -37272,6 +37378,26 @@ def build_no_write_selftest() -> dict[str, Any]:
                 "greybox_policy": greybox_assessment_policy,
                 "blackbox_policy": blackbox_assessment_policy,
             },
+        },
+        {
+            "id": "provider-public-docs-are-context-not-impact-evidence",
+            "passed": (
+                provider_context_docs_review.get("status") == "public-docs-indexed"
+                and (provider_context_docs_review.get("summary") or {}).get("documents") == 2
+                and (provider_context_docs_review.get("summary") or {}).get("provider_impact_tag_count") == 0
+                and (provider_context_docs_review.get("summary") or {}).get("impact_gate")
+                == "context-only-operator-evidence-required"
+                and (provider_context_docs_review.get("summary") or {}).get("evidence_tier_counts", {}).get(
+                    "provider-auth-or-payload-context"
+                )
+                == 2
+                and (provider_context_docs_review.get("decision_support") or {}).get(
+                    "operator_decisions_still_required"
+                )
+                == sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS)
+            ),
+            "expected": "provider public docs support auth/payload context but do not close quota, billing, rate-limit, or monitoring evidence gates",
+            "actual": provider_context_docs_review,
         },
         {
             "id": "promote-observation-candidate-no-write-skips-artifacts",
@@ -54781,7 +54907,9 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
             "Provider docs: "
             f"status={provider_docs.get('status')} "
             f"documents={provider_docs_summary.get('documents', 0)} "
-            f"assertions={provider_docs_summary.get('assertions', 0)}"
+            f"assertions={provider_docs_summary.get('assertions', 0)} "
+            f"tiers={json.dumps(provider_docs_summary.get('evidence_tier_counts', {}), sort_keys=True)} "
+            f"impact_gate={provider_docs_summary.get('impact_gate') or 'unknown'}"
         )
     if source_contract:
         print(
@@ -54917,7 +55045,8 @@ def run_credential_impact_checklist(args: argparse.Namespace) -> int:
             f"status={provider_docs.get('status')} "
             f"documents={provider_docs_summary.get('documents', 0)} "
             f"assertions={provider_docs_summary.get('assertions', 0)} "
-            "impact_gate=does-not-satisfy-quota-billing-evidence"
+            f"tiers={json.dumps(provider_docs_summary.get('evidence_tier_counts', {}), sort_keys=True)} "
+            f"impact_gate={provider_docs_summary.get('impact_gate') or 'unknown'}"
         )
     if args.show_evidence_contract:
         evidence_contract = (
