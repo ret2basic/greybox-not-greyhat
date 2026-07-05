@@ -10172,6 +10172,9 @@ def hypothesis_from_rpc_method_policy(
             "quote_source_contract_missing_required": (
                 quote_contract.get("summary") or {}
             ).get("missing_required_decisions", []),
+            "quote_payload_contract_ref_count": (quote_contract.get("summary") or {}).get("payload_contract_refs", 0),
+            "quote_expected_payload_type": (quote_contract.get("summary") or {}).get("expected_payload_type"),
+            "quote_expected_transaction_path": (quote_contract.get("summary") or {}).get("expected_transaction_path"),
             "server_credential_proxy_status": credential_proxy.get("status") or "missing",
             "server_credential_proxy_priority": credential_proxy.get("priority") or "info",
             "deployment_credential_provider_status": deployment_provider.get("status") or "missing",
@@ -11082,6 +11085,25 @@ def rewrite_review_items_by_cluster_id(rewrite_review: dict[str, Any] | None) ->
     return items_by_cluster
 
 
+def transaction_flow_review_artifact_has_current_schema(artifact: dict[str, Any]) -> bool:
+    quote_contract = artifact.get("quote_source_contract_review")
+    if not isinstance(quote_contract, dict):
+        return False
+    quote_summary = quote_contract.get("summary")
+    if not isinstance(quote_summary, dict):
+        return False
+    required_quote_summary_keys = {
+        "payload_contract_refs",
+        "payload_type_refs",
+        "payload_transaction_path_refs",
+        "expected_payload_type",
+        "expected_transaction_path",
+    }
+    if not required_quote_summary_keys.issubset(quote_summary):
+        return False
+    return isinstance(artifact.get("server_credential_proxy_review"), dict)
+
+
 def transaction_flow_review_for_hypothesis_matrix(
     *,
     profile: dict[str, Any] | None,
@@ -11091,8 +11113,7 @@ def transaction_flow_review_for_hypothesis_matrix(
     artifact = load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT)
     if (
         isinstance(artifact, dict)
-        and isinstance(artifact.get("quote_source_contract_review"), dict)
-        and isinstance(artifact.get("server_credential_proxy_review"), dict)
+        and transaction_flow_review_artifact_has_current_schema(artifact)
     ):
         return artifact, "artifact"
 
@@ -18503,6 +18524,14 @@ def transaction_flow_match_categories() -> dict[str, list[str]]:
             "data.transaction",
             "payloads.map",
         ],
+        "quote_payload_contract": [
+            "payload.data?.type !== 'svm'",
+            "Unsupported payload type from M0 API",
+            "payload.data.transaction",
+            "Quote payload at index",
+            "transactionBase64s",
+            "payloads.map",
+        ],
         "transaction_deserializers": [
             "VersionedTransaction.deserialize",
             "deserializeTransaction(",
@@ -18830,6 +18859,7 @@ def build_quote_source_contract_review(
     request_refs = refs_by_group.get("quote_request_fields", []) or []
     validation_refs = refs_by_group.get("server_quote_validation", []) or []
     remote_refs = refs_by_group.get("remote_transaction_sources", []) or []
+    payload_contract_refs = refs_by_group.get("quote_payload_contract", []) or []
 
     def refs_for_tokens(refs: list[dict[str, Any]], tokens: set[str]) -> list[dict[str, Any]]:
         return [
@@ -18879,6 +18909,17 @@ def build_quote_source_contract_review(
     payload_extraction_refs = refs_for_tokens(
         remote_refs,
         {"transactionBase64s", "payload.data.transaction", "data.transaction", "payloads.map"},
+    )
+    payload_type_refs = refs_for_tokens(
+        payload_contract_refs,
+        {"payload.data?.type !== 'svm'", "Unsupported payload type from M0 API"},
+    )
+    payload_transaction_path_refs = refs_for_tokens(
+        payload_contract_refs,
+        {"payload.data.transaction", "Quote payload at index", "transactionBase64s", "payloads.map"},
+    )
+    response_payload_contract_refs = ordered_unique_ref_dicts(
+        [*payload_type_refs, *payload_transaction_path_refs]
     )
 
     def decision(
@@ -18946,6 +18987,11 @@ def build_quote_source_contract_review(
             "Which response fields are treated as executable Solana transaction material?",
         ),
         decision(
+            "client-response-payload-contract",
+            response_payload_contract_refs,
+            "Does client-side quote handling require SVM payload type and payload.data.transaction before wallet signing?",
+        ),
+        decision(
             "profile-quote-intent-directions",
             profile_policy_refs,
             "Are buy/sell source and destination mints indexed in the target profile for decode-time comparison?",
@@ -18963,6 +19009,7 @@ def build_quote_source_contract_review(
         "server-sender-recipient-binding",
         "server-amount-bound",
         "server-quote-count-bound",
+        "client-response-payload-contract",
         "profile-quote-intent-directions",
     }
     missing_required = [
@@ -18970,7 +19017,7 @@ def build_quote_source_contract_review(
         for row in decisions
         if row.get("id") in required_decisions and row.get("status") == "missing-evidence"
     ]
-    if not request_refs and not validation_refs and not configured_directions:
+    if not request_refs and not validation_refs and not payload_contract_refs and not configured_directions:
         status = "no-quote-source-contract-evidence"
     elif missing_required:
         status = "partial-quote-source-contract"
@@ -18983,6 +19030,15 @@ def build_quote_source_contract_review(
             "request_field_refs": len(request_refs),
             "server_validation_refs": len(validation_refs),
             "payload_extraction_refs": len(payload_extraction_refs),
+            "payload_contract_refs": len(response_payload_contract_refs),
+            "payload_type_refs": len(payload_type_refs),
+            "payload_transaction_path_refs": len(payload_transaction_path_refs),
+            "expected_payload_type": "svm" if payload_type_refs else None,
+            "expected_transaction_path": (
+                "payloads[*].data.transaction"
+                if payload_transaction_path_refs
+                else None
+            ),
             "decisions": len(decisions),
             "decision_status_counts": dict(sorted(decision_status_counts.items())),
             "missing_required_decisions": missing_required,
@@ -18990,6 +19046,7 @@ def build_quote_source_contract_review(
         "decisions": decisions,
         "required_evidence": [
             "Approved quote corpus whose request body matches this source contract.",
+            "Quote response payload shape checked against SVM type and payloads[*].data.transaction expectations.",
             "Decoded transaction intent compared against profile mints, wallet, amountIn, and allowed program policy.",
             "Manual review for any missing source-contract decision before treating decoded mismatch as reportable.",
         ],
@@ -19376,9 +19433,9 @@ def build_transaction_flow_review(
             "quote-source-contract-indexed",
             "source-policy-indexed",
             "info",
-            "Client quote request shape and server quote validation policy are indexed for decode-time comparison.",
+            "Client quote request shape, response payload contract, and server quote validation policy are indexed for decode-time comparison.",
             contract_refs[:12],
-            "Do decoded executable transactions match the source contract for wallet, amountIn, mint direction, quote count, and allowed programs?",
+            "Do decoded executable transactions match the source contract for SVM payload shape, wallet, amountIn, mint direction, quote count, and allowed programs?",
         )
     if provider_public_docs_review.get("status") == "public-docs-indexed":
         docs_summary = provider_public_docs_review.get("summary", {}) or {}
@@ -19474,6 +19531,7 @@ def build_transaction_flow_review(
             "local_signing_sink_refs": len(local_signing_refs),
             "quote_request_field_refs": len(refs_by_group.get("quote_request_fields", []) or []),
             "server_quote_validation_refs": len(refs_by_group.get("server_quote_validation", []) or []),
+            "quote_payload_contract_refs": len(refs_by_group.get("quote_payload_contract", []) or []),
             "preview_execution_quote_status": preview_execution_quote_review.get("status"),
             "quote_source_contract_status": quote_contract_review.get("status"),
             "server_credential_proxy_status": credential_proxy_review.get("status"),
@@ -19621,6 +19679,7 @@ def build_transaction_payload_shape_guidance(
         "payloads": [
             {
                 "data": {
+                    "type": "svm",
                     "transaction": "REPLACE_WITH_BASE64_VERSIONED_TRANSACTION",
                 },
             }
@@ -20015,6 +20074,7 @@ def build_transaction_corpus_checklist(
         "payloads": [
             {
                 "data": {
+                    "type": "svm",
                     "transaction": "REPLACE_WITH_BASE64_VERSIONED_TRANSACTION",
                 },
             }
@@ -30698,6 +30758,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-sidecar-review", "run_transaction_sidecar_review"),
         refresh_expectation("transaction-corpus-checklist", "run_transaction_corpus_checklist"),
+        refresh_expectation("prepare-transaction-intent-policy", "run_prepare_transaction_intent_policy"),
         refresh_expectation("credential-impact-checklist", "run_credential_impact_checklist"),
         refresh_expectation("validation-plan", "run_validation_plan"),
         refresh_expectation("iteration-decision", "run_iteration_decision"),
@@ -39659,8 +39720,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                   return VersionedTransaction.deserialize(bytes)
                 }
 
-                export async function extractRemoteTransactions(payloads: Array<{ data?: { transaction?: string } }>) {
-                  const transactionBase64s = payloads.map((payload) => payload.data?.transaction).filter(Boolean)
+                export async function extractRemoteTransactions(payloads: Array<{ data?: { type?: string; transaction?: string } }>) {
+                  const transactionBase64s = payloads.map((payload, index) => {
+                    if (payload.data?.type !== 'svm') {
+                      throw new Error(`Unsupported payload type from M0 API at index ${index}: ${String(payload.data?.type)}`)
+                    }
+                    if (!payload.data.transaction) {
+                      throw new Error(`Quote payload at index ${index} has no transaction`)
+                    }
+                    return payload.data.transaction
+                  })
                   return transactionBase64s.map((item) => deserializeTransaction(item as string))
                 }
                 """
@@ -40723,6 +40792,21 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             if isinstance(rewrite_transaction_flow_review.get("preview_execution_quote_review"), dict)
             else {}
         )
+        quote_source_contract_review = (
+            rewrite_transaction_flow_review.get("quote_source_contract_review", {})
+            if isinstance(rewrite_transaction_flow_review.get("quote_source_contract_review"), dict)
+            else {}
+        )
+        quote_source_contract_summary = (
+            quote_source_contract_review.get("summary", {})
+            if isinstance(quote_source_contract_review.get("summary"), dict)
+            else {}
+        )
+        quote_source_contract_decisions = {
+            item.get("id"): item
+            for item in quote_source_contract_review.get("decisions", [])
+            if isinstance(item, dict)
+        }
         preview_execution_dataflow = transaction_flow_review_dataflows.get("preview-wallet-vs-execution-wallet", {})
         transaction_flow_hypothesis_passed = (
             rewrite_transaction_policy.get("remote_transaction_signing_review", {}).get("status")
@@ -40748,6 +40832,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rewrite_transaction_flow_review.get("intent_policy_scaffold", {}).get("configured_direction_count", 0) >= 2
             and rewrite_transaction_flow_review.get("quote_source_contract_review", {}).get("status")
             == "quote-source-contract-indexed"
+            and quote_source_contract_summary.get("payload_contract_refs", 0) >= 4
+            and quote_source_contract_summary.get("payload_type_refs", 0) >= 2
+            and quote_source_contract_summary.get("payload_transaction_path_refs", 0) >= 2
+            and quote_source_contract_summary.get("expected_payload_type") == "svm"
+            and quote_source_contract_summary.get("expected_transaction_path") == "payloads[*].data.transaction"
+            and quote_source_contract_decisions.get("client-response-payload-contract", {}).get("status")
+            == "evidence-present"
             and rewrite_transaction_flow_review.get("server_credential_proxy_review", {}).get("status")
             == "needs-cost-abuse-review"
             and "remote-payload-to-wallet-signing" in transaction_flow_review_dataflow_ids
@@ -40781,6 +40872,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             >= 2
             and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("quote_source_contract_status")
             == "quote-source-contract-indexed"
+            and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("quote_payload_contract_ref_count", 0)
+            >= 4
+            and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("quote_expected_payload_type") == "svm"
+            and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get(
+                "quote_expected_transaction_path"
+            )
+            == "payloads[*].data.transaction"
             and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get("server_credential_proxy_status")
             == "needs-cost-abuse-review"
             and rewrite_transaction_hypothesis.get("transaction_flow_review", {}).get(
@@ -40816,6 +40914,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             >= 1
             and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("quote_source_contract_status")
             == "quote-source-contract-indexed"
+            and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get(
+                "quote_payload_contract_ref_count",
+                0,
+            )
+            >= 4
+            and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get("quote_expected_payload_type")
+            == "svm"
+            and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get(
+                "quote_expected_transaction_path"
+            )
+            == "payloads[*].data.transaction"
             and rewrite_transaction_validation_item.get("transaction_flow_review", {}).get(
                 "server_credential_proxy_status"
             )
@@ -46655,6 +46764,8 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
             "Source contract: "
             f"status={source_contract.get('status')}, "
             f"decisions={source_contract_summary.get('decisions', 0)}, "
+            f"payload_contract={source_contract_summary.get('expected_payload_type') or 'missing'}, "
+            f"payload_path={source_contract_summary.get('expected_transaction_path') or 'missing'}, "
             f"missing_required={len(source_contract_summary.get('missing_required_decisions', []) or [])}"
         )
     if credential_proxy:
@@ -47231,6 +47342,8 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         f"remote_signing_sinks={transaction_flow.get('remote_signing_sink_ref_count', 0)} "
                         f"policy_scaffold={transaction_flow.get('intent_policy_scaffold_status', 'missing')} "
                         f"quote_contract={transaction_flow.get('quote_source_contract_status', 'missing')} "
+                        f"payload_contract={transaction_flow.get('quote_expected_payload_type') or 'missing'} "
+                        f"payload_path={transaction_flow.get('quote_expected_transaction_path') or 'missing'} "
                         f"credential_proxy={transaction_flow.get('server_credential_proxy_status', 'missing')} "
                         f"provider={transaction_flow.get('deployment_credential_provider_status', 'missing')}"
                     )
