@@ -9466,6 +9466,7 @@ def build_methodology_supporting_reviews(
         operator_evidence=operator_evidence,
         deployment_review=deployment_review,
         rpc_method_policy=rpc_method_policy,
+        profile=profile,
     )
     reviews.update(
         {
@@ -19513,6 +19514,21 @@ OPERATOR_EVIDENCE_PRESENT_STATUSES = {
     "present",
 }
 
+OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS = {
+    "credentialed-upstream-quota-policy",
+    "credentialed-upstream-rate-limit-policy",
+    "credentialed-upstream-billing-impact",
+    "credentialed-upstream-usage-monitoring",
+}
+
+OPERATOR_RESOURCE_CONTROL_DECISION_IDS = {
+    "external-rate-limit-store-config",
+    "proxy-header-trust-model",
+    "rate-limit-bounds",
+    "fallback-monitoring-alerts",
+    "rpc-client-ip-header-trust-model",
+}
+
 
 def operator_evidence_items(operator_evidence: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not isinstance(operator_evidence, dict):
@@ -19593,6 +19609,194 @@ def classify_operator_evidence_item(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def operator_evidence_closure_contracts(
+    *,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    summary: dict[str, Any],
+    sidecar_path: str,
+    missing_decisions: list[dict[str, Any]],
+    accepted_present_statuses: list[str],
+) -> list[dict[str, Any]]:
+    missing_lookup = {
+        str(item.get("id") or ""): item
+        for item in missing_decisions
+        if isinstance(item, dict) and item.get("id")
+    }
+    provider_missing = [
+        str(item)
+        for item in summary.get("provider_missing", []) or []
+        if str(item)
+    ]
+    missing_ids = [
+        str(item)
+        for item in summary.get("missing_decisions", []) or []
+        if str(item)
+    ]
+    quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
+
+    def command(subcommand: str) -> str:
+        return validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile)
+
+    def command_safety(commands: list[dict[str, Any]]) -> dict[str, Any]:
+        refs = [
+            validation_command_ref(
+                str(row.get("command") or ""),
+                source=f"operator-evidence-closure-contract:{row.get('id')}",
+            )
+            for row in commands
+            if isinstance(row, dict) and row.get("command")
+        ]
+        return command_safety_summary(refs)
+
+    def needed(decision_ids: list[str]) -> list[dict[str, Any]]:
+        rows = []
+        for decision_id in decision_ids:
+            item = missing_lookup.get(decision_id, {"id": decision_id, "operator_evidence_needed": []})
+            rows.append(
+                {
+                    "id": decision_id,
+                    "operator_evidence_needed": item.get("operator_evidence_needed", []),
+                    "status": "missing" if decision_id in missing_lookup or decision_id in provider_missing else "present",
+                }
+            )
+        return rows
+
+    contracts = []
+    credential_missing = [
+        decision_id
+        for decision_id in provider_missing
+        if decision_id in OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS
+    ]
+    if credential_missing:
+        commands = [
+            {
+                "id": "operator-template-preview",
+                "risk": "offline-local-template",
+                "command": command(
+                    "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract"
+                ),
+            },
+            {
+                "id": "operator-evidence-review",
+                "risk": "offline-redacted-sidecar-review",
+                "command": command("operator-evidence-review --no-write --show-evidence --show-missing --show-closure-contract"),
+            },
+            {
+                "id": "credential-impact-review",
+                "risk": "offline-provider-impact-review",
+                "command": command(
+                    "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check"
+                ),
+            },
+            {
+                "id": "deployment-context",
+                "risk": "offline-local-deployment-review",
+                "command": command("deployment-review --no-write --top 8"),
+            },
+            {
+                "id": "finding-gate-preview",
+                "risk": "offline-manual-gate-preview",
+                "command": command("gate --no-write --show-items"),
+            },
+        ]
+        contracts.append(
+            {
+                "id": "credentialed-upstream-cost-abuse",
+                "impact": "credentialed-upstream-cost-abuse",
+                "entrypoint": f"POST {quote_path}",
+                "sidecar_path": sidecar_path,
+                "required_decision_ids": credential_missing,
+                "decision_requirements": needed(credential_missing),
+                "accepted_present_statuses": accepted_present_statuses,
+                "commands": commands,
+                "command_safety": command_safety(commands),
+                "required_order": [
+                    "Fill only redacted provider/operator evidence for the required credentialed-upstream decisions.",
+                    "Run operator-template-preview before editing the sidecar and keep placeholders pending.",
+                    "Run operator-evidence-review until every required decision is present with a non-placeholder summary.",
+                    "Run credential-impact-review; continue only if provider impact evidence is complete.",
+                    "Run finding-gate-preview only after route reachability and provider impact evidence are both present.",
+                ],
+                "stop_conditions": [
+                    "Do not include provider API keys, bearer tokens, cookies, billing account identifiers, or raw dashboards.",
+                    "Do not use request floods, quota depletion, Scanner, Intruder, or stress traffic to prove provider cost impact.",
+                    "Do not report credentialed upstream usage unless quota, rate-limit, billing/credit, or monitoring impact is evidenced.",
+                ],
+                "safety": (
+                    "Offline closure contract only. It reads local redacted sidecars and source context; "
+                    "it sends no target, provider, Burp, wallet, or transaction traffic."
+                ),
+            }
+        )
+
+    resource_missing = [
+        decision_id
+        for decision_id in missing_ids
+        if decision_id in OPERATOR_RESOURCE_CONTROL_DECISION_IDS
+    ]
+    if resource_missing:
+        commands = [
+            {
+                "id": "operator-template-preview",
+                "risk": "offline-local-template",
+                "command": command(
+                    "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract"
+                ),
+            },
+            {
+                "id": "operator-evidence-review",
+                "risk": "offline-redacted-sidecar-review",
+                "command": command("operator-evidence-review --no-write --show-evidence --show-missing --show-closure-contract"),
+            },
+            {
+                "id": "deployment-context",
+                "risk": "offline-local-deployment-review",
+                "command": command("deployment-review --no-write --top 8"),
+            },
+            {
+                "id": "resource-gate",
+                "risk": "offline-local-resource-check",
+                "command": command("resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict"),
+            },
+            {
+                "id": "finding-gate-preview",
+                "risk": "offline-manual-gate-preview",
+                "command": command("gate --no-write --show-items"),
+            },
+        ]
+        contracts.append(
+            {
+                "id": "rpc-resource-exhaustion",
+                "impact": "resource-exhaustion",
+                "entrypoint": "POST /api/rpc/solana/{cluster}",
+                "sidecar_path": sidecar_path,
+                "required_decision_ids": resource_missing,
+                "decision_requirements": needed(resource_missing),
+                "accepted_present_statuses": accepted_present_statuses,
+                "commands": commands,
+                "command_safety": command_safety(commands),
+                "required_order": [
+                    "Fill only redacted deployment/operator evidence for the required resource-control decisions.",
+                    "Run operator-evidence-review until external store, proxy trust, bounds, fallback monitoring, and IP trust decisions are present or explicitly not applicable.",
+                    "Run deployment-context to align sidecar statements with local deployment/source evidence.",
+                    "Run resource-gate before any approved single-request validation; stop unless it is healthy.",
+                    "Run finding-gate-preview only with non-stress evidence tying missing controls to availability impact.",
+                ],
+                "stop_conditions": [
+                    "Do not run floods, stress tests, Scanner, Intruder, or rate-limit exhaustion attempts.",
+                    "Do not claim spoofable IP-keyed limits unless direct-to-app reachability or untrusted header control is evidenced.",
+                    "Do not report resource exhaustion from static source alone without deployment/operator impact evidence.",
+                ],
+                "safety": (
+                    "Offline closure contract only. It prints evidence review and resource-gate steps; "
+                    "it does not send target traffic or perform rate-limit validation."
+                ),
+            }
+        )
+    return contracts
+
+
 def build_operator_evidence_review(
     *,
     target: str,
@@ -19600,6 +19804,7 @@ def build_operator_evidence_review(
     operator_evidence: dict[str, Any] | None,
     deployment_review: dict[str, Any] | None = None,
     rpc_method_policy: dict[str, Any] | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     raw_items = operator_evidence_items(operator_evidence)
     classified_items = [classify_operator_evidence_item(item) for item in raw_items]
@@ -19727,31 +19932,44 @@ def build_operator_evidence_review(
         provider="deployment/operator",
         missing_decisions=missing_sidecar_decisions,
     )
+    summary = {
+        "items": len(raw_items),
+        "classification_counts": dict(sorted(classification_counts.items())),
+        "status_counts": dict(sorted(status_counts.items())),
+        "present_decision_ids": present_decision_ids,
+        "pending_decision_ids": pending_decision_ids,
+        "invalid_items": len(invalid_items),
+        "decision_coverage": len(decision_coverage),
+        "missing_decisions": [str(item.get("id")) for item in missing_decisions],
+        "provider_missing": [str(item) for item in provider_missing],
+        "critical_missing": [str(item) for item in critical_missing],
+        "rpc_client_ip_trust_status": client_ip_trust_review.get("status") or "missing",
+        "rpc_client_ip_trust_missing": bool(rpc_client_ip_trust_missing),
+    }
+    accepted_present_statuses = sorted(OPERATOR_EVIDENCE_PRESENT_STATUSES)
+    sidecar_path = repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
+    closure_contracts = operator_evidence_closure_contracts(
+        profile=profile,
+        artifact_dir=artifact_dir,
+        summary=summary,
+        sidecar_path=sidecar_path,
+        missing_decisions=missing_sidecar_decisions,
+        accepted_present_statuses=accepted_present_statuses,
+    )
+    summary["closure_contracts"] = len(closure_contracts)
     return {
         "generated_at": utc_now(),
         "status": status,
         "target": target,
         "artifact_dir": repo_relative_or_absolute(artifact_dir),
-        "sidecar_path": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
-        "summary": {
-            "items": len(raw_items),
-            "classification_counts": dict(sorted(classification_counts.items())),
-            "status_counts": dict(sorted(status_counts.items())),
-            "present_decision_ids": present_decision_ids,
-            "pending_decision_ids": pending_decision_ids,
-            "invalid_items": len(invalid_items),
-            "decision_coverage": len(decision_coverage),
-            "missing_decisions": [str(item.get("id")) for item in missing_decisions],
-            "provider_missing": [str(item) for item in provider_missing],
-            "critical_missing": [str(item) for item in critical_missing],
-            "rpc_client_ip_trust_status": client_ip_trust_review.get("status") or "missing",
-            "rpc_client_ip_trust_missing": bool(rpc_client_ip_trust_missing),
-        },
+        "sidecar_path": sidecar_path,
+        "summary": summary,
         "items": classified_items,
         "decision_coverage": decision_coverage,
         "missing_decisions": missing_sidecar_decisions,
+        "closure_contracts": closure_contracts,
         "sidecar_template": sidecar_template,
-        "accepted_present_statuses": sorted(OPERATOR_EVIDENCE_PRESENT_STATUSES),
+        "accepted_present_statuses": accepted_present_statuses,
         "reportability_gate": (
             "Only present operator evidence with a non-placeholder redacted summary is indexed. "
             "Pending, unknown, placeholder, or invalid items do not satisfy reportability gates."
@@ -33402,6 +33620,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--no-write",
                     "--show-template",
                     "--show-template-json",
+                    "--show-closure-contract",
                     "--show-missing",
                 ]
             )
@@ -34363,8 +34582,12 @@ def build_no_write_selftest() -> dict[str, Any]:
                 operator_evidence_review_return_code == 0
                 and "Operator evidence review:" in operator_evidence_review_stdout_text
                 and "Coverage:" in operator_evidence_review_stdout_text
+                and "contracts=" in operator_evidence_review_stdout_text
                 and "Sidecar template:" in operator_evidence_review_stdout_text
                 and "Sidecar template JSON:" in operator_evidence_review_stdout_text
+                and "Closure contracts:" in operator_evidence_review_stdout_text
+                and "credentialed-upstream-cost-abuse" in operator_evidence_review_stdout_text
+                and "rpc-resource-exhaustion" in operator_evidence_review_stdout_text
                 and '"schema": "inferforge-operator-evidence-v1"' in operator_evidence_review_stdout_text
                 and '"evidence_items": [' in operator_evidence_review_stdout_text
                 and "- template " in operator_evidence_review_stdout_text
@@ -41905,6 +42128,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 artifact_dir=operator_sidecar_source_root,
                 operator_evidence=operator_sidecar,
                 deployment_review=operator_sidecar_review,
+                profile=test_profile,
             )
             operator_sidecar_provider = operator_sidecar_review.get("credential_provider_review", {})
             operator_sidecar_credential_checklist = build_credential_impact_checklist(
@@ -41949,6 +42173,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 artifact_dir=operator_sidecar_source_root,
                 operator_evidence=operator_placeholder,
                 deployment_review=operator_placeholder_review,
+                profile=test_profile,
             )
         operator_evidence_sidecar_passed = (
             operator_sidecar_provider.get("status") == "provider-evidence-indexed"
@@ -41977,6 +42202,25 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and "gate --no-write --show-items" in operator_sidecar_checklist_commands
             and "adjudicate --no-write" in operator_sidecar_checklist_commands
             and "evidence-chain --no-write" in operator_sidecar_checklist_commands
+        )
+        operator_closure_contracts = [
+            item
+            for item in operator_placeholder_evidence_review.get("closure_contracts", []) or []
+            if isinstance(item, dict)
+        ]
+        operator_closure_contract_text = json.dumps(operator_closure_contracts, sort_keys=True)
+        operator_closure_contract_passed = (
+            len(operator_closure_contracts) >= 2
+            and "credentialed-upstream-cost-abuse" in operator_closure_contract_text
+            and "rpc-resource-exhaustion" in operator_closure_contract_text
+            and "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract"
+            in operator_closure_contract_text
+            and "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check"
+            in operator_closure_contract_text
+            and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict"
+            in operator_closure_contract_text
+            and "Do not use request floods" in operator_closure_contract_text
+            and "Do not run floods" in operator_closure_contract_text
         )
     websocket_header_forwarding_bad_review: dict[str, Any] = {}
     websocket_header_forwarding_filtered_review: dict[str, Any] = {}
@@ -45095,6 +45339,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and empty_replay_queue_passed
         and resource_release_candidates_passed
         and operator_evidence_sidecar_passed
+        and operator_closure_contract_passed
         and websocket_header_forwarding_passed
         and transaction_gate_ingestion_passed
         and transaction_corpus_gate_checklist_passed
@@ -45393,13 +45638,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         },
         "operator_evidence_sidecar": {
             "status": "passed"
-            if operator_evidence_sidecar_passed and operator_evidence_checklist_gate_passed
+            if operator_evidence_sidecar_passed and operator_evidence_checklist_gate_passed and operator_closure_contract_passed
             else "failed",
             "provider_review": operator_sidecar_provider,
             "placeholder_provider_review": operator_placeholder_review.get("credential_provider_review", {}),
             "operator_evidence": operator_sidecar_review.get("operator_evidence", {}),
             "operator_review": operator_sidecar_evidence_review.get("summary", {}),
             "placeholder_operator_review": operator_placeholder_evidence_review.get("summary", {}),
+            "closure_contracts": operator_closure_contracts,
             "credential_checklist": {
                 "status": operator_sidecar_credential_checklist.get("status"),
                 "summary": operator_sidecar_credential_checklist.get("summary", {}),
@@ -49884,6 +50130,7 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
         operator_evidence=operator_evidence,
         deployment_review=deployment_review,
         rpc_method_policy=rpc_method_policy,
+        profile=profile,
     )
     output_path = (
         resolve_repo_path(args.output)
@@ -49912,7 +50159,8 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
         f"decisions={summary.get('decision_coverage', 0)} "
         f"missing={','.join(summary.get('missing_decisions', []) or []) or 'none'} "
         f"provider_missing={','.join(summary.get('provider_missing', []) or []) or 'none'} "
-        f"rpc_client_ip_trust={summary.get('rpc_client_ip_trust_status') or 'missing'}"
+        f"rpc_client_ip_trust={summary.get('rpc_client_ip_trust_status') or 'missing'} "
+        f"contracts={summary.get('closure_contracts', 0)}"
     )
     top_count = max(0, int(args.top))
     if top_count:
@@ -49954,6 +50202,24 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
         template = review.get("sidecar_template") if isinstance(review.get("sidecar_template"), dict) else {}
         print("Sidecar template JSON:")
         print(json.dumps(sanitize_artifact_samples(template), indent=2, sort_keys=False))
+    if args.show_closure_contract:
+        print("Closure contracts:")
+        for contract in (review.get("closure_contracts", []) or [])[:top_count]:
+            if not isinstance(contract, dict):
+                continue
+            missing = ",".join(str(item) for item in contract.get("required_decision_ids", []) or []) or "none"
+            print(
+                f"- contract={contract.get('id')} impact={contract.get('impact')} "
+                f"entrypoint={contract.get('entrypoint')} missing={missing}"
+            )
+            for command_row in (contract.get("commands", []) or [])[:6]:
+                if not isinstance(command_row, dict):
+                    continue
+                print(
+                    "  step="
+                    f"{command_row.get('id')} risk={command_row.get('risk')} "
+                    f"command={inline_summary_text(command_row.get('command'), max_chars=420)}"
+                )
     if no_write:
         print("No files written (--no-write).")
     else:
@@ -53133,6 +53399,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-template-json",
         action="store_true",
         help="Print the redacted operator-evidence.json sidecar template JSON for missing decisions.",
+    )
+    operator_evidence_review.add_argument(
+        "--show-closure-contract",
+        action="store_true",
+        help="Print the credential-cost and resource-abuse evidence closure contracts for missing operator decisions.",
     )
     operator_evidence_review.add_argument(
         "--no-write",

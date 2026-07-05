@@ -393,6 +393,9 @@ prints the redacted `operator-evidence.json` sidecar path plus template item
 IDs, evidence questions, accepted present statuses, and redaction reminders for
 the missing decisions. Add `--show-template-json` to print the redacted sidecar
 template body directly for manual review before creating `operator-evidence.json`.
+Add `--show-closure-contract` to group the same sidecar requirements into
+credentialed-upstream cost-abuse and RPC resource-exhaustion closure contracts,
+including the offline review/gate commands and stop conditions.
 When RPC source shows rate-limit buckets keyed from
 `x-forwarded-for`, that template also includes
 `rpc-client-ip-header-trust-model`, which asks for production edge/header
