@@ -27867,6 +27867,18 @@ def build_verification_queue(
     cmd = lambda subcommand: verification_command(clusters, artifact_dir, subcommand)
     audit_policy = verification_audit_policy_for_clusters(clusters)
 
+    def quote_transaction_evidence_contract_commands() -> list[str]:
+        return [
+            cmd(
+                "transaction-sidecar-review --no-write --show-files --show-commands "
+                "--show-payload-template-json --show-evidence-contract"
+            ),
+            cmd(
+                "transaction-corpus-checklist --no-write --show-commands --show-steps "
+                "--show-payload-template-json --skip-current-resource-check"
+            ),
+        ]
+
     def add_item(
         item_id: str,
         title: str,
@@ -28015,15 +28027,7 @@ def build_verification_queue(
         waiting_action_ids = {str(action.get("id") or "") for action in waiting_actions}
         commands = []
         if "NEXT-transaction-intent-corpus" in waiting_action_ids:
-            transaction_payload_path = shlex.quote(
-                verification_artifact_path(artifact_dir, "transaction-payloads.json")
-            )
-            commands.extend(
-                [
-                    cmd(f"collect-quote --direction buy --wallet {PLACEHOLDER_REAL_WALLET} --amount-in 1000000"),
-                    cmd(f"decode-transactions --input {transaction_payload_path}"),
-                ]
-            )
+            commands.extend(quote_transaction_evidence_contract_commands())
         commands.append(cmd(audit_policy["subcommand"]))
         add_item(
             "RESOLVE-attack-strategy-external-evidence",
@@ -28089,10 +28093,8 @@ def build_verification_queue(
         ]
         if gap_id == "GAP-quote-transaction-corpus":
             prerequisites = (environment_readiness or {}).get("next_steps", [])
-            transaction_payload_path = shlex.quote(verification_artifact_path(artifact_dir, "transaction-payloads.json"))
             commands = [
-                cmd(f"collect-quote --direction buy --wallet {PLACEHOLDER_REAL_WALLET} --amount-in 1000000"),
-                cmd(f"decode-transactions --input {transaction_payload_path}"),
+                *quote_transaction_evidence_contract_commands(),
                 cmd(audit_policy["subcommand"]),
             ]
             status = "blocked-external"
@@ -29188,6 +29190,11 @@ def verification_queue_command_preview_lines(item: dict[str, Any], *, limit: int
                 "--skip-current-resource-check "
                 "until one approved quote corpus can be captured safely."
             )
+        if "transaction-sidecar-review --no-write" in command_text and "--show-evidence-contract" in command_text:
+            lines.append(
+                "    offline_alternative=Review the transaction evidence contract before any quote capture; "
+                "it prints sidecar, intent-policy, Burp import, and no-write decode steps without sending requests."
+            )
     return lines
 
 
@@ -29256,6 +29263,11 @@ def verification_queue_followup_preview_lines(item: dict[str, Any], *, limit: in
                 "    offline_alternative=Run transaction-corpus-checklist --no-write --show-commands --show-steps "
                 "--skip-current-resource-check "
                 "until one approved quote corpus can be captured safely."
+            )
+        if "transaction-sidecar-review --no-write" in command_text and "--show-evidence-contract" in command_text:
+            lines.append(
+                "    offline_alternative=Review the transaction evidence contract before any quote capture; "
+                "it prints sidecar, intent-policy, Burp import, and no-write decode steps without sending requests."
             )
 
     safety = inline_summary_text(item.get("safety") or "", max_chars=260)
@@ -45245,7 +45257,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and strategy_external_item is not None
         and strategy_external_item.get("status") == "blocked-external"
         and "NEXT-transaction-intent-corpus" in strategy_external_item.get("waiting_action_ids", [])
-        and any("collect-quote" in command for command in strategy_external_item.get("commands", []))
+        and any("--show-evidence-contract" in command for command in strategy_external_item.get("commands", []))
+        and any("transaction-corpus-checklist --no-write --show-commands --show-steps" in command for command in strategy_external_item.get("commands", []))
+        and not any("collect-quote" in command for command in strategy_external_item.get("commands", []))
         and strategy_external_queue.get("status") == "ready-with-external-blockers"
         and strategy_external_queue.get("summary", {}).get("attack_strategy") == "needs-external-evidence"
         and strategy_external_blockers.get("status") == "ready-with-external-blockers"
