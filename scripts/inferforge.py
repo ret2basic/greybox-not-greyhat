@@ -89,6 +89,10 @@ TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND = (
     "transaction-corpus-checklist --no-write --show-commands --show-steps "
     "--show-payload-template-json --skip-current-resource-check"
 )
+REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND = (
+    "rewrite-response-review --no-write --show-observations --show-commands "
+    "--show-observation-contract"
+)
 QUOTE_TRANSACTION_CORPUS_CONTRACT_NEXT_STEP = (
     "Prepare or approve one quote response or extracted transaction payload sidecar, then run "
     "`transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json "
@@ -8816,7 +8820,7 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
         "evidence-gaps --no-write",
         "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check",
         "rewrite-validation-checklist --no-write --show-candidates --show-commands",
-        "rewrite-response-review --no-write --show-observations --show-commands",
+        REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND,
         "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check",
         "operator-evidence-review --no-write --show-missing --show-template",
         TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND,
@@ -9372,7 +9376,7 @@ def methodology_next_command_for_hypothesis(
     elif impact == "resource-exhaustion" or hypothesis_type == "resource-abuse-review":
         subcommand = "deployment-review --no-write --top 8"
     elif impact == "fixed-upstream-proxy-confusion":
-        subcommand = "rewrite-response-review --no-write --show-observations --show-commands"
+        subcommand = REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND
     else:
         subcommand = "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check"
     ref = validation_command_ref(
@@ -9859,7 +9863,7 @@ def build_rewrite_evidence_closure(
     command_specs = [
         ("rewrite-review", "rewrite-review --no-write --show-next"),
         ("rewrite-validation-checklist", "rewrite-validation-checklist --no-write --show-candidates --show-commands"),
-        ("rewrite-response-review", "rewrite-response-review --no-write --show-observations --show-commands"),
+        ("rewrite-response-review", REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND),
     ]
     if candidate_impact_count:
         command_specs.extend(
@@ -13065,7 +13069,7 @@ def rewrite_response_observation_contracts(
                 "command": verification_command_for_profile(
                     reviewed_profile,
                     artifact_dir,
-                    "rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract",
+                    REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND,
                 ),
             },
             {
@@ -13441,7 +13445,7 @@ def validation_allowed_commands(
     ]
     if rewrite_review_item:
         allowed_now_commands.insert(3, command("rewrite-validation-checklist --no-write --show-candidates --show-commands"))
-        allowed_now_commands.insert(4, command("rewrite-response-review --no-write --show-observations --show-commands"))
+        allowed_now_commands.insert(4, command(REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND))
     if hypothesis.get("type") == "resource-abuse-review" or hypothesis.get("impact") == "resource-exhaustion":
         allowed_now_commands.insert(3, command("operator-evidence-review --no-write --show-missing --show-template"))
         allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
@@ -27850,7 +27854,7 @@ def review_candidate_command_templates(
             verification_command_for_profile(
                 reviewed_profile,
                 artifact_dir,
-                "rewrite-response-review --no-write --show-observations --show-commands",
+                REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND,
             ),
             verification_command_for_profile(
                 reviewed_profile,
@@ -27883,7 +27887,7 @@ def promoted_observation_followup_commands(
         verification_command_for_profile(
             reviewed_profile,
             artifact_dir,
-            "rewrite-response-review --no-write --show-observations --show-commands",
+            REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND,
         ),
         verification_command_for_profile(
             reviewed_profile,
@@ -34315,7 +34319,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Profile validation:" in promote_stdout_text
                 and "Next commands:" in promote_stdout
                 and "burp-sync --observe" in promote_stdout_text
-                and "rewrite-response-review --no-write --show-observations --show-commands" in promote_stdout_text
+                and REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND in promote_stdout_text
                 and REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND in promote_stdout_text
                 and "No files written (--no-write)." in promote_stdout
                 and not any(
@@ -35371,8 +35375,7 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                 and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict"
                 in no_history_contract_text
                 and "burp-sync --observe --ws-upgrade --replace" in no_history_contract_text
-                and "rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract"
-                in no_history_contract_text
+                and REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND in no_history_contract_text
                 and "Do not enumerate catch-all paths." in no_history_contract_text
             ),
             "expected": "missing approved rewrite responses expose a single-path observation contract with gated observe/review steps",
@@ -43926,7 +43929,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict" in rewrite_queue_commands[2]
             and "burp-sync --observe" in rewrite_queue_commands[3]
             and f"--count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}" in rewrite_queue_commands[3]
-            and "rewrite-response-review --no-write --show-observations --show-commands" in rewrite_queue_commands[4]
+            and REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND in rewrite_queue_commands[4]
             and REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND in rewrite_queue_commands[5]
             and all(command.count("--profile") <= 1 for command in rewrite_queue_commands)
             and all(command.count("--artifact-dir") == 1 for command in rewrite_queue_commands)

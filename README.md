@@ -428,9 +428,10 @@ client-derived read-only candidates, blocked dynamic templates, and no-write
 The checklist is still offline: it does not invoke Burp, start a browser, send
 HTTP traffic, or enumerate catch-all paths.
 After the reviewed profile has produced a normalized observation, use
-`rewrite-response-review --no-write --show-observations --show-commands` to
-review only the existing `burp-history-observations.jsonl` rows for that
-rewrite. It separates “one approved response observed” from “candidate
+`rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract`
+to review only the existing `burp-history-observations.jsonl` rows for that
+rewrite and keep the single-path promotion/observe/review contract visible. It
+separates “one approved response observed” from “candidate
 sensitive-field or path confusion impact evidence”, redacts response samples,
 and still requires a manual finding-gate decision before anything is treated as
 reportable.
