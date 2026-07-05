@@ -34034,6 +34034,9 @@ def build_adjudication(
                 "report_bucket": "blocked-before-finding-gate",
                 "title": preview.get("title"),
                 "checks": preview.get("checks", []),
+                "validation_oracle": preview.get("validation_oracle"),
+                "oracle_type": preview.get("oracle_type"),
+                "oracle_status": preview.get("oracle_status"),
                 "safety": preview.get("safety"),
             }
         )
@@ -44575,8 +44578,12 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                 and blocked_preview_item.get("classification") == "blocked-rewrite-response-finding-gate-preview"
                 and not blocked_preview_gate.get("gates")
                 and (blocked_preview_gate.get("summary") or {}).get("blocked_gate_previews") == 1
+                and blocked_preview_item.get("oracle_type") == "single-response-impact"
+                and (blocked_preview_item.get("validation_oracle") or {}).get("id")
+                == "single-response-impact-validation-oracle"
                 and "No approved redacted response observation" in blocked_preview_gate_text
                 and "not a finding" in blocked_preview_gate_text
+                and "single-response-impact" in blocked_preview_gate_text
             ),
             "expected": "approval-packet blockers are visible as blocked previews without creating reportable gate items",
             "actual": {
@@ -44618,6 +44625,7 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                 and (blocked_preview_adjudication.get("summary") or {}).get("reportable_findings") == 0
                 and any(
                     decision.get("report_bucket") == "blocked-before-finding-gate"
+                    and decision.get("oracle_type") == "single-response-impact"
                     for decision in blocked_preview_adjudication.get("decisions", []) or []
                     if isinstance(decision, dict)
                 )
@@ -44653,6 +44661,7 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                 gate_return_code == 0
                 and "Gated 1 item(s)" in gate_stdout
                 and any("candidate-fixed-upstream-proxy-confusion-impact" in line for line in gate_stdout)
+                and any("oracle=" in line for line in gate_stdout)
                 and "No files written (--no-write)." in gate_stdout
                 and not gate_output_path_exists
                 and "response_sample" not in "\n".join(gate_stdout)
@@ -47983,6 +47992,27 @@ def approval_packet_preview_context(packet_type: str, packet: dict[str, Any]) ->
     return context
 
 
+def finding_gate_preview_validation_oracle(
+    *,
+    packet_type: str,
+    impact: str,
+) -> dict[str, Any]:
+    lane_by_packet_type = {
+        "transaction-corpus": "approved-transaction-payload",
+        "credential-impact": "provider-operator-evidence",
+        "resource-control": "deployment-resource-evidence",
+        "rpc-proxy-abuse": "finding-gate-review",
+        "rewrite-response": "single-approved-response",
+        "websocket-header-forwarding": "provider-operator-evidence",
+    }
+    lane = lane_by_packet_type.get(str(packet_type), "unclassified-evidence")
+    return objective_unblocker_validation_oracle(
+        lane=lane,
+        package_status="waiting-finding-gate-evidence",
+        impact=impact,
+    )
+
+
 def validation_plan_blocked_finding_gate_previews(
     validation_plan: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
@@ -48005,6 +48035,10 @@ def validation_plan_blocked_finding_gate_previews(
             packet_context = approval_packet_preview_context(packet_type, packet)
             assessment_rank = item.get("assessment_rank") if isinstance(item.get("assessment_rank"), dict) else {}
             relative_focus = item.get("relative_focus") if isinstance(item.get("relative_focus"), dict) else {}
+            validation_oracle = finding_gate_preview_validation_oracle(
+                packet_type=packet_type,
+                impact=str(item.get("impact") or ""),
+            )
             previews.append(
                 {
                     "suspicion_id": f"BLOCKED-{safe_probe_id(item_id)}-{safe_probe_id(packet_type)}",
@@ -48017,6 +48051,9 @@ def validation_plan_blocked_finding_gate_previews(
                     "packet_type": packet_type,
                     "packet_status": packet.get("status"),
                     "packet_context": packet_context,
+                    "validation_oracle": validation_oracle,
+                    "oracle_type": validation_oracle.get("type"),
+                    "oracle_status": validation_oracle.get("status"),
                     "assessment_rank": assessment_rank,
                     "relative_focus": relative_focus,
                     "title": "Approval packet is not ready for finding-gate review",
@@ -57280,6 +57317,7 @@ def run_gate(args: argparse.Namespace) -> int:
                 f"- {item.get('gate_status')} {item.get('classification')} "
                 f"severity={item.get('severity') or '-'} "
                 f"entrypoint={item.get('entrypoint') or '-'} "
+                f"oracle={item.get('oracle_type') or '-'} "
                 f"blockers={blocker_check.get('blocker_count', 0)} "
                 f"id={item.get('suspicion_id') or '-'}"
             )

@@ -662,6 +662,12 @@ be completed before any active validation. Package commands also appear as an
 current blocker before generic planning commands. Those package commands are
 deduped out of the generic offline action preview.
 
+`gate --no-write --show-items` carries the same oracle vocabulary into blocked
+finding-gate previews. A blocked preview can now say whether it is waiting on a
+`transaction-intent`, `single-response-impact`, `provider-impact`, or
+`resource-control` oracle, which keeps gate/adjudication output aligned with the
+objective rollup.
+
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:
 
