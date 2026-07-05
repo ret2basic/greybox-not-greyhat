@@ -14920,10 +14920,17 @@ def validation_allowed_commands(
         validation_command_ref(command, source=f"{hypothesis.get('id')}:allowed_now[{index}]")
         for index, command in enumerate(ordered_unique_strings(allowed_now_commands), start=1)
     ]
-    allowed_after_gate = [
-        validation_command_ref(command, source=f"{hypothesis.get('id')}:allowed_after_resource_gate[{index}]")
-        for index, command in enumerate(ordered_unique_strings(allowed_after_gate_commands), start=1)
-    ]
+    resource_gated_after_gate = str(hypothesis.get("status") or "") == "resource-gated"
+    allowed_after_gate = []
+    for index, command in enumerate(ordered_unique_strings(allowed_after_gate_commands), start=1):
+        source = f"{hypothesis.get('id')}:allowed_after_resource_gate[{index}]"
+        item_status = (
+            "blocked-resource"
+            if resource_gated_after_gate
+            and "resource-snapshot" not in validation_command_tokens(command)
+            else None
+        )
+        allowed_after_gate.append(validation_command_ref(command, source=source, item_status=item_status))
     return {
         "allowed_now": allowed_now,
         "allowed_after_resource_gate": allowed_after_gate,
@@ -15339,9 +15346,12 @@ def collect_iteration_command_sets(validation_plan: dict[str, Any]) -> dict[str,
                     reason="Safe read-only planning command available before any target traffic.",
                 )
         for ref in item.get("allowed_after_resource_gate", []) or []:
-            if not isinstance(ref, dict) or ref.get("classification") != "ready":
+            if not isinstance(ref, dict):
                 continue
+            classification = str(ref.get("classification") or "")
             if command_ref_is_resource_check(ref):
+                if classification != "ready":
+                    continue
                 append_unique_command_ref(
                     resource_checks,
                     seen_resource,
@@ -15349,13 +15359,16 @@ def collect_iteration_command_sets(validation_plan: dict[str, Any]) -> dict[str,
                     item=item,
                     reason="Resource gate command that must pass before active validation traffic.",
                 )
-            else:
+            elif classification in {"ready", "resource-gated"}:
+                reason = "Constrained active validation command allowed only after resource and scope gates pass."
+                if classification == "resource-gated":
+                    reason = "Active validation command is blocked until local resource preflight is healthy."
                 append_unique_command_ref(
                     active_after_gate,
                     seen_active,
                     ref,
                     item=item,
-                    reason="Constrained active validation command allowed only after resource and scope gates pass.",
+                    reason=reason,
                 )
         for ref in item.get("blocked_commands", []) or []:
             if isinstance(ref, dict):
@@ -29470,6 +29483,10 @@ def classify_verification_command(
         classification = "manual-template"
         runnable = False
         requires_manual_input = True
+    elif item_status == "blocked-resource":
+        classification = "resource-gated"
+        runnable = False
+        requires_manual_input = False
     elif item_status in {"manual-review", "blocked", "blocked-external"}:
         classification = "review-gated"
         runnable = False
@@ -29603,6 +29620,15 @@ def build_command_safety_selftest() -> dict[str, Any]:
             "expected_runnable": False,
             "expected_requires_manual_input": False,
             "expected_blocked_external": True,
+        },
+        {
+            "id": "resource-gated-command",
+            "command": "python3 scripts/inferforge.py audit --max-probes 1 --no-ws",
+            "item_status": "blocked-resource",
+            "expected_classification": "resource-gated",
+            "expected_runnable": False,
+            "expected_requires_manual_input": False,
+            "expected_blocked_external": False,
         },
         {
             "id": "angle-placeholder-unsafe",
@@ -36559,6 +36585,28 @@ def build_no_write_selftest() -> dict[str, Any]:
         "allowed_after_resource_gate",
         {"classification": "ready"},
     )
+    resource_gated_allowed_commands = validation_allowed_commands(
+        artifact_dir=root / "resource-gated-validation-output",
+        profile=profile,
+        hypothesis={
+            "id": "HYP-resource-gated-active-command",
+            "status": "resource-gated",
+            "type": "cluster-strategy",
+            "impact": "fixed-upstream-proxy-confusion",
+        },
+        verification_queue={},
+    )
+    resource_gated_after_refs = [
+        ref
+        for ref in resource_gated_allowed_commands.get("allowed_after_resource_gate", []) or []
+        if isinstance(ref, dict)
+    ]
+    resource_gated_local_gate_refs = [
+        ref for ref in resource_gated_after_refs if command_ref_is_resource_check(ref)
+    ]
+    resource_gated_active_refs = [
+        ref for ref in resource_gated_after_refs if not command_ref_is_resource_check(ref)
+    ]
     regression_health_summary_line = regression_suite_artifact_health_summary_line(
         {
             "status": "needs-human-review",
@@ -36915,6 +36963,23 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "synthetic_protected_watch_ports": synthetic_protected_watch_ports,
                 "default_watch_ports": DEFAULT_RESOURCE_WATCH_PORTS,
+            },
+        },
+        {
+            "id": "resource-gated-after-gate-active-commands-non-runnable",
+            "passed": (
+                bool(resource_gated_local_gate_refs)
+                and all(ref.get("classification") == "ready" and ref.get("runnable") for ref in resource_gated_local_gate_refs)
+                and bool(resource_gated_active_refs)
+                and all(
+                    ref.get("classification") == "resource-gated" and not ref.get("runnable")
+                    for ref in resource_gated_active_refs
+                )
+            ),
+            "expected": "resource-gated validation keeps local resource checks runnable but marks active after-gate commands non-runnable",
+            "actual": {
+                "local_gate_refs": resource_gated_local_gate_refs,
+                "active_refs": resource_gated_active_refs,
             },
         },
         {
