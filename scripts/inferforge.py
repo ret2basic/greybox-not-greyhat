@@ -9698,6 +9698,7 @@ def rewrite_review_item_for_cluster(
     path = str(cluster.get("path") or "")
     source_refs = compact_source_refs([str(ref) for ref in cluster.get("source_refs", []) or []])
     dynamic_segments = route_dynamic_segments(path)
+    path_candidate_prefix = catchall_prefix_for_path(path)
     catch_all = any("*" in str(segment) for segment in dynamic_segments) or any(
         ":path*" in str(rewrite.get("source") or "") or "{path*" in str(rewrite.get("source_pattern") or "")
         for rewrite in rewrites
@@ -9720,6 +9721,28 @@ def rewrite_review_item_for_cluster(
         if source_root is not None and source_refs
         else {}
     )
+    if path_candidate_prefix:
+        candidate_derivation = {
+            "status": "client-candidates-derived",
+            "reason": "Catch-all rewrite/proxy path can derive concrete local paths from client-side HTTP literals.",
+            "prefix": path_candidate_prefix,
+        }
+    elif dynamic_segments:
+        candidate_derivation = {
+            "status": "manual-concrete-parameter-required",
+            "reason": (
+                "Parameterized non-catch-all routes require exactly one reviewed concrete parameter value; "
+                "client-derived catch-all path expansion is not applicable."
+            ),
+            "path_template": path,
+            "dynamic_segments": dynamic_segments,
+        }
+    else:
+        candidate_derivation = {
+            "status": "no-dynamic-candidate-needed",
+            "reason": "Static fixed-upstream route does not need catch-all path candidate derivation.",
+            "path_template": path,
+        }
 
     risk_factors = []
     if fixed_upstreams:
@@ -9765,6 +9788,7 @@ def rewrite_review_item_for_cluster(
         "review_observation_candidates": review_candidates,
         "read_only_path_candidates": read_only_candidates,
         "blocked_path_candidates": blocked_candidates,
+        "candidate_derivation": candidate_derivation,
         "source_guard_review": source_guard_review,
         "source_refs": source_refs,
         "validation_questions": [
@@ -9788,6 +9812,8 @@ def rewrite_review_item_for_cluster(
             if read_only_candidates
             else "Choose exactly one known safe read-only concrete path, confirm scope, then add it through review-observation promotion."
             if rewrites and catch_all
+            else "Choose exactly one known safe read-only concrete parameter value, confirm scope, then review the source guard and response."
+            if dynamic_segments and source_guard_review.get("status") == "source-guard-indexed"
             else "Review source guards and identify whether a single safe read-only validation path exists."
         ),
         "references": [
@@ -42614,6 +42640,17 @@ def run_rewrite_review(args: argparse.Namespace) -> int:
                         f"guards={source_summary.get('positive_guard_refs', 0)} "
                         f"query_refs={source_summary.get('query_forwarding_refs', 0)} "
                         f"credential_refs={source_summary.get('credential_forwarding_refs', 0)}"
+                    )
+                candidate_derivation = (
+                    item.get("candidate_derivation")
+                    if isinstance(item.get("candidate_derivation"), dict)
+                    else {}
+                )
+                if candidate_derivation:
+                    print(
+                        "  candidate_derivation="
+                        f"{candidate_derivation.get('status')} "
+                        f"reason={inline_summary_text(candidate_derivation.get('reason'), max_chars=180)}"
                     )
                 read_only_candidates = item.get("read_only_path_candidates", []) or []
                 blocked_candidates = item.get("blocked_path_candidates", []) or []
