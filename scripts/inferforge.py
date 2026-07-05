@@ -37695,6 +37695,50 @@ def compact_review_blocker_unblock_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 approval_context.get("redacted_sidecar_required_fields")
             )[:8],
         }
+    if str(plan.get("packet_type") or "") in {
+        "credential-impact",
+        "resource-control",
+        "rpc-proxy-abuse",
+        "websocket-header-forwarding",
+    } and approval_context:
+        recommended_evidence = (
+            approval_context.get("recommended_evidence")
+            if isinstance(approval_context.get("recommended_evidence"), dict)
+            else {}
+        )
+        compact["operator_evidence_context"] = {
+            "recommended_evidence": {
+                key: recommended_evidence.get(key)
+                for key in [
+                    "entrypoint",
+                    "provider",
+                    "route_count",
+                    "provider_review_status",
+                    "operator_review_status",
+                    "deployment_review_status",
+                    "rpc_client_ip_trust_status",
+                    "policy_posture",
+                    "transaction_method_exposure_status",
+                    "rate_limit_resource_status",
+                    "client_ip_trust_status",
+                    "auth_context_status",
+                ]
+                if recommended_evidence.get(key) is not None
+            },
+            "operator_evidence_sidecar": approval_context.get("operator_evidence_sidecar"),
+            "accepted_present_statuses": normalize_string_list(
+                approval_context.get("accepted_present_statuses")
+            )[:8],
+            "missing_decision_ids": normalize_string_list(
+                recommended_evidence.get("missing_decision_ids")
+            )[:12],
+            "required_decision_ids": normalize_string_list(
+                recommended_evidence.get("required_decision_ids")
+            )[:12],
+            "redacted_sidecar_required_fields": normalize_string_list(
+                approval_context.get("redacted_sidecar_required_fields")
+            )[:8],
+        }
     return compact
 
 
@@ -37961,6 +38005,24 @@ def review_blocker_oracle_evidence_contract(group: dict[str, Any], oracle: dict[
             if isinstance(transaction_context.get("recommended_quote"), dict)
             else {}
         )
+    operator_context = (
+        selected.get("operator_evidence_context")
+        if isinstance(selected.get("operator_evidence_context"), dict)
+        else {}
+    )
+    if operator_context and not required_fields:
+        required_fields = normalize_string_list(operator_context.get("redacted_sidecar_required_fields"))
+        if not required_fields:
+            required_fields = [
+                f"operator evidence decision: {decision_id}"
+                for decision_id in normalize_string_list(operator_context.get("missing_decision_ids"))[:8]
+            ]
+        sidecar_path = operator_context.get("operator_evidence_sidecar")
+        recommended_request = (
+            operator_context.get("recommended_evidence")
+            if isinstance(operator_context.get("recommended_evidence"), dict)
+            else {}
+        )
     recommended_request_keys = [
         "method",
         "path",
@@ -37974,6 +38036,18 @@ def review_blocker_oracle_evidence_contract(group: dict[str, Any], oracle: dict[
         "expectedPayloadType",
         "programAllowlistStatus",
         "allowedPrograms_count",
+        "entrypoint",
+        "provider",
+        "route_count",
+        "provider_review_status",
+        "operator_review_status",
+        "deployment_review_status",
+        "rpc_client_ip_trust_status",
+        "policy_posture",
+        "transaction_method_exposure_status",
+        "rate_limit_resource_status",
+        "client_ip_trust_status",
+        "auth_context_status",
     ]
     return {
         "status": "has-contract",
@@ -37987,6 +38061,14 @@ def review_blocker_oracle_evidence_contract(group: dict[str, Any], oracle: dict[
         "payload_sidecar": transaction_context.get("payload_sidecar") if transaction_context else None,
         "intent_policy_sidecar": (
             transaction_context.get("intent_policy_sidecar") if transaction_context else None
+        ),
+        "operator_evidence_sidecar": (
+            operator_context.get("operator_evidence_sidecar") if operator_context else None
+        ),
+        "missing_decision_ids": (
+            normalize_string_list(operator_context.get("missing_decision_ids"))[:12]
+            if operator_context
+            else []
         ),
         "recommended_request": {
             key: recommended_request.get(key)
@@ -39562,6 +39644,67 @@ def build_review_blockers_selftest() -> dict[str, Any]:
         if gate_oracle_plan.get("actions")
         else {}
     )
+    operator_contract = review_blocker_oracle_evidence_contract(
+        {
+            "id": "GROUP-operator-evidence-contract",
+            "unblock_plans": [
+                compact_review_blocker_unblock_plan(
+                    {
+                        "packet_type": "credential-impact",
+                        "entrypoint": "POST /api/quote",
+                        "kind": "provider-operator-cost-impact",
+                        "first_unblocker": "Fill redacted operator evidence.",
+                        "evidence_artifacts": [OPERATOR_EVIDENCE_ARTIFACT],
+                        "oracle_type": "provider-impact",
+                        "approval_packet_context": {
+                            "recommended_evidence": {
+                                "entrypoint": "POST /api/quote",
+                                "provider": "M0",
+                                "missing_decision_ids": [
+                                    "credentialed-upstream-billing-impact",
+                                ],
+                            },
+                            "operator_evidence_sidecar": ".greybox/selftest-gate-blockers/operator-evidence.json",
+                            "accepted_present_statuses": ["present-valid"],
+                            "redacted_sidecar_required_fields": [
+                                "one evidence_items[] row per missing provider/operator decision id",
+                                "summary must be short, non-placeholder, and redacted",
+                            ],
+                        },
+                    }
+                )
+            ],
+        },
+        {"type": "provider-impact"},
+    )
+    operator_decision_fallback_contract = review_blocker_oracle_evidence_contract(
+        {
+            "id": "GROUP-operator-decision-fallback-contract",
+            "unblock_plans": [
+                compact_review_blocker_unblock_plan(
+                    {
+                        "packet_type": "websocket-header-forwarding",
+                        "entrypoint": "WS /api/rpc/solana/{cluster}",
+                        "kind": "websocket-header-trust-impact",
+                        "first_unblocker": "Fill redacted WebSocket header trust evidence.",
+                        "evidence_artifacts": [OPERATOR_EVIDENCE_ARTIFACT],
+                        "oracle_type": "provider-impact",
+                        "approval_packet_context": {
+                            "recommended_evidence": {
+                                "entrypoint": "WS /api/rpc/solana/{cluster}",
+                                "provider": "websocket-upstream/operator",
+                                "missing_decision_ids": [
+                                    "sensitive-app-auth-material-presence",
+                                ],
+                            },
+                            "operator_evidence_sidecar": ".greybox/selftest-gate-blockers/operator-evidence.json",
+                        },
+                    }
+                )
+            ],
+        },
+        {"type": "provider-impact"},
+    )
     gate_no_write_stdout_text = " ".join(gate_no_write_stdout.split())
     oracle_plan_no_write_stdout_text = " ".join(oracle_plan_no_write_stdout.split())
     assertions = [
@@ -39799,6 +39942,33 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "oracle_summary": gate_oracle_summary,
                 "summary": gate_blockers.get("summary"),
             },
+        },
+        {
+            "id": "operator-evidence-contract-renders-required-fields",
+            "passed": (
+                operator_contract.get("kind") == "provider-operator-cost-impact"
+                and operator_contract.get("required_field_count") == 2
+                and operator_contract.get("first_required_field")
+                == "one evidence_items[] row per missing provider/operator decision id"
+                and operator_contract.get("operator_evidence_sidecar")
+                == ".greybox/selftest-gate-blockers/operator-evidence.json"
+                and operator_contract.get("missing_decision_ids")
+                == ["credentialed-upstream-billing-impact"]
+            ),
+            "expected": "operator evidence contracts preserve redacted sidecar required fields and missing decisions",
+            "actual": operator_contract,
+        },
+        {
+            "id": "operator-evidence-contract-falls-back-to-missing-decisions",
+            "passed": (
+                operator_decision_fallback_contract.get("required_field_count") == 1
+                and operator_decision_fallback_contract.get("first_required_field")
+                == "operator evidence decision: sensitive-app-auth-material-presence"
+                and operator_decision_fallback_contract.get("missing_decision_ids")
+                == ["sensitive-app-auth-material-presence"]
+            ),
+            "expected": "operator evidence contracts expose missing decision IDs when no sidecar field contract is present",
+            "actual": operator_decision_fallback_contract,
         },
         {
             "id": "cli-no-write-skips-review-blocker-outputs",
@@ -49551,6 +49721,8 @@ def approval_packet_preview_context(packet_type: str, packet: dict[str, Any]) ->
         "accepted_payload_sidecars",
         "intent_policy_sidecar",
         "resource_capture_gate",
+        "operator_evidence_sidecar",
+        "accepted_present_statuses",
         "path_options_considered",
         "redacted_sidecar_required_fields",
         "source_context",
