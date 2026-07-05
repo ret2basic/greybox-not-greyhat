@@ -8,6 +8,9 @@ Hard rule:
 
 - Do not kill, stop, restart, signal, or otherwise manage the process,
   container, service, or port behind `2455`.
+- Do not manage the AI API load balancer by process name, container name,
+  service name, supervisor unit, or any other identifier, even if the port is
+  not mentioned directly.
 - Do not use `2455` as a memory-reclaim candidate.
 - Do not add `2455` to watch-port lists, health checks, readiness checks,
   resource checks, or active probes.
