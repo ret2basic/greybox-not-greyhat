@@ -8092,6 +8092,13 @@ def websocket_header_forwarding_approval_packet(
             "missing_decision_ids": ordered_unique_strings(missing_decisions),
         },
         "operator_evidence_sidecar": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+        "redacted_sidecar_required_fields": [
+            "one evidence_items[] row per missing WebSocket/header-forwarding decision id",
+            "status must stay pending/needs-review until reviewed evidence proves sensitive auth/header context or upstream trust impact",
+            "summary must be short, non-placeholder, and redacted",
+            "source_ref should identify reviewed source, provider/operator documentation, operator note, ticket, or equivalent source without raw secrets",
+            "no raw cookies, bearer tokens, authorization headers, provider API keys, private keys, seed phrases, wallet signatures, raw Burp history, or WebSocket frame payloads",
+        ],
         "offline_commands": [
             validation_command_for_artifact_dir(
                 artifact_dir,
@@ -14350,6 +14357,13 @@ def rpc_proxy_abuse_approval_packet(
             "missing_decision_ids": missing_decision_ids,
         },
         "operator_evidence_sidecar": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+        "redacted_sidecar_required_fields": [
+            "one evidence_items[] row per missing RPC policy, deployment, operator, or concrete-impact decision id",
+            "status must stay pending/needs-review until reviewed evidence justifies a concrete non-DoS RPC impact claim",
+            "summary must be short, non-placeholder, and redacted",
+            "source_ref should identify reviewed source, deployment config, provider/operator documentation, operator note, ticket, dashboard excerpt, log summary, or equivalent source without raw secrets",
+            "no RPC provider credentials, bearer tokens, cookies, private keys, seed phrases, wallet signatures, raw Burp history, method-enumeration output, flood output, or stress-test output",
+        ],
         "offline_commands": [
             command("hypothesis-matrix --no-write --show-next"),
             command("deployment-review --no-write --top 8"),
@@ -31291,8 +31305,10 @@ def quote_transaction_corpus_approval_review_candidate(
         "assessment": approval_packet.get("assessment", {}),
         "recommended_quote": approval_packet.get("recommended_quote", {}),
         "payload_sidecar": approval_packet.get("payload_sidecar"),
+        "accepted_payload_sidecars": approval_packet.get("accepted_payload_sidecars", []),
         "intent_policy_sidecar": approval_packet.get("intent_policy_sidecar"),
         "resource_capture_gate": approval_packet.get("resource_capture_gate", {}),
+        "redacted_sidecar_required_fields": approval_packet.get("redacted_sidecar_required_fields", []),
         "approval_sequence": approval_sequence,
         "finding_gate_blockers": blockers[:8],
         "finding_gate_blocker_count": len(blockers),
@@ -31345,6 +31361,7 @@ def quote_credential_impact_approval_review_candidate(
         "recommended_evidence": recommended_evidence,
         "operator_evidence_sidecar": approval_packet.get("operator_evidence_sidecar"),
         "accepted_present_statuses": approval_packet.get("accepted_present_statuses", []),
+        "redacted_sidecar_required_fields": approval_packet.get("redacted_sidecar_required_fields", []),
         "approval_sequence": approval_sequence,
         "finding_gate_blockers": blockers[:8],
         "finding_gate_blocker_count": len(blockers),
@@ -31397,6 +31414,7 @@ def quote_resource_control_approval_review_candidate(
         "recommended_evidence": recommended_evidence,
         "operator_evidence_sidecar": approval_packet.get("operator_evidence_sidecar"),
         "accepted_present_statuses": approval_packet.get("accepted_present_statuses", []),
+        "redacted_sidecar_required_fields": approval_packet.get("redacted_sidecar_required_fields", []),
         "approval_sequence": approval_sequence,
         "finding_gate_blockers": blockers[:8],
         "finding_gate_blocker_count": len(blockers),
@@ -39705,6 +39723,57 @@ def build_review_blockers_selftest() -> dict[str, Any]:
         },
         {"type": "provider-impact"},
     )
+    credential_candidate_required_fields = quote_credential_impact_approval_review_candidate(
+        {
+            "status": "needs-provider-impact-evidence",
+            "credential_impact_approval_packet": {
+                "status": "waiting-provider-operator-evidence",
+                "recommended_evidence": {
+                    "entrypoint": "POST /api/quote",
+                    "provider": "M0",
+                    "missing_decision_ids": ["credentialed-upstream-billing-impact"],
+                },
+                "operator_evidence_sidecar": ".greybox/selftest-gate-blockers/operator-evidence.json",
+                "accepted_present_statuses": ["present-valid"],
+                "redacted_sidecar_required_fields": [
+                    "one evidence_items[] row per missing provider/operator decision id",
+                ],
+                "finding_gate_blockers": ["No provider/operator billing impact evidence is present."],
+            },
+        }
+    ) or {}
+    resource_candidate_required_fields = quote_resource_control_approval_review_candidate(
+        {
+            "status": "waiting-deployment-operator-evidence",
+            "resource_control_approval_packet": {
+                "status": "waiting-deployment-operator-evidence",
+                "recommended_evidence": {
+                    "entrypoint": "POST /api/rpc/solana/{cluster}",
+                    "provider": "deployment/operator",
+                    "missing_decision_ids": ["external-rate-limit-store-config"],
+                },
+                "operator_evidence_sidecar": ".greybox/selftest-gate-blockers/operator-evidence.json",
+                "accepted_present_statuses": ["present-valid"],
+                "redacted_sidecar_required_fields": [
+                    "one evidence_items[] row per missing resource-control decision id",
+                ],
+                "finding_gate_blockers": [
+                    "No production external rate-limit store configuration/health evidence is present.",
+                ],
+            },
+        }
+    ) or {}
+    websocket_candidate_packet = websocket_header_forwarding_approval_packet(
+        artifact_dir=Path(".greybox/selftest-gate-blockers"),
+        profile=profile,
+        source_review={
+            "summary": {
+                "missing_sensitive_header_filters": ["authorization", "cookie"],
+                "auth_context_status": "unknown",
+            },
+            "leads": [{"file": "server.js"}],
+        },
+    )
     gate_no_write_stdout_text = " ".join(gate_no_write_stdout.split())
     oracle_plan_no_write_stdout_text = " ".join(oracle_plan_no_write_stdout.split())
     assertions = [
@@ -39969,6 +40038,32 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             ),
             "expected": "operator evidence contracts expose missing decision IDs when no sidecar field contract is present",
             "actual": operator_decision_fallback_contract,
+        },
+        {
+            "id": "operator-approval-review-candidates-preserve-required-fields",
+            "passed": (
+                credential_candidate_required_fields.get("redacted_sidecar_required_fields")
+                == ["one evidence_items[] row per missing provider/operator decision id"]
+                and resource_candidate_required_fields.get("redacted_sidecar_required_fields")
+                == ["one evidence_items[] row per missing resource-control decision id"]
+            ),
+            "expected": "credential/resource approval review candidates carry sidecar required fields into blocked previews",
+            "actual": {
+                "credential": credential_candidate_required_fields,
+                "resource": resource_candidate_required_fields,
+            },
+        },
+        {
+            "id": "websocket-approval-packet-renders-sidecar-required-fields",
+            "passed": (
+                len(websocket_candidate_packet.get("redacted_sidecar_required_fields") or []) >= 5
+                and "WebSocket/header-forwarding decision id"
+                in str((websocket_candidate_packet.get("redacted_sidecar_required_fields") or [""])[0])
+                and "sensitive-app-auth-material-presence"
+                in (websocket_candidate_packet.get("recommended_evidence", {}).get("missing_decision_ids") or [])
+            ),
+            "expected": "websocket approval packets expose redacted operator-evidence sidecar requirements",
+            "actual": websocket_candidate_packet,
         },
         {
             "id": "cli-no-write-skips-review-blocker-outputs",
