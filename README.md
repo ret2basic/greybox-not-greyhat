@@ -367,11 +367,16 @@ remain parked. The rollup includes `top_unblocker`,
 payload capture, provider/operator evidence, deployment resource evidence,
 read-only response observation, resource gates, finding-gate review, and whether
 the current package is waiting on a sidecar, operator evidence, offline review,
-or a resource gate. Each unblocker also carries an `evidence_package` with
-required artifacts, safe no-write review commands, active-validation gates, and
-forbidden validation steps for that lane. When an artifact directory is known,
-the package's safe reviews are expanded into command-safety-classified
-`safe_offline_command_refs`.
+or a resource gate. Each unblocker also carries a `validation_oracle` that names
+the exact proof model required for validity, such as `transaction-intent`,
+`single-response-impact`, `provider-impact`, `resource-control`, or
+`finding-gate`. The oracle lists acceptance checks and rejection conditions so
+blackbox mode can pursue one valid bounty path while greybox mode can close each
+dangerous surface without treating static suspicion as a finding. Each unblocker
+also carries an `evidence_package` with required artifacts, safe no-write review
+commands, active-validation gates, and forbidden validation steps for that lane.
+When an artifact directory is known, the package's safe reviews are expanded
+into command-safety-classified `safe_offline_command_refs`.
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \

@@ -12597,6 +12597,8 @@ def assessment_objective_satisfaction_summary(
         "unblocker_lane_counts": unblocker_rollup.get("lane_counts", {}),
         "unblocker_actionability_counts": unblocker_rollup.get("actionability_counts", {}),
         "unblocker_package_status_counts": unblocker_rollup.get("package_status_counts", {}),
+        "unblocker_oracle_type_counts": unblocker_rollup.get("oracle_type_counts", {}),
+        "unblocker_oracle_status_counts": unblocker_rollup.get("oracle_status_counts", {}),
         "top_unblocker": unblocker_rollup.get("top_unblocker"),
         "unblockers": unblocker_rollup.get("items", []),
         "safe_offline_commands": unblocker_rollup.get("safe_offline_commands", []),
@@ -12774,6 +12776,121 @@ def objective_unblocker_package_status(
         "status": "needs-evidence-triage",
         "next_step_kind": "triage",
         "reason": "Classify the evidence lane before active validation.",
+    }
+
+
+def objective_unblocker_validation_oracle(
+    *,
+    lane: str,
+    package_status: str,
+    impact: str,
+) -> dict[str, Any]:
+    status = "blocked" if package_status == "blocked-resource-gate" else "waiting-evidence"
+    if lane in {"approved-transaction-payload", "transaction-intent-policy", "decoded-transaction-review"}:
+        return {
+            "id": "transaction-intent-validation-oracle",
+            "type": "transaction-intent",
+            "status": status,
+            "impact_claim": "transaction-integrity",
+            "acceptance_checks": [
+                "One approved quote transaction payload sidecar is present and tied to the requested wallet, direction, amount, and mint pair.",
+                "Offline decode shows signer, account, mint, amount, instruction, or program behavior that conflicts with approved user intent.",
+                "The mismatch can be reproduced from the minimal evidence package without wallet signing or transaction submission.",
+            ],
+            "reject_if": [
+                "Only static source suspicion or an unsigned/sample payload is available.",
+                "The decoded transaction matches the approved wallet, mints, amount, programs, and direction.",
+                "Evidence requires signing, submitting, trading, or collecting raw private material.",
+            ],
+            "next_step": "Build the approved transaction sidecar, then run transaction corpus and decode reviews offline.",
+        }
+    if lane in {"single-approved-response", "read-only-path-selection", "impact-classification"}:
+        return {
+            "id": "single-response-impact-validation-oracle",
+            "type": "single-response-impact",
+            "status": status,
+            "impact_claim": "sensitive-data-or-path-confusion",
+            "acceptance_checks": [
+                "Exactly one concrete in-scope read-only path was selected before any request.",
+                "One approved redacted response proves sensitive data exposure, path confusion, authorization bypass, or equivalent trust-boundary impact.",
+                "The finding-gate can tie the response to concrete user, account, business, or authorization impact.",
+            ],
+            "reject_if": [
+                "Evidence is only a rewrite/proxy configuration or a 2xx response.",
+                "The response body is raw, unredacted, out of scope, mutating, or collected through endpoint enumeration.",
+                "No concrete sensitive-data, authz, or trust-boundary impact is present.",
+            ],
+            "next_step": "Select one read-only path and close the response sidecar/review before finding-gate.",
+        }
+    if lane == "provider-operator-evidence":
+        return {
+            "id": "provider-impact-validation-oracle",
+            "type": "provider-impact",
+            "status": status,
+            "impact_claim": "credentialed-upstream-cost-or-quota-abuse",
+            "acceptance_checks": [
+                "Redacted provider/operator evidence shows quota, billing, rate-limit, monitoring, or account impact.",
+                "The route is attacker-controllable without wallet signing or privileged credentials.",
+                "The finding-gate can prove concrete cost, quota, availability, or credential-abuse impact without high-volume traffic.",
+            ],
+            "reject_if": [
+                "Only public provider documentation or static credential presence is available.",
+                "No account-level quota, billing, usage, rate-limit, or monitoring impact is evidenced.",
+                "Validation would require provider stress, quota depletion, Scanner, Intruder, or request flooding.",
+            ],
+            "next_step": "Collect redacted operator/provider evidence and review it offline before any route reachability check.",
+        }
+    if lane in {"deployment-resource-evidence", "resource-gate"}:
+        return {
+            "id": "resource-control-validation-oracle",
+            "type": "resource-control",
+            "status": status,
+            "impact_claim": "non-stress-availability-or-resource-control-impact",
+            "acceptance_checks": [
+                "Deployment/operator evidence shows external rate-limit store state, proxy/header trust, direct reachability, and key bounds.",
+                "Attacker-controlled input can affect resource-control decisions without relying on floods or stress tests.",
+                "Concrete availability, quota, monitoring, or operator impact is evidenced through non-stress artifacts.",
+            ],
+            "reject_if": [
+                "Evidence is only a static in-memory fallback branch or development configuration.",
+                "Proxy/header trust, external store health, key bounds, or monitoring impact is missing.",
+                "Validation would require rate-limit exhaustion, DoS, spoofed-header probing, or high-volume RPC traffic.",
+            ],
+            "next_step": "Close deployment/operator evidence first; keep active validation blocked behind a healthy resource gate.",
+        }
+    if lane == "finding-gate-review":
+        return {
+            "id": "finding-gate-validation-oracle",
+            "type": "finding-gate",
+            "status": status,
+            "impact_claim": impact or "medium-plus-reportability",
+            "acceptance_checks": [
+                "Finding-gate accepts concrete impact from the collected minimal evidence package.",
+                "Adjudication classifies the issue as a valid Medium, High, or Critical finding.",
+                "Evidence-chain contains enough redacted reproduction context to support a report without more active traffic.",
+            ],
+            "reject_if": [
+                "Finding-gate or adjudication is still blocked.",
+                "Impact is configuration-only, static-only, or below Medium severity.",
+                "Report steps require additional unsafe traffic, signing, secrets, or state mutation.",
+            ],
+            "next_step": "Run finding-gate and adjudication previews, then prepare the minimal report package only if accepted.",
+        }
+    return {
+        "id": "evidence-triage-validation-oracle",
+        "type": "evidence-triage",
+        "status": status,
+        "impact_claim": impact or "unclassified",
+        "acceptance_checks": [
+            "Evidence lane is classified before active validation.",
+            "Required artifacts and forbidden validation steps are known.",
+            "The next command is no-write, local/offline, and command-safety classified as ready.",
+        ],
+        "reject_if": [
+            "The lane is unclassified.",
+            "The next step would require active traffic before scope, resource, and evidence gates are clear.",
+        ],
+        "next_step": "Classify the evidence lane, then select the appropriate validation oracle.",
     }
 
 
@@ -12996,6 +13113,11 @@ def assessment_item_objective_unblocker(
         missing_requirements=missing_requirements,
         active_step=active_step,
     )
+    validation_oracle = objective_unblocker_validation_oracle(
+        lane=lane,
+        package_status=str(package_status.get("status") or ""),
+        impact=impact,
+    )
     unblocker = {
         "item_id": assessment_item_identity(item),
         "priority": item.get("priority") or item.get("validation_item_priority"),
@@ -13006,6 +13128,9 @@ def assessment_item_objective_unblocker(
         "package_status": package_status.get("status"),
         "package_next_step_kind": package_status.get("next_step_kind"),
         "package_status_reason": package_status.get("reason"),
+        "validation_oracle": validation_oracle,
+        "oracle_type": validation_oracle.get("type"),
+        "oracle_status": validation_oracle.get("status"),
         "evidence_package": evidence_package,
         "evidence_package_id": evidence_package.get("id"),
         "active_step": active_step or None,
@@ -13037,11 +13162,15 @@ def objective_unblocker_rollup(
     lane_counts: dict[str, int] = {}
     actionability_counts: dict[str, int] = {}
     package_status_counts: dict[str, int] = {}
+    oracle_type_counts: dict[str, int] = {}
+    oracle_status_counts: dict[str, int] = {}
     command_refs = []
     for unblocker in unblockers:
         increment_count(lane_counts, str(unblocker.get("lane") or "unknown"))
         increment_count(actionability_counts, str(unblocker.get("actionability") or "unknown"))
         increment_count(package_status_counts, str(unblocker.get("package_status") or "unknown"))
+        increment_count(oracle_type_counts, str(unblocker.get("oracle_type") or "unknown"))
+        increment_count(oracle_status_counts, str(unblocker.get("oracle_status") or "unknown"))
         for ref in unblocker.get("safe_offline_command_refs", []) or []:
             if isinstance(ref, dict):
                 command_refs.append(ref)
@@ -13051,6 +13180,8 @@ def objective_unblocker_rollup(
         "lane_counts": dict(sorted(lane_counts.items())),
         "actionability_counts": dict(sorted(actionability_counts.items())),
         "package_status_counts": dict(sorted(package_status_counts.items())),
+        "oracle_type_counts": dict(sorted(oracle_type_counts.items())),
+        "oracle_status_counts": dict(sorted(oracle_status_counts.items())),
         "safe_offline_commands": command_refs[:8],
         "command_safety": command_safety_summary(command_refs) if command_refs else {"commands": 0},
     }
@@ -13292,6 +13423,16 @@ def build_bounty_harness_alignment(
         artifact_dir=artifact_dir,
         profile=profile,
     )
+    top_objective_unblocker = (
+        objective_satisfaction.get("top_unblocker")
+        if isinstance(objective_satisfaction.get("top_unblocker"), dict)
+        else {}
+    )
+    top_validation_oracle = (
+        top_objective_unblocker.get("validation_oracle")
+        if isinstance(top_objective_unblocker.get("validation_oracle"), dict)
+        else {}
+    )
     top_candidate = candidate_leads[0] if candidate_leads else {}
 
     def command(subcommand: str, *, source: str) -> dict[str, Any] | None:
@@ -13394,9 +13535,20 @@ def build_bounty_harness_alignment(
                 "gate_ready_threads": gate_ready_threads,
                 "closure_status_counts": evidence_closure_summary.get("status_counts", {}),
                 "validation_items": validation_summary.get("items", 0),
+                "top_unblocker": {
+                    "item_id": top_objective_unblocker.get("item_id"),
+                    "lane": top_objective_unblocker.get("lane"),
+                    "package_status": top_objective_unblocker.get("package_status"),
+                    "oracle_type": top_objective_unblocker.get("oracle_type"),
+                    "oracle_status": top_objective_unblocker.get("oracle_status"),
+                }
+                if top_objective_unblocker
+                else {},
+                "top_validation_oracle": top_validation_oracle,
             },
             (
-                "Close the top lead's missing sidecar, decoded corpus, response observation, or operator evidence contract."
+                top_validation_oracle.get("next_step")
+                or "Close the top lead's missing sidecar, decoded corpus, response observation, or operator evidence contract."
                 if not gate_ready_threads
                 else "Run finding-gate and adjudication no-write before writing reports."
             ),
@@ -42659,6 +42811,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 == "approved-transaction-payload-evidence-package"
                 and blackbox_objective_satisfaction_sample.get("top_unblocker", {}).get("package_status")
                 == "needs-approved-transaction-sidecar"
+                and blackbox_objective_satisfaction_sample.get("top_unblocker", {}).get("oracle_type")
+                == "transaction-intent"
                 and "transaction-payloads.jsonl"
                 in (
                     blackbox_objective_satisfaction_sample.get("top_unblocker", {})
@@ -42737,6 +42891,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 == "deployment-resource-evidence-package"
                 and greybox_objective_satisfaction_sample.get("top_unblocker", {}).get("package_status")
                 == "needs-deployment-operator-evidence"
+                and greybox_objective_satisfaction_sample.get("top_unblocker", {}).get("oracle_type")
+                == "resource-control"
                 and blackbox_objective_satisfaction_sample.get("satisfied_items") == 1
                 and blackbox_objective_satisfaction_sample.get("top_satisfied_id") == "gate-ready-sensitive-data"
                 and blackbox_objective_satisfaction_sample.get("open_items") == 2
@@ -43154,6 +43310,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "lane=" in methodology_review_stdout_text
                 and "package=" in methodology_review_stdout_text
                 and "package_status=" in methodology_review_stdout_text
+                and "oracle=" in methodology_review_stdout_text
                 and "commands=" in methodology_review_stdout_text
                 and "- bounty system-context-threat-model:" in methodology_review_stdout_text
                 and "High-value threads:" in methodology_review_stdout
@@ -43189,6 +43346,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "action=" in lead_dossier_stdout_text
                 and "package=" in lead_dossier_stdout_text
                 and "package_status=" in lead_dossier_stdout_text
+                and "oracle=" in lead_dossier_stdout_text
                 and "commands=" in lead_dossier_stdout_text
                 and "strict_validation=blocked-before-finding-gate" in lead_dossier_stdout_text
                 and "question=waiting concrete-impact-evidence" in lead_dossier_stdout_text
@@ -60535,6 +60693,7 @@ def run_methodology_review(args: argparse.Namespace) -> int:
             f"lane={bounty_top_unblocker.get('lane') or '-'} "
             f"package={bounty_top_unblocker.get('evidence_package_id') or '-'} "
             f"package_status={bounty_top_unblocker.get('package_status') or '-'} "
+            f"oracle={bounty_top_unblocker.get('oracle_type') or '-'} "
             f"commands={len(bounty_objective.get('safe_offline_commands', []) or [])} "
             f"top={bounty_summary.get('top_candidate_id') or '-'} "
             f"gate_ready={bounty_summary.get('gate_ready_threads', 0)} "
@@ -60684,6 +60843,7 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
             f"action={top_unblocker.get('actionability') or '-'} "
             f"package={top_unblocker.get('evidence_package_id') or '-'} "
             f"package_status={top_unblocker.get('package_status') or '-'} "
+            f"oracle={top_unblocker.get('oracle_type') or '-'} "
             f"commands={len(objective_satisfaction.get('safe_offline_commands', []) or [])}"
         )
     if assessment_policy:
@@ -62901,6 +63061,7 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
             f"action={top_unblocker.get('actionability') or '-'} "
             f"package={top_unblocker.get('evidence_package_id') or '-'} "
             f"package_status={top_unblocker.get('package_status') or '-'} "
+            f"oracle={top_unblocker.get('oracle_type') or '-'} "
             f"commands={len(objective_satisfaction.get('safe_offline_commands', []) or [])}"
         )
     if resource_preflight and resource_preflight.get("status") != "not-run":
