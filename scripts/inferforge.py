@@ -157,6 +157,7 @@ ITERATION_DECISION_ARTIFACT = "iteration-decision.json"
 EVIDENCE_PREP_PACKAGE_ARTIFACT = "evidence-prep-package.json"
 EVIDENCE_PREP_STATUS_ARTIFACT = "evidence-prep-status.json"
 EVIDENCE_SIDECAR_DRAFTS_ARTIFACT = "evidence-sidecar-drafts.json"
+CLAIM_EVIDENCE_LEDGER_ARTIFACT = "claim-evidence-ledger.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -260,6 +261,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     EVIDENCE_PREP_PACKAGE_ARTIFACT,
     EVIDENCE_PREP_STATUS_ARTIFACT,
     EVIDENCE_SIDECAR_DRAFTS_ARTIFACT,
+    CLAIM_EVIDENCE_LEDGER_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -355,6 +357,7 @@ INDEX_ARTIFACT_ORDER = [
     EVIDENCE_PREP_PACKAGE_ARTIFACT,
     EVIDENCE_PREP_STATUS_ARTIFACT,
     EVIDENCE_SIDECAR_DRAFTS_ARTIFACT,
+    CLAIM_EVIDENCE_LEDGER_ARTIFACT,
     "config.json",
     "collection-summary.json",
     "endpoint-clusters.json",
@@ -20663,6 +20666,671 @@ def write_evidence_sidecar_draft_files(draft_doc: dict[str, Any]) -> list[Path]:
     return written
 
 
+CLAIM_LEDGER_IMPACT_BY_ORACLE = {
+    "transaction-intent": "transaction-integrity",
+    "single-response-impact": "sensitive-data-or-path-confusion",
+    "provider-impact": "provider-cost-or-quota-impact",
+    "resource-control": "deployment-resource-control-impact",
+    "rpc-proxy-abuse": "rpc-method-boundary-impact",
+    "websocket-header-forwarding": "websocket-header-trust-impact",
+    "finding-gate": "finding-gate-reportability",
+}
+
+CLAIM_LEDGER_REQUIRED_CATEGORIES_BY_ORACLE = {
+    "transaction-intent": {"transaction-payload-sidecar", "transaction-intent-policy"},
+    "single-response-impact": {"rewrite-response-sidecar"},
+    "provider-impact": {"operator-evidence"},
+    "resource-control": {"operator-evidence"},
+    "rpc-proxy-abuse": {"operator-evidence"},
+    "websocket-header-forwarding": {"operator-evidence"},
+}
+
+CLAIM_LEDGER_ORACLE_BY_PACKET_TYPE = {
+    "transaction-corpus": "transaction-intent",
+    "rewrite-response": "single-response-impact",
+    "credential-impact": "provider-impact",
+    "resource-control": "resource-control",
+    "rpc-proxy-abuse": "rpc-proxy-abuse",
+    "websocket-header-forwarding": "websocket-header-forwarding",
+}
+
+
+def claim_ledger_status_index(status_doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+    row_sets = [
+        ("required-evidence", "required_evidence_artifacts"),
+        ("template-only", "template_artifacts"),
+        ("supporting-artifact", "supporting_artifacts"),
+    ]
+    for evidence_role, key in row_sets:
+        for row in status_doc.get(key, []) or []:
+            if not isinstance(row, dict):
+                continue
+            indexed = json_clone(row)
+            indexed["evidence_role"] = evidence_role
+            for value in [row.get("artifact"), row.get("path"), row.get("name")]:
+                text = str(value or "").strip()
+                if text:
+                    index[text] = indexed
+                    index[Path(text).name] = indexed
+    return index
+
+
+def claim_ledger_status_row_for_ref(
+    ref: str,
+    *,
+    status_index: dict[str, dict[str, Any]],
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    text = str(ref or "").strip()
+    name = Path(text).name
+    indexed = status_index.get(text) or status_index.get(name)
+    if indexed:
+        return json_clone(indexed)
+    path = evidence_prep_artifact_ref_path(text, artifact_dir)
+    file_status = evidence_prep_artifact_file_status(path)
+    category = evidence_prep_artifact_category(path.name)
+    readiness = "supporting-artifact-present" if file_status.get("status") == "present" else "supporting-artifact-missing"
+    evidence_role = "supporting-artifact"
+    if path.name in EVIDENCE_PREP_REQUIRED_EVIDENCE_ARTIFACT_NAMES:
+        evidence_role = "required-evidence"
+        if file_status.get("status") == "missing":
+            readiness = "missing-evidence"
+        elif file_status.get("status") == "present":
+            readiness = "waiting-evidence-review"
+        else:
+            readiness = "invalid-evidence"
+    elif path.name in EVIDENCE_PREP_TEMPLATE_ARTIFACT_NAMES:
+        evidence_role = "template-only"
+        readiness = "template-only-not-evidence"
+    return {
+        "artifact": text,
+        "path": file_status.get("path"),
+        "name": path.name,
+        "category": category,
+        "file_status": file_status.get("status"),
+        "bytes": file_status.get("bytes"),
+        "readiness": readiness,
+        "validation": {},
+        "evidence_role": evidence_role,
+    }
+
+
+def claim_ledger_validator_status(row: dict[str, Any]) -> str:
+    validation = row.get("validation") if isinstance(row.get("validation"), dict) else {}
+    return str(validation.get("status") or row.get("file_status") or row.get("readiness") or "unknown")
+
+
+def claim_ledger_evidence_row(
+    ref: str,
+    *,
+    status_index: dict[str, dict[str, Any]],
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    row = claim_ledger_status_row_for_ref(ref, status_index=status_index, artifact_dir=artifact_dir)
+    category = str(row.get("category") or evidence_prep_artifact_category(str(row.get("name") or "")))
+    validation_commands = (
+        evidence_sidecar_draft_validation_commands(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            category=category,
+        )
+        if category in {"rewrite-response-sidecar", "transaction-payload-sidecar", "transaction-intent-policy", "operator-evidence"}
+        else []
+    )
+    return {
+        "artifact": row.get("artifact") or ref,
+        "path": row.get("path"),
+        "name": row.get("name") or Path(str(ref)).name,
+        "category": category,
+        "evidence_role": row.get("evidence_role") or "supporting-artifact",
+        "status": row.get("readiness"),
+        "file_status": row.get("file_status"),
+        "validator_status": claim_ledger_validator_status(row),
+        "validation": row.get("validation") if isinstance(row.get("validation"), dict) else {},
+        "verification_commands": validation_commands,
+        "finding_gate_boundary": (
+            "This artifact can support a later claim review only. Templates, drafts, and this ledger are not evidence."
+        ),
+    }
+
+
+def claim_ledger_required_evidence_is_blocking(row: dict[str, Any]) -> bool:
+    return str(row.get("evidence_role") or "") == "required-evidence" or str(row.get("category") or "") in {
+        "rewrite-response-sidecar",
+        "transaction-payload-sidecar",
+        "transaction-intent-policy",
+        "operator-evidence",
+    }
+
+
+def claim_ledger_claim_readiness(evidence_rows: list[dict[str, Any]]) -> str:
+    blocking = [row for row in evidence_rows if claim_ledger_required_evidence_is_blocking(row)]
+    if not blocking:
+        if any(row.get("status") == "template-only-not-evidence" for row in evidence_rows):
+            return "template-only-not-evidence"
+        return "blocked-no-evidence-contract"
+    statuses = {str(row.get("status") or "") for row in blocking}
+    if "invalid-evidence" in statuses:
+        return "invalid-evidence"
+    if "missing-evidence" in statuses:
+        return "missing-evidence"
+    if all(status.startswith("ready-") for status in statuses):
+        return "ready-for-finding-gate-review"
+    return "waiting-evidence-review"
+
+
+def claim_ledger_group_maps(review_blockers: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    by_key: dict[str, dict[str, Any]] = {}
+    for group in review_blockers.get("groups", []) or []:
+        if not isinstance(group, dict):
+            continue
+        if group.get("id"):
+            by_id[str(group.get("id"))] = group
+        if group.get("key"):
+            by_key[str(group.get("key"))] = group
+    return by_id, by_key
+
+
+def claim_ledger_group_for_action(
+    action: dict[str, Any],
+    *,
+    groups_by_id: dict[str, dict[str, Any]],
+    groups_by_key: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    group_id = str(action.get("group_id") or "")
+    if group_id in groups_by_id:
+        return groups_by_id[group_id]
+    if group_id in groups_by_key:
+        return groups_by_key[group_id]
+    return {}
+
+
+def claim_ledger_oracle_for_action(action: dict[str, Any], group: dict[str, Any]) -> dict[str, Any]:
+    oracle_type = str(action.get("oracle_type") or "")
+    for oracle in group.get("validation_oracles", []) or []:
+        if not isinstance(oracle, dict):
+            continue
+        if str(oracle.get("type") or oracle.get("id") or "") == oracle_type:
+            return oracle
+    return {}
+
+
+def claim_ledger_plan_for_oracle(oracle_type: str, group: dict[str, Any]) -> dict[str, Any]:
+    plans = [plan for plan in group.get("unblock_plans", []) or [] if isinstance(plan, dict)]
+    for plan in plans:
+        if str(plan.get("oracle_type") or "") == oracle_type:
+            return plan
+    return plans[0] if plans else {}
+
+
+def claim_ledger_entrypoint_from_title(title: Any) -> str | None:
+    text = str(title or "").strip()
+    marker = "Blocked finding-gate preview:"
+    if marker in text:
+        return text.split(marker, 1)[1].strip() or None
+    return None
+
+
+def claim_ledger_entrypoint(
+    *,
+    action: dict[str, Any],
+    group: dict[str, Any],
+    plan: dict[str, Any],
+    contract: dict[str, Any],
+) -> str | None:
+    for candidate in [
+        plan.get("entrypoint"),
+        contract.get("entrypoint"),
+        claim_ledger_entrypoint_from_title(group.get("title")),
+        claim_ledger_entrypoint_from_title(action.get("title")),
+    ]:
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    recommended = contract.get("recommended_request") if isinstance(contract.get("recommended_request"), dict) else {}
+    method = str(recommended.get("method") or "").strip()
+    path = str(recommended.get("path") or recommended.get("client_path") or "").strip()
+    if method and path:
+        return f"{method} {path}"
+    if path:
+        return path
+    return None
+
+
+def claim_ledger_required_refs_for_oracle(
+    *,
+    oracle_type: str,
+    action: dict[str, Any],
+    group: dict[str, Any],
+    contract: dict[str, Any],
+    status_doc: dict[str, Any],
+    artifact_dir: Path,
+) -> list[str]:
+    refs: list[str] = []
+    first_missing = str(action.get("first_missing_artifact") or "").strip()
+    required_names = {
+        str(row.get("name") or Path(str(row.get("artifact") or "")).name)
+        for row in status_doc.get("required_evidence_artifacts", []) or []
+        if isinstance(row, dict)
+    }
+    for ref in normalize_string_list(contract.get("evidence_artifacts")):
+        name = Path(ref).name
+        if (
+            required_names
+            and name in EVIDENCE_PREP_REQUIRED_EVIDENCE_ARTIFACT_NAMES
+            and name not in required_names
+            and ref != first_missing
+        ):
+            continue
+        refs.append(ref)
+    if first_missing:
+        refs.append(first_missing)
+    wanted_categories = CLAIM_LEDGER_REQUIRED_CATEGORIES_BY_ORACLE.get(oracle_type, set())
+    for row in status_doc.get("required_evidence_artifacts", []) or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("category") or "") in wanted_categories:
+            refs.append(str(row.get("artifact") or row.get("name") or ""))
+    if not refs:
+        refs.extend(normalize_string_list(group.get("artifact_refs")))
+    return [ref for ref in evidence_prep_dedupe_artifact_refs([ref for ref in refs if ref], artifact_dir) if ref]
+
+
+def claim_ledger_verification_commands(
+    evidence_rows: list[dict[str, Any]],
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> list[str]:
+    commands: list[str] = []
+    for row in evidence_rows:
+        commands.extend(normalize_string_list(row.get("verification_commands")))
+    commands.extend(
+        [
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "gate --no-write --show-items",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "adjudicate --no-write",
+                profile=profile,
+            ),
+        ]
+    )
+    return ordered_unique_strings(commands)
+
+
+def claim_ledger_claim_text(
+    *,
+    oracle_type: str,
+    entrypoint: str | None,
+    action: dict[str, Any],
+    group: dict[str, Any],
+) -> str:
+    subject = entrypoint or action.get("cluster_id") or group.get("cluster_id") or action.get("group_id") or "this lead"
+    impact = CLAIM_LEDGER_IMPACT_BY_ORACLE.get(oracle_type, str(action.get("impact_claim") or oracle_type or "impact"))
+    return (
+        f"{subject} may satisfy a {impact} claim only if the listed evidence artifacts prove the oracle contract; "
+        "static source, templates, drafts, and this ledger are not reportable evidence."
+    )
+
+
+def claim_ledger_claim_from_action(
+    *,
+    index: int,
+    action: dict[str, Any],
+    review_blockers: dict[str, Any],
+    groups_by_id: dict[str, dict[str, Any]],
+    groups_by_key: dict[str, dict[str, Any]],
+    status_doc: dict[str, Any],
+    status_index: dict[str, dict[str, Any]],
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    oracle_type = str(action.get("oracle_type") or "unknown")
+    group = claim_ledger_group_for_action(action, groups_by_id=groups_by_id, groups_by_key=groups_by_key)
+    oracle = claim_ledger_oracle_for_action(action, group)
+    plan = claim_ledger_plan_for_oracle(oracle_type, group)
+    contract = (
+        review_blocker_oracle_evidence_contract(group, oracle)
+        if group and oracle
+        else {
+            "status": action.get("evidence_contract_status"),
+            "kind": action.get("evidence_contract_kind"),
+            "first_required_field": action.get("first_required_field"),
+            "required_field_count": action.get("required_field_count", 0),
+            "evidence_artifacts": [action.get("first_missing_artifact")] if action.get("first_missing_artifact") else [],
+        }
+    )
+    entrypoint = claim_ledger_entrypoint(action=action, group=group, plan=plan, contract=contract)
+    refs = claim_ledger_required_refs_for_oracle(
+        oracle_type=oracle_type,
+        action=action,
+        group=group,
+        contract=contract,
+        status_doc=status_doc,
+        artifact_dir=artifact_dir,
+    )
+    evidence_rows = [
+        claim_ledger_evidence_row(
+            ref,
+            status_index=status_index,
+            artifact_dir=artifact_dir,
+            profile=profile,
+        )
+        for ref in refs
+    ]
+    readiness = claim_ledger_claim_readiness(evidence_rows)
+    acceptance_checks = normalize_string_list(oracle.get("acceptance_checks"))
+    if not acceptance_checks:
+        acceptance_checks = normalize_string_list(contract.get("required_fields"))
+    if not acceptance_checks and contract.get("first_required_field"):
+        acceptance_checks = [str(contract.get("first_required_field"))]
+    reject_if = normalize_string_list(oracle.get("reject_if"))
+    if not reject_if and action.get("static_only_not_reportable"):
+        reject_if = [str(action.get("static_only_not_reportable"))]
+    return {
+        "id": f"CLAIM-{index:03d}-{safe_probe_id(oracle_type)}-{safe_probe_id(str(entrypoint or action.get('group_id') or index))}",
+        "source": "oracle-plan",
+        "source_group_id": action.get("group_id") or group.get("id"),
+        "source_action_id": action.get("id"),
+        "entrypoint": entrypoint,
+        "cluster_id": action.get("cluster_id") or group.get("cluster_id"),
+        "oracle_type": oracle_type,
+        "oracle_status": action.get("oracle_status") or oracle.get("status"),
+        "impact_claim": CLAIM_LEDGER_IMPACT_BY_ORACLE.get(oracle_type, action.get("impact_claim")),
+        "claim_text": claim_ledger_claim_text(
+            oracle_type=oracle_type,
+            entrypoint=entrypoint,
+            action=action,
+            group=group,
+        ),
+        "priority": action.get("priority") or group.get("priority"),
+        "recommendation": action.get("recommendation"),
+        "score": action.get("score"),
+        "evidence_contract": {
+            "status": contract.get("status"),
+            "kind": contract.get("kind") or action.get("evidence_contract_kind"),
+            "first_required_field": contract.get("first_required_field") or action.get("first_required_field"),
+            "required_field_count": contract.get("required_field_count") or action.get("required_field_count", 0),
+        },
+        "required_evidence": evidence_rows,
+        "acceptance_criteria": acceptance_checks[:8],
+        "reject_if": reject_if[:8],
+        "verification_commands": claim_ledger_verification_commands(
+            evidence_rows,
+            artifact_dir=artifact_dir,
+            profile=profile,
+        ),
+        "blocker_reason": group.get("reason") or action.get("reason") or action.get("next_step"),
+        "first_unblocker": plan.get("first_unblocker") or action.get("next_step"),
+        "readiness": readiness,
+        "finding_gate_boundary": "This claim is not a finding by itself; only adjudicated finding-gate items can become findings.",
+    }
+
+
+def claim_ledger_claim_from_approval_packet(
+    *,
+    index: int,
+    packet: dict[str, Any],
+    status_doc: dict[str, Any],
+    status_index: dict[str, dict[str, Any]],
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    packet_type = str(packet.get("packet_type") or packet.get("type") or "").replace("_", "-")
+    oracle_type = CLAIM_LEDGER_ORACLE_BY_PACKET_TYPE.get(packet_type, packet_type or "approval-packet")
+    refs = []
+    for key in ["sidecar", "payload_sidecar", "intent_policy_sidecar", "operator_evidence_sidecar"]:
+        value = str(packet.get(key) or "").strip()
+        if value:
+            refs.append(value)
+    wanted_categories = CLAIM_LEDGER_REQUIRED_CATEGORIES_BY_ORACLE.get(oracle_type, set())
+    for row in status_doc.get("required_evidence_artifacts", []) or []:
+        if isinstance(row, dict) and str(row.get("category") or "") in wanted_categories:
+            refs.append(str(row.get("artifact") or row.get("name") or ""))
+    deduped_refs = evidence_prep_dedupe_artifact_refs([ref for ref in refs if ref], artifact_dir)
+    evidence_rows = [
+        claim_ledger_evidence_row(
+            ref,
+            status_index=status_index,
+            artifact_dir=artifact_dir,
+            profile=profile,
+        )
+        for ref in deduped_refs
+    ]
+    recommended = packet.get("recommended_evidence") if isinstance(packet.get("recommended_evidence"), dict) else {}
+    quote = packet.get("recommended_quote") if isinstance(packet.get("recommended_quote"), dict) else {}
+    request = packet.get("recommended_request") if isinstance(packet.get("recommended_request"), dict) else {}
+    entrypoint = recommended.get("entrypoint")
+    if not entrypoint and quote.get("method") and quote.get("path"):
+        entrypoint = f"{quote.get('method')} {quote.get('path')}"
+    if not entrypoint and request.get("method") and request.get("path"):
+        entrypoint = f"{request.get('method')} {request.get('path')}"
+    readiness = claim_ledger_claim_readiness(evidence_rows)
+    return {
+        "id": f"CLAIM-{index:03d}-{safe_probe_id(oracle_type)}-{safe_probe_id(str(entrypoint or packet_type or index))}",
+        "source": "evidence-prep-package",
+        "entrypoint": entrypoint,
+        "oracle_type": oracle_type,
+        "oracle_status": packet.get("status"),
+        "impact_claim": CLAIM_LEDGER_IMPACT_BY_ORACLE.get(oracle_type, oracle_type),
+        "claim_text": claim_ledger_claim_text(
+            oracle_type=oracle_type,
+            entrypoint=str(entrypoint) if entrypoint else None,
+            action={"group_id": packet_type},
+            group={},
+        ),
+        "priority": "medium",
+        "evidence_contract": {
+            "status": "from-approval-packet",
+            "kind": packet_type,
+            "first_required_field": None,
+            "required_field_count": len(normalize_string_list(packet.get("required_fields"))),
+        },
+        "required_evidence": evidence_rows,
+        "acceptance_criteria": normalize_string_list(packet.get("required_fields"))[:8],
+        "reject_if": [
+            "Only a template, draft, static source path, or unapproved payload is available.",
+            "Evidence contains raw secrets, signatures, raw Burp history, or unredacted response bodies.",
+        ],
+        "verification_commands": claim_ledger_verification_commands(
+            evidence_rows,
+            artifact_dir=artifact_dir,
+            profile=profile,
+        ),
+        "blocker_reason": "Approval packet requires concrete sidecar evidence before finding-gate.",
+        "first_unblocker": "Create only the required approved/redacted evidence sidecars, then rerun evidence-prep-status --strict.",
+        "readiness": readiness,
+        "finding_gate_boundary": "This claim is not a finding by itself; only adjudicated finding-gate items can become findings.",
+    }
+
+
+def build_claim_evidence_ledger(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    package_doc: dict[str, Any] | None = None,
+    package_path: Path | None = None,
+    review_blockers: dict[str, Any] | None = None,
+    oracle_plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    package_file = package_path or artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT
+    if package_doc is None:
+        package_doc = load_optional_json(package_file) if package_file.exists() else None
+    if not isinstance(package_doc, dict):
+        package_doc = None
+    status_doc = build_evidence_prep_status(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        package_doc=package_doc,
+        package_path=package_file,
+    )
+    if review_blockers is None:
+        review_blockers = build_review_blockers(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            discovery_coverage=load_optional_json(artifact_dir / DISCOVERY_COVERAGE_ARTIFACT),
+            burp_observation_coverage=load_optional_json(artifact_dir / "burp-observation-coverage.json"),
+            verification_queue=load_optional_json(artifact_dir / "verification-queue.json"),
+            source_peek_requests=load_optional_json(artifact_dir / "source-peek-requests.json"),
+            environment_readiness=load_optional_json(artifact_dir / "environment-readiness.json"),
+            artifact_health=load_optional_json(artifact_dir / "artifact-health.json"),
+            finding_gate=current_finding_gate_for_artifact_dir(
+                target=target,
+                profile=profile,
+                artifact_dir=artifact_dir,
+            ),
+        )
+    if oracle_plan is None:
+        oracle_plan = build_oracle_plan_from_review_blockers(
+            review_blockers,
+            artifact_dir=artifact_dir,
+            profile=profile,
+        )
+
+    status_index = claim_ledger_status_index(status_doc)
+    groups_by_id, groups_by_key = claim_ledger_group_maps(review_blockers)
+    claims = []
+    seen_claim_keys: set[str] = set()
+    for action in oracle_plan.get("actions", []) or []:
+        if not isinstance(action, dict):
+            continue
+        claim = claim_ledger_claim_from_action(
+            index=len(claims) + 1,
+            action=action,
+            review_blockers=review_blockers,
+            groups_by_id=groups_by_id,
+            groups_by_key=groups_by_key,
+            status_doc=status_doc,
+            status_index=status_index,
+            artifact_dir=artifact_dir,
+            profile=profile,
+        )
+        claim_key = "|".join(
+            str(claim.get(field) or "")
+            for field in ["entrypoint", "oracle_type", "impact_claim"]
+        )
+        if claim_key in seen_claim_keys:
+            continue
+        seen_claim_keys.add(claim_key)
+        claims.append(claim)
+
+    if package_doc:
+        for packet in package_doc.get("approval_packets", []) or []:
+            if not isinstance(packet, dict):
+                continue
+            claim = claim_ledger_claim_from_approval_packet(
+                index=len(claims) + 1,
+                packet=packet,
+                status_doc=status_doc,
+                status_index=status_index,
+                artifact_dir=artifact_dir,
+                profile=profile,
+            )
+            claim_key = "|".join(
+                str(claim.get(field) or "")
+                for field in ["entrypoint", "oracle_type", "impact_claim"]
+            )
+            if claim_key in seen_claim_keys:
+                continue
+            seen_claim_keys.add(claim_key)
+            claims.append(claim)
+
+    readiness_counts: dict[str, int] = {}
+    oracle_type_counts: dict[str, int] = {}
+    evidence_status_counts: dict[str, int] = {}
+    for claim in claims:
+        increment_count(readiness_counts, str(claim.get("readiness") or "unknown"))
+        increment_count(oracle_type_counts, str(claim.get("oracle_type") or "unknown"))
+        for row in claim.get("required_evidence", []) or []:
+            if isinstance(row, dict):
+                increment_count(evidence_status_counts, str(row.get("status") or "unknown"))
+
+    ready_claims = int(readiness_counts.get("ready-for-finding-gate-review") or 0)
+    missing_claims = int(readiness_counts.get("missing-evidence") or 0)
+    invalid_claims = int(readiness_counts.get("invalid-evidence") or 0)
+    waiting_claims = int(readiness_counts.get("waiting-evidence-review") or 0)
+    template_only_claims = int(readiness_counts.get("template-only-not-evidence") or 0)
+    blocked_claims = len(claims) - ready_claims
+    if invalid_claims:
+        status = "blocked-invalid-evidence"
+    elif missing_claims:
+        status = "blocked-missing-evidence"
+    elif waiting_claims:
+        status = "waiting-evidence-review"
+    elif template_only_claims:
+        status = "template-only-not-evidence"
+    elif claims and ready_claims == len(claims):
+        status = "ready-for-finding-gate-review"
+    elif claims:
+        status = "blocked-no-evidence-contract"
+    else:
+        status = "no-claim-blockers"
+
+    finding_gate_ready = bool(claims) and status == "ready-for-finding-gate-review"
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-claim-evidence-ledger-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "assessment_policy": assessment_mode_policy(profile),
+        "finding_gate_ready": finding_gate_ready,
+        "summary": {
+            "claims": len(claims),
+            "ready_claims": ready_claims,
+            "missing_evidence_claims": missing_claims,
+            "invalid_evidence_claims": invalid_claims,
+            "waiting_evidence_claims": waiting_claims,
+            "blocked_claims": blocked_claims,
+            "template_only_claims": template_only_claims,
+            "readiness_counts": dict(sorted(readiness_counts.items())),
+            "oracle_type_counts": dict(sorted(oracle_type_counts.items())),
+            "evidence_status_counts": dict(sorted(evidence_status_counts.items())),
+            "required_evidence_artifacts": (status_doc.get("summary") or {}).get("required_evidence_artifacts", 0),
+            "ready_evidence_artifacts": (status_doc.get("summary") or {}).get("ready_evidence_artifacts", 0),
+            "missing_evidence_artifacts": (status_doc.get("summary") or {}).get("missing_evidence_artifacts", 0),
+            "template_artifacts": (status_doc.get("summary") or {}).get("template_artifacts", 0),
+        },
+        "claims": claims,
+        "evidence_prep_status": {
+            "status": status_doc.get("status"),
+            "package_status": status_doc.get("package_status"),
+            "top_unblocker": status_doc.get("top_unblocker") if isinstance(status_doc.get("top_unblocker"), dict) else {},
+            "required_evidence_artifacts": status_doc.get("required_evidence_artifacts", []),
+            "template_artifacts": status_doc.get("template_artifacts", []),
+        },
+        "oracle_plan_status": oracle_plan.get("status"),
+        "review_blockers_status": review_blockers.get("status"),
+        "next_step": (
+            "Create only the missing approved/redacted evidence sidecars, then rerun claim-evidence-ledger --strict."
+            if status == "blocked-missing-evidence"
+            else "Fix invalid sidecars before rerunning claim-evidence-ledger --strict."
+            if status == "blocked-invalid-evidence"
+            else "Run gate --no-write --show-items and adjudicate --no-write only after claim evidence is ready."
+            if finding_gate_ready
+            else "Refresh oracle-plan and evidence-prep-status, then close each claim blocker with concrete evidence."
+        ),
+        "finding_gate_boundary": (
+            "The ledger decomposes claims and evidence dependencies only. It is not evidence, not a PoC, and not a finding."
+        ),
+        "safety": (
+            "Offline claim/evidence ledger only. It reads local artifacts and validators, sends no requests, invokes no Burp tools, "
+            "runs no scanners, signs no wallets, submits no transactions, and creates no official evidence sidecars."
+        ),
+    }
+
+
 VALIDATION_APPROVAL_PACKET_KEYS = [
     ("transaction_corpus_approval_packet", "transaction-corpus"),
     ("credential_impact_approval_packet", "credential-impact"),
@@ -21068,6 +21736,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     REVIEW_BLOCKERS_ARTIFACT: "review-blockers",
     REVIEW_BLOCKERS_MARKDOWN_ARTIFACT: "review-blockers",
     ORACLE_PLAN_ARTIFACT: "oracle-plan",
+    CLAIM_EVIDENCE_LEDGER_ARTIFACT: "claim-evidence-ledger",
     ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT: "oracle-plan --write-sidecar-template",
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT: "rewrite-response-review --write-sidecar-template",
     "finding-gate.json": "gate",
@@ -21103,6 +21772,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "verification-queue",
     "review-blockers",
     "oracle-plan",
+    "claim-evidence-ledger",
     "rewrite-response-review --write-sidecar-template",
     "report",
     "transaction-corpus-checklist --write-policy-template --skip-current-resource-check",
@@ -21123,6 +21793,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "verification-queue": "verification-queue --no-write",
     "review-blockers": "review-blockers --no-write",
     "oracle-plan": "oracle-plan --no-write",
+    "claim-evidence-ledger": "claim-evidence-ledger --no-write",
     "rewrite-response-review --write-sidecar-template": (
         "rewrite-response-review --no-write --show-sidecar-template-json"
     ),
@@ -45095,6 +45766,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         },
         refresh_expectation("evidence-prep-status", "run_evidence_prep_status"),
         refresh_expectation("evidence-sidecar-drafts", "run_evidence_sidecar_drafts"),
+        refresh_expectation("claim-evidence-ledger", "run_claim_evidence_ledger"),
         refresh_expectation("iteration-decision", "run_iteration_decision"),
         refresh_expectation("collect", "run_collect"),
         refresh_expectation("burp-observe", "run_burp_observe", min_refreshes=3, min_prints=3),
@@ -55820,6 +56492,29 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for row in focused_iteration_evidence_sidecar_drafts.get("drafts", []) or []
             if isinstance(row, dict)
         ]
+        focused_iteration_claim_evidence_ledger = build_claim_evidence_ledger(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_run_dir,
+            package_doc=focused_iteration_evidence_prep_package,
+            review_blockers={
+                "generated_at": utc_now(),
+                "status": "needs-human-review",
+                "summary": {"groups": 0},
+                "groups": [],
+            },
+            oracle_plan=focused_iteration_oracle_plan_sample,
+        )
+        focused_iteration_claim_ledger_summary = (
+            focused_iteration_claim_evidence_ledger.get("summary")
+            if isinstance(focused_iteration_claim_evidence_ledger.get("summary"), dict)
+            else {}
+        )
+        focused_iteration_claim_rows = [
+            row
+            for row in focused_iteration_claim_evidence_ledger.get("claims", []) or []
+            if isinstance(row, dict)
+        ]
         focused_iteration_preview_commands = [
             str(ref.get("command") or "")
             for action in focused_iteration_decision_sample.get("actions", [])
@@ -57097,6 +57792,25 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and focused_iteration_evidence_sidecar_drafts.get("status") == "drafts-ready"
         and focused_iteration_evidence_sidecar_draft_summary.get("drafts", 0) >= 3
         and focused_iteration_evidence_sidecar_drafts.get("finding_gate_ready") is False
+        and focused_iteration_claim_evidence_ledger.get("schema") == "inferforge-claim-evidence-ledger-v1"
+        and focused_iteration_claim_evidence_ledger.get("status") == "blocked-missing-evidence"
+        and focused_iteration_claim_ledger_summary.get("claims", 0) >= 3
+        and focused_iteration_claim_ledger_summary.get("missing_evidence_claims", 0) >= 3
+        and focused_iteration_claim_ledger_summary.get("template_artifacts", 0) == 3
+        and focused_iteration_claim_evidence_ledger.get("finding_gate_ready") is False
+        and any(row.get("oracle_type") == "transaction-intent" for row in focused_iteration_claim_rows)
+        and any(row.get("oracle_type") == "provider-impact" for row in focused_iteration_claim_rows)
+        and any(
+            evidence.get("status") == "missing-evidence"
+            and evidence.get("evidence_role") == "required-evidence"
+            for row in focused_iteration_claim_rows
+            for evidence in row.get("required_evidence", [])
+            if isinstance(evidence, dict)
+        )
+        and all(
+            "not a finding" in str(row.get("finding_gate_boundary") or "")
+            for row in focused_iteration_claim_rows
+        )
         and all(
             EVIDENCE_SIDECAR_DRAFT_DIR_NAME in str(row.get("draft_path") or "")
             and str(row.get("draft_path") or "") != str(row.get("target_evidence_path") or "")
@@ -60501,6 +61215,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     "status": focused_iteration_evidence_sidecar_drafts.get("status"),
                     "summary": focused_iteration_evidence_sidecar_draft_summary,
                     "drafts": focused_iteration_evidence_sidecar_draft_rows,
+                },
+                "claim_evidence_ledger": {
+                    "status": focused_iteration_claim_evidence_ledger.get("status"),
+                    "summary": focused_iteration_claim_ledger_summary,
+                    "claims": focused_iteration_claim_rows,
+                    "finding_gate_ready": focused_iteration_claim_evidence_ledger.get("finding_gate_ready"),
                 },
                 "expected_commands": [
                     focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
@@ -67826,6 +68546,97 @@ def run_evidence_sidecar_drafts(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_claim_evidence_ledger(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    package_path = (
+        resolve_repo_path(args.package)
+        if getattr(args, "package", None)
+        else artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT
+    )
+    ledger = build_claim_evidence_ledger(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        package_path=package_path,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / CLAIM_EVIDENCE_LEDGER_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(ledger))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="claim-evidence-ledger",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = ledger.get("summary", {}) if isinstance(ledger.get("summary"), dict) else {}
+    print(f"Claim evidence ledger: {ledger.get('status')}")
+    print(
+        "Claims: "
+        f"total={summary.get('claims', 0)} "
+        f"ready={summary.get('ready_claims', 0)} "
+        f"missing={summary.get('missing_evidence_claims', 0)} "
+        f"invalid={summary.get('invalid_evidence_claims', 0)} "
+        f"waiting={summary.get('waiting_evidence_claims', 0)} "
+        f"blocked={summary.get('blocked_claims', 0)}"
+    )
+    print(
+        "Evidence: "
+        f"required={summary.get('required_evidence_artifacts', 0)} "
+        f"ready={summary.get('ready_evidence_artifacts', 0)} "
+        f"missing={summary.get('missing_evidence_artifacts', 0)} "
+        f"templates={summary.get('template_artifacts', 0)}"
+    )
+    if getattr(args, "show_claims", False):
+        display_limit = max(0, int(args.top))
+        for claim in (ledger.get("claims", []) or [])[:display_limit]:
+            if not isinstance(claim, dict):
+                continue
+            print(
+                f"- {claim.get('id')}: {claim.get('readiness')} "
+                f"oracle={claim.get('oracle_type')} "
+                f"entrypoint={claim.get('entrypoint') or '-'} "
+                f"impact={claim.get('impact_claim') or '-'}"
+            )
+            evidence_rows = [row for row in claim.get("required_evidence", []) or [] if isinstance(row, dict)]
+            for row in evidence_rows[:4]:
+                print(
+                    f"  evidence={row.get('status')} {row.get('name')} "
+                    f"role={row.get('evidence_role')} "
+                    f"validator={row.get('validator_status') or '-'}"
+                )
+            if len(evidence_rows) > 4:
+                print(f"  evidence=... +{len(evidence_rows) - 4} more")
+            commands = normalize_string_list(claim.get("verification_commands"))
+            if commands:
+                print(f"  verify={inline_summary_text(commands[0], max_chars=420)}")
+        remaining = len(ledger.get("claims", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more claim(s); rerun without --no-write to write the full ledger")
+            else:
+                print(f"- {remaining} more claim(s) in {output_path}")
+    print(f"Next: {inline_summary_text(ledger.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and ledger.get("status") != "ready-for-finding-gate-review":
+        return 1
+    return 0
+
+
 def run_iteration_decision(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -70905,6 +71716,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless at least one safe non-evidence draft can be generated.",
     )
     evidence_sidecar_drafts.set_defaults(func=run_evidence_sidecar_drafts)
+
+    claim_evidence_ledger = sub.add_parser(
+        "claim-evidence-ledger",
+        help="Build an offline claim-to-evidence ledger for blocked finding-gate previews",
+    )
+    claim_evidence_ledger.add_argument(
+        "--package",
+        help=(
+            f"Evidence prep package to read. Defaults to --artifact-dir/{EVIDENCE_PREP_PACKAGE_ARTIFACT}."
+        ),
+    )
+    claim_evidence_ledger.add_argument(
+        "--output",
+        help=(
+            f"Where to write {CLAIM_EVIDENCE_LEDGER_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{CLAIM_EVIDENCE_LEDGER_ARTIFACT}."
+        ),
+    )
+    claim_evidence_ledger.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of claim rows to print with --show-claims.",
+    )
+    claim_evidence_ledger.add_argument(
+        "--show-claims",
+        action="store_true",
+        help="Print claim readiness, evidence status, and first verifier command.",
+    )
+    claim_evidence_ledger.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print claim ledger only; do not write {CLAIM_EVIDENCE_LEDGER_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    claim_evidence_ledger.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless every claim is ready for finding-gate review.",
+    )
+    claim_evidence_ledger.set_defaults(func=run_claim_evidence_ledger)
 
     iteration_decision = sub.add_parser(
         "iteration-decision",
