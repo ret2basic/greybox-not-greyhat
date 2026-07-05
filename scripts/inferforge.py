@@ -19278,6 +19278,67 @@ def transaction_payload_sidecar_paths(artifact_dir: Path) -> list[Path]:
     ]
 
 
+def build_transaction_payload_shape_guidance(
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    *,
+    max_input_bytes: int = DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+) -> dict[str, Any]:
+    candidate_paths = quote_response_candidate_paths(profile)
+    quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
+    accepted_sidecars = [
+        repo_relative_or_absolute(path)
+        for path in transaction_payload_sidecar_paths(artifact_dir)
+    ]
+    json_payload = {
+        "payloads": [
+            {
+                "data": {
+                    "transaction": "REPLACE_WITH_BASE64_VERSIONED_TRANSACTION",
+                },
+            }
+        ],
+    }
+    return {
+        "quote_path": quote_path,
+        "accepted_sidecars": accepted_sidecars,
+        "max_input_bytes": max_input_bytes,
+        "configured_candidate_paths": candidate_paths,
+        "auto_detection": [
+            "Configured quote_response.transaction_candidate_paths are tried first when the sidecar is JSON.",
+            "JSON string values whose path contains `transaction` are scanned recursively.",
+            "Plain-text base64-like transaction payloads are accepted from transaction-payloads.txt.",
+        ],
+        "examples": [
+            {
+                "file": "transaction-payloads.jsonl",
+                "description": "One approved quote response per line; keep only the minimum response needed for decode.",
+                "line": json_payload,
+            },
+            {
+                "file": "transaction-payloads.json",
+                "description": "A single approved quote response object or an array of quote response objects.",
+                "object": json_payload,
+                "array": [json_payload],
+            },
+            {
+                "file": "transaction-payloads.txt",
+                "description": "Only an extracted base64 transaction payload, with no surrounding HTTP body.",
+                "text": "REPLACE_WITH_BASE64_VERSIONED_TRANSACTION",
+            },
+        ],
+        "empty_burp_candidate_note": (
+            "An empty burp-transaction-candidates.json placeholder is not enough. Import one POST "
+            f"{quote_path} response with extracted transaction candidates or save the response body to "
+            "transaction-payloads.jsonl/json/txt."
+        ),
+        "redaction_gate": (
+            "Do not include wallet private keys, seed phrases, signatures, raw Burp history, or more quote responses "
+            "than the single approved corpus needed for decoding."
+        ),
+    }
+
+
 def transaction_sidecar_file_status(path: Path, max_input_bytes: int) -> dict[str, Any]:
     rel = repo_relative_or_absolute(path)
     if not path.exists():
@@ -19356,6 +19417,11 @@ def build_transaction_sidecar_review(
         transaction_sidecar_file_status(path, max_input_bytes)
         for path in transaction_payload_sidecar_paths(artifact_dir)
     ]
+    payload_shape_guidance = build_transaction_payload_shape_guidance(
+        profile,
+        artifact_dir,
+        max_input_bytes=max_input_bytes,
+    )
     present_payload_files = [row for row in payload_files if row.get("status") == "present"]
     oversized_payload_files = [row for row in payload_files if row.get("status") == "too-large"]
 
@@ -19440,7 +19506,10 @@ def build_transaction_sidecar_review(
     elif candidates:
         next_step = "Fix transaction-intent-policy.json, then rerun transaction-sidecar-review."
     elif present_payload_files:
-        next_step = "Inspect the payload sidecar shape; no base64 transaction candidates were extracted."
+        next_step = (
+            "Fix the payload sidecar shape; no base64 transaction candidates were extracted. "
+            "Use --show-commands to print accepted JSON/JSONL/TXT examples."
+        )
     else:
         next_step = "Add one approved quote response or extracted transaction payload sidecar before wallet signing."
 
@@ -19459,6 +19528,7 @@ def build_transaction_sidecar_review(
             "ready_for_decode": ready_for_decode,
             "warnings": len(warnings),
         },
+        "payload_shape_guidance": payload_shape_guidance,
         "payload_sidecars": payload_files,
         "intent_policy_sidecar": {
             "path": repo_relative_or_absolute(policy_path),
@@ -19579,6 +19649,7 @@ def build_transaction_corpus_checklist(
         repo_relative_or_absolute(artifact_dir / "transaction-payloads.txt"),
         repo_relative_or_absolute(artifact_dir / "burp-transaction-candidates.json"),
     ]
+    payload_shape_guidance = build_transaction_payload_shape_guidance(profile, artifact_dir)
     intent_policy_sidecar_path = repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json")
     intent_policy_sidecar_templates = [
         {
@@ -19596,18 +19667,13 @@ def build_transaction_corpus_checklist(
         if row.get("intent_policy_sidecar_template")
     ]
     sidecar_example = {
-        "direction": "buy",
-        "wallet": PLACEHOLDER_REAL_WALLET,
-        "amountIn": "REPLACE_WITH_RAW_AMOUNT",
-        "response": {
-            "payloads": [
-                {
-                    "data": {
-                        "transaction": "REPLACE_WITH_BASE64_VERSIONED_TRANSACTION",
-                    }
-                }
-            ]
-        },
+        "payloads": [
+            {
+                "data": {
+                    "transaction": "REPLACE_WITH_BASE64_VERSIONED_TRANSACTION",
+                },
+            }
+        ],
     }
     capture_steps = [
         {
@@ -19758,6 +19824,7 @@ def build_transaction_corpus_checklist(
         "policy_templates": policy_templates,
         "capture_steps": capture_steps,
         "payload_sidecars": payload_sidecars,
+        "payload_shape_guidance": payload_shape_guidance,
         "intent_policy_sidecar": {
             "path": intent_policy_sidecar_path,
             "templates": intent_policy_sidecar_templates,
@@ -34014,6 +34081,7 @@ def build_transaction_decoder_selftest(
     )
     decoded_count = sum(1 for item in transactions if item.get("decoded"))
     sidecar_ready_review: dict[str, Any] = {}
+    sidecar_empty_review: dict[str, Any] = {}
     with tempfile.TemporaryDirectory() as temp_dir:
         guard_artifact_dir = Path(temp_dir) / "transaction-sidecar-guard"
         guard_artifact_dir.mkdir()
@@ -34058,6 +34126,22 @@ def build_transaction_decoder_selftest(
             profile=profile,
             artifact_dir=ready_artifact_dir,
         )
+        empty_artifact_dir = Path(temp_dir) / "transaction-sidecar-empty"
+        empty_artifact_dir.mkdir()
+        write_json(
+            empty_artifact_dir / "burp-transaction-candidates.json",
+            {
+                "source": "selftest-empty-placeholder",
+                "quote_response_count": 0,
+                "candidate_count": 0,
+                "candidates": [],
+            },
+        )
+        sidecar_empty_review = build_transaction_sidecar_review(
+            target=DEFAULT_TARGET,
+            profile=profile,
+            artifact_dir=empty_artifact_dir,
+        )
     sidecar_guard_passed = (
         sidecar_guard_intent.get("candidates_seen") == 0
         and sidecar_guard_intent.get("resource_limits", {}).get("max_transaction_candidate_input_bytes") == 32
@@ -34072,6 +34156,17 @@ def build_transaction_decoder_selftest(
         and payload["base64"] not in sidecar_ready_text
         and sidecar_ready_review.get("decode_commands")
     )
+    sidecar_empty_guidance = (
+        sidecar_empty_review.get("payload_shape_guidance")
+        if isinstance(sidecar_empty_review.get("payload_shape_guidance"), dict)
+        else {}
+    )
+    sidecar_empty_passed = (
+        sidecar_empty_review.get("status") == "payload-sidecar-no-candidates"
+        and sidecar_empty_guidance.get("configured_candidate_paths") == quote_response_candidate_paths(profile)
+        and len(sidecar_empty_guidance.get("examples", []) or []) >= 3
+        and "empty burp-transaction-candidates.json" in str(sidecar_empty_guidance.get("empty_burp_candidate_note", ""))
+    )
     status = (
         "passed"
         if decoded_count == 1
@@ -34080,6 +34175,7 @@ def build_transaction_decoder_selftest(
         and mismatch_gate_passed
         and sidecar_guard_passed
         and sidecar_ready_passed
+        and sidecar_empty_passed
         else "failed"
     )
     return {
@@ -34116,6 +34212,12 @@ def build_transaction_decoder_selftest(
             "summary": sidecar_ready_review.get("summary", {}),
             "candidate_summaries": sidecar_ready_review.get("candidate_summaries", []),
             "decode_commands": sidecar_ready_review.get("decode_commands", []),
+        },
+        "sidecar_empty_guidance": {
+            "status": "passed" if sidecar_empty_passed else "failed",
+            "review_status": sidecar_empty_review.get("status"),
+            "configured_candidate_paths": sidecar_empty_guidance.get("configured_candidate_paths", []),
+            "examples": len(sidecar_empty_guidance.get("examples", []) or []),
         },
         "transactions": transactions,
         "note": "This self-test proves decoder mechanics only; it does not satisfy GAP-quote-transaction-corpus.",
@@ -45639,6 +45741,41 @@ def run_credential_impact_checklist(args: argparse.Namespace) -> int:
     return 0
 
 
+def print_transaction_payload_shape_guidance(guidance: dict[str, Any], *, top: int = 4) -> None:
+    if not isinstance(guidance, dict) or not guidance:
+        return
+    accepted_sidecars = normalize_string_list(guidance.get("accepted_sidecars"))
+    candidate_paths = normalize_string_list(guidance.get("configured_candidate_paths"))
+    print("Payload shape guidance:")
+    print(
+        "- accepted_sidecars="
+        f"{','.join(accepted_sidecars) if accepted_sidecars else '(none)'}"
+    )
+    print(
+        "- candidate_paths="
+        f"{','.join(candidate_paths) if candidate_paths else '(recursive/base64 fallback only)'}"
+    )
+    for example in (guidance.get("examples", []) or [])[: max(0, int(top))]:
+        if not isinstance(example, dict):
+            continue
+        sample = example.get("line")
+        if sample is None:
+            sample = example.get("object")
+        if sample is None:
+            sample = example.get("text")
+        if not isinstance(sample, str):
+            sample_text = json.dumps(sample, sort_keys=True)
+        else:
+            sample_text = sample
+        print(
+            f"- {example.get('file')}: "
+            f"{inline_summary_text(example.get('description'), max_chars=160)} "
+            f"sample={inline_summary_text(sample_text, max_chars=320)}"
+        )
+    if guidance.get("empty_burp_candidate_note"):
+        print(f"- note={inline_summary_text(guidance.get('empty_burp_candidate_note'), max_chars=320)}")
+
+
 def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -45710,6 +45847,11 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
         print("Decode commands:")
         for command_text in (review.get("decode_commands", []) or [])[: max(0, int(args.top))]:
             print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    if args.show_commands and review.get("payload_shape_guidance"):
+        print_transaction_payload_shape_guidance(
+            review.get("payload_shape_guidance", {}),
+            top=args.top,
+        )
     print(f"Next: {inline_summary_text(review.get('next_step'), max_chars=260)}")
     if no_write:
         print("No files written (--no-write).")
@@ -45808,6 +45950,11 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
         print("Post-decode commands:")
         for command_text in post_decode_commands[:3]:
             print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    if (args.show_steps or args.show_commands) and checklist.get("payload_shape_guidance"):
+        print_transaction_payload_shape_guidance(
+            checklist.get("payload_shape_guidance", {}),
+            top=args.top,
+        )
     if args.show_steps:
         print("Capture steps:")
         for step in checklist.get("capture_steps", []) or []:

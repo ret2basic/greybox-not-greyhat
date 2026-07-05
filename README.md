@@ -922,6 +922,10 @@ approved:
 When the active profile declares `quote_response.transaction_candidate_paths`,
 those simple JSON paths are applied before the generic recursive/base64 scan so
 candidate summaries retain the provider-specific response location.
+`transaction-sidecar-review --no-write --show-files --show-commands` prints the
+accepted sidecar files, configured candidate paths, and compact JSON/JSONL/TXT
+payload-shape examples when a sidecar is present but no base64 transaction
+candidate can be extracted.
 
 `transaction-corpus-checklist` is the offline bridge between source-flow review
 and decoding. It reads the current quote collection, Burp transaction candidate,
