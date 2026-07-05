@@ -8796,7 +8796,7 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
         "evidence-gaps --no-write",
         "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check",
         "rewrite-validation-checklist --no-write --show-candidates --show-commands",
-        "rewrite-response-review --no-write --show-observations",
+        "rewrite-response-review --no-write --show-observations --show-commands",
         "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check",
         "operator-evidence-review --no-write --show-missing --show-template",
         "transaction-sidecar-review --no-write --show-files --show-commands",
@@ -9352,7 +9352,7 @@ def methodology_next_command_for_hypothesis(
     elif impact == "resource-exhaustion" or hypothesis_type == "resource-abuse-review":
         subcommand = "deployment-review --no-write --top 8"
     elif impact == "fixed-upstream-proxy-confusion":
-        subcommand = "rewrite-response-review --no-write --show-observations"
+        subcommand = "rewrite-response-review --no-write --show-observations --show-commands"
     else:
         subcommand = "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check"
     ref = validation_command_ref(
@@ -9838,13 +9838,25 @@ def build_rewrite_evidence_closure(
             "Escalate only if that one response proves unauthorized data exposure, upstream path confusion, or equivalent concrete impact.",
         ),
     ]
-    commands = []
-    for source, subcommand in [
+    command_specs = [
         ("rewrite-review", "rewrite-review --no-write --show-next"),
         ("rewrite-validation-checklist", "rewrite-validation-checklist --no-write --show-candidates --show-commands"),
-        ("rewrite-response-review", "rewrite-response-review --no-write --show-observations"),
-        ("validation-plan", "validation-plan --no-write --top 8 --show-commands --skip-current-resource-check"),
-    ]:
+        ("rewrite-response-review", "rewrite-response-review --no-write --show-observations --show-commands"),
+    ]
+    if candidate_impact_count:
+        command_specs.extend(
+            [
+                ("finding-gate", "gate --no-write --show-items"),
+                ("adjudication", "adjudicate --no-write"),
+                ("evidence-chain", "evidence-chain --no-write"),
+            ]
+        )
+    else:
+        command_specs.append(
+            ("validation-plan", "validation-plan --no-write --top 8 --show-commands --skip-current-resource-check")
+        )
+    commands = []
+    for source, subcommand in command_specs:
         ref = methodology_command_ref(
             artifact_dir,
             profile,
@@ -12828,6 +12840,18 @@ def build_rewrite_validation_checklist(
     }
 
 
+def rewrite_response_gate_followup_commands(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> list[str]:
+    return [
+        validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+        validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+        validation_command_for_artifact_dir(artifact_dir, "evidence-chain --no-write", profile=profile),
+    ]
+
+
 REWRITE_RESPONSE_SENSITIVE_FIELD_KEYWORDS = {
     "account",
     "address",
@@ -13012,6 +13036,11 @@ def build_rewrite_response_review(
             )
         approved_observations = [row for row in observations if row.get("approved_path")]
         candidate_impact_observations = [row for row in observations if row.get("candidate_impact")]
+        followup_commands = (
+            rewrite_response_gate_followup_commands(artifact_dir=artifact_dir, profile=profile)
+            if candidate_impact_observations
+            else []
+        )
         if candidate_impact_observations:
             item_status = "candidate-impact-review"
         elif approved_observations:
@@ -13033,8 +13062,9 @@ def build_rewrite_response_review(
                 "candidate_impact_observation_count": len(candidate_impact_observations),
                 "unapproved_observation_count": len(observations) - len(approved_observations),
                 "observations": observations[:10],
+                "followup_commands": followup_commands,
                 "next_step": (
-                    "Open finding-gate only after manual review confirms authorization bypass, sensitive data exposure, path confusion, or equivalent concrete impact."
+                    "Run gate --no-write --show-items, then adjudicate/evidence-chain only after manual review confirms authorization bypass, sensitive data exposure, path confusion, or equivalent concrete impact."
                     if candidate_impact_observations
                     else "Observe exactly one approved read-only path after scope and resource gates; do not enumerate catch-all paths."
                     if not approved_observations
@@ -13045,10 +13075,16 @@ def build_rewrite_response_review(
     status_counts: dict[str, int] = {}
     approved_count = 0
     candidate_impact_count = 0
+    followup_commands = []
     for item in items:
         increment_count(status_counts, str(item.get("status") or "unknown"))
         approved_count += int(item.get("observed_approved_response_count") or 0)
         candidate_impact_count += int(item.get("candidate_impact_observation_count") or 0)
+        followup_commands.extend(
+            str(command)
+            for command in item.get("followup_commands", []) or []
+            if str(command).strip()
+        )
     if candidate_impact_count:
         status = "candidate-impact-review"
     elif approved_count:
@@ -13069,10 +13105,12 @@ def build_rewrite_response_review(
             "burp_observations": len(burp_history),
             "observed_approved_responses": approved_count,
             "candidate_impact_observations": candidate_impact_count,
+            "followup_commands": len(ordered_unique_strings(followup_commands)),
             "endpoint_clusters_source": endpoint_clusters_source,
             "rewrite_review": rewrite_review.get("status"),
         },
         "items": items,
+        "followup_commands": ordered_unique_strings(followup_commands),
         "artifact_refs": {
             "burp_history": "burp-history-observations.jsonl",
             "rewrite_review": REWRITE_REVIEW_ARTIFACT,
@@ -13115,7 +13153,7 @@ def validation_allowed_commands(
     ]
     if rewrite_review_item:
         allowed_now_commands.insert(3, command("rewrite-validation-checklist --no-write --show-candidates --show-commands"))
-        allowed_now_commands.insert(4, command("rewrite-response-review --no-write --show-observations"))
+        allowed_now_commands.insert(4, command("rewrite-response-review --no-write --show-observations --show-commands"))
     if hypothesis.get("type") == "resource-abuse-review" or hypothesis.get("impact") == "resource-exhaustion":
         allowed_now_commands.insert(3, command("operator-evidence-review --no-write --show-missing --show-template"))
         allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
@@ -34276,6 +34314,12 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
         review_text = json.dumps(review, sort_keys=True)
         closure_text = json.dumps(closure, sort_keys=True)
         finding_gate_text = json.dumps(finding_gate, sort_keys=True)
+        followup_command_text = "\n".join(str(command) for command in review.get("followup_commands", []) or [])
+        closure_command_text = "\n".join(
+            str(command.get("command") or command)
+            for command in closure.get("next_safe_commands", []) or []
+            if isinstance(command, dict)
+        )
         write_json(artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT, review)
         gate_stdout_buffer = io.StringIO()
         gate_args = build_parser().parse_args(
@@ -34391,6 +34435,25 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "candidate-impact-emits-offline-gate-followup-commands",
+            "passed": (
+                (review.get("summary") or {}).get("followup_commands") == 3
+                and "gate --no-write --show-items" in followup_command_text
+                and "adjudicate --no-write" in followup_command_text
+                and "evidence-chain --no-write" in followup_command_text
+                and "gate --no-write --show-items" in closure_command_text
+                and "adjudicate --no-write" in closure_command_text
+                and "evidence-chain --no-write" in closure_command_text
+                and "should-not-appear" not in followup_command_text
+                and "should-not-appear" not in closure_command_text
+            ),
+            "expected": "rewrite candidate impact exposes redacted offline gate/adjudication/evidence-chain follow-up commands",
+            "actual": {
+                "review_followup_commands": review.get("followup_commands", []),
+                "closure_next_safe_commands": closure.get("next_safe_commands", []),
+            },
+        },
+        {
             "id": "gate-no-write-loads-rewrite-response-review-artifact",
             "passed": (
                 gate_return_code == 0
@@ -34420,6 +34483,7 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             "closure_status": closure.get("status"),
             "gate_ready": closure.get("gate_ready"),
             "finding_gate_items": len(finding_gate.get("gates", []) or []),
+            "followup_commands": (review.get("summary") or {}).get("followup_commands"),
             "gate_no_write_return_code": gate_return_code,
         },
         "cases": {
@@ -48834,6 +48898,13 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
                         f"{marker.get('field_path')} "
                         f"keywords={','.join(marker.get('matched_keywords', []) or [])}"
                     )
+        if args.show_commands:
+            for command_text in (item.get("followup_commands", []) or [])[:3]:
+                print(f"  command={inline_summary_text(command_text, max_chars=420)}")
+    if args.show_commands and review.get("followup_commands"):
+        print("Follow-up commands:")
+        for command_text in (review.get("followup_commands", []) or [])[: max(0, int(args.top))]:
+            print(f"- {inline_summary_text(command_text, max_chars=420)}")
     print(f"Gate: {inline_summary_text(review.get('reportability_gate'), max_chars=280)}")
     if no_write:
         print("No files written (--no-write).")
@@ -51974,6 +52045,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-observations",
         action="store_true",
         help="Print compact approved-response and candidate-impact observation details.",
+    )
+    rewrite_response_review.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print manual gate/adjudication follow-up commands when candidate impact evidence exists.",
     )
     rewrite_response_review.add_argument(
         "--no-write",
