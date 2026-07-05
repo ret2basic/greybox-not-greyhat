@@ -21662,6 +21662,11 @@ def transaction_corpus_policy_templates(
                     " ".join(shlex.quote(str(part)) for part in prepare_parts),
                     profile=profile,
                 ),
+                "decode_preview_command": validation_command_for_artifact_dir(
+                    artifact_dir,
+                    " ".join(shlex.quote(str(part)) for part in [*decode_parts, "--no-write"]),
+                    profile=profile,
+                ),
                 "decode_command": validation_command_for_artifact_dir(
                     artifact_dir,
                     " ".join(shlex.quote(str(part)) for part in decode_parts),
@@ -22094,6 +22099,7 @@ def build_transaction_sidecar_review(
                     "programAllowlistStatus": row.get("programAllowlistStatus"),
                     "prepare_preview_command": row.get("prepare_policy_preview_command"),
                     "prepare_command": row.get("prepare_policy_command"),
+                    "decode_preview_command": row.get("decode_preview_command"),
                     "decode_command": row.get("decode_command"),
                 }
             )
@@ -22356,6 +22362,8 @@ def build_transaction_corpus_checklist(
             "policy": row.get("intent_policy_sidecar_template", {}),
             "prepare_preview_command": row.get("prepare_policy_preview_command"),
             "prepare_command": row.get("prepare_policy_command"),
+            "decode_preview_command": row.get("decode_preview_command"),
+            "decode_command": row.get("decode_command"),
             "notes": [
                 "Copy exactly one policy object to transaction-intent-policy.json for the approved quote direction.",
                 "Replace wallet and amountIn placeholders with the real approved quote request values before decoding.",
@@ -44906,6 +44914,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         for template in transaction_policy_sidecar_templates
         if isinstance(template, dict)
     )
+    transaction_policy_decode_preview_commands = "\n".join(
+        str(template.get("decode_preview_command") or "")
+        for template in transaction_policy_sidecar_templates
+        if isinstance(template, dict)
+    )
+    transaction_policy_decode_commands = "\n".join(
+        str(template.get("decode_command") or "")
+        for template in transaction_policy_sidecar_templates
+        if isinstance(template, dict)
+    )
     transaction_prepare_policy_sample = build_transaction_intent_policy_sidecar(
         test_profile,
         direction="buy",
@@ -44926,6 +44944,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and "prepare-transaction-intent-policy --direction buy" in transaction_policy_prepare_commands
         and "prepare-transaction-intent-policy --direction sell" in transaction_policy_prepare_commands
         and "--no-write" not in transaction_policy_prepare_commands
+        and "decode-transactions --input" in transaction_policy_decode_preview_commands
+        and "--no-write" in transaction_policy_decode_preview_commands
+        and "decode-transactions --input" in transaction_policy_decode_commands
+        and "--no-write" not in transaction_policy_decode_commands
         and transaction_prepare_policy_sample.get("direction") == "buy"
         and transaction_prepare_policy_sample.get("amountIn") == "1000000"
         and transaction_prepare_policy_sample.get("wallet") == "EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR"
@@ -50882,6 +50904,8 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
                 print(f"  prepare_preview={inline_summary_text(row.get('prepare_preview_command'), max_chars=420)}")
             if row.get("prepare_command"):
                 print(f"  prepare={inline_summary_text(row.get('prepare_command'), max_chars=420)}")
+            if row.get("decode_preview_command"):
+                print(f"  decode_preview={inline_summary_text(row.get('decode_preview_command'), max_chars=420)}")
             if row.get("decode_command"):
                 print(f"  decode={inline_summary_text(row.get('decode_command'), max_chars=420)}")
     if args.show_commands and review.get("payload_shape_guidance"):
@@ -51052,6 +51076,8 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
             print(f"  prepare_preview={inline_summary_text(row.get('prepare_policy_preview_command'), max_chars=420)}")
         if args.show_commands and row.get("prepare_policy_command"):
             print(f"  prepare={inline_summary_text(row.get('prepare_policy_command'), max_chars=420)}")
+        if args.show_commands and row.get("decode_preview_command"):
+            print(f"  decode_preview={inline_summary_text(row.get('decode_preview_command'), max_chars=420)}")
         if args.show_commands and row.get("decode_command"):
             print(f"  decode={inline_summary_text(row.get('decode_command'), max_chars=420)}")
     post_decode_commands = checklist.get("post_decode_commands", []) or []
