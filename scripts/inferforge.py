@@ -137,7 +137,8 @@ DISCOVERED_PROFILE_ARTIFACT = "discovered-profile.json"
 BLACKBOX_PROFILE_ARTIFACT = "blackbox-profile.json"
 BLACKBOX_ASSET_CANDIDATES_ARTIFACT = "blackbox-asset-candidates.json"
 BLACKBOX_ASSET_PROFILE_ARTIFACT = "blackbox-asset-profile.json"
-DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND = "audit --include-external --ws-resource-probes"
+DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND = "audit --max-probes 6 --no-ws"
+EXTERNAL_VERIFICATION_AUDIT_SUBCOMMAND = "audit --include-external --ws-resource-probes"
 BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND = "audit --max-probes 6 --no-ws"
 REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND = "audit --max-probes 6 --no-ws"
 HOST_TAKEOVER_BASELINE_ARTIFACT = "host-takeover-baseline.json"
@@ -9067,6 +9068,30 @@ def current_evidence_gaps_for_artifact_dir(
     )
 
 
+def current_verification_queue_for_artifact_dir(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    evidence_gaps: dict[str, Any] | None,
+) -> dict[str, Any]:
+    artifact = load_optional_json(artifact_dir / "verification-queue.json") or {}
+    clusters = load_optional_json(artifact_dir / "endpoint-clusters.json") or {}
+    if not isinstance(clusters, dict) or not clusters.get("clusters"):
+        return artifact
+    return build_verification_queue(
+        target,
+        clusters,
+        load_optional_json(artifact_dir / "evidence-appendix.json") or {},
+        evidence_gaps or {},
+        load_optional_json(artifact_dir / "blackbox-coverage.json") or {},
+        load_optional_json(artifact_dir / "adjudication.json") or {},
+        load_optional_json(artifact_dir / "environment-readiness.json") or {},
+        artifact_dir,
+        attack_strategy=load_optional_json(artifact_dir / "attack-strategy.json") or {},
+    )
+
+
 def build_harness_loop_run(
     *,
     target: str,
@@ -9081,13 +9106,18 @@ def build_harness_loop_run(
     source_peek_requests = load_optional_json(artifact_dir / "source-peek-requests.json") or {}
     asset_candidates = load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT) or {}
     lead_portfolio = load_optional_json(artifact_dir / LEAD_PORTFOLIO_ARTIFACT) or {}
-    verification_queue = load_optional_json(artifact_dir / "verification-queue.json") or {}
     response_deltas = load_optional_json(artifact_dir / "response-delta-analysis.json") or {}
     suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
     finding_gate = load_optional_json(artifact_dir / "finding-gate.json") or {}
     adjudication = load_optional_json(artifact_dir / "adjudication.json") or {}
     findings_doc = load_optional_json(artifact_dir / "findings.json") or {}
     evidence_gaps = current_evidence_gaps_for_artifact_dir(target=target, profile=profile, artifact_dir=artifact_dir)
+    verification_queue = current_verification_queue_for_artifact_dir(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        evidence_gaps=evidence_gaps,
+    )
     evidence_appendix = load_optional_json(artifact_dir / "evidence-appendix.json") or {}
     review_blockers_doc = load_optional_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT)
     review_blockers = review_blockers_doc or {}
@@ -28515,7 +28545,10 @@ def verification_audit_policy_for_asset_candidate(
         }
     return {
         "subcommand": DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND,
-        "safety": "No signing, no transaction submission, and no broad fuzzing.",
+        "safety": (
+            "Bounded same-target audit replay. No external probes, no WebSocket resource probes, "
+            "no wallet signing, and no transaction submission."
+        ),
         "profile": "default",
     }
 
@@ -28899,11 +28932,8 @@ def build_verification_queue(
         ]
         if gap_id == "GAP-quote-transaction-corpus":
             prerequisites = (environment_readiness or {}).get("next_steps", [])
-            commands = [
-                *quote_transaction_evidence_contract_commands(),
-                cmd(audit_policy["subcommand"]),
-            ]
-            status = "blocked-external"
+            commands = quote_transaction_evidence_contract_commands()
+            status = "manual-review"
         elif gap_id == "GAP-orca-real-address-cache-baseline":
             prerequisites = [str(gap.get("safe_next_step"))]
             commands = [
@@ -35179,13 +35209,14 @@ def build_no_write_selftest() -> dict[str, Any]:
             "id": "verification-queue-no-write-skips-artifacts",
             "passed": (
                 verification_queue_return_code == 0
-                and "Verification queue: ready-with-external-blockers" in verification_queue_stdout
-                and 'status_counts={"blocked-external": 1, "ready": 3}' in verification_queue_stdout_text
+                and "Verification queue: ready" in verification_queue_stdout
+                and 'status_counts={"ready": 4}' in verification_queue_stdout_text
                 and "Queue items:" in verification_queue_stdout
                 and "Command previews:" in verification_queue_stdout
-                and "- VERIFY-safe-audit-loop: blocked-external" in verification_queue_stdout_text
+                and "- VERIFY-safe-audit-loop: ready" in verification_queue_stdout_text
                 and "[ready]" in verification_queue_stdout_text
-                and "audit --include-external --ws-resource-probes" in verification_queue_stdout_text
+                and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND in verification_queue_stdout_text
+                and EXTERNAL_VERIFICATION_AUDIT_SUBCOMMAND not in verification_queue_stdout_text
                 and "No files written (--no-write)." in verification_queue_stdout
                 and not any(
                     output_paths[key]
@@ -42981,7 +43012,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             if item.get("id") == "VERIFY-safe-audit-loop":
                 item["commands"] = [
                     "python3 scripts/inferforge.py --profile .greybox/selftest/blackbox-profile.json "
-                    f"--artifact-dir .greybox/selftest {DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND}"
+                    f"--artifact-dir .greybox/selftest {EXTERNAL_VERIFICATION_AUDIT_SUBCOMMAND}"
                 ]
                 break
         write_json(harness_loop_run_dir / "endpoint-clusters.json", blackbox_clusters_sample)
@@ -43778,7 +43809,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_target_info_sample.get("health_path") is None
         and blackbox_target_info_sample.get("health_source") == "blackbox-burp-history"
         and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_verification_command_text
-        and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_verification_command_text
+        and EXTERNAL_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_verification_command_text
         and blackbox_asset_map_sample.get("status") == "candidates-found"
         and blackbox_asset_map_sample.get("page", {}).get("script_urls_seen") == 2
         and blackbox_asset_map_sample.get("page", {}).get("same_origin_script_urls_seen") == 1
@@ -43907,7 +43938,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_validation_plan_sample.get("summary", {}).get("blocked_command_safety", {}).get("commands") == 0
         and blackbox_validation_replacement_count >= 1
         and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_validation_allowed_command_text_sample
-        and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_validation_allowed_command_text_sample
+        and EXTERNAL_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_validation_allowed_command_text_sample
         and all(
             item.get("required_evidence")
             and item.get("forbidden")
@@ -43927,7 +43958,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             action.get("status") == "blocked-resource" and action.get("kind") == "active-validation"
             for action in blackbox_iteration_decision_sample.get("actions", [])
         )
-        and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_iteration_command_text_sample
+        and EXTERNAL_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_iteration_command_text_sample
         and "top-secret" not in blackbox_iteration_command_text_sample
         and "AbC1234567890Token" not in blackbox_iteration_command_text_sample
         and focused_iteration_decision_sample.get("summary", {}).get("offline_command_preview_limit") == 2
@@ -43951,7 +43982,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and "audit " not in artifact_repair_iteration_command_text_sample
         and blackbox_asset_clusters_sample.get("profile", {}).get("asset_candidate_profile") is True
         and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_verification_command_text
-        and DEFAULT_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_asset_verification_command_text
+        and EXTERNAL_VERIFICATION_AUDIT_SUBCOMMAND not in blackbox_asset_verification_command_text
         and BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_followup_command_text
         and "--include-external" not in blackbox_asset_followup_command_text
         and "--ws-resource-probes" not in blackbox_asset_followup_command_text
