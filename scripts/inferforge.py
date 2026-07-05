@@ -9126,17 +9126,18 @@ HARNESS_STAGE_FOCUS_RANK = {
     "reportable-findings": 0,
     "needs-poc-report": 1,
     "finding-candidates": 2,
-    "needs-safe-follow-up": 3,
-    "needs-review": 4,
-    "needs-adjudication": 5,
-    "suspicions-present": 6,
-    "needs-identification": 7,
-    "actionable-leads": 8,
-    "blocked-external-commands": 9,
-    "needs-leads": 10,
-    "needs-coverage-review": 11,
-    "covered-with-source-limits": 12,
-    "needs-recon": 13,
+    "gate-blockers": 3,
+    "needs-safe-follow-up": 4,
+    "needs-review": 5,
+    "needs-adjudication": 6,
+    "suspicions-present": 7,
+    "needs-identification": 8,
+    "actionable-leads": 9,
+    "blocked-external-commands": 10,
+    "needs-leads": 11,
+    "needs-coverage-review": 12,
+    "covered-with-source-limits": 13,
+    "needs-recon": 14,
 }
 
 HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
@@ -9158,6 +9159,8 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
         "hypothesis-matrix --no-write --show-next",
     ],
     "issue-validation": [
+        "gate --no-write --show-items",
+        "adjudicate --no-write",
         "methodology-review --no-write --limit 8 --skip-current-resource-check",
         "evidence-gaps --no-write",
         "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check",
@@ -9466,6 +9469,51 @@ def current_verification_queue_for_artifact_dir(
     )
 
 
+def current_finding_gate_for_artifact_dir(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    preview_limit: int = 8,
+    allow_validation_plan_preview: bool = True,
+) -> dict[str, Any]:
+    artifact = load_optional_json(artifact_dir / "finding-gate.json") or {}
+    if isinstance(artifact, dict) and artifact.get("blocked_gate_previews"):
+        return artifact
+    profile_doc = profile if isinstance(profile, dict) else load_optional_json(artifact_dir / TARGET_PROFILE_ARTIFACT) or {}
+    validation_plan = load_optional_json(artifact_dir / VALIDATION_PLAN_ARTIFACT)
+    if (
+        allow_validation_plan_preview
+        and not isinstance(validation_plan, dict)
+        and isinstance(profile_doc, dict)
+        and profile_doc
+    ):
+        validation_plan = build_validation_plan_run(
+            target=target,
+            profile=profile_doc,
+            artifact_dir=artifact_dir,
+            limit=max(1, int(preview_limit)),
+            current_resource_snapshot={"status": "not-run"},
+        )
+    built = build_finding_gate(
+        (load_optional_json(artifact_dir / "suspicions.json") or {}).get("suspicions", []),
+        load_jsonl(artifact_dir / "burp-history-observations.jsonl"),
+        load_optional_json(artifact_dir / "transaction-intent.json") or {},
+        load_optional_json(artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT) or {},
+        validation_plan if isinstance(validation_plan, dict) else None,
+    )
+    if not isinstance(artifact, dict) or not artifact:
+        return built
+    if not artifact.get("blocked_gate_previews") and built.get("blocked_gate_previews"):
+        merged = json_clone(artifact)
+        merged["blocked_gate_previews"] = built.get("blocked_gate_previews", [])
+        summary = merged.get("summary") if isinstance(merged.get("summary"), dict) else {}
+        summary = {**summary, "blocked_gate_previews": len(merged["blocked_gate_previews"])}
+        merged["summary"] = summary
+        return merged
+    return artifact
+
+
 def current_response_deltas_for_artifact_dir(artifact_dir: Path, endpoint_clusters: dict[str, Any]) -> dict[str, Any]:
     artifact = load_optional_json(artifact_dir / "response-delta-analysis.json")
     if isinstance(artifact, dict) and artifact:
@@ -9482,6 +9530,7 @@ def build_harness_loop_run(
     profile: dict[str, Any] | None,
     artifact_dir: Path,
     current_resource_snapshot: dict[str, Any] | None = None,
+    allow_finding_gate_preview: bool = False,
 ) -> dict[str, Any]:
     endpoint_clusters = load_optional_json(artifact_dir / "endpoint-clusters.json") or {}
     blackbox_coverage = load_optional_json(artifact_dir / "blackbox-coverage.json") or {}
@@ -9496,7 +9545,12 @@ def build_harness_loop_run(
     lead_portfolio = load_optional_json(artifact_dir / LEAD_PORTFOLIO_ARTIFACT) or {}
     response_deltas = current_response_deltas_for_artifact_dir(artifact_dir, endpoint_clusters)
     suspicions_doc = load_optional_json(artifact_dir / "suspicions.json") or {}
-    finding_gate = load_optional_json(artifact_dir / "finding-gate.json") or {}
+    finding_gate = current_finding_gate_for_artifact_dir(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        allow_validation_plan_preview=allow_finding_gate_preview,
+    )
     adjudication = load_optional_json(artifact_dir / "adjudication.json") or {}
     findings_doc = load_optional_json(artifact_dir / "findings.json") or {}
     evidence_gaps = current_evidence_gaps_for_artifact_dir(target=target, profile=profile, artifact_dir=artifact_dir)
@@ -9594,9 +9648,13 @@ def build_harness_loop_run(
 
     gap_count = int(gaps_summary.get("gaps", 0) or 0)
     blocker_count = int(blockers_summary.get("blockers", 0) or 0)
+    blocked_gate_previews = int(gate_summary.get("blocked_gate_previews", 0) or 0)
     if reportable_findings:
         validation_status = "reportable-findings"
         validation_next = "Prepare final PoC/report artifacts and avoid unnecessary additional probing."
+    elif blocked_gate_previews:
+        validation_status = "gate-blockers"
+        validation_next = "Clear the top blocked finding-gate preview; do not report a preview as a finding."
     elif artifact_summary_status(evidence_gaps) == "needs-safe-follow-up" or gap_count:
         validation_status = "needs-safe-follow-up"
         validation_next = "Use resource and scope gates before running the smallest follow-up that closes the gap."
@@ -9677,6 +9735,7 @@ def build_harness_loop_run(
                 "reportable_findings": reportable_findings,
                 "evidence_gaps": gap_count,
                 "finding_gate": artifact_summary_status(finding_gate),
+                "blocked_gate_previews": blocked_gate_previews,
                 "review_blockers": blocker_count,
                 "review_blockers_status": review_blockers_status,
             },
@@ -9711,7 +9770,7 @@ def build_harness_loop_run(
 
     if reportable_findings:
         status = "reportable-findings"
-    elif actionable_leads or suspicion_count or gap_count:
+    elif actionable_leads or suspicion_count or gap_count or blocked_gate_previews:
         status = "needs-deepening"
     elif discovery_status.startswith("needs") or lead_status == "needs-leads" or validation_status == "needs-adjudication":
         status = "needs-setup"
@@ -9748,6 +9807,7 @@ def build_harness_loop_run(
             "actionable_leads": actionable_leads,
             "suspicions": suspicion_count,
             "evidence_gaps": gap_count,
+            "blocked_gate_previews": blocked_gate_previews,
             "external_probe_commands": external_commands,
             "focus_stage": focus.get("stage"),
             "focus_status": focus.get("status"),
@@ -12670,6 +12730,7 @@ def build_harness_loop_rollup(
         "actionable_leads": 0,
         "suspicions": 0,
         "evidence_gaps": 0,
+        "blocked_gate_previews": 0,
         "external_probe_commands": 0,
     }
 
@@ -12728,7 +12789,12 @@ def build_harness_loop_rollup(
         status = "failed"
     elif totals["reportable_findings"]:
         status = "reportable-findings"
-    elif totals["actionable_leads"] or totals["suspicions"] or totals["evidence_gaps"]:
+    elif (
+        totals["actionable_leads"]
+        or totals["suspicions"]
+        or totals["evidence_gaps"]
+        or totals["blocked_gate_previews"]
+    ):
         status = "needs-deepening"
     elif not runs:
         status = "no-runs"
@@ -34733,6 +34799,33 @@ def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str
     return groups
 
 
+def finding_gate_preview_blocker_strings(preview: dict[str, Any]) -> list[str]:
+    blockers: list[Any] = []
+    for check in preview.get("checks", []) or []:
+        if not isinstance(check, dict):
+            continue
+        if check.get("id") != "finding-gate-blockers-cleared":
+            continue
+        blockers.extend(normalize_string_list(check.get("evidence")))
+        blocker_count = check.get("blocker_count")
+        try:
+            blocker_count_int = int(blocker_count)
+        except (TypeError, ValueError):
+            blocker_count_int = len(blockers)
+        if blocker_count_int > len(blockers):
+            blockers.append(f"... +{blocker_count_int - len(blockers)} more finding-gate blocker(s)")
+    return ordered_unique_strings(blockers)
+
+
+def finding_gate_preview_review_priority(preview: dict[str, Any]) -> str:
+    severity = str(preview.get("severity") or "").lower()
+    if severity in {"critical", "high"}:
+        return "high"
+    if severity == "medium":
+        return "medium"
+    return "low"
+
+
 def build_review_blockers(
     *,
     target: str,
@@ -34744,6 +34837,7 @@ def build_review_blockers(
     source_peek_requests: dict[str, Any] | None = None,
     environment_readiness: dict[str, Any] | None = None,
     artifact_health: dict[str, Any] | None = None,
+    finding_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     blockers: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -34893,6 +34987,48 @@ def build_review_blockers(
             evidence={"command_safety": command_safety},
         )
 
+    for preview in (finding_gate or {}).get("blocked_gate_previews", []) or []:
+        if not isinstance(preview, dict):
+            continue
+        preview_id = str(preview.get("suspicion_id") or preview.get("id") or "blocked-gate-preview")
+        blocker_strings = finding_gate_preview_blocker_strings(preview)
+        next_action = "; ".join(blocker_strings[:4]) if blocker_strings else None
+        add_blocker(
+            blocker_id=f"GATE-{preview_id}",
+            source="finding-gate.json",
+            category="finding-gate-blocker",
+            status="needs-human-review",
+            priority=finding_gate_preview_review_priority(preview),
+            title=(
+                "Blocked finding-gate preview"
+                f": {preview.get('entrypoint') or preview.get('validation_item_id') or preview_id}"
+            ),
+            reason=(
+                "Approval packet is blocked before finding-gate. This is not a finding; "
+                "clear the listed blockers before any reportability claim."
+            ),
+            next_action=next_action,
+            cluster_id=preview.get("cluster_id"),
+            artifact_refs=["finding-gate.json", VALIDATION_PLAN_ARTIFACT, "adjudication.json"],
+            evidence={
+                "entrypoint": preview.get("entrypoint"),
+                "classification": preview.get("classification"),
+                "severity": preview.get("severity"),
+                "packet_key": preview.get("packet_key"),
+                "packet_type": preview.get("packet_type"),
+                "packet_status": preview.get("packet_status"),
+                "validation_item_id": preview.get("validation_item_id"),
+                "blockers": blocker_strings,
+                "checks": preview.get("checks", []),
+                "safety": preview.get("safety"),
+            },
+            group_key=(
+                "finding-gate-blocker:needs-human-review:"
+                f"{safe_probe_id(str(preview.get('entrypoint') or preview_id))}:"
+                f"{safe_probe_id(str(preview.get('packet_type') or 'packet'))}"
+            ),
+        )
+
     for request in (source_peek_requests or {}).get("requests", []) or []:
         request_status = str(request.get("status") or "")
         if request_status != "manual-review":
@@ -35021,6 +35157,10 @@ def build_review_blockers(
             "source_peek_requests": (source_peek_requests or {}).get("status"),
             "environment_readiness": (environment_readiness or {}).get("status"),
             "artifact_health": (artifact_health or {}).get("status"),
+            "blocked_gate_previews": (finding_gate or {}).get("summary", {}).get(
+                "blocked_gate_previews",
+                len((finding_gate or {}).get("blocked_gate_previews", []) or []),
+            ),
         },
         "groups": groups,
         "blockers": blockers,
@@ -35031,6 +35171,7 @@ def build_review_blockers(
             "source_peek_requests": "source-peek-requests.json",
             "environment_readiness": "environment-readiness.json",
             "artifact_health": "artifact-health.json",
+            "finding_gate": "finding-gate.json",
         },
         "safety": "Read-only review blocker summary. It does not send HTTP requests, invoke Burp, run Burp Scanner, sign wallets, or submit transactions.",
     }
@@ -35326,6 +35467,48 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             }
         ],
     }
+    finding_gate_with_blocked_preview = {
+        "generated_at": utc_now(),
+        "summary": {"gates": 0, "blocked_gate_previews": 1},
+        "gates": [],
+        "blocked_gate_previews": [
+            {
+                "suspicion_id": "BLOCKED-quote-transaction-corpus-transaction-corpus",
+                "validation_item_id": "VAL-quote-transaction-corpus",
+                "entrypoint": "POST /api/quote",
+                "classification": "blocked-transaction-corpus-finding-gate-preview",
+                "gate_status": "blocked-before-finding-gate",
+                "severity": "high",
+                "packet_key": "transaction_corpus_approval_packet",
+                "packet_type": "transaction-corpus",
+                "packet_status": "blocked-before-finding-gate",
+                "title": "Approval packet is not ready for finding-gate review",
+                "checks": [
+                    {
+                        "id": "approval-packet-present",
+                        "passed": True,
+                        "evidence": "transaction_corpus_approval_packet",
+                    },
+                    {
+                        "id": "finding-gate-blockers-cleared",
+                        "passed": False,
+                        "evidence": [
+                            "No approved transaction payload sidecar is present.",
+                            "No extractable transaction candidate is available.",
+                            "No valid transaction intent policy has been accepted.",
+                        ],
+                        "blocker_count": 3,
+                    },
+                    {
+                        "id": "concrete-impact-evidence",
+                        "passed": False,
+                        "evidence": "Concrete transaction-integrity impact has not passed finding-gate.",
+                    },
+                ],
+                "safety": "Blocked preview only. This is not a finding.",
+            }
+        ],
+    }
 
     default_blockers = build_review_blockers(
         target=target,
@@ -35343,6 +35526,13 @@ def build_review_blockers_selftest() -> dict[str, Any]:
         verification_queue=discovered_queue,
         source_peek_requests=source_peek_requests,
         environment_readiness=environment_readiness,
+    )
+    gate_blockers = build_review_blockers(
+        target=target,
+        profile=profile,
+        artifact_dir=Path(".greybox/selftest-gate-blockers"),
+        finding_gate=finding_gate_with_blocked_preview,
+        environment_readiness={"status": "ready", "checks": []},
     )
 
     with tempfile.TemporaryDirectory(prefix="inferforge-review-blockers-selftest-") as temp_dir:
@@ -35465,6 +35655,14 @@ def build_review_blockers_selftest() -> dict[str, Any]:
     single_route_group = review_blocker_group_by_cluster(discovered_blockers, "route-api-proxy-path") or {}
     rollup_route_group = review_blocker_group_by_cluster(rollup, "route-api-proxy-path") or {}
     rollup_quote_group = review_blocker_group_by_cluster(rollup, "quote") or {}
+    gate_blocker_group = next(
+        (
+            item
+            for item in gate_blockers.get("groups", []) or []
+            if item.get("category") == "finding-gate-blocker"
+        ),
+        {},
+    )
     rollup_readiness_group = next(
         (
             item
@@ -35652,6 +35850,22 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "finding-gate-previews-enter-review-blockers",
+            "passed": (
+                gate_blockers.get("status") == "needs-human-review"
+                and gate_blockers.get("summary", {}).get("blocked_gate_previews") == 1
+                and gate_blocker_group.get("priority") == "high"
+                and "POST /api/quote" in str(gate_blocker_group.get("title") or "")
+                and "No approved transaction payload sidecar" in str(gate_blocker_group.get("next_action") or "")
+            ),
+            "expected": "blocked finding-gate previews are exposed as high-priority review blockers without becoming findings",
+            "actual": {
+                "status": gate_blockers.get("status"),
+                "summary": gate_blockers.get("summary"),
+                "gate_blocker_group": gate_blocker_group,
+            },
+        },
+        {
             "id": "cli-no-write-skips-review-blocker-outputs",
             "passed": (
                 no_write_return_code == 0
@@ -35715,6 +35929,11 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "status": discovered_blockers.get("status"),
                 "summary": discovered_blockers.get("summary"),
                 "route_group": single_route_group,
+            },
+            "gate_blockers": {
+                "status": gate_blockers.get("status"),
+                "summary": gate_blockers.get("summary"),
+                "group": gate_blocker_group,
             },
             "rollup": {
                 "status": rollup.get("status"),
@@ -48448,6 +48667,75 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             artifact_dir=harness_loop_root,
             check_dirs=[harness_loop_run_dir],
         )
+        harness_loop_gate_blocker_dir = harness_loop_root / "gate-blocker"
+        harness_loop_gate_blocker_dir.mkdir()
+        write_json(harness_loop_gate_blocker_dir / "endpoint-clusters.json", blackbox_clusters_sample)
+        write_json(harness_loop_gate_blocker_dir / "blackbox-coverage.json", blackbox_coverage_sample)
+        write_json(harness_loop_gate_blocker_dir / "source-peek-requests.json", {"status": "ready", "summary": {}})
+        write_json(
+            harness_loop_gate_blocker_dir / LEAD_PORTFOLIO_ARTIFACT,
+            {"generated_at": utc_now(), "status": "leads-indexed", "summary": {"leads": 0, "actionable_leads": 0}},
+        )
+        write_json(
+            harness_loop_gate_blocker_dir / "verification-queue.json",
+            {"generated_at": utc_now(), "status": "ready", "summary": {"items": 0, "command_safety": {}}},
+        )
+        write_json(
+            harness_loop_gate_blocker_dir / "response-delta-analysis.json",
+            {"generated_at": utc_now(), "status": "stable", "summary": {"unexpected_probes": 0}},
+        )
+        write_json(harness_loop_gate_blocker_dir / "suspicions.json", {"generated_at": utc_now(), "suspicions": []})
+        write_json(
+            harness_loop_gate_blocker_dir / "finding-gate.json",
+            {
+                "generated_at": utc_now(),
+                "status": "blocked-before-finding-gate",
+                "summary": {"gates": 0, "blocked_gate_previews": 1},
+                "gates": [],
+                "blocked_gate_previews": [
+                    {
+                        "suspicion_id": "BLOCKED-blackbox-gate-preview",
+                        "entrypoint": "POST /api/orders",
+                        "classification": "blocked-asset-candidate-finding-gate-preview",
+                        "gate_status": "blocked-before-finding-gate",
+                        "severity": "high",
+                        "packet_type": "asset-candidate",
+                        "checks": [
+                            {
+                                "id": "finding-gate-blockers-cleared",
+                                "passed": False,
+                                "evidence": ["Concrete bounty impact evidence is missing."],
+                                "blocker_count": 1,
+                            }
+                        ],
+                        "safety": "Blocked preview only. This is not a finding.",
+                    }
+                ],
+            },
+        )
+        write_json(
+            harness_loop_gate_blocker_dir / "adjudication.json",
+            {
+                "generated_at": utc_now(),
+                "status": "no-reportable-findings-with-gate-blockers",
+                "summary": {"reportable_findings": 0, "blocked_gate_previews": 1},
+            },
+        )
+        write_json(harness_loop_gate_blocker_dir / "findings.json", {"generated_at": utc_now(), "findings": []})
+        write_json(
+            harness_loop_gate_blocker_dir / "evidence-gaps.json",
+            {"generated_at": utc_now(), "status": "no-evidence-gaps", "summary": {"gaps": 0}},
+        )
+        write_json(
+            harness_loop_gate_blocker_dir / "evidence-appendix.json",
+            {"generated_at": utc_now(), "status": "indexed", "summary": {"probe_rows": 0}},
+        )
+        blackbox_gate_blocker_harness_loop_sample = build_harness_loop_run(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_gate_blocker_dir,
+            allow_finding_gate_preview=True,
+        )
         blackbox_harness_loop_discovered_dirs = [
             path.name for path in discover_harness_loop_dirs(harness_loop_root)
         ]
@@ -49470,13 +49758,20 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             stage.get("stage") == "lead-generation" and stage.get("status") == "actionable-leads"
             for stage in blackbox_harness_loop_sample.get("stages", [])
         )
+        and blackbox_gate_blocker_harness_loop_sample.get("summary", {}).get("blocked_gate_previews") == 1
+        and blackbox_gate_blocker_harness_loop_sample.get("focus", {}).get("stage") == "issue-validation"
+        and blackbox_gate_blocker_harness_loop_sample.get("focus", {}).get("status") == "gate-blockers"
+        and any(
+            stage.get("stage") == "issue-validation" and stage.get("status") == "gate-blockers"
+            for stage in blackbox_gate_blocker_harness_loop_sample.get("stages", [])
+        )
         and blackbox_harness_loop_rollup_sample.get("status") == "needs-deepening"
         and blackbox_harness_loop_rollup_sample.get("summary", {}).get("runs") == 1
         and blackbox_harness_loop_rollup_sample.get("summary", {}).get("focus_stage_counts", {}).get("lead-generation")
         == 1
         and (blackbox_harness_loop_rollup_sample.get("runs", []) or [{}])[0].get("focus", {}).get("stage")
         == "lead-generation"
-        and blackbox_harness_loop_discovered_dirs == ["run"]
+        and blackbox_harness_loop_discovered_dirs == ["gate-blocker", "run"]
         and blackbox_hypothesis_matrix_sample.get("status") == "has-ranked-hypotheses"
         and blackbox_hypothesis_matrix_sample.get("summary", {}).get("hypotheses", 0) >= 3
         and blackbox_hypothesis_matrix_sample.get("summary", {}).get("ready_hypotheses", 0) >= 1
@@ -52641,6 +52936,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "asset_profile_observed_only_notice": blackbox_asset_observed_notice_sample,
             "harness_loop_status": blackbox_harness_loop_sample.get("status"),
             "harness_focus": blackbox_harness_loop_sample.get("focus", {}),
+            "gate_blocker_harness_status": blackbox_gate_blocker_harness_loop_sample.get("status"),
+            "gate_blocker_harness_focus": blackbox_gate_blocker_harness_loop_sample.get("focus", {}),
+            "gate_blocker_harness_summary": blackbox_gate_blocker_harness_loop_sample.get("summary", {}),
             "harness_rollup_focus_counts": blackbox_harness_loop_rollup_sample.get("summary", {}).get(
                 "focus_stage_counts",
                 {},
@@ -54937,6 +55235,11 @@ def run_review_blockers(args: argparse.Namespace) -> int:
             source_peek_requests=load_optional_json(artifact_dir / "source-peek-requests.json"),
             environment_readiness=load_optional_json(artifact_dir / "environment-readiness.json"),
             artifact_health=load_optional_json(artifact_dir / "artifact-health.json"),
+            finding_gate=current_finding_gate_for_artifact_dir(
+                target=target,
+                profile=profile,
+                artifact_dir=artifact_dir,
+            ),
         )
     output_path = resolve_repo_path(args.output) if args.output else artifact_dir / REVIEW_BLOCKERS_ARTIFACT
     markdown_path = (
@@ -57459,6 +57762,7 @@ def run_harness_loop(args: argparse.Namespace) -> int:
             profile=profile,
             artifact_dir=artifact_dir,
             current_resource_snapshot=current_resource_snapshot,
+            allow_finding_gate_preview=True,
         )
 
     output_path = resolve_repo_path(args.output) if args.output else artifact_dir / HARNESS_LOOP_ARTIFACT

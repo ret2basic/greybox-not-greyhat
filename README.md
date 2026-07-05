@@ -281,7 +281,10 @@ python3 scripts/inferforge.py --artifact-dir .greybox/target-set \
 `harness-loop` is also read-only. It is intended for low-memory unattended runs:
 use it after `resource-snapshot --strict` to decide whether to deepen an
 existing lead, regenerate passive leads, refresh adjudication, or stop because
-there is no reportable evidence yet.
+there is no reportable evidence yet. If the finding gate only has
+`blocked_gate_previews`, the issue-validation stage reports `gate-blockers` and
+prints offline gate/adjudication follow-ups first; those previews are the
+nearest evidence blockers, not reportable findings.
 
 Use `methodology-review` to align the harness with business-logic testing
 methodology before broadening. It maps high-value threads to offline-safe
@@ -1485,8 +1488,11 @@ CI job.
 `.greybox/review-blockers.md`, a read-only summary of the human-review,
 profile-update, and external blockers currently spread across discovery
 coverage, Burp observation coverage, verification queue, source-peek requests,
-environment readiness, and artifact health. `audit` and `verification-queue`
-refresh it automatically.
+environment readiness, artifact health, and blocked finding-gate previews.
+Blocked previews enter the `finding-gate-blocker` category with the missing
+evidence, severity, entrypoint, and packet type, but remain explicitly
+non-reportable until a real finding gate passes. `audit` and
+`verification-queue` refresh it automatically.
 The Markdown playbook is useful as the first artifact to inspect after a
 regression run because it keeps the approved-path, source-only review, missing
 profile coverage, external-configuration actions, and gated command templates in
