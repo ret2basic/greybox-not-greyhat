@@ -178,6 +178,7 @@ BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT = "bounty-evidence-request.md"
 BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT = "bounty-evidence-templates.json"
 BOUNTY_TEMPLATE_SAFETY_ARTIFACT = "bounty-template-safety.json"
 BOUNTY_TEMPLATE_SAFETY_SELFTEST_ARTIFACT = "bounty-template-safety-selftest.json"
+BOUNTY_PREP_PACKAGE_SELFTEST_ARTIFACT = "bounty-prep-package-selftest.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -306,6 +307,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT,
     BOUNTY_TEMPLATE_SAFETY_ARTIFACT,
     BOUNTY_TEMPLATE_SAFETY_SELFTEST_ARTIFACT,
+    BOUNTY_PREP_PACKAGE_SELFTEST_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -26183,6 +26185,39 @@ BOUNTY_PREP_COMPATIBLE_PREP_LANES: dict[str, set[str]] = {
 }
 
 
+BOUNTY_PREP_REQUIRED_ARTIFACT_ORDER_BY_LANE: dict[str, list[str]] = {
+    "transaction-integrity": [
+        "transaction-payloads.jsonl",
+        "transaction-intent-policy.json",
+    ],
+    "sensitive-response-impact": [
+        REWRITE_RESPONSE_SIDECAR_ARTIFACT,
+    ],
+    "credentialed-provider-impact": [
+        OPERATOR_EVIDENCE_ARTIFACT,
+    ],
+    "resource-control": [
+        OPERATOR_EVIDENCE_ARTIFACT,
+    ],
+    "websocket-header-trust": [
+        OPERATOR_EVIDENCE_ARTIFACT,
+    ],
+}
+
+
+def bounty_prep_order_required_artifacts(lane: str, artifacts: list[str]) -> list[str]:
+    ordered = ordered_unique_strings([item for item in artifacts if item])
+    preferred = BOUNTY_PREP_REQUIRED_ARTIFACT_ORDER_BY_LANE.get(str(lane or ""), [])
+    preferred_index = {name: index for index, name in enumerate(preferred)}
+    return sorted(
+        ordered,
+        key=lambda name: (
+            preferred_index.get(name, len(preferred) + ordered.index(name)),
+            ordered.index(name),
+        ),
+    )
+
+
 def bounty_prep_top_action(action_queue: dict[str, Any] | None) -> dict[str, Any]:
     actions = (
         action_queue.get("actions", [])
@@ -26384,6 +26419,7 @@ def build_bounty_prep_sync(
         ]
     )
     first_blocker = (blocked or missing)[0] if (blocked or missing) else None
+    prep_next_step = str(prep_package.get("next_step") or "")
     return {
         "generated_at": utc_now(),
         "schema": "inferforge-bounty-prep-sync-v1",
@@ -26424,6 +26460,8 @@ def build_bounty_prep_sync(
         "next_step": (
             first_blocker.get("next_step")
             if isinstance(first_blocker, dict)
+            else prep_next_step
+            if prep_next_step
             else top_action.get("next_step")
             or "Continue with the current bounty action queue."
         ),
@@ -26467,7 +26505,7 @@ def bounty_prep_action_required_artifacts(action: dict[str, Any]) -> list[str]:
         artifacts.append(REWRITE_RESPONSE_SIDECAR_ARTIFACT)
     elif lane in {"credentialed-provider-impact", "resource-control", "websocket-header-trust"}:
         artifacts.append(OPERATOR_EVIDENCE_ARTIFACT)
-    return ordered_unique_strings([item for item in artifacts if item])
+    return bounty_prep_order_required_artifacts(lane, artifacts)
 
 
 def bounty_prep_approval_packet_for_action(
@@ -26478,6 +26516,13 @@ def bounty_prep_approval_packet_for_action(
 ) -> dict[str, Any]:
     lane = str(action.get("lane") or authorization.get("lane") or "unknown")
     required = bounty_prep_action_required_artifacts(action)
+    approval_question = authorization.get("question") or action.get("next_step")
+    if lane == "transaction-integrity":
+        approval_question = (
+            "Can the operator approve and provide transaction-payloads.jsonl first, then the matching "
+            "transaction-intent-policy.json for the same quote request? Provide one approved quote transaction "
+            "payload and one matching explicit intent policy."
+        )
     packet = {
         "id": f"BOUNTY-PREP-{safe_probe_id(str(action.get('id') or lane))}",
         "status": "waiting-approved-evidence",
@@ -26491,7 +26536,7 @@ def bounty_prep_approval_packet_for_action(
         "redacted_sidecar_required_fields": normalize_string_list(authorization.get("handoff_fields"))[:16],
         "allowed_actions": normalize_string_list(authorization.get("allowed_actions"))[:8],
         "forbidden_actions": normalize_string_list(authorization.get("forbidden_actions"))[:12],
-        "approval_question": authorization.get("question") or action.get("next_step"),
+        "approval_question": approval_question,
         "reportability_boundary": action.get("reportability_boundary") or authorization.get("reportability_boundary"),
     }
     for artifact_name in required:
@@ -26678,10 +26723,207 @@ def build_bounty_prep_package(
             "This package is not evidence and is not a vulnerability report. It only names approved evidence that must be "
             "provided before lane validation, finding-gate, and adjudication can promote a Medium+ finding."
         ),
-        "next_step": primary.get("next_step") or "Refresh bounty-action-queue and rebuild the bounty prep package.",
+        "next_step": (
+            approval_packets[0].get("approval_question")
+            if approval_packets
+            else primary.get("next_step")
+            or "Refresh bounty-action-queue and rebuild the bounty prep package."
+        ),
         "safety": (
             "Offline evidence preparation package only. It sends no requests, calls no Burp tool, starts no browser, "
             "creates no official evidence sidecars, signs no wallet, submits no transaction, and changes no infrastructure."
+        ),
+    }
+
+
+def build_bounty_prep_package_selftest() -> dict[str, Any]:
+    target = "http://127.0.0.1:9997"
+    with tempfile.TemporaryDirectory(prefix="inferforge-bounty-prep-package-selftest-") as temp_dir:
+        artifact_dir = Path(temp_dir) / "artifacts"
+        artifact_dir.mkdir(parents=True)
+        action = {
+            "id": "ACTION-selftest-transaction-integrity",
+            "kind": "collect-approved-evidence",
+            "lane": "transaction-integrity",
+            "entrypoint": "POST /api/quote",
+            "expected_severity": "high-candidate",
+            "authorization_request_id": "AUTHZ-selftest-transaction-integrity",
+            "workorder_id": "WORKORDER-selftest-transaction-integrity",
+            "gate_id": "GATE-selftest-transaction-integrity",
+            "requested_evidence": ["transaction-intent-policy.json", "transaction-payloads.jsonl"],
+            "safe_offline_command": validation_command_for_artifact_dir(
+                artifact_dir,
+                "transaction-sidecar-review --no-write --show-files --show-candidates --show-commands",
+                profile=None,
+            ),
+            "next_step": "Provide one approved quote transaction payload and one matching explicit intent policy.",
+            "reportability_boundary": "Synthetic self-test action only; not a finding.",
+        }
+        queue = {
+            "generated_at": utc_now(),
+            "schema": "inferforge-bounty-action-queue-v1",
+            "status": "waiting-human-evidence-action",
+            "target": target,
+            "summary": {
+                "actions": 1,
+                "top_lane": "transaction-integrity",
+                "top_kind": "collect-approved-evidence",
+            },
+            "actions": [action],
+        }
+        auth = {
+            "generated_at": utc_now(),
+            "schema": "inferforge-bounty-evidence-authorization-v1",
+            "status": "authorization-required-before-evidence-collection",
+            "target": target,
+            "authorization_requests": [
+                {
+                    "id": "AUTHZ-selftest-transaction-integrity",
+                    "lane": "transaction-integrity",
+                    "requested_official_evidence_labels": [
+                        "transaction-intent-policy.json",
+                        "transaction-payloads.jsonl",
+                    ],
+                    "handoff_fields": ["approval_reference", "direction", "wallet_or_test_wallet_marker", "raw_amount_in"],
+                    "allowed_actions": ["Use one approved in-scope POST /api/quote capture."],
+                    "forbidden_actions": ["Do not sign, broadcast, or submit transactions."],
+                    "question": "Can the operator approve and provide one quote payload and one matching intent policy?",
+                    "after_evidence_validation_commands": [
+                        validation_command_for_artifact_dir(
+                            artifact_dir,
+                            "transaction-sidecar-review --no-write --show-files --show-candidates",
+                            profile=None,
+                        )
+                    ],
+                }
+            ],
+        }
+        package = build_bounty_prep_package(
+            target=target,
+            profile=None,
+            artifact_dir=artifact_dir,
+            bounty_action_queue=queue,
+            bounty_evidence_authorization=auth,
+            top=1,
+        )
+        status_doc = build_evidence_prep_status(
+            target=target,
+            profile=None,
+            artifact_dir=artifact_dir,
+            package_doc=package,
+            package_path=artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT,
+        )
+        sync = build_bounty_prep_sync(
+            target=target,
+            profile=None,
+            artifact_dir=artifact_dir,
+            bounty_action_queue=queue,
+            evidence_prep_package=package,
+            evidence_prep_status=status_doc,
+            bounty_template_safety={"status": "no-templates-to-review"},
+        )
+        official_sidecars = [
+            artifact_dir / "transaction-payloads.jsonl",
+            artifact_dir / "transaction-intent-policy.json",
+            artifact_dir / REWRITE_RESPONSE_SIDECAR_ARTIFACT,
+            artifact_dir / OPERATOR_EVIDENCE_ARTIFACT,
+        ]
+        sidecar_exists = [repo_relative_or_absolute(path) for path in official_sidecars if path.exists()]
+
+    required_artifacts = normalize_string_list(package.get("required_artifacts"))
+    approval_packets = [
+        row
+        for row in (package.get("approval_packets", []) or [])
+        if isinstance(row, dict)
+    ]
+    approval_question = str(approval_packets[0].get("approval_question") or "") if approval_packets else ""
+    status_rows = [
+        row
+        for row in (status_doc.get("required_evidence_artifacts", []) or [])
+        if isinstance(row, dict)
+    ]
+    assertions = [
+        {
+            "id": "transaction-payload-precedes-policy",
+            "passed": required_artifacts[:2] == ["transaction-payloads.jsonl", "transaction-intent-policy.json"],
+            "expected": ["transaction-payloads.jsonl", "transaction-intent-policy.json"],
+            "actual": required_artifacts[:2],
+        },
+        {
+            "id": "top-unblocker-uses-payload-first-missing",
+            "passed": (
+                (package.get("top_unblocker") or {}).get("lane") == "transaction-integrity"
+                and (package.get("top_unblocker") or {}).get("first_missing_artifact") == "transaction-payloads.jsonl"
+            ),
+            "expected": {"lane": "transaction-integrity", "first_missing_artifact": "transaction-payloads.jsonl"},
+            "actual": package.get("top_unblocker"),
+        },
+        {
+            "id": "evidence-prep-status-preserves-order",
+            "passed": [row.get("name") for row in status_rows[:2]]
+            == ["transaction-payloads.jsonl", "transaction-intent-policy.json"],
+            "expected": ["transaction-payloads.jsonl", "transaction-intent-policy.json"],
+            "actual": [row.get("name") for row in status_rows[:2]],
+        },
+        {
+            "id": "approval-question-uses-payload-first",
+            "passed": (
+                "transaction-payloads.jsonl" in approval_question
+                and "transaction-intent-policy.json" in approval_question
+                and approval_question.index("transaction-payloads.jsonl")
+                < approval_question.index("transaction-intent-policy.json")
+            ),
+            "expected": "transaction-payloads.jsonl appears before transaction-intent-policy.json",
+            "actual": approval_question,
+        },
+        {
+            "id": "prep-sync-aligned-waiting-evidence",
+            "passed": sync.get("status") == "prep-sync-aligned-waiting-evidence",
+            "expected": "prep-sync-aligned-waiting-evidence",
+            "actual": sync.get("status"),
+        },
+        {
+            "id": "prep-sync-next-step-uses-package-order",
+            "passed": (
+                "transaction-payloads.jsonl" in str(sync.get("next_step") or "")
+                and "transaction-intent-policy.json" in str(sync.get("next_step") or "")
+                and str(sync.get("next_step") or "").index("transaction-payloads.jsonl")
+                < str(sync.get("next_step") or "").index("transaction-intent-policy.json")
+            ),
+            "expected": "sync next_step preserves package payload-first order",
+            "actual": sync.get("next_step"),
+        },
+        {
+            "id": "builder-does-not-create-official-sidecars",
+            "passed": not sidecar_exists,
+            "expected": [],
+            "actual": sidecar_exists,
+        },
+    ]
+    failed = [item for item in assertions if not item.get("passed")]
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-prep-package-selftest-v1",
+        "status": "failed" if failed else "passed",
+        "target": target,
+        "summary": {
+            "assertions": len(assertions),
+            "failed": len(failed),
+            "package_status": package.get("status"),
+            "status_doc_status": status_doc.get("status"),
+            "sync_status": sync.get("status"),
+            "required_artifacts": required_artifacts,
+        },
+        "cases": {
+            "package": package,
+            "evidence_prep_status": status_doc,
+            "bounty_prep_sync": sync,
+        },
+        "assertions": assertions,
+        "safety": (
+            "Synthetic local fixture only. It writes temporary files under tempfile, sends no requests, calls no Burp tool, "
+            "starts no browser, creates no workspace evidence sidecars, signs no wallet, submits no transaction, "
+            "and changes no infrastructure."
         ),
     }
 
@@ -54180,6 +54422,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("self-test-burp-sync-failures", "run_burp_sync_failure_selftest"),
         refresh_expectation("self-test-transactions", "run_transaction_decoder_selftest"),
         refresh_expectation("self-test-bounty-template-safety", "run_bounty_template_safety_selftest"),
+        refresh_expectation("self-test-bounty-prep-package", "run_bounty_prep_package_selftest"),
         refresh_expectation("collect-quote", "run_collect_quote", min_refreshes=2, min_prints=2),
         refresh_expectation("collect-orca-baseline", "run_collect_orca_baseline", min_refreshes=2, min_prints=2),
     ]
@@ -72808,6 +73051,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             ("self-test-burp-sync-failures", "self-test-burp-sync-failures"),
             ("self-test-transactions", "self-test-transactions"),
             ("self-test-bounty-template-safety", "self-test-bounty-template-safety"),
+            ("self-test-bounty-prep-package", "self-test-bounty-prep-package"),
         ]:
             command = inferforge_cli_command(
                 args,
@@ -79663,6 +79907,37 @@ def run_bounty_prep_package(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_bounty_prep_package_selftest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result = build_bounty_prep_package_selftest()
+    result["current_profile_context"] = profile_summary(profile)
+    output_path = artifact_dir / BOUNTY_PREP_PACKAGE_SELFTEST_ARTIFACT
+    write_json(output_path, sanitize_artifact_samples(result))
+    summary = result.get("summary", {}) if isinstance(result.get("summary"), dict) else {}
+    print(f"Bounty prep package self-test: {result['status']}")
+    print(
+        "Cases: "
+        f"assertions={summary.get('assertions', 0)} "
+        f"failed={summary.get('failed', 0)} "
+        f"package={summary.get('package_status') or '-'} "
+        f"sync={summary.get('sync_status') or '-'}"
+    )
+    failed = [item for item in result.get("assertions", []) if not item.get("passed")]
+    if failed:
+        print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="self-test-bounty-prep-package",
+            output_paths=[output_path],
+        )
+    )
+    return 0 if result["status"] == "passed" else 1
+
+
 def run_bounty_prep_sync(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -84746,6 +85021,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a synthetic self-test for bounty template safety negative controls",
     )
     bounty_template_safety_selftest.set_defaults(func=run_bounty_template_safety_selftest)
+
+    bounty_prep_package_selftest = sub.add_parser(
+        "self-test-bounty-prep-package",
+        help="Run a synthetic self-test for bounty prep package ordering and sync",
+    )
+    bounty_prep_package_selftest.set_defaults(func=run_bounty_prep_package_selftest)
 
     collect_quote = sub.add_parser(
         "collect-quote",
