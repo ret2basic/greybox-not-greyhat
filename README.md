@@ -279,7 +279,7 @@ which artifact or sidecar still blocks finding-gate review:
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
-  methodology-review --no-write --show-commands --skip-current-resource-check
+  methodology-review --no-write --show-commands --show-poc-plan --skip-current-resource-check
 ```
 
 The business-logic map is still a prioritization aid, not a finding. A
@@ -290,6 +290,10 @@ is conservative: transaction-integrity threads need an approved decoded corpus
 and intent-policy review, credentialed-upstream threads need redacted
 provider/operator impact evidence, and resource-exhaustion threads need
 deployment/proxy trust evidence plus non-stress availability impact evidence.
+`--show-poc-plan` expands each high-value thread into a minimal reproduction
+evidence package: required sidecars or operator inputs, missing evidence,
+offline no-write commands, gate entry conditions, and forbidden actions. It is a
+planning view only, not an exploit script or approval to run active traffic.
 With `--skip-current-resource-check`, `methodology-review` stays fully offline
 and reports resource status as `not-run` instead of reading current `/proc`
 resource state.

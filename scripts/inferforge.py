@@ -9987,6 +9987,123 @@ def build_evidence_closure_summary(closures: list[dict[str, Any]]) -> dict[str, 
     }
 
 
+def minimal_poc_manual_inputs_for_thread(item: dict[str, Any]) -> list[str]:
+    impact = str(item.get("impact") or "")
+    hypothesis_type = str(item.get("hypothesis_type") or item.get("type") or "")
+    if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
+        return [
+            "One approved quote response or extracted transaction payload sidecar from the in-scope quote flow.",
+            "Approved intent values: direction, wallet, amountIn, sourceMint, destinationMint, and reviewed allowedPrograms.",
+            "Decoded transaction intent review showing whether signer, account, mint, amount, or program behavior matches the approved intent.",
+        ]
+    if impact == "fixed-upstream-proxy-confusion":
+        return [
+            "One approved read-only concrete path under the fixed-upstream rewrite.",
+            "One approved response observation for that path, stored only as normalized/redacted evidence.",
+            "Concrete impact notes showing sensitive data exposure, path confusion, authorization confusion, or equivalent upstream trust-boundary impact.",
+        ]
+    if impact == "credentialed-upstream-cost-abuse" or hypothesis_type == "credential-proxy-review":
+        return [
+            "Redacted provider/operator evidence for quota, rate limits, billing or credits, and usage monitoring.",
+            "Route review showing the credentialed upstream call is reachable without route-bound auth or rate controls.",
+            "At most one approved reachability request after a healthy resource gate, only if provider evidence shows material impact.",
+        ]
+    if impact == "resource-exhaustion" or hypothesis_type == "resource-abuse-review":
+        return [
+            "Deployment/operator evidence for proxy header trust, direct-to-app reachability, external rate-limit storage, and key/TTL bounds.",
+            "Non-stress availability impact evidence from configuration, logs, dashboards, or reviewed operator statements.",
+            "A finding-gate decision that does not rely on flooding, rate-limit stress, or DoS traffic.",
+        ]
+    return [
+        "Endpoint-specific observed evidence for the claimed impact.",
+        "A finding-gate decision showing concrete exploitability or impact, not only source-code suspicion.",
+    ]
+
+
+def build_minimal_poc_plan_for_thread(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    item: dict[str, Any],
+    evidence_closure: dict[str, Any],
+    next_offline_command: dict[str, Any] | None,
+) -> dict[str, Any]:
+    requirements = []
+    for requirement in evidence_closure.get("requirements", []) or []:
+        if not isinstance(requirement, dict):
+            continue
+        requirements.append(
+            {
+                "id": requirement.get("id"),
+                "status": requirement.get("status"),
+                "next_step": requirement.get("next_step"),
+            }
+        )
+
+    commands = []
+    if isinstance(next_offline_command, dict):
+        commands.append(next_offline_command)
+    for ref in evidence_closure.get("next_safe_commands", []) or []:
+        if isinstance(ref, dict):
+            commands.append(ref)
+
+    if evidence_closure.get("gate_ready"):
+        for source, subcommand in [
+            ("minimal-poc:finding-gate", "gate --no-write --show-items"),
+            ("minimal-poc:adjudication", "adjudicate --no-write"),
+            ("minimal-poc:evidence-chain", "evidence-chain --no-write"),
+        ]:
+            ref = methodology_command_ref(artifact_dir, profile, subcommand, source=source)
+            if ref:
+                commands.append(ref)
+
+    deduped_commands = []
+    seen_commands: set[str] = set()
+    for ref in commands:
+        command_text = str(ref.get("command") or "")
+        if not command_text or command_text in seen_commands:
+            continue
+        seen_commands.add(command_text)
+        deduped_commands.append(ref)
+
+    status = "ready-for-gate-review" if evidence_closure.get("gate_ready") else "needs-evidence"
+    if evidence_closure.get("status") == "blocked-resource":
+        status = "blocked-resource"
+
+    return {
+        "status": status,
+        "priority": item.get("priority"),
+        "impact": item.get("impact"),
+        "path": item.get("path"),
+        "validation_question": item.get("validation_question"),
+        "minimum_evidence_package": requirements,
+        "missing_evidence": evidence_closure.get("missing_requirements", []),
+        "manual_inputs": minimal_poc_manual_inputs_for_thread(item),
+        "offline_commands": deduped_commands[:8],
+        "command_safety": command_safety_summary(deduped_commands),
+        "gate_condition": evidence_closure.get("finding_gate_entry_condition"),
+        "forbidden": ordered_unique_strings(
+            [
+                *normalize_string_list(item.get("forbidden")),
+                "Do not run scanners, Intruder, fuzzing, flooding, stress, or DoS validation.",
+                "Do not sign wallets, submit transactions, place trades, or approve wallet prompts.",
+                "Do not include secrets, bearer tokens, cookies, private keys, seed phrases, or raw Burp history in PoC artifacts.",
+            ]
+        ),
+        "artifact_refs": [
+            METHODOLOGY_REVIEW_ARTIFACT,
+            VALIDATION_PLAN_ARTIFACT,
+            "finding-gate.json",
+            "adjudication.json",
+            "evidence-chain.json",
+        ],
+        "safety": (
+            "Minimal PoC planning only. It is a reproducible evidence checklist and no-write command preview, "
+            "not an exploit script or authorization to run active traffic."
+        ),
+    }
+
+
 def methodology_thread_rank(thread: dict[str, Any]) -> tuple[int, int, int, str]:
     impact_rank = {
         "transaction-integrity": 0,
@@ -10196,6 +10313,13 @@ def build_methodology_review(
             item=item,
             supporting_reviews=supporting_reviews,
         )
+        minimal_poc_plan = build_minimal_poc_plan_for_thread(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            item=item,
+            evidence_closure=evidence_closure,
+            next_offline_command=command_ref,
+        )
         high_value_threads.append(
             {
                 "id": item.get("id") or item.get("hypothesis_id"),
@@ -10212,6 +10336,7 @@ def build_methodology_review(
                 "required_evidence": item.get("required_evidence", []),
                 "forbidden": item.get("forbidden", []),
                 "evidence_closure": evidence_closure,
+                "minimal_poc_plan": minimal_poc_plan,
             }
         )
     high_value_threads.sort(key=methodology_thread_rank)
@@ -10240,6 +10365,7 @@ def build_methodology_review(
         "ready_hypotheses": (hypothesis_matrix.get("summary", {}) or {}).get("ready_hypotheses", 0),
         "validation_items": (validation_plan.get("summary", {}) or {}).get("items", 0),
         "high_value_threads": len(high_value_threads),
+        "minimal_poc_plans": len(high_value_threads),
         "evidence_closure_status_counts": evidence_closure_summary.get("status_counts", {}),
         "evidence_closure_gate_ready_threads": evidence_closure_summary.get("gate_ready_threads", 0),
     }
@@ -32866,6 +32992,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "methodology-review",
                     "--no-write",
                     "--show-commands",
+                    "--show-poc-plan",
                     "--skip-current-resource-check",
                 ]
             )
@@ -33781,6 +33908,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "resource=not-run" in methodology_review_stdout_text
                 and "Evidence closure:" in methodology_review_stdout_text
                 and "High-value threads:" in methodology_review_stdout
+                and "poc_plan=" in methodology_review_stdout_text
+                and "input=" in methodology_review_stdout_text
                 and "No files written (--no-write)." in methodology_review_stdout
                 and not any(
                     output_paths[key]
@@ -48658,6 +48787,30 @@ def run_methodology_review(args: argparse.Namespace) -> int:
                         f"{format_command_ref_label(ref)} "
                         f"{inline_summary_text(ref.get('command'), max_chars=420)}"
                     )
+        poc_plan = thread.get("minimal_poc_plan") if isinstance(thread.get("minimal_poc_plan"), dict) else {}
+        if args.show_poc_plan and poc_plan:
+            print(
+                "  poc_plan="
+                f"{poc_plan.get('status')} "
+                f"missing={','.join(str(item) for item in (poc_plan.get('missing_evidence', []) or [])[:4]) or 'none'}"
+            )
+            for manual_input in (poc_plan.get("manual_inputs", []) or [])[:2]:
+                print(f"    input={inline_summary_text(manual_input, max_chars=220)}")
+            for requirement in (poc_plan.get("minimum_evidence_package", []) or [])[:3]:
+                if isinstance(requirement, dict):
+                    print(
+                        "    evidence="
+                        f"{requirement.get('status')} {requirement.get('id')} "
+                        f"next={inline_summary_text(requirement.get('next_step'), max_chars=220)}"
+                    )
+            if args.show_commands:
+                for ref in (poc_plan.get("offline_commands", []) or [])[:2]:
+                    if isinstance(ref, dict):
+                        print(
+                            "    - poc "
+                            f"{format_command_ref_label(ref)} "
+                            f"{inline_summary_text(ref.get('command'), max_chars=420)}"
+                        )
     if no_write:
         print("No files written (--no-write).")
     else:
@@ -52155,6 +52308,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-commands",
         action="store_true",
         help="Print safe offline command previews for stage gaps and high-value threads.",
+    )
+    methodology_review.add_argument(
+        "--show-poc-plan",
+        action="store_true",
+        help="Print minimal no-write PoC/evidence plans for high-value threads.",
     )
     methodology_review.add_argument(
         "--skip-current-resource-check",
