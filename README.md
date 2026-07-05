@@ -1540,11 +1540,18 @@ carries forward key gate statuses such as black-box coverage, discovery
 coverage, verification queue, review blockers, response deltas,
 source-peek requests, and Burp observation coverage, and
 classifies each run as `healthy`, `ready-with-external-blockers`,
-`needs-human-review`, or `failed`. When it writes `artifact-health.json` inside
-a managed artifact directory, it refreshes that directory's manifest so the
-health artifact does not make the next integrity check stale. When stale inputs
-exist, the CLI prints the first few affected files with their reason, newer
-inputs, and suggested refresh command. It is useful after regression runs:
+`ready-with-evidence-gaps`, `needs-human-review`, or `failed`. Coverage gaps and
+`response-deltas` with `no-probe-results` stay visible as
+`ready-with-evidence-gaps` instead of hard failures; structural integrity,
+staleness, parse, profile, and security-hygiene problems still fail the health
+gate. `iteration-decision` blocks active validation only for hard failed
+artifact health; manual-review and evidence-gap states remain visible while
+command-safety and resource gates control individual active commands. When it
+writes `artifact-health.json` inside a managed artifact directory, it refreshes
+that directory's manifest so the health artifact does not make the next
+integrity check stale. When stale inputs exist, the CLI prints the first few
+affected files with their reason, newer inputs, and suggested refresh command. It
+is useful after regression runs:
 
 ```bash
 python3 scripts/inferforge.py artifact-health \

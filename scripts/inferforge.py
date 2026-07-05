@@ -17008,7 +17008,8 @@ def build_iteration_decision_from_plan(
     )
     allowed_command_summary = command_safety_summary([*artifact_repair, *offline, *resource_checks, *active_after_gate])
     blocked_command_summary = command_safety_summary(blocked)
-    artifact_health_blocks_active = artifact_health_status in {"failed", "needs-human-review"}
+    artifact_health_blocks_active = artifact_health_status == "failed"
+    artifact_health_needs_review = artifact_health_status == "needs-human-review"
     resource_blocks_active = bool(active_after_gate and resource_status not in {"healthy", "not-run"})
     approval_packets = []
     for item in validation_plan.get("items", []) or []:
@@ -17084,6 +17085,8 @@ def build_iteration_decision_from_plan(
         elif artifact_health_blocks_active:
             active_status = "blocked-artifact-health"
             active_reason = "Artifact health is not clean; refresh required artifacts before active validation commands."
+        elif artifact_health_needs_review:
+            active_reason += " Artifact health has manual-review evidence gaps; command_safety still gates individual commands."
         actions.append(
             iteration_action(
                 action_id="active-validation",
@@ -17158,6 +17161,7 @@ def build_iteration_decision_from_plan(
             "resource_check_commands": len(resource_checks),
             "active_after_resource_gate_commands": len(active_after_gate),
             "artifact_health_blocked_active_commands": len(active_after_gate) if artifact_health_blocks_active else 0,
+            "artifact_health_review_gated_active_commands": len(active_after_gate) if artifact_health_needs_review else 0,
             "resource_blocked_active_commands": len(active_after_gate) if resource_blocks_active else 0,
             "approval_packets": len(approval_packets),
             "blocked_commands": len(blocked),
@@ -36482,15 +36486,20 @@ def mcp_action_audit_security_issues(parsed_json_by_name: dict[str, Any]) -> lis
 def artifact_health_status(checks: list[dict[str, Any]], statuses: dict[str, Any]) -> str:
     if any(check.get("status") == "failed" for check in checks):
         return "failed"
+    if any(check.get("status") == "needs-human-review" for check in checks):
+        return "needs-human-review"
+    if any(check.get("status") == "needs-evidence" for check in checks):
+        return "ready-with-evidence-gaps"
     if (
         statuses.get("verification_queue") == "needs-human-review"
         or statuses.get("review_blockers") == "needs-human-review"
         or statuses.get("discovery_coverage") == "needs-human-review"
         or statuses.get("burp_observation_coverage") == "needs-human-review"
         or statuses.get("source_peek_requests") == "answered-with-manual-review"
-        or statuses.get("coverage") == "covered-with-evidence-gaps"
     ):
         return "needs-human-review"
+    if statuses.get("coverage") == "covered-with-evidence-gaps":
+        return "ready-with-evidence-gaps"
     if any(
         status in {
             "complete-with-external-blocker",
@@ -36696,12 +36705,20 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
             )
 
         response_delta_status = statuses.get("response_delta_analysis")
-        if response_delta_status in {"review-needed", "no-probe-results"}:
+        if response_delta_status == "review-needed":
             checks.append(
                 {
                     "id": "response-delta-analysis",
-                    "status": "failed",
+                    "status": "needs-human-review",
                     "message": f"Response delta status is {response_delta_status}.",
+                }
+            )
+        elif response_delta_status == "no-probe-results":
+            checks.append(
+                {
+                    "id": "response-delta-analysis",
+                    "status": "needs-evidence",
+                    "message": "Response delta analysis has no probe rows yet; this is an evidence gap, not an artifact integrity failure.",
                 }
             )
 
@@ -36710,8 +36727,8 @@ def build_single_artifact_health(artifact_dir: Path) -> dict[str, Any]:
             checks.append(
                 {
                     "id": "coverage",
-                    "status": "failed",
-                    "message": f"Coverage status is {coverage_status}.",
+                    "status": "needs-evidence",
+                    "message": f"Coverage status is {coverage_status}; refresh evidence with scoped, resource-gated validation rather than treating the artifact as corrupt.",
                 }
             )
 
@@ -36834,6 +36851,7 @@ def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
     failed_dirs = []
     human_review_dirs = []
     external_blocker_dirs = []
+    evidence_gap_dirs = []
     parse_error_count = 0
     missing_required_count = 0
     stale_input_count = 0
@@ -36848,6 +36866,8 @@ def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
             human_review_dirs.append(item["artifact_dir"])
         elif status == "ready-with-external-blockers":
             external_blocker_dirs.append(item["artifact_dir"])
+        elif status == "ready-with-evidence-gaps":
+            evidence_gap_dirs.append(item["artifact_dir"])
         parse_doc = item.get("parse", {}) or {}
         parse_error_count += len(parse_doc.get("json_errors", []) or [])
         parse_error_count += len(parse_doc.get("jsonl_errors", []) or [])
@@ -36863,6 +36883,8 @@ def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
         status = "needs-human-review"
     elif external_blocker_dirs:
         status = "ready-with-external-blockers"
+    elif evidence_gap_dirs:
+        status = "ready-with-evidence-gaps"
     else:
         status = "healthy"
 
@@ -36875,6 +36897,7 @@ def build_artifact_health(artifact_dirs: list[Path]) -> dict[str, Any]:
             "failed_dirs": failed_dirs,
             "human_review_dirs": human_review_dirs,
             "external_blocker_dirs": external_blocker_dirs,
+            "evidence_gap_dirs": evidence_gap_dirs,
             "parse_error_count": parse_error_count,
             "missing_required_count": missing_required_count,
             "stale_input_count": stale_input_count,
@@ -36961,6 +36984,7 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         observation_error_leak_dir = root / "observation-error-leak"
         sample_field_leak_dir = root / "sample-field-leak"
         warning_error_leak_dir = root / "warning-error-leak"
+        evidence_gap_dir = root / "evidence-gap"
         refresh_dir = root / "refresh"
         derived_dir = root / "derived"
         for directory in [healthy_dir, modified_dir, missing_dir, untracked_dir]:
@@ -37192,6 +37216,36 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             ["transaction-decoder-selftest.json", "transaction-intent.json"],
         )
 
+        evidence_gap_dir.mkdir(parents=True)
+        for name in REQUIRED_ARTIFACTS:
+            write_sample_artifact(evidence_gap_dir / name)
+        write_json(
+            evidence_gap_dir / "blackbox-coverage.json",
+            {
+                "generated_at": utc_now(),
+                "status": "failed",
+                "summary": {
+                    "required_failures": ["quote:safe-probes-executed"],
+                    "evidence_gaps": ["GAP-quote-burp-observation"],
+                },
+                "safety": "Synthetic coverage gap only; no probes were executed.",
+            },
+        )
+        write_json(
+            evidence_gap_dir / "response-delta-analysis.json",
+            {
+                "generated_at": utc_now(),
+                "status": "no-probe-results",
+                "summary": {"probe_rows": 0},
+                "safety": "Synthetic no-probe response delta state.",
+            },
+        )
+        evidence_gap_mtime_ns = 1_720_000_000_000_000_000
+        for path in evidence_gap_dir.iterdir():
+            if path.is_file():
+                set_mtime_ns(path, evidence_gap_mtime_ns)
+        write_artifact_manifest(evidence_gap_dir, "http://127.0.0.1:9997", command="self-test-artifact-health")
+
         healthy = build_single_artifact_health(healthy_dir)
         modified = build_single_artifact_health(modified_dir)
         missing = build_single_artifact_health(missing_dir)
@@ -37213,6 +37267,8 @@ def build_artifact_health_selftest() -> dict[str, Any]:
         sample_field_leak_text = json.dumps(sample_field_leak, sort_keys=True)
         warning_error_leak = build_single_artifact_health(warning_error_leak_dir)
         warning_error_leak_text = json.dumps(warning_error_leak, sort_keys=True)
+        evidence_gap_health = build_single_artifact_health(evidence_gap_dir)
+        evidence_gap_rollup = build_artifact_health([evidence_gap_dir])
         sanitized_probe_artifact_sample = sanitize_probe_result_for_artifact(
             {
                 "probe_id": "sanitize-sample",
@@ -37410,6 +37466,23 @@ def build_artifact_health_selftest() -> dict[str, Any]:
             "passed": aggregate.get("status") == "failed" and aggregate.get("summary", {}).get("stale_input_count") == 3,
             "expected": 3,
             "actual": aggregate.get("summary", {}).get("stale_input_count"),
+        },
+        {
+            "id": "artifact-health-evidence-gaps-do-not-hard-fail",
+            "passed": (
+                evidence_gap_health.get("status") == "ready-with-evidence-gaps"
+                and evidence_gap_rollup.get("status") == "ready-with-evidence-gaps"
+                and evidence_gap_rollup.get("summary", {}).get("evidence_gap_dirs") == [str(evidence_gap_dir)]
+                and not evidence_gap_health.get("stale_inputs")
+                and not evidence_gap_health.get("security_issues")
+            ),
+            "expected": "coverage gaps and no-probe response deltas remain visible without becoming artifact integrity failures",
+            "actual": {
+                "single_status": evidence_gap_health.get("status"),
+                "rollup_status": evidence_gap_rollup.get("status"),
+                "rollup_summary": evidence_gap_rollup.get("summary"),
+                "checks": evidence_gap_health.get("checks"),
+            },
         },
         {
             "id": "artifact-health-detects-mcp-action-audit-leaks",
@@ -58609,6 +58682,7 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
         f"resource_checks={summary.get('resource_check_commands', 0)} "
         f"active_after_gate={summary.get('active_after_resource_gate_commands', 0)} "
         f"artifact_blocked_active={summary.get('artifact_health_blocked_active_commands', 0)} "
+        f"artifact_review_gated_active={summary.get('artifact_health_review_gated_active_commands', 0)} "
         f"resource_blocked_active={summary.get('resource_blocked_active_commands', 0)} "
         f"approval_packets={summary.get('approval_packets', 0)} "
         f"blocked={summary.get('blocked_commands', 0)}"
