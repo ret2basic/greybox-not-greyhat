@@ -169,6 +169,7 @@ DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
 REVIEW_BLOCKERS_MARKDOWN_ARTIFACT = "review-blockers.md"
 REVIEW_BLOCKERS_SELFTEST_ARTIFACT = "review-blockers-selftest.json"
+ORACLE_PLAN_ARTIFACT = "oracle-plan.json"
 COMMAND_SAFETY_SELFTEST_ARTIFACT = "command-safety-selftest.json"
 ARTIFACT_HEALTH_SELFTEST_ARTIFACT = "artifact-health-selftest.json"
 MANIFEST_REFRESH_SELFTEST_ARTIFACT = "manifest-refresh-selftest.json"
@@ -19477,6 +19478,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     "reproduction-steps.md": "verification-queue",
     REVIEW_BLOCKERS_ARTIFACT: "review-blockers",
     REVIEW_BLOCKERS_MARKDOWN_ARTIFACT: "review-blockers",
+    ORACLE_PLAN_ARTIFACT: "oracle-plan",
     "finding-gate.json": "gate",
     "adjudication.json": "adjudicate",
     "findings.json": "adjudicate",
@@ -19506,6 +19508,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "adjudicate",
     "verification-queue",
     "review-blockers",
+    "oracle-plan",
     "report",
     "decode-transactions",
     "self-test-transactions",
@@ -19523,6 +19526,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "adjudicate": "adjudicate --no-write",
     "verification-queue": "verification-queue --no-write",
     "review-blockers": "review-blockers --no-write",
+    "oracle-plan": "oracle-plan --no-write",
     "report": "report --no-write",
 }
 
@@ -37420,6 +37424,173 @@ def build_review_blocker_oracle_summary(groups: list[dict[str, Any]], *, artifac
     }
 
 
+ORACLE_PLAN_TYPE_PAYOFF = {
+    "transaction-intent": 95,
+    "single-response-impact": 90,
+    "provider-impact": 70,
+    "resource-control": 60,
+    "finding-gate": 55,
+    "evidence-triage": 20,
+}
+
+
+def oracle_plan_priority_score(priority: Any) -> int:
+    return {"critical": 45, "high": 35, "medium": 20, "low": 5}.get(str(priority or "").lower(), 0)
+
+
+def oracle_plan_dependency_score(dependency_kind: str) -> int:
+    return {
+        "approved-sidecar-or-single-observation": 30,
+        "finding-gate-review": 25,
+        "operator-or-deployment-evidence": 10,
+        "evidence-triage": 0,
+    }.get(dependency_kind, 0)
+
+
+def oracle_plan_action_score(action: dict[str, Any], *, assessment_mode: str) -> int:
+    coverage_score = int(action.get("coverage_pressure") or 0)
+    bounty_score = int(action.get("bounty_pressure") or 0)
+    validity_score = int(action.get("validity_pressure") or 0)
+    if assessment_mode == "blackbox":
+        return bounty_score + validity_score
+    return coverage_score + validity_score
+
+
+def oracle_plan_action_from_work_item(
+    work_item: dict[str, Any],
+    *,
+    assessment_mode: str,
+    index: int,
+) -> dict[str, Any]:
+    oracle_type = str(work_item.get("oracle_type") or "unknown")
+    dependency_kind = str(work_item.get("dependency_kind") or "evidence-triage")
+    operator_dependency = dependency_kind == "operator-or-deployment-evidence"
+    active_traffic_required = dependency_kind == "approved-sidecar-or-single-observation"
+    missing_artifacts = int(work_item.get("missing_artifact_count") or 0)
+    contract_ready = str(work_item.get("evidence_contract_status") or "") == "has-contract"
+    priority_score = oracle_plan_priority_score(work_item.get("priority"))
+    payoff_score = ORACLE_PLAN_TYPE_PAYOFF.get(oracle_type, 10)
+    dependency_score = oracle_plan_dependency_score(dependency_kind)
+    validity_pressure = payoff_score + dependency_score + (15 if contract_ready else 0) - min(missing_artifacts, 10)
+    bounty_pressure = payoff_score + priority_score + (10 if active_traffic_required else 0) - (20 if operator_dependency else 0)
+    coverage_pressure = priority_score + missing_artifacts + (10 if operator_dependency else 0)
+    action = {
+        "id": f"ORACLE-{index:03d}-{safe_probe_id(str(work_item.get('group_id') or oracle_type))}",
+        "group_id": work_item.get("group_id"),
+        "oracle_type": oracle_type,
+        "oracle_status": work_item.get("oracle_status"),
+        "priority": work_item.get("priority"),
+        "category": work_item.get("category"),
+        "cluster_id": work_item.get("cluster_id"),
+        "title": work_item.get("title"),
+        "dependency_kind": dependency_kind,
+        "operator_dependency": operator_dependency,
+        "active_traffic_required": active_traffic_required,
+        "active_traffic_policy": (
+            "blocked-until-approval-and-healthy-resource-gate"
+            if active_traffic_required
+            else "not-required-before-offline-evidence-review"
+        ),
+        "first_missing_artifact": work_item.get("first_missing_artifact"),
+        "missing_artifact_count": missing_artifacts,
+        "evidence_contract_kind": work_item.get("evidence_contract_kind"),
+        "evidence_contract_status": work_item.get("evidence_contract_status"),
+        "first_required_field": work_item.get("first_required_field"),
+        "required_field_count": work_item.get("required_field_count", 0),
+        "next_step": work_item.get("next_step"),
+        "coverage_pressure": coverage_pressure,
+        "bounty_pressure": bounty_pressure,
+        "validity_pressure": validity_pressure,
+        "score": 0,
+        "recommendation": "review-offline-first",
+        "reason": (
+            "Operator/deployment evidence is required before any active validation."
+            if operator_dependency
+            else "A compact evidence contract exists; close the missing sidecar or single observation before finding-gate."
+            if active_traffic_required and contract_ready
+            else "Classify or complete the evidence contract before validation."
+        ),
+        "forbidden_validation": (
+            (work_item.get("evidence_contract") or {}).get("forbidden_validation", [])
+            if isinstance(work_item.get("evidence_contract"), dict)
+            else []
+        ),
+    }
+    action["score"] = oracle_plan_action_score(action, assessment_mode=assessment_mode)
+    return action
+
+
+def build_oracle_plan_from_review_blockers(
+    review_blockers: dict[str, Any],
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    assessment_policy = (
+        review_blockers.get("assessment_policy")
+        if isinstance(review_blockers.get("assessment_policy"), dict)
+        else assessment_mode_policy(profile)
+    )
+    assessment_mode = str(assessment_policy.get("mode") or "greybox")
+    oracle_summary = (
+        review_blockers.get("oracle_summary")
+        if isinstance(review_blockers.get("oracle_summary"), dict)
+        else {}
+    )
+    work_items = [
+        item
+        for item in oracle_summary.get("work_items", []) or []
+        if isinstance(item, dict)
+    ]
+    actions = [
+        oracle_plan_action_from_work_item(item, assessment_mode=assessment_mode, index=index)
+        for index, item in enumerate(work_items, start=1)
+    ]
+    actions.sort(
+        key=lambda item: (
+            -int(item.get("score") or 0),
+            review_blocker_priority_rank(str(item.get("priority") or "")),
+            str(item.get("group_id") or ""),
+        )
+    )
+    for index, action in enumerate(actions):
+        if index == 0:
+            action["recommendation"] = "pursue-first"
+        elif action.get("operator_dependency"):
+            action["recommendation"] = "park-until-operator-evidence"
+        elif assessment_mode == "blackbox":
+            action["recommendation"] = "park-behind-top-bounty-path"
+        else:
+            action["recommendation"] = "keep-open-for-coverage"
+    status = "no-oracle-blockers" if not actions else "needs-oracle-evidence"
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "assessment_policy": assessment_policy,
+        "summary": {
+            "actions": len(actions),
+            "assessment_mode": assessment_mode,
+            "lead_selection_strategy": lead_dossier_ranking_strategy(assessment_policy),
+            "top_action_id": actions[0].get("id") if actions else None,
+            "top_oracle_type": actions[0].get("oracle_type") if actions else None,
+            "active_traffic_required": sum(1 for action in actions if action.get("active_traffic_required")),
+            "operator_dependency": sum(1 for action in actions if action.get("operator_dependency")),
+            "oracle_type_counts": oracle_summary.get("type_counts", {}),
+            "oracle_dependency_counts": oracle_summary.get("dependency_counts", {}),
+            "oracle_artifact_status_counts": oracle_summary.get("artifact_status_counts", {}),
+        },
+        "actions": actions[:12],
+        "review_blockers_status": review_blockers.get("status"),
+        "review_blockers_summary": review_blockers.get("summary", {}),
+        "safety": (
+            "Offline oracle plan only. It reads local review-blocker artifacts and in-memory gate previews; "
+            "it sends no requests, invokes no Burp tools, signs no wallets, submits no transactions, and runs no scanners."
+        ),
+    }
+
+
 def finding_gate_preview_blocker_strings(preview: dict[str, Any]) -> list[str]:
     blockers: list[Any] = []
     for check in preview.get("checks", []) or []:
@@ -38540,6 +38711,31 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             REVIEW_BLOCKERS_MARKDOWN_ARTIFACT: (gate_no_write_output_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT).exists(),
             MANIFEST_NAME: (gate_no_write_output_dir / MANIFEST_NAME).exists(),
         }
+        oracle_plan_no_write_args = parser.parse_args(
+            [
+                "--profile",
+                str(profile_path),
+                "--artifact-dir",
+                str(gate_no_write_output_dir),
+                "--target",
+                target,
+                "--source-root",
+                str(root),
+                "oracle-plan",
+                "--no-write",
+                "--top",
+                "4",
+                "--show-details",
+            ]
+        )
+        oracle_plan_stdout_buffer = io.StringIO()
+        with contextlib.redirect_stdout(oracle_plan_stdout_buffer):
+            oracle_plan_no_write_return_code = oracle_plan_no_write_args.func(oracle_plan_no_write_args)
+        oracle_plan_no_write_stdout = oracle_plan_stdout_buffer.getvalue()
+        oracle_plan_no_write_outputs_exist = {
+            ORACLE_PLAN_ARTIFACT: (gate_no_write_output_dir / ORACLE_PLAN_ARTIFACT).exists(),
+            MANIFEST_NAME: (gate_no_write_output_dir / MANIFEST_NAME).exists(),
+        }
         discover_no_write_args = parser.parse_args(
             [
                 "--profile",
@@ -38591,7 +38787,18 @@ def build_review_blockers_selftest() -> dict[str, Any]:
     rollup_top_group_summaries = top_review_blocker_group_summaries(rollup, limit=2)
     gate_oracle_summary = gate_blockers.get("oracle_summary", {}) or {}
     gate_top_oracle = gate_oracle_summary.get("top_oracle", {}) or {}
+    gate_oracle_plan = build_oracle_plan_from_review_blockers(
+        gate_blockers,
+        artifact_dir=Path(".greybox/selftest-gate-blockers"),
+        profile=profile,
+    )
+    gate_oracle_plan_top = (
+        (gate_oracle_plan.get("actions") or [{}])[0]
+        if gate_oracle_plan.get("actions")
+        else {}
+    )
     gate_no_write_stdout_text = " ".join(gate_no_write_stdout.split())
+    oracle_plan_no_write_stdout_text = " ".join(oracle_plan_no_write_stdout.split())
     assertions = [
         {
             "id": "default-status-external-only",
@@ -38873,6 +39080,43 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "return_code": gate_no_write_return_code,
                 "stdout": gate_no_write_stdout.splitlines(),
                 "outputs_exist": gate_no_write_outputs_exist,
+            },
+        },
+        {
+            "id": "oracle-plan-ranks-blocked-validation-oracles",
+            "passed": (
+                gate_oracle_plan.get("status") == "needs-oracle-evidence"
+                and gate_oracle_plan.get("summary", {}).get("actions") == 1
+                and gate_oracle_plan_top.get("oracle_type") == "transaction-intent"
+                and gate_oracle_plan_top.get("recommendation") == "pursue-first"
+                and gate_oracle_plan_top.get("dependency_kind") == "approved-sidecar-or-single-observation"
+                and gate_oracle_plan_top.get("evidence_contract_kind") == "approved-quote-transaction-corpus"
+                and gate_oracle_plan_top.get("active_traffic_required") is True
+                and "blocked-until-approval-and-healthy-resource-gate"
+                in str(gate_oracle_plan_top.get("active_traffic_policy") or "")
+            ),
+            "expected": "oracle-plan ranks blocked validation oracles by evidence path without marking them reportable",
+            "actual": {
+                "plan": gate_oracle_plan,
+            },
+        },
+        {
+            "id": "oracle-plan-no-write-cli-renders-ranked-actions",
+            "passed": (
+                oracle_plan_no_write_return_code == 0
+                and "Oracle plan: needs-oracle-evidence" in oracle_plan_no_write_stdout
+                and "top=transaction-intent" in oracle_plan_no_write_stdout
+                and "recommend=pursue-first" in oracle_plan_no_write_stdout
+                and "contract=approved-quote-transaction-corpus" in oracle_plan_no_write_stdout
+                and "active_policy=blocked-until-approval-and-healthy-resource-gate" in oracle_plan_no_write_stdout_text
+                and "No files written (--no-write)." in oracle_plan_no_write_stdout
+                and not any(oracle_plan_no_write_outputs_exist.values())
+            ),
+            "expected": "oracle-plan --no-write prints ranked oracle actions without writing plan or manifest artifacts",
+            "actual": {
+                "return_code": oracle_plan_no_write_return_code,
+                "stdout": oracle_plan_no_write_stdout.splitlines(),
+                "outputs_exist": oracle_plan_no_write_outputs_exist,
             },
         },
         {
@@ -58952,12 +59196,7 @@ def run_verification_queue(args: argparse.Namespace) -> int:
     return verification_queue_exit_code(verification_queue)
 
 
-def run_review_blockers(args: argparse.Namespace) -> int:
-    profile, artifact_dir, target, source_root = resolve_run_context(args)
-    no_write = bool(args.no_write)
-    if not no_write:
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+def review_blocker_check_dirs_from_args(args: argparse.Namespace, artifact_dir: Path) -> list[Path]:
     check_dirs: list[Path] = []
     for item in args.check_dir or []:
         check_dirs.append(resolve_repo_path(item))
@@ -58972,17 +59211,30 @@ def run_review_blockers(args: argparse.Namespace) -> int:
             continue
         seen_dirs.add(key)
         deduped_dirs.append(resolved)
+    return deduped_dirs
 
+
+def build_review_blockers_for_cli_args(
+    args: argparse.Namespace,
+    *,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    target: str,
+) -> tuple[dict[str, Any], list[Path]]:
+    deduped_dirs = review_blocker_check_dirs_from_args(args, artifact_dir)
     if deduped_dirs:
-        review_blockers = build_review_blockers_rollup(
-            target=target,
-            profile=profile,
-            artifact_dir=artifact_dir,
-            check_dirs=deduped_dirs,
-            artifact_health=load_optional_json(artifact_dir / "artifact-health.json"),
+        return (
+            build_review_blockers_rollup(
+                target=target,
+                profile=profile,
+                artifact_dir=artifact_dir,
+                check_dirs=deduped_dirs,
+                artifact_health=load_optional_json(artifact_dir / "artifact-health.json"),
+            ),
+            deduped_dirs,
         )
-    else:
-        review_blockers = build_review_blockers(
+    return (
+        build_review_blockers(
             target=target,
             profile=profile,
             artifact_dir=artifact_dir,
@@ -58997,7 +59249,23 @@ def run_review_blockers(args: argparse.Namespace) -> int:
                 profile=profile,
                 artifact_dir=artifact_dir,
             ),
-        )
+        ),
+        deduped_dirs,
+    )
+
+
+def run_review_blockers(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    review_blockers, deduped_dirs = build_review_blockers_for_cli_args(
+        args,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        target=target,
+    )
     output_path = resolve_repo_path(args.output) if args.output else artifact_dir / REVIEW_BLOCKERS_ARTIFACT
     markdown_path = (
         resolve_repo_path(args.markdown_output)
@@ -59123,6 +59391,83 @@ def run_review_blockers(args: argparse.Namespace) -> int:
     if review_blockers["status"] == "failed":
         return 1
     if args.strict and review_blockers["status"] != "ready":
+        return 1
+    return 0
+
+
+def run_oracle_plan(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    review_blockers, deduped_dirs = build_review_blockers_for_cli_args(
+        args,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        target=target,
+    )
+    oracle_plan = build_oracle_plan_from_review_blockers(
+        review_blockers,
+        artifact_dir=artifact_dir,
+        profile=profile,
+    )
+    output_path = resolve_repo_path(args.output) if args.output else artifact_dir / ORACLE_PLAN_ARTIFACT
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, oracle_plan)
+        refreshed_manifests = refresh_manifests_for_artifact_outputs(
+            output_paths=[output_path],
+            artifact_dir=artifact_dir,
+            check_dirs=deduped_dirs,
+            target=target,
+            command="oracle-plan",
+        )
+    summary = oracle_plan.get("summary", {}) or {}
+    print(f"Oracle plan: {oracle_plan.get('status')}")
+    print(
+        "Actions: "
+        f"{summary.get('actions', 0)} total, "
+        f"mode={summary.get('assessment_mode') or '-'} "
+        f"selection={summary.get('lead_selection_strategy') or '-'} "
+        f"top={summary.get('top_oracle_type') or '-'} "
+        f"active_traffic_required={summary.get('active_traffic_required', 0)} "
+        f"operator_dependency={summary.get('operator_dependency', 0)}"
+    )
+    display_limit = max(0, int(args.top))
+    for action in (oracle_plan.get("actions", []) or [])[:display_limit]:
+        print(
+            f"- {action.get('id')}: score={action.get('score')} "
+            f"oracle={action.get('oracle_type')} priority={action.get('priority')} "
+            f"recommend={action.get('recommendation')} "
+            f"dependency={action.get('dependency_kind')} "
+            f"contract={action.get('evidence_contract_kind') or '-'} "
+            f"first_missing={action.get('first_missing_artifact') or '-'} "
+            f"first_required={inline_summary_text(action.get('first_required_field'), max_chars=160) or '-'}"
+        )
+        if args.show_details:
+            print(f"  next={inline_summary_text(action.get('next_step'), max_chars=260)}")
+            print(f"  active_policy={action.get('active_traffic_policy')}")
+            print(
+                "  pressure="
+                f"coverage:{action.get('coverage_pressure', 0)} "
+                f"bounty:{action.get('bounty_pressure', 0)} "
+                f"validity:{action.get('validity_pressure', 0)}"
+            )
+            if action.get("reason"):
+                print(f"  reason={inline_summary_text(action.get('reason'), max_chars=260)}")
+    remaining = len(oracle_plan.get("actions", []) or []) - display_limit
+    if remaining > 0:
+        if no_write:
+            print(f"- {remaining} more oracle action(s); rerun without --no-write to write the full oracle plan")
+        else:
+            print(f"- {remaining} more oracle action(s) in {output_path}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if args.strict and oracle_plan.get("status") != "no-oracle-blockers":
         return 1
     return 0
 
@@ -65360,6 +65705,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless no review, profile-update, or external blockers remain.",
     )
     review_blockers.set_defaults(func=run_review_blockers)
+
+    oracle_plan = sub.add_parser(
+        "oracle-plan",
+        help="Rank validation-oracle blockers by objective pressure and shortest evidence path",
+    )
+    oracle_plan.add_argument(
+        "--output",
+        help="Where to write oracle-plan.json. Defaults to --artifact-dir/oracle-plan.json.",
+    )
+    oracle_plan.add_argument(
+        "--check-dir",
+        action="append",
+        help="Child artifact directory to include in a review-blocker rollup. Repeat as needed.",
+    )
+    oracle_plan.add_argument(
+        "--discover-child-runs",
+        action="store_true",
+        help="Build the plan from child directories under --artifact-dir that contain review-blockers.json.",
+    )
+    oracle_plan.add_argument(
+        "--top",
+        type=positive_int,
+        default=6,
+        help="Number of oracle actions to print.",
+    )
+    oracle_plan.add_argument(
+        "--show-details",
+        action="store_true",
+        help="Print next-step, traffic policy, and pressure details for each action.",
+    )
+    oracle_plan.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print oracle plan only; do not write oracle-plan.json or refreshed manifests.",
+    )
+    oracle_plan.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless no validation-oracle blockers remain.",
+    )
+    oracle_plan.set_defaults(func=run_oracle_plan)
 
     manifest = sub.add_parser(
         "manifest",

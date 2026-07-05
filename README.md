@@ -1618,6 +1618,25 @@ the same grouped summary without writing `review-blockers.json`,
 `review-blockers.md`, or refreshed manifests, and `--strict` when any remaining
 blocker should fail a CI job.
 
+`oracle-plan` turns the validation-oracle blockers into a shorter offline
+execution queue. It ranks each oracle by the active objective, bounty/coverage
+pressure, evidence-contract availability, missing artifacts, whether the next
+step requires operator/deployment evidence, and whether any active traffic must
+stay blocked behind approval and a healthy resource gate:
+
+```bash
+python3 scripts/inferforge.py oracle-plan --no-write --top 6 --show-details
+python3 scripts/inferforge.py oracle-plan
+python3 scripts/inferforge.py oracle-plan \
+  --check-dir .greybox/regression-default \
+  --check-dir .greybox/regression-discovered \
+  --no-write
+```
+
+The command writes `.greybox/oracle-plan.json` unless `--no-write` is used. It
+does not send HTTP requests, query Burp, sign wallets, submit transactions, run
+scanners, or perform resource stress validation.
+
 `manifest` writes `.greybox/artifact-manifest.json`, an integrity snapshot with
 SHA256 hashes, sizes, modification timestamps, generated-at timestamps, JSONL row
 counts, key status summaries, and missing-required-artifact checks. `audit`
@@ -1628,7 +1647,7 @@ top-level artifacts, such as `profile`, `plan`, `collect`, `burp-observe`,
 `discovery-coverage`, `response-deltas`, `source-peek`,
 `source-peek-requests`,
 `evidence-chain`, `evidence-appendix`, `verification-queue`, `review-blockers`,
-`gate`, `adjudicate`, `artifact-health`, `review-candidates`,
+`oracle-plan`, `gate`, `adjudicate`, `artifact-health`, `review-candidates`,
 `promote-observation-candidate`, `discover-profile`, `capabilities`,
 `readiness`, `decode-transactions`, `collect-quote`, `collect-orca-baseline`,
 and the static `self-test-*` commands, also refresh the manifest when their
