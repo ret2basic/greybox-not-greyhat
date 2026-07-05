@@ -27773,6 +27773,29 @@ def build_response_delta_analysis(
         "generated_at": utc_now(),
         "status": status,
         "methodology": "Read-only response delta analysis over probe-results.jsonl. Deltas are evidence indexes, not findings; unexpected or transport-error deltas still require the finding gate.",
+        "next_step": (
+            "No probe rows are available for response-delta analysis. Use offline planning and queue review to choose the smallest evidence-changing step before any active replay."
+            if status == "no-probe-results"
+            else "Review response delta groups through finding-gate before making any reportability claim."
+            if status == "review-needed"
+            else "Use this artifact as supporting context only; response deltas alone are not findings."
+        ),
+        "followup_subcommands": (
+            [
+                "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check",
+                "verification-queue --no-write",
+                "methodology-review --no-write --limit 8 --skip-current-resource-check",
+                "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict",
+            ]
+            if status == "no-probe-results"
+            else [
+                "gate --no-write --show-items",
+                "adjudicate --no-write",
+                "evidence-chain --no-write",
+            ]
+            if status == "review-needed"
+            else []
+        ),
         "summary": {
             "probe_rows": len(results),
             "clusters": len(cluster_summaries),
@@ -48050,6 +48073,17 @@ def run_response_deltas(args: argparse.Namespace) -> int:
         f"review_needed={response_delta_analysis['summary']['review_needed_groups']}, "
         f"expected_deltas={response_delta_analysis['summary']['expected_delta_groups']}"
     )
+    if response_delta_analysis.get("next_step"):
+        print(f"Next: {inline_summary_text(response_delta_analysis.get('next_step'), max_chars=260)}")
+    if args.show_commands and response_delta_analysis.get("followup_subcommands"):
+        print("Follow-up commands:")
+        for subcommand in response_delta_analysis.get("followup_subcommands", [])[:8]:
+            command = validation_command_for_artifact_dir(artifact_dir, str(subcommand), profile=profile)
+            ref = validation_command_ref(command, source=f"response-deltas:{response_delta_analysis['status']}")
+            print(
+                f"- [{ref.get('classification') or 'unknown'}] "
+                f"{inline_summary_text(ref.get('command') or command, max_chars=420)}"
+            )
     if no_write:
         print("No files written (--no-write).")
     else:
@@ -54248,6 +54282,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-write",
         action="store_true",
         help="Print response delta summary only; do not write response-delta-analysis.json or refreshed manifests.",
+    )
+    response_deltas.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print safe follow-up command previews for the current response-delta status.",
     )
     response_deltas.set_defaults(func=run_response_deltas)
 
