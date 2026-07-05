@@ -403,7 +403,11 @@ resource-gated approval sequence, and current finding-gate blockers. In
 `greybox` mode this helps close credentialed-upstream coverage for every
 dangerous source-derived route; in `blackbox` mode it keeps the work focused on
 the smallest provider/operator evidence package that can support one valid
-high-impact bounty report.
+high-impact bounty report. Credential leads also expose a
+`credential-impact-evidence-closure` plan so route context, redacted operator
+evidence, provider-impact review, single-request resource gates, and
+finding-gate entry stay ordered and blocked until concrete provider impact
+evidence exists.
 Profiles can attach `quote_provider.public_docs` entries for official provider
 documentation. InferForge indexes those references as public context for API-key
 authentication and executable transaction-payload behavior, but it does not

@@ -10180,6 +10180,224 @@ def build_methodology_supporting_reviews(
     return reviews
 
 
+def credential_approval_sequence_step(approval_packet: dict[str, Any], step_id: str) -> dict[str, Any]:
+    for step in approval_packet.get("approval_sequence", []) or []:
+        if isinstance(step, dict) and step.get("id") == step_id:
+            return step
+    return {}
+
+
+def credential_impact_evidence_closure_plan(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    requirements: list[dict[str, Any]],
+    checklist: dict[str, Any],
+    approval_packet: dict[str, Any],
+    gate_ready: bool,
+) -> dict[str, Any]:
+    requirement_by_id = {
+        str(requirement.get("id") or ""): requirement
+        for requirement in requirements
+        if isinstance(requirement, dict)
+    }
+    summary = checklist.get("summary", {}) if isinstance(checklist.get("summary"), dict) else {}
+    resource_preflight = (
+        checklist.get("resource_preflight")
+        if isinstance(checklist.get("resource_preflight"), dict)
+        else {}
+    )
+    recommended_evidence = (
+        approval_packet.get("recommended_evidence")
+        if isinstance(approval_packet.get("recommended_evidence"), dict)
+        else {}
+    )
+    operator_sidecar = (
+        checklist.get("operator_evidence_sidecar")
+        if isinstance(checklist.get("operator_evidence_sidecar"), dict)
+        else {}
+    )
+    sidecar_path = (
+        approval_packet.get("operator_evidence_sidecar")
+        or operator_sidecar.get("path")
+        or repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
+    )
+    missing_decision_ids = ordered_unique_strings(
+        [
+            *normalize_string_list(recommended_evidence.get("missing_decision_ids")),
+            *normalize_string_list(summary.get("missing_provider_evidence")),
+        ]
+    )
+    required_fields = normalize_string_list(approval_packet.get("redacted_sidecar_required_fields"))
+    finding_gate_blockers = normalize_string_list(approval_packet.get("finding_gate_blockers"))
+
+    def requirement_status(requirement_id: str) -> str:
+        requirement = requirement_by_id.get(requirement_id, {})
+        return str(requirement.get("status") or "waiting")
+
+    def requirement_next(requirement_id: str, fallback: str) -> str:
+        requirement = requirement_by_id.get(requirement_id, {})
+        return str(requirement.get("next_step") or fallback)
+
+    def offline_command(subcommand: str, source: str) -> dict[str, Any] | None:
+        return methodology_command_ref(artifact_dir, profile, subcommand, source=source)
+
+    def packet_step_summary(step_id: str) -> dict[str, Any]:
+        step = credential_approval_sequence_step(approval_packet, step_id)
+        if not step:
+            return {}
+        return {
+            key: step.get(key)
+            for key in ["id", "status", "risk", "action", "command", "checklist_step_status"]
+            if step.get(key) is not None
+        }
+
+    route_status = requirement_status("credentialed-upstream-route-without-bound-controls")
+    provider_status = requirement_status("provider-impact-evidence-complete")
+    resource_status = requirement_status("resource-safe-for-single-request")
+    provider_ready = provider_status == "passed"
+    steps = [
+        {
+            "id": "credentialed-route-context",
+            "requirement": "credentialed-upstream-route-without-bound-controls",
+            "status": route_status,
+            "artifact": "transaction-flow-review.json",
+            "evidence": {
+                "entrypoint": recommended_evidence.get("entrypoint"),
+                "provider": recommended_evidence.get("provider"),
+                "route_count": recommended_evidence.get("route_count"),
+                "credential_proxy_status": summary.get("credential_proxy_status"),
+            },
+            "offline_command": offline_command(
+                "transaction-flow-review --no-write --top 8",
+                "credential-closure-plan:route-context",
+            ),
+            "next_step": requirement_next(
+                "credentialed-upstream-route-without-bound-controls",
+                "Keep route-bound auth/rate evidence explicit before treating provider usage as attacker-controlled.",
+            ),
+        },
+        {
+            "id": "operator-evidence-sidecar",
+            "requirement": "provider-impact-evidence-complete",
+            "status": provider_status,
+            "artifact": sidecar_path,
+            "required_decision_ids": sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS),
+            "missing_decision_ids": missing_decision_ids,
+            "required_fields": required_fields[:5],
+            "packet_steps": [
+                packet_step_summary("operator-template-preview"),
+                packet_step_summary("operator-evidence-review"),
+            ],
+            "offline_command": offline_command(
+                "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
+                "credential-closure-plan:operator-evidence-sidecar",
+            ),
+            "next_step": requirement_next(
+                "provider-impact-evidence-complete",
+                "Collect redacted quota, billing, rate-limit, and usage-monitoring evidence from the provider/operator.",
+            ),
+        },
+        {
+            "id": "provider-impact-review",
+            "requirement": "provider-impact-evidence-complete",
+            "status": "passed" if provider_ready else "waiting",
+            "artifact": CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT,
+            "evidence": {
+                "checklist_status": checklist.get("status"),
+                "provider_review_status": summary.get("provider_review_status"),
+                "provider_public_docs_status": summary.get("provider_public_docs_status"),
+                "missing_provider_evidence": missing_decision_ids,
+            },
+            "packet_steps": [packet_step_summary("credential-impact-review")],
+            "offline_command": offline_command(
+                "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check --show-evidence-contract",
+                "credential-closure-plan:provider-impact-review",
+            ),
+            "next_step": (
+                "Review credential-impact-checklist only after every provider/operator decision has redacted non-placeholder evidence."
+            ),
+        },
+        {
+            "id": "single-request-resource-gate",
+            "requirement": "resource-safe-for-single-request",
+            "status": resource_status,
+            "artifact": "resource-snapshot",
+            "evidence": {
+                "resource_status": resource_preflight.get("status"),
+                "resource_budget": resource_preflight.get("resource_budget", {}),
+            },
+            "packet_steps": [
+                packet_step_summary("resource-gate"),
+                packet_step_summary("single-request-validation"),
+            ],
+            "offline_command": offline_command(
+                "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict",
+                "credential-closure-plan:resource-gate",
+            ),
+            "next_step": requirement_next(
+                "resource-safe-for-single-request",
+                "Run only a final resource gate before any single approved request; do not use flooding or stress traffic.",
+            ),
+        },
+        {
+            "id": "finding-gate-entry",
+            "requirement": "finding-gate-impact",
+            "status": "ready-offline" if gate_ready else "waiting",
+            "artifact": "finding-gate.json",
+            "evidence": {
+                "finding_gate_blockers": [] if gate_ready else finding_gate_blockers[:6],
+                "provider_ready": provider_ready,
+                "checklist_status": checklist.get("status"),
+            },
+            "packet_steps": [packet_step_summary("finding-gate-preview")],
+            "offline_command": offline_command(
+                "gate --no-write --show-items",
+                "credential-closure-plan:finding-gate-entry",
+            ),
+            "next_step": (
+                "Run finding-gate only after provider/operator evidence proves concrete quota, billing, account, or availability impact."
+            ),
+        },
+    ]
+    incomplete_steps = [
+        step
+        for step in steps
+        if step.get("status") not in {"passed", "ready-offline", "ready-after-resource-check"}
+    ]
+    active_step = incomplete_steps[0] if incomplete_steps else {}
+    if gate_ready:
+        status = "ready-for-finding-gate-review"
+    elif route_status != "passed":
+        status = "needs-credentialed-route-context"
+    elif provider_status != "passed":
+        status = "needs-provider-operator-evidence"
+    elif resource_status == "blocked-resource":
+        status = "blocked-resource-before-single-request"
+    else:
+        status = "needs-finding-gate-review"
+
+    return {
+        "id": "credential-impact-evidence-closure",
+        "status": status,
+        "active_step": active_step.get("id"),
+        "operator_evidence_sidecar": sidecar_path,
+        "recommended_evidence": recommended_evidence,
+        "steps": steps,
+        "finding_gate_blockers": [] if gate_ready else finding_gate_blockers,
+        "reportability_gate": (
+            "A credentialed-upstream cost-abuse lead is reportable only after redacted provider/operator evidence "
+            "proves material quota, rate-limit, billing/credit, monitoring, account, or availability impact. "
+            "Server-side credential use by itself is not enough."
+        ),
+        "safety": (
+            "Offline closure plan only. It emits redacted sidecar requirements, provider-impact review steps, "
+            "resource gates, and finding-gate blockers; it sends no target/provider traffic, invokes no Burp tools, "
+            "exposes no secrets, signs no wallets, and submits no transactions."
+        ),
+    }
+
+
 def transaction_approval_sequence_step(approval_packet: dict[str, Any], step_id: str) -> dict[str, Any]:
     for step in approval_packet.get("approval_sequence", []) or []:
         if isinstance(step, dict) and step.get("id") == step_id:
@@ -10554,6 +10772,14 @@ def build_credential_evidence_closure(
             "Run only a final resource gate before any single approved request; do not use flooding or stress traffic.",
         ),
     ]
+    closure_plan = credential_impact_evidence_closure_plan(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        requirements=requirements,
+        checklist=checklist,
+        approval_packet=approval_packet,
+        gate_ready=gate_ready,
+    )
     commands = []
     for source, subcommand in [
         (
@@ -10593,6 +10819,7 @@ def build_credential_evidence_closure(
         "next_safe_commands": commands[:6],
         "evidence_contract": evidence_contract,
         "credential_impact_approval_packet": approval_packet,
+        "closure_plan": closure_plan,
         "finding_gate_entry_condition": (
             "Only enter finding-gate after provider/operator evidence proves material quota, billing, account, "
             "or availability impact from attacker-controlled unauthenticated use."
@@ -50344,6 +50571,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         operator_sidecar_evidence_review: dict[str, Any] = {}
         operator_placeholder_evidence_review: dict[str, Any] = {}
         operator_sidecar_credential_checklist: dict[str, Any] = {}
+        operator_placeholder_credential_checklist: dict[str, Any] = {}
+        operator_sidecar_credential_closure: dict[str, Any] = {}
+        operator_placeholder_credential_closure: dict[str, Any] = {}
         with tempfile.TemporaryDirectory(prefix="inferforge-operator-evidence-selftest-") as operator_temp_dir:
             operator_sidecar_source_root = Path(operator_temp_dir) / "operator-sidecar-source"
             operator_sidecar_source_root.mkdir()
@@ -50460,6 +50690,41 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 rpc_method_policy=operator_rpc_method_policy,
                 profile=test_profile,
             )
+            operator_placeholder_credential_checklist = build_credential_impact_checklist(
+                target=DEFAULT_TARGET,
+                profile=test_profile,
+                artifact_dir=operator_sidecar_source_root,
+                transaction_flow_review={
+                    "server_credential_proxy_review": {
+                        "status": "needs-cost-abuse-review",
+                        "files": [
+                            {
+                                "file": "src/app/api/quote/route.ts",
+                                "status": "needs-cost-abuse-review",
+                                "credential_refs": ["M0_ORCHESTRATION_API_KEY"],
+                                "external_upstream_refs": ["https://api.m0.xyz"],
+                                "auth_guard_refs": [],
+                                "rate_limit_guard_refs": [],
+                                "request_validation_refs": [],
+                                "review_question": "Synthetic credentialed upstream proxy review.",
+                            }
+                        ],
+                    }
+                },
+                deployment_review=operator_placeholder_review,
+            )
+            operator_sidecar_credential_closure = build_credential_evidence_closure(
+                artifact_dir=operator_sidecar_source_root,
+                profile=test_profile,
+                item={"impact": "credentialed-upstream-cost-abuse"},
+                supporting_reviews={"credential_impact_checklist": operator_sidecar_credential_checklist},
+            )
+            operator_placeholder_credential_closure = build_credential_evidence_closure(
+                artifact_dir=operator_sidecar_source_root,
+                profile=test_profile,
+                item={"impact": "credentialed-upstream-cost-abuse"},
+                supporting_reviews={"credential_impact_checklist": operator_placeholder_credential_checklist},
+            )
         operator_evidence_sidecar_passed = (
             operator_sidecar_provider.get("status") == "provider-evidence-indexed"
             and (operator_sidecar_provider.get("summary") or {}).get("missing_provider_evidence") == []
@@ -50513,6 +50778,57 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             in operator_closure_contract_text
             and "Do not use request floods" in operator_closure_contract_text
             and "Do not run floods" in operator_closure_contract_text
+        )
+        operator_ready_closure_plan = (
+            operator_sidecar_credential_closure.get("closure_plan")
+            if isinstance(operator_sidecar_credential_closure.get("closure_plan"), dict)
+            else {}
+        )
+        operator_placeholder_closure_plan = (
+            operator_placeholder_credential_closure.get("closure_plan")
+            if isinstance(operator_placeholder_credential_closure.get("closure_plan"), dict)
+            else {}
+        )
+        operator_ready_closure_steps = [
+            item
+            for item in (operator_ready_closure_plan.get("steps", []) or [])
+            if isinstance(item, dict)
+        ]
+        operator_placeholder_closure_steps = [
+            item
+            for item in (operator_placeholder_closure_plan.get("steps", []) or [])
+            if isinstance(item, dict)
+        ]
+        operator_credential_closure_plan_text = json.dumps(
+            {
+                "ready": operator_ready_closure_plan,
+                "placeholder": operator_placeholder_closure_plan,
+            },
+            sort_keys=True,
+        )
+        operator_credential_closure_plan_passed = (
+            operator_ready_closure_plan.get("id") == "credential-impact-evidence-closure"
+            and operator_ready_closure_plan.get("status") == "ready-for-finding-gate-review"
+            and operator_ready_closure_plan.get("active_step") is None
+            and operator_placeholder_closure_plan.get("id") == "credential-impact-evidence-closure"
+            and operator_placeholder_closure_plan.get("status") == "needs-provider-operator-evidence"
+            and operator_placeholder_closure_plan.get("active_step") == "operator-evidence-sidecar"
+            and [item.get("id") for item in operator_placeholder_closure_steps[:4]]
+            == [
+                "credentialed-route-context",
+                "operator-evidence-sidecar",
+                "provider-impact-review",
+                "single-request-resource-gate",
+            ]
+            and operator_placeholder_closure_steps[0].get("status") == "passed"
+            and operator_placeholder_closure_steps[1].get("status") == "waiting"
+            and str(operator_placeholder_closure_plan.get("operator_evidence_sidecar") or "").endswith(
+                OPERATOR_EVIDENCE_ARTIFACT
+            )
+            and "credentialed-upstream-billing-impact" in operator_credential_closure_plan_text
+            and "provider API keys" in operator_credential_closure_plan_text
+            and "M0_ORCHESTRATION_API_KEY=" not in operator_credential_closure_plan_text
+            and len(operator_ready_closure_steps) == 5
         )
     websocket_header_forwarding_bad_review: dict[str, Any] = {}
     websocket_header_forwarding_filtered_review: dict[str, Any] = {}
@@ -54487,7 +54803,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         },
         "operator_evidence_sidecar": {
             "status": "passed"
-            if operator_evidence_sidecar_passed and operator_evidence_checklist_gate_passed and operator_closure_contract_passed
+            if operator_evidence_sidecar_passed
+            and operator_evidence_checklist_gate_passed
+            and operator_closure_contract_passed
+            and operator_credential_closure_plan_passed
             else "failed",
             "provider_review": operator_sidecar_provider,
             "placeholder_provider_review": operator_placeholder_review.get("credential_provider_review", {}),
@@ -54495,6 +54814,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "operator_review": operator_sidecar_evidence_review.get("summary", {}),
             "placeholder_operator_review": operator_placeholder_evidence_review.get("summary", {}),
             "closure_contracts": operator_closure_contracts,
+            "credential_closure_plan": {
+                "status": "passed" if operator_credential_closure_plan_passed else "failed",
+                "ready_plan": operator_ready_closure_plan,
+                "placeholder_plan": operator_placeholder_closure_plan,
+            },
             "credential_checklist": {
                 "status": operator_sidecar_credential_checklist.get("status"),
                 "summary": operator_sidecar_credential_checklist.get("summary", {}),
