@@ -26986,6 +26986,11 @@ def review_candidate_command_templates(
             verification_command_for_profile(
                 reviewed_profile,
                 artifact_dir,
+                "rewrite-response-review --no-write --show-observations --show-commands",
+            ),
+            verification_command_for_profile(
+                reviewed_profile,
+                artifact_dir,
                 REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND,
             ),
         ]
@@ -27010,6 +27015,11 @@ def promoted_observation_followup_commands(
             reviewed_profile,
             artifact_dir,
             f"burp-sync --observe --ws-upgrade --replace --count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}",
+        ),
+        verification_command_for_profile(
+            reviewed_profile,
+            artifact_dir,
+            "rewrite-response-review --no-write --show-observations --show-commands",
         ),
         verification_command_for_profile(
             reviewed_profile,
@@ -33333,7 +33343,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Choose one known safe read-only path." in review_candidates_stdout_text
                 and "promote_to_burp_observation_plan: id=burp_observe_no_write_reviewed_path" in review_candidates_stdout_text
                 and f"path={PLACEHOLDER_APPROVED_CONCRETE_PATH}" in review_candidates_stdout_text
-                and "command_safety=commands=5" in review_candidates_stdout_text
+                and "command_safety=commands=6" in review_candidates_stdout_text
+                and '"review-gated": 4' in review_candidates_stdout_text
                 and "command_templates:" in review_candidates_stdout_text
                 and "[manual-template]" in review_candidates_stdout_text
                 and "[review-gated]" in review_candidates_stdout_text
@@ -33401,6 +33412,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Profile validation:" in promote_stdout_text
                 and "Next commands:" in promote_stdout
                 and "burp-sync --observe" in promote_stdout_text
+                and "rewrite-response-review --no-write --show-observations --show-commands" in promote_stdout_text
                 and REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND in promote_stdout_text
                 and "No files written (--no-write)." in promote_stdout
                 and not any(
@@ -42783,7 +42795,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         )
         queue_promotion_selftest_passed = (
             rewrite_queue_item is not None
-            and len(rewrite_queue_commands) == 5
+            and len(rewrite_queue_commands) == 6
             and "promote-observation-candidate" in rewrite_queue_commands[0]
             and f"--path {PLACEHOLDER_APPROVED_CONCRETE_PATH}" in rewrite_queue_commands[0]
             and "reviewed-profile.json" in rewrite_queue_commands[0]
@@ -42795,12 +42807,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict" in rewrite_queue_commands[2]
             and "burp-sync --observe" in rewrite_queue_commands[3]
             and f"--count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}" in rewrite_queue_commands[3]
-            and REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND in rewrite_queue_commands[4]
+            and "rewrite-response-review --no-write --show-observations --show-commands" in rewrite_queue_commands[4]
+            and REVIEWED_OBSERVATION_VERIFICATION_AUDIT_SUBCOMMAND in rewrite_queue_commands[5]
             and all(command.count("--profile") <= 1 for command in rewrite_queue_commands)
             and all(command.count("--artifact-dir") == 1 for command in rewrite_queue_commands)
             and rewrite_queue_command_counts.get("manual-template") == 2
             and rewrite_queue_command_counts.get("review-gated") == 2
-            and rewrite_queue_command_counts.get("ready") == 1
+            and rewrite_queue_command_counts.get("ready") == 2
             and rewrite_queue_command_safety.get("unsafe_template_count") == 0
             and rewrite_queue_global_command_safety.get("unsafe_template_count") == 0
             and unsafe_command_classification.get("classification") == "unsafe-template"
