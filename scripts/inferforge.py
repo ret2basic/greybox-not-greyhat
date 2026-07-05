@@ -128,6 +128,7 @@ DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT = "deployment-resource-review.json"
 TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
 TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
 CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT = "credential-impact-checklist.json"
+OPERATOR_EVIDENCE_ARTIFACT = "operator-evidence.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -216,6 +217,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
     CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT,
+    OPERATOR_EVIDENCE_ARTIFACT,
     "artifact-health.json",
     "regression-suite.json",
     "orca-baseline.json",
@@ -308,6 +310,7 @@ INDEX_ARTIFACT_ORDER = [
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
     CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT,
+    OPERATOR_EVIDENCE_ARTIFACT,
     "response-delta-analysis.json",
     "warmup-results.json",
     "traffic-index.json",
@@ -16507,12 +16510,106 @@ def deployment_review_token_matches(category: str, token: str, lowered_line: str
     return any(context in lowered_line for context in resource_context)
 
 
+OPERATOR_EVIDENCE_PRESENT_STATUSES = {
+    "confirmed",
+    "evidence-present",
+    "operator-confirmed",
+    "provider-confirmed",
+    "present",
+}
+
+
+def operator_evidence_items(operator_evidence: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(operator_evidence, dict):
+        return []
+    for key in ["evidence_items", "items", "decisions", "evidence"]:
+        items = operator_evidence.get(key)
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+    return []
+
+
+def operator_evidence_refs_for_decision(
+    operator_evidence: dict[str, Any] | None,
+    decision_id: str,
+) -> list[dict[str, Any]]:
+    refs = []
+    for item in operator_evidence_items(operator_evidence):
+        if str(item.get("id") or item.get("decision_id") or "") != decision_id:
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        if status not in OPERATOR_EVIDENCE_PRESENT_STATUSES:
+            continue
+        summary = str(item.get("summary") or item.get("statement") or "").strip()
+        source_ref = str(item.get("source_ref") or item.get("reference") or "").strip()
+        if not summary or summary.startswith("REPLACE_WITH_"):
+            continue
+        refs.append(
+            {
+                "file": OPERATOR_EVIDENCE_ARTIFACT,
+                "line": None,
+                "token": decision_id,
+                "excerpt": redact_text(summary, max_chars=220) or "",
+                "source_ref": redact_text(source_ref, max_chars=160) or "",
+                "evidence_type": item.get("evidence_type") or item.get("type") or "operator-statement",
+                "operator_evidence": True,
+            }
+        )
+    return refs[:8]
+
+
+def build_operator_evidence_sidecar_template(
+    *,
+    target: str,
+    provider: str,
+    missing_decisions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    items = []
+    for decision in missing_decisions:
+        if not isinstance(decision, dict):
+            continue
+        decision_id = str(decision.get("id") or "").strip()
+        if not decision_id:
+            continue
+        items.append(
+            {
+                "id": decision_id,
+                "status": "pending",
+                "evidence_type": "operator-statement",
+                "summary": "REPLACE_WITH_REDACTED_OPERATOR_OR_PROVIDER_EVIDENCE_SUMMARY",
+                "source_ref": "REPLACE_WITH_TICKET_DOC_SCREENSHOT_OR_DASHBOARD_REFERENCE",
+                "operator_evidence_needed": decision.get("operator_evidence_needed", []),
+                "redaction_required": [
+                    "Do not include provider API key values, bearer tokens, cookies, wallet secrets, or raw account identifiers.",
+                    "Use short references to screenshots, tickets, docs, dashboards, or billing pages instead of embedding sensitive content.",
+                ],
+            }
+        )
+    return {
+        "generated_at": utc_now(),
+        "status": "template",
+        "target": target,
+        "provider": provider,
+        "schema": "inferforge-operator-evidence-v1",
+        "instructions": [
+            "Copy this template to operator-evidence.json only after replacing placeholders with redacted evidence summaries.",
+            "Set an item status to confirmed, evidence-present, operator-confirmed, provider-confirmed, or present only when the evidence is reviewed.",
+            "Leave uncertain or placeholder items as pending; pending items are not counted as evidence.",
+        ],
+        "evidence_items": items,
+        "safety": (
+            "Manual offline evidence sidecar. It is never a substitute for reportability review and must not contain secrets."
+        ),
+    }
+
+
 def build_deployment_resource_review(
     source_root: Path,
     profile: dict[str, Any] | None = None,
     *,
     max_file_bytes: int = DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES,
     max_files: int = 32,
+    operator_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     files = []
     category_matches: dict[str, list[dict[str, Any]]] = {
@@ -16630,8 +16727,21 @@ def build_deployment_resource_review(
         if any(ref not in local_env_files for ref in refs)
     }
 
-    def category_status(category: str) -> str:
-        return "evidence-present" if category_matches.get(category) else "missing-evidence"
+    def operator_refs(decision_id: str) -> list[dict[str, Any]]:
+        return operator_evidence_refs_for_decision(operator_evidence, decision_id)
+
+    def category_status(category: str, decision_id: str | None = None) -> str:
+        if category_matches.get(category):
+            return "evidence-present"
+        if decision_id and operator_refs(decision_id):
+            return "operator-evidence-present"
+        return "missing-evidence"
+
+    def category_evidence(category: str, decision_id: str | None = None) -> list[dict[str, Any]]:
+        evidence = [*category_matches.get(category, [])[:8]]
+        if decision_id:
+            evidence.extend(operator_refs(decision_id))
+        return evidence[:8]
 
     credential_provider_decisions = [
         {
@@ -16653,32 +16763,38 @@ def build_deployment_resource_review(
         },
         {
             "id": "credentialed-upstream-quota-policy",
-            "status": category_status("credential_provider_quota_policy"),
-            "evidence": category_matches["credential_provider_quota_policy"][:8],
+            "status": category_status("credential_provider_quota_policy", "credentialed-upstream-quota-policy"),
+            "evidence": category_evidence("credential_provider_quota_policy", "credentialed-upstream-quota-policy"),
             "operator_evidence_needed": [
                 "Confirm provider-side quota, usage caps, and account-level request limits for the credentialed upstream.",
             ],
         },
         {
             "id": "credentialed-upstream-rate-limit-policy",
-            "status": category_status("credential_provider_rate_limit_policy"),
-            "evidence": category_matches["credential_provider_rate_limit_policy"][:8],
+            "status": category_status(
+                "credential_provider_rate_limit_policy",
+                "credentialed-upstream-rate-limit-policy",
+            ),
+            "evidence": category_evidence(
+                "credential_provider_rate_limit_policy",
+                "credentialed-upstream-rate-limit-policy",
+            ),
             "operator_evidence_needed": [
                 "Confirm whether unauthenticated application requests can consume provider rate limits or trigger provider-side 429s.",
             ],
         },
         {
             "id": "credentialed-upstream-billing-impact",
-            "status": category_status("credential_provider_billing_impact"),
-            "evidence": category_matches["credential_provider_billing_impact"][:8],
+            "status": category_status("credential_provider_billing_impact", "credentialed-upstream-billing-impact"),
+            "evidence": category_evidence("credential_provider_billing_impact", "credentialed-upstream-billing-impact"),
             "operator_evidence_needed": [
                 "Confirm whether quote requests are billable, credit-consuming, or otherwise account-impacting.",
             ],
         },
         {
             "id": "credentialed-upstream-usage-monitoring",
-            "status": category_status("credential_provider_monitoring"),
-            "evidence": category_matches["credential_provider_monitoring"][:8],
+            "status": category_status("credential_provider_monitoring", "credentialed-upstream-usage-monitoring"),
+            "evidence": category_evidence("credential_provider_monitoring", "credentialed-upstream-usage-monitoring"),
             "operator_evidence_needed": [
                 "Confirm monitoring or alerting for provider usage, quota depletion, billing spikes, or upstream availability errors.",
             ],
@@ -16697,6 +16813,17 @@ def build_deployment_resource_review(
         if decision.get("id") != "credentialed-upstream-secret-injection"
         and decision.get("status") == "missing-evidence"
     ]
+    operator_evidence_decision_ids = sorted(
+        {
+            str(item.get("id") or item.get("decision_id") or "")
+            for item in operator_evidence_items(operator_evidence)
+            if str(item.get("id") or item.get("decision_id") or "").strip()
+            if operator_evidence_refs_for_decision(
+                operator_evidence,
+                str(item.get("id") or item.get("decision_id") or ""),
+            )
+        }
+    )
     if not provider_secret_present:
         provider_review_status = "no-credentialed-upstream-provider-evidence"
     elif provider_missing:
@@ -16719,7 +16846,19 @@ def build_deployment_resource_review(
                 "rate_limit_policy": len(category_matches["credential_provider_rate_limit_policy"]),
                 "billing_impact": len(category_matches["credential_provider_billing_impact"]),
                 "usage_monitoring": len(category_matches["credential_provider_monitoring"]),
+                "operator_sidecar": len(
+                    [
+                        decision_id
+                        for decision_id in operator_evidence_decision_ids
+                        if decision_id.startswith("credentialed-upstream-")
+                    ]
+                ),
             },
+            "operator_evidence_decision_ids": [
+                decision_id
+                for decision_id in operator_evidence_decision_ids
+                if decision_id.startswith("credentialed-upstream-")
+            ],
         },
         "decisions": credential_provider_decisions,
         "required_evidence": [
@@ -16744,9 +16883,11 @@ def build_deployment_resource_review(
                 if external_local_keys
                 else "templated"
                 if external_template_keys
+                else "operator-evidence-present"
+                if operator_refs("external-rate-limit-store-config")
                 else "missing-evidence"
             ),
-            "evidence": category_matches["external_rate_limit_store"][:8],
+            "evidence": category_evidence("external_rate_limit_store", "external-rate-limit-store-config"),
             "env_keys": sorted(external_key_sources.keys()),
             "local_env_key_only": sorted(external_local_keys.keys()),
             "operator_evidence_needed": [
@@ -16756,8 +16897,8 @@ def build_deployment_resource_review(
         },
         {
             "id": "proxy-header-trust-model",
-            "status": category_status("proxy_header_trust"),
-            "evidence": category_matches["proxy_header_trust"][:8],
+            "status": category_status("proxy_header_trust", "proxy-header-trust-model"),
+            "evidence": category_evidence("proxy_header_trust", "proxy-header-trust-model"),
             "operator_evidence_needed": [
                 "Confirm whether x-forwarded-for, cf-connecting-ip, or x-real-ip is overwritten by a trusted edge.",
                 "Confirm ingress or platform settings that prevent clients from spoofing the selected IP key.",
@@ -16765,24 +16906,24 @@ def build_deployment_resource_review(
         },
         {
             "id": "rate-limit-bounds",
-            "status": category_status("rate_limit_bounds"),
-            "evidence": category_matches["rate_limit_bounds"][:8],
+            "status": category_status("rate_limit_bounds", "rate-limit-bounds"),
+            "evidence": category_evidence("rate_limit_bounds", "rate-limit-bounds"),
             "operator_evidence_needed": [
                 "Confirm burst/sustained limits, window length, TTL, and memory eviction behavior for rate-limit keys.",
             ],
         },
         {
             "id": "fallback-monitoring-alerts",
-            "status": category_status("fallback_monitoring"),
-            "evidence": category_matches["fallback_monitoring"][:8],
+            "status": category_status("fallback_monitoring", "fallback-monitoring-alerts"),
+            "evidence": category_evidence("fallback_monitoring", "fallback-monitoring-alerts"),
             "operator_evidence_needed": [
                 "Confirm monitoring or alerting when memory fallback is used or external store operations fail.",
             ],
         },
         {
             "id": "deployment-env-injection",
-            "status": category_status("deployment_env_injection"),
-            "evidence": category_matches["deployment_env_injection"][:8],
+            "status": category_status("deployment_env_injection", "deployment-env-injection"),
+            "evidence": category_evidence("deployment_env_injection", "deployment-env-injection"),
             "operator_evidence_needed": [
                 "Confirm the actual environment values deployed for the target service without exposing secrets.",
             ],
@@ -16826,6 +16967,7 @@ def build_deployment_resource_review(
                 category: len(matches)
                 for category, matches in sorted(category_matches.items())
             },
+            "operator_evidence_decision_ids": operator_evidence_decision_ids,
         },
         "resource_limits": {
             "max_file_bytes": max_file_bytes,
@@ -16836,6 +16978,11 @@ def build_deployment_resource_review(
         "skipped": skipped,
         "decisions": decisions,
         "credential_provider_review": credential_provider_review,
+        "operator_evidence": {
+            "artifact": OPERATOR_EVIDENCE_ARTIFACT,
+            "status": "indexed" if operator_evidence_decision_ids else "missing-or-pending",
+            "decision_ids": operator_evidence_decision_ids,
+        },
         "operator_evidence_still_required": [
             "Production external store configuration and health, with secret values redacted.",
             "Production proxy/header trust model for client IP selection.",
@@ -17696,6 +17843,7 @@ def build_transaction_flow_review(
     *,
     transaction_intent: dict[str, Any] | None = None,
     rpc_method_policy: dict[str, Any] | None = None,
+    operator_evidence: dict[str, Any] | None = None,
     max_file_bytes: int = DEFAULT_TRANSACTION_FLOW_REVIEW_MAX_FILE_BYTES,
     max_files: int = 256,
 ) -> dict[str, Any]:
@@ -17793,6 +17941,7 @@ def build_transaction_flow_review(
         profile,
         max_file_bytes=DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES,
         max_files=32,
+        operator_evidence=operator_evidence,
     ).get("credential_provider_review", {})
     if isinstance(deployment_provider_review, dict) and deployment_provider_review:
         credential_proxy_review["deployment_credential_provider_review"] = deployment_provider_review
@@ -18375,6 +18524,11 @@ def build_credential_impact_checklist(
                 validation_command_for_artifact_dir(artifact_dir, "evidence-chain --no-write", profile=profile),
             ]
         )
+    sidecar_template = build_operator_evidence_sidecar_template(
+        target=target,
+        provider=str(provider_review.get("provider") or "M0"),
+        missing_decisions=evidence_requests,
+    )
 
     return {
         "generated_at": utc_now(),
@@ -18393,6 +18547,12 @@ def build_credential_impact_checklist(
         "resource_preflight": resource_preflight,
         "route_reviews": route_reviews,
         "provider_evidence_requests": evidence_requests,
+        "operator_evidence_sidecar": {
+            "path": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+            "template": sidecar_template,
+            "accepted_present_statuses": sorted(OPERATOR_EVIDENCE_PRESENT_STATUSES),
+            "redaction_gate": "Do not include provider API key values, bearer tokens, cookies, wallet secrets, or raw account identifiers.",
+        },
         "safe_validation_steps": safe_validation_steps,
         "followup_commands": followup_commands,
         "acceptance_checks": [
@@ -35854,6 +36014,60 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and resource_budget_swap_pressure_sample.get("release_candidate_count") == 3
             and resource_budget_swap_pressure_sample.get("release_candidate_rss_mib") == 1960.0
         )
+        operator_sidecar_review: dict[str, Any] = {}
+        operator_placeholder_review: dict[str, Any] = {}
+        operator_sidecar_provider: dict[str, Any] = {}
+        with tempfile.TemporaryDirectory(prefix="inferforge-operator-evidence-selftest-") as operator_temp_dir:
+            operator_sidecar_source_root = Path(operator_temp_dir) / "operator-sidecar-source"
+            operator_sidecar_source_root.mkdir()
+            (operator_sidecar_source_root / ".env.template").write_text(
+                "M0_ORCHESTRATION_API_KEY=\n",
+                encoding="utf-8",
+            )
+            operator_sidecar = {
+                "schema": "inferforge-operator-evidence-v1",
+                "evidence_items": [
+                    {
+                        "id": decision_id,
+                        "status": "confirmed",
+                        "summary": f"Redacted operator evidence confirms {decision_id}.",
+                        "source_ref": "redacted-selftest-reference",
+                    }
+                    for decision_id in [
+                        "credentialed-upstream-quota-policy",
+                        "credentialed-upstream-rate-limit-policy",
+                        "credentialed-upstream-billing-impact",
+                        "credentialed-upstream-usage-monitoring",
+                    ]
+                ],
+            }
+            operator_sidecar_review = build_deployment_resource_review(
+                operator_sidecar_source_root,
+                test_profile,
+                operator_evidence=operator_sidecar,
+            )
+            operator_sidecar_provider = operator_sidecar_review.get("credential_provider_review", {})
+            operator_placeholder_review = build_deployment_resource_review(
+                operator_sidecar_source_root,
+                test_profile,
+                operator_evidence={
+                    "evidence_items": [
+                        {
+                            "id": "credentialed-upstream-quota-policy",
+                            "status": "pending",
+                            "summary": "REPLACE_WITH_REDACTED_OPERATOR_OR_PROVIDER_EVIDENCE_SUMMARY",
+                        }
+                    ]
+                },
+            )
+        operator_evidence_sidecar_passed = (
+            operator_sidecar_provider.get("status") == "provider-evidence-indexed"
+            and (operator_sidecar_provider.get("summary") or {}).get("missing_provider_evidence") == []
+            and (operator_sidecar_provider.get("summary") or {}).get("evidence_counts", {}).get("operator_sidecar") == 4
+            and operator_sidecar_review.get("operator_evidence", {}).get("status") == "indexed"
+            and operator_placeholder_review.get("credential_provider_review", {}).get("status")
+            == "needs-provider-operator-evidence"
+        )
     blackbox_asset_profile_paths = {
         cluster.get("path")
         for cluster in blackbox_asset_profile_sample.get("clusters", [])
@@ -38486,6 +38700,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and attack_strategy_status_passed
         and empty_replay_queue_passed
         and resource_release_candidates_passed
+        and operator_evidence_sidecar_passed
         and transaction_gate_ingestion_passed
         and transaction_corpus_gate_checklist_passed
         )
@@ -38744,6 +38959,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             else "failed",
             "candidates": resource_release_candidate_sample,
             "swap_pressure_budget": resource_budget_swap_pressure_sample,
+        },
+        "operator_evidence_sidecar": {
+            "status": "passed" if operator_evidence_sidecar_passed else "failed",
+            "provider_review": operator_sidecar_provider,
+            "placeholder_provider_review": operator_placeholder_review.get("credential_provider_review", {}),
+            "operator_evidence": operator_sidecar_review.get("operator_evidence", {}),
         },
         "active_observation_validation": {
             "status": "passed" if unsafe_observation_validation_passed else "failed",
@@ -42692,6 +42913,7 @@ def run_deployment_review(args: argparse.Namespace) -> int:
         profile,
         max_file_bytes=args.max_file_bytes,
         max_files=args.max_files,
+        operator_evidence=load_optional_json(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
     )
     output_path = resolve_repo_path(args.output) if args.output else artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT
     refreshed_manifests = []
@@ -42754,11 +42976,13 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
 
     transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {}
     rpc_method_policy = load_optional_json(artifact_dir / "rpc-method-policy.json") or {}
+    operator_evidence = load_optional_json(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
     review = build_transaction_flow_review(
         source_root,
         profile,
         transaction_intent=transaction_intent,
         rpc_method_policy=rpc_method_policy,
+        operator_evidence=operator_evidence,
         max_file_bytes=args.max_file_bytes,
         max_files=args.max_files,
     )
@@ -42871,9 +43095,11 @@ def run_credential_impact_checklist(args: argparse.Namespace) -> int:
     current_resource_snapshot = None
     if not getattr(args, "skip_current_resource_check", False):
         current_resource_snapshot = build_default_resource_snapshot(max_processes=8)
+    operator_evidence = load_optional_json(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
+    operator_evidence_active = bool(operator_evidence_items(operator_evidence))
     transaction_flow_review = load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT)
     deployment_review = load_optional_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT)
-    if not isinstance(transaction_flow_review, dict) or not isinstance(
+    if operator_evidence_active or not isinstance(transaction_flow_review, dict) or not isinstance(
         transaction_flow_review.get("server_credential_proxy_review"),
         dict,
     ):
@@ -42882,12 +43108,17 @@ def run_credential_impact_checklist(args: argparse.Namespace) -> int:
             profile,
             transaction_intent=load_optional_json(artifact_dir / "transaction-intent.json") or {},
             rpc_method_policy=load_optional_json(artifact_dir / "rpc-method-policy.json") or {},
+            operator_evidence=operator_evidence,
         )
-    if not isinstance(deployment_review, dict) or not isinstance(
+    if operator_evidence_active or not isinstance(deployment_review, dict) or not isinstance(
         deployment_review.get("credential_provider_review"),
         dict,
     ):
-        deployment_review = build_deployment_resource_review(source_root, profile)
+        deployment_review = build_deployment_resource_review(
+            source_root,
+            profile,
+            operator_evidence=operator_evidence,
+        )
 
     checklist = build_credential_impact_checklist(
         target=target,
@@ -42927,6 +43158,15 @@ def run_credential_impact_checklist(args: argparse.Namespace) -> int:
             if args.show_evidence:
                 for needed in (request.get("operator_evidence_needed", []) or [])[:2]:
                     print(f"  needed={inline_summary_text(needed, max_chars=180)}")
+    sidecar = checklist.get("operator_evidence_sidecar") if isinstance(checklist.get("operator_evidence_sidecar"), dict) else {}
+    if args.show_evidence and sidecar:
+        template = sidecar.get("template") if isinstance(sidecar.get("template"), dict) else {}
+        print(
+            "Operator evidence sidecar: "
+            f"path={sidecar.get('path')} "
+            f"items={len(template.get('evidence_items', []) or [])} "
+            f"accepted_statuses={','.join(sidecar.get('accepted_present_statuses', []) or [])}"
+        )
     if args.show_commands:
         print("Follow-up commands:")
         for command_text in (checklist.get("followup_commands", []) or [])[:5]:
