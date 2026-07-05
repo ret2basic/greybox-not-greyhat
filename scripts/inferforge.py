@@ -104,6 +104,7 @@ MAX_BODY_SAMPLE_CHARS = 1200
 DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_BURP_HISTORY_INPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_REWRITE_RESPONSE_SIDECAR_INPUT_BYTES = 256 * 1024
+DEFAULT_OPERATOR_EVIDENCE_INPUT_BYTES = 256 * 1024
 DEFAULT_RESOURCE_WARNING_BURP_HISTORY_INPUT_BYTES = 1 * 1024 * 1024
 DEFAULT_RESOURCE_CRITICAL_BURP_HISTORY_INPUT_BYTES = 256 * 1024
 DEFAULT_BURP_SYNC_COUNT = 20
@@ -25569,6 +25570,278 @@ def operator_evidence_refs_for_decision(
     return refs[:8]
 
 
+def operator_evidence_sidecar_path(artifact_dir: Path) -> Path:
+    return artifact_dir / OPERATOR_EVIDENCE_ARTIFACT
+
+
+def load_operator_evidence_sidecar(artifact_dir: Path) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    path = operator_evidence_sidecar_path(artifact_dir)
+    rel = repo_relative_or_absolute(path)
+    if not path.exists():
+        return None, {"path": rel, "name": path.name, "status": "missing"}
+    if not path.is_file():
+        return None, {"path": rel, "name": path.name, "status": "not-a-file"}
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        return None, {
+            "path": rel,
+            "name": path.name,
+            "status": "stat-failed",
+            "error": redacted_error_summary(error),
+        }
+    if size > DEFAULT_OPERATOR_EVIDENCE_INPUT_BYTES:
+        return None, {
+            "path": rel,
+            "name": path.name,
+            "status": "too-large",
+            "bytes": size,
+            "max_input_bytes": DEFAULT_OPERATOR_EVIDENCE_INPUT_BYTES,
+        }
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        parsed = json.loads(text)
+    except json.JSONDecodeError as error:
+        return None, {
+            "path": rel,
+            "name": path.name,
+            "status": "parse-error",
+            "bytes": size,
+            "error": f"json-decode-error:{error.msg}",
+        }
+    except OSError as error:
+        return None, {
+            "path": rel,
+            "name": path.name,
+            "status": "read-failed",
+            "bytes": size,
+            "error": redacted_error_summary(error),
+        }
+    if not isinstance(parsed, dict):
+        return None, {
+            "path": rel,
+            "name": path.name,
+            "status": "not-json-object",
+            "bytes": size,
+        }
+    return parsed, {
+        "path": rel,
+        "name": path.name,
+        "status": "present",
+        "bytes": size,
+        "max_input_bytes": DEFAULT_OPERATOR_EVIDENCE_INPUT_BYTES,
+    }
+
+
+def operator_evidence_sensitive_field_keys(item: dict[str, Any]) -> list[str]:
+    sensitive_tokens = [
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+        "billing_account",
+        "body",
+        "cookie",
+        "dashboard_raw",
+        "headers",
+        "private_key",
+        "raw",
+        "raw_dashboard",
+        "raw_log",
+        "screenshot_base64",
+        "secret",
+        "seed",
+        "signature",
+        "token",
+    ]
+    return [
+        str(key)
+        for key in item.keys()
+        if any(token in str(key).lower() for token in sensitive_tokens)
+        and str(key)
+        not in {
+            "id",
+            "decision_id",
+            "evidence_type",
+            "operator_evidence_needed",
+            "redaction_required",
+            "source_ref",
+        }
+    ]
+
+
+def operator_evidence_sidecar_item_validation(
+    item: dict[str, Any],
+    *,
+    index: int,
+    required_decision_ids: set[str],
+    accepted_present_statuses: set[str],
+) -> dict[str, Any]:
+    decision_id = operator_evidence_item_id(item)
+    status = str(item.get("status") or "").strip().lower()
+    summary = str(item.get("summary") or item.get("statement") or "").strip()
+    source_ref = str(item.get("source_ref") or item.get("reference") or "").strip()
+    evidence_type = str(item.get("evidence_type") or item.get("type") or "operator-statement").strip()
+    missing_fields: list[str] = []
+    invalid_fields: list[str] = []
+    warnings: list[str] = []
+    if not decision_id:
+        invalid_fields.append("id or decision_id")
+    if not status:
+        missing_fields.append("status")
+    elif status in accepted_present_statuses:
+        if operator_evidence_placeholder(summary):
+            missing_fields.append("non-placeholder redacted summary")
+        if not source_ref:
+            warnings.append("source_ref recommended for present evidence")
+        elif operator_evidence_placeholder(source_ref):
+            warnings.append("replace placeholder source_ref")
+    elif status in {"pending", "todo", "draft", "placeholder", "needs-review", "manual-review"}:
+        if summary and not operator_evidence_placeholder(summary):
+            warnings.append("pending row has summary but does not satisfy reportability")
+    else:
+        invalid_fields.append("status must be pending/needs-review or an accepted present status")
+    if not evidence_type:
+        missing_fields.append("evidence_type")
+    if required_decision_ids and decision_id and decision_id not in required_decision_ids:
+        warnings.append("decision id is not currently required by provider/resource blockers")
+    if contains_unredacted_secret_text(summary):
+        warnings.append("redact-secret-like-summary")
+    if contains_unredacted_secret_text(source_ref):
+        warnings.append("redact-secret-like-source-ref")
+    for key in operator_evidence_sensitive_field_keys(item):
+        warnings.append(f"remove-sensitive-field:{key}")
+    if invalid_fields:
+        row_status = "invalid"
+    elif missing_fields:
+        row_status = "missing-fields"
+    elif status in accepted_present_statuses:
+        row_status = "present-valid"
+    else:
+        row_status = "pending"
+    return {
+        "index": index,
+        "id": decision_id or None,
+        "status": row_status,
+        "item_status": status or "missing",
+        "evidence_type": evidence_type or None,
+        "required": bool(decision_id and decision_id in required_decision_ids),
+        "accepted_present_status": status in accepted_present_statuses,
+        "missing_fields": missing_fields,
+        "invalid_fields": invalid_fields,
+        "warnings": ordered_unique_strings(warnings),
+    }
+
+
+def operator_evidence_sidecar_validation_review(
+    *,
+    operator_evidence: dict[str, Any] | None,
+    sidecar_file: dict[str, Any],
+    required_decision_ids: list[str],
+    accepted_present_statuses: list[str],
+) -> dict[str, Any]:
+    file_status = str(sidecar_file.get("status") or "missing")
+    required_ids = {str(item) for item in required_decision_ids if str(item).strip()}
+    accepted_statuses = {str(item) for item in accepted_present_statuses if str(item).strip()}
+    if file_status not in {"present", "provided-in-memory"}:
+        return {
+            "status": file_status,
+            "path": sidecar_file.get("path") or OPERATOR_EVIDENCE_ARTIFACT,
+            "row_count": 0,
+            "required_decisions": sorted(required_ids),
+            "present_required_decisions": [],
+            "missing_required_decisions": sorted(required_ids),
+            "present_rows": 0,
+            "pending_rows": 0,
+            "invalid_rows": 0,
+            "warning_rows": 0,
+            "first_missing_field": OPERATOR_EVIDENCE_ARTIFACT if file_status == "missing" else None,
+            "first_invalid_field": None if file_status == "missing" else f"operator evidence file status is {file_status}",
+            "rows": [],
+            "accepted_present_statuses": sorted(accepted_statuses),
+        }
+    rows = operator_evidence_items(operator_evidence)
+    row_reviews = [
+        operator_evidence_sidecar_item_validation(
+            item,
+            index=index,
+            required_decision_ids=required_ids,
+            accepted_present_statuses=accepted_statuses,
+        )
+        for index, item in enumerate(rows, start=1)
+        if isinstance(item, dict)
+    ]
+    present_required = sorted(
+        {
+            str(row.get("id"))
+            for row in row_reviews
+            if row.get("id") in required_ids and row.get("status") == "present-valid"
+        }
+    )
+    missing_required = sorted(required_ids - set(present_required))
+    invalid_rows = [
+        row
+        for row in row_reviews
+        if row.get("status") in {"invalid", "missing-fields"}
+        or row.get("invalid_fields")
+        or row.get("missing_fields")
+    ]
+    warning_rows = [row for row in row_reviews if row.get("warnings")]
+    pending_rows = [row for row in row_reviews if row.get("status") == "pending"]
+    global_errors = []
+    if not rows and required_ids:
+        global_errors.append("operator-evidence sidecar has no evidence_items rows")
+    if missing_required:
+        global_errors.append("required operator evidence decisions are missing")
+    if invalid_rows or global_errors:
+        status = "invalid"
+    elif warning_rows:
+        status = "valid-with-warnings"
+    elif pending_rows:
+        status = "pending-only"
+    elif rows:
+        status = "valid"
+    else:
+        status = "empty"
+    first_missing_field = next(
+        (
+            str(row.get("missing_fields", [])[0])
+            for row in row_reviews
+            if row.get("missing_fields")
+        ),
+        None,
+    )
+    first_invalid_field = global_errors[0] if global_errors else next(
+        (
+            str(row.get("invalid_fields", [])[0])
+            for row in row_reviews
+            if row.get("invalid_fields")
+        ),
+        None,
+    )
+    return {
+        "status": status,
+        "path": sidecar_file.get("path") or OPERATOR_EVIDENCE_ARTIFACT,
+        "row_count": len(rows),
+        "required_decisions": sorted(required_ids),
+        "present_required_decisions": present_required,
+        "missing_required_decisions": missing_required,
+        "present_rows": sum(1 for row in row_reviews if row.get("status") == "present-valid"),
+        "pending_rows": len(pending_rows),
+        "invalid_rows": len(invalid_rows) + len(global_errors),
+        "warning_rows": len(warning_rows),
+        "first_missing_field": first_missing_field,
+        "first_invalid_field": first_invalid_field,
+        "global_errors": global_errors,
+        "rows": row_reviews[:20],
+        "accepted_present_statuses": sorted(accepted_statuses),
+        "safety": (
+            "Offline operator evidence sidecar validation only. It reads local redacted JSON and never sends target, "
+            "provider, Burp, wallet, or transaction traffic."
+        ),
+    }
+
+
 def operator_evidence_item_id(item: dict[str, Any]) -> str:
     return str(item.get("id") or item.get("decision_id") or "").strip()
 
@@ -26075,6 +26348,7 @@ def build_operator_evidence_review(
     target: str,
     artifact_dir: Path,
     operator_evidence: dict[str, Any] | None,
+    operator_evidence_file: dict[str, Any] | None = None,
     deployment_review: dict[str, Any] | None = None,
     rpc_method_policy: dict[str, Any] | None = None,
     profile: dict[str, Any] | None = None,
@@ -26248,6 +26522,32 @@ def build_operator_evidence_review(
     )
     summary["closure_contracts"] = len(closure_contracts)
     summary["credential_provider_contract"] = credential_evidence_contract.get("id") or "missing"
+    sidecar_file = operator_evidence_file if isinstance(operator_evidence_file, dict) else None
+    if sidecar_file is None:
+        sidecar_file = {
+            "path": sidecar_path,
+            "name": OPERATOR_EVIDENCE_ARTIFACT,
+            "status": "provided-in-memory" if isinstance(operator_evidence, dict) else "missing",
+        }
+    required_validation_decisions = ordered_unique_strings(
+        [
+            *[str(item) for item in summary.get("provider_missing", []) or []],
+            *[str(item) for item in summary.get("missing_decisions", []) or []],
+            *[str(item) for item in summary.get("critical_missing", []) or []],
+        ]
+    )
+    sidecar_validation = operator_evidence_sidecar_validation_review(
+        operator_evidence=operator_evidence,
+        sidecar_file=sidecar_file,
+        required_decision_ids=required_validation_decisions,
+        accepted_present_statuses=accepted_present_statuses,
+    )
+    summary["sidecar_file_status"] = sidecar_file.get("status")
+    summary["sidecar_validation_status"] = sidecar_validation.get("status")
+    summary["sidecar_validation_invalid_rows"] = sidecar_validation.get("invalid_rows", 0)
+    summary["sidecar_validation_warning_rows"] = sidecar_validation.get("warning_rows", 0)
+    summary["sidecar_validation_first_missing"] = sidecar_validation.get("first_missing_field")
+    summary["sidecar_validation_first_invalid"] = sidecar_validation.get("first_invalid_field")
     resource_control_packet = resource_control_approval_packet(
         artifact_dir=artifact_dir,
         profile=profile,
@@ -26270,6 +26570,8 @@ def build_operator_evidence_review(
         "target": target,
         "artifact_dir": repo_relative_or_absolute(artifact_dir),
         "sidecar_path": sidecar_path,
+        "sidecar_file": sidecar_file,
+        "sidecar_validation": sidecar_validation,
         "summary": summary,
         "items": classified_items,
         "decision_coverage": decision_coverage,
@@ -44582,6 +44884,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "contracts=" in operator_evidence_review_stdout_text
                 and "Approval packet: status=" in operator_evidence_review_stdout_text
                 and "type=resource-control" in operator_evidence_review_stdout_text
+                and "Sidecar validation:" in operator_evidence_review_stdout_text
                 and "Sidecar template:" in operator_evidence_review_stdout_text
                 and "Sidecar template JSON:" in operator_evidence_review_stdout_text
                 and "Closure contracts:" in operator_evidence_review_stdout_text
@@ -53397,6 +53700,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     "current_resource_snapshot": {"status": "not-run"},
                 },
             )
+        operator_sidecar_validation = (
+            operator_sidecar_evidence_review.get("sidecar_validation")
+            if isinstance(operator_sidecar_evidence_review.get("sidecar_validation"), dict)
+            else {}
+        )
+        operator_placeholder_validation = (
+            operator_placeholder_evidence_review.get("sidecar_validation")
+            if isinstance(operator_placeholder_evidence_review.get("sidecar_validation"), dict)
+            else {}
+        )
         operator_evidence_sidecar_passed = (
             operator_sidecar_provider.get("status") == "provider-evidence-indexed"
             and (operator_sidecar_provider.get("summary") or {}).get("missing_provider_evidence") == []
@@ -53410,6 +53723,19 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and operator_placeholder_evidence_review.get("status") == "pending-only"
             and (operator_placeholder_evidence_review.get("summary") or {}).get("classification_counts", {}).get("pending") == 1
             and not (operator_placeholder_evidence_review.get("summary") or {}).get("present_decision_ids", [])
+            and operator_sidecar_validation.get("status") == "invalid"
+            and operator_sidecar_validation.get("present_rows") == 4
+            and operator_sidecar_validation.get("warning_rows") == 4
+            and operator_sidecar_validation.get("first_invalid_field")
+            == "required operator evidence decisions are missing"
+            and "external-rate-limit-store-config"
+            in (operator_sidecar_validation.get("missing_required_decisions") or [])
+            and operator_placeholder_validation.get("status") == "invalid"
+            and operator_placeholder_validation.get("pending_rows") == 1
+            and operator_placeholder_validation.get("first_invalid_field")
+            == "required operator evidence decisions are missing"
+            and "credentialed-upstream-billing-impact"
+            in (operator_placeholder_validation.get("missing_required_decisions") or [])
         )
         operator_sidecar_checklist_commands = "\n".join(
             str(command_text)
@@ -57611,6 +57937,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "operator_evidence": operator_sidecar_review.get("operator_evidence", {}),
             "operator_review": operator_sidecar_evidence_review.get("summary", {}),
             "placeholder_operator_review": operator_placeholder_evidence_review.get("summary", {}),
+            "operator_sidecar_validation": operator_sidecar_validation,
+            "placeholder_sidecar_validation": operator_placeholder_validation,
             "closure_contracts": operator_closure_contracts,
             "credential_closure_plan": {
                 "status": "passed" if operator_credential_closure_plan_passed else "failed",
@@ -63142,7 +63470,7 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         write_target_profile_artifact(artifact_dir, profile, target, source_root)
 
-    operator_evidence = load_optional_json(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
+    operator_evidence, operator_evidence_file = load_operator_evidence_sidecar(artifact_dir)
     deployment_review = build_deployment_resource_review(
         source_root,
         profile,
@@ -63158,6 +63486,7 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
         target=target,
         artifact_dir=artifact_dir,
         operator_evidence=operator_evidence,
+        operator_evidence_file=operator_evidence_file,
         deployment_review=deployment_review,
         rpc_method_policy=rpc_method_policy,
         profile=profile,
@@ -63182,7 +63511,9 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
     print(
         "Items: "
         f"total={summary.get('items', 0)} "
-        f"classifications={json.dumps(summary.get('classification_counts', {}), sort_keys=True)}"
+        f"classifications={json.dumps(summary.get('classification_counts', {}), sort_keys=True)} "
+        f"sidecar_file={summary.get('sidecar_file_status') or '-'} "
+        f"sidecar_validation={summary.get('sidecar_validation_status') or '-'}"
     )
     print(
         "Coverage: "
@@ -63199,6 +63530,24 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
     )
     if resource_packet:
         print(f"Approval packet: {format_approval_packet_inline(resource_packet, status_key=True)}")
+    sidecar_validation = (
+        review.get("sidecar_validation")
+        if isinstance(review.get("sidecar_validation"), dict)
+        else {}
+    )
+    if sidecar_validation:
+        print(
+            "Sidecar validation: "
+            f"status={sidecar_validation.get('status') or '-'} "
+            f"rows={sidecar_validation.get('row_count', 0)} "
+            f"present_rows={sidecar_validation.get('present_rows', 0)} "
+            f"pending_rows={sidecar_validation.get('pending_rows', 0)} "
+            f"invalid_rows={sidecar_validation.get('invalid_rows', 0)} "
+            f"warning_rows={sidecar_validation.get('warning_rows', 0)} "
+            f"missing_required={','.join(sidecar_validation.get('missing_required_decisions', []) or []) or 'none'} "
+            f"first_missing={sidecar_validation.get('first_missing_field') or '-'} "
+            f"first_invalid={sidecar_validation.get('first_invalid_field') or '-'}"
+        )
     top_count = max(0, int(args.top))
     if top_count:
         print("Evidence items:")
@@ -63209,6 +63558,18 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
             )
             if args.show_evidence and item.get("summary"):
                 print(f"  summary={inline_summary_text(item.get('summary'), max_chars=220)}")
+        if args.show_sidecar_validation and sidecar_validation:
+            print("Sidecar validation rows:")
+            for row in (sidecar_validation.get("rows", []) or [])[:top_count]:
+                if not isinstance(row, dict):
+                    continue
+                print(
+                    f"- row={row.get('index')} status={row.get('status')} "
+                    f"id={row.get('id') or '-'} item_status={row.get('item_status') or '-'} "
+                    f"required={row.get('required')} missing={','.join(row.get('missing_fields', []) or []) or '-'} "
+                    f"invalid={','.join(row.get('invalid_fields', []) or []) or '-'} "
+                    f"warnings={','.join(row.get('warnings', []) or []) or '-'}"
+                )
         if args.show_missing:
             print("Missing decisions:")
             for item in (review.get("missing_decisions", []) or [])[:top_count]:
@@ -66963,6 +67324,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-closure-contract",
         action="store_true",
         help="Print the credential-cost and resource-abuse evidence closure contracts for missing operator decisions.",
+    )
+    operator_evidence_review.add_argument(
+        "--show-sidecar-validation",
+        action="store_true",
+        help="Print field-level validation status for operator-evidence.json rows.",
     )
     operator_evidence_review.add_argument(
         "--no-write",
