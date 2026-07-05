@@ -9689,10 +9689,17 @@ def hypothesis_priority_from_values(*values: Any) -> str:
     return best
 
 
+def verification_queue_hypothesis_role(item_id: str) -> str:
+    if item_id.startswith("VERIFY-reportability") or item_id.startswith("VERIFY-evidence"):
+        return "procedural-refresh"
+    return "impact-followup"
+
+
 def hypothesis_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
     return (
         HYPOTHESIS_STATUS_RANK.get(str(item.get("status") or ""), 9),
         HYPOTHESIS_PRIORITY_RANK.get(str(item.get("priority") or "info"), 9),
+        1 if str(item.get("queue_role") or "") == "procedural-refresh" else 0,
         0 if str(item.get("scope_decision") or "") == "in-scope-explicit-host" else 1,
         str(item.get("host") or ""),
         str(item.get("path") or ""),
@@ -9796,9 +9803,12 @@ def hypothesis_from_queue_item(
     command_safety = dict_summary(dict_summary(item.get("command_safety")).get("summary"))
     external_commands = int(command_safety.get("blocked_external", 0) or 0)
     offline_only = bool(item.get("offline_only")) or not bool(item.get("commands"))
+    queue_role = verification_queue_hypothesis_role(item_id)
     if item_id.startswith("VERIFY-evidence") or item_id.startswith("VERIFY-reportability"):
         offline_only = True
     priority = hypothesis_priority_from_values(item.get("priority") or "medium")
+    if queue_role == "procedural-refresh":
+        priority = "info"
     return {
         "id": f"HYP-queue-{safe_hypothesis_id(item_id)}",
         "type": "verification-queue",
@@ -9814,8 +9824,9 @@ def hypothesis_from_queue_item(
         "priority": priority,
         "host": None,
         "path": None,
-        "impact": item.get("impact"),
+        "impact": item.get("impact") or ("process-readiness" if queue_role == "procedural-refresh" else None),
         "queue_item_id": item_id,
+        "queue_role": queue_role,
         "cluster_id": item.get("cluster_id"),
         "scope_decision": "in-scope-explicit-host",
         "source_status": status,
@@ -38866,6 +38877,15 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         },
         resource_gated=True,
     ) or {}
+    procedural_queue_hypothesis = hypothesis_from_queue_item(
+        {
+            "id": "VERIFY-reportability-gates",
+            "status": "ready",
+            "priority": "high",
+            "commands": ["python3 scripts/inferforge.py gate"],
+        },
+        resource_gated=True,
+    ) or {}
     websocket_header_forwarding_passed = (
         websocket_header_forwarding_bad_review.get("status") == "needs-header-trust-review"
         and websocket_bad_summary.get("lead_count") == 1
@@ -38906,6 +38926,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and websocket_matrix_hypothesis.get("offline_only") is True
         and websocket_matrix_hypothesis.get("impact") == "websocket-header-forwarding"
         and websocket_low_queue_hypothesis.get("priority") == "low"
+        and procedural_queue_hypothesis.get("priority") == "info"
+        and procedural_queue_hypothesis.get("queue_role") == "procedural-refresh"
+        and procedural_queue_hypothesis.get("impact") == "process-readiness"
         and websocket_validation_item.get("status") == "ready-offline"
         and "websocket-candidate-review --no-write" in websocket_validation_allowed_now
     )
@@ -41986,6 +42009,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             },
             "queue_item": websocket_queue_item,
             "matrix_hypothesis": websocket_matrix_hypothesis,
+            "procedural_queue_hypothesis": procedural_queue_hypothesis,
             "validation_item": websocket_validation_item,
         },
         "active_observation_validation": {
