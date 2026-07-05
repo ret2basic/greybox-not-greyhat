@@ -108,6 +108,7 @@ DEFAULT_RESOURCE_CRITICAL_BURP_HISTORY_INPUT_BYTES = 256 * 1024
 DEFAULT_BURP_SYNC_COUNT = 20
 DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT = 5
 DEFAULT_SINGLE_REVIEWED_OBSERVATION_BURP_SYNC_COUNT = 1
+DEFAULT_SINGLE_QUOTE_CORPUS_BURP_SYNC_COUNT = 1
 DEFAULT_RESOURCE_WARNING_BURP_SYNC_COUNT = 10
 DEFAULT_RESOURCE_CRITICAL_BURP_SYNC_COUNT = 3
 DEFAULT_RESOURCE_DEGRADED_OFFLINE_COMMAND_LIMIT = 4
@@ -22064,15 +22065,16 @@ def transaction_sidecar_evidence_contracts(
                 "action": (
                     f"Use the Burp built-in browser to perform exactly one approved POST {quote_path} quote flow "
                     "for this direction, stop before wallet signing, and keep only the minimum response body needed "
-                    "for offline decoding."
+                    "for offline decoding. Import history immediately so the approved quote response is the latest "
+                    "matching item."
                 ),
             },
             {
                 "id": "burp-history-import",
-                "risk": "burp-mcp-history-read-no-raw-persist",
+                "risk": "burp-mcp-single-history-read-no-raw-persist",
                 "command": validation_command_for_artifact_dir(
                     artifact_dir,
-                    f"burp-sync --replace --count {DEFAULT_REVIEWED_OBSERVATION_BURP_SYNC_COUNT}",
+                    f"burp-sync --replace --count {DEFAULT_SINGLE_QUOTE_CORPUS_BURP_SYNC_COUNT}",
                     profile=profile,
                 ),
             },
@@ -22149,7 +22151,7 @@ def transaction_sidecar_evidence_contracts(
                     "Run intent-policy-write only after the direction, wallet, amountIn, mints, and program policy are approved.",
                     "Run resource-gate and stop unless it is healthy.",
                     "Perform single-approved-quote-capture manually in Burp's built-in browser; do not sign or submit.",
-                    "Run burp-history-import only after the approved browser flow exists in Burp history.",
+                    "Run burp-history-import only once after the approved quote response is the latest matching Burp history item.",
                     "Run sidecar-review and decode-preview; continue to finding-gate only on concrete decoded intent impact.",
                 ],
                 "stop_conditions": [
@@ -35385,6 +35387,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Payload sidecar template JSON:" in transaction_sidecar_review_stdout_text
                 and "Evidence contracts:" in transaction_sidecar_review_stdout_text
                 and "single-approved-quote-capture" in transaction_sidecar_review_stdout_text
+                and "burp-sync --replace --count 1" in transaction_sidecar_review_stdout_text
+                and "burp-sync --replace --count 5" not in transaction_sidecar_review_stdout_text
                 and "REPLACE_WITH_BASE64_VERSIONED_TRANSACTION" in transaction_sidecar_review_stdout_text
                 and "No files written (--no-write)." in transaction_sidecar_review_stdout
                 and not any(
@@ -39250,7 +39254,9 @@ def build_transaction_decoder_selftest(
         and "intent-policy-preview" in sidecar_contract_text
         and "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict" in sidecar_contract_text
         and "single-approved-quote-capture" in sidecar_contract_text
-        and "burp-sync --replace --count" in sidecar_contract_text
+        and "burp-mcp-single-history-read-no-raw-persist" in sidecar_contract_text
+        and "burp-sync --replace --count 1" in sidecar_contract_text
+        and "burp-sync --replace --count 5" not in sidecar_contract_text
         and "transaction-sidecar-review --no-write --show-files --show-candidates --show-commands" in sidecar_contract_text
         and "decode-transactions --no-write" in sidecar_contract_text
         and sidecar_contract_step_safety.get("intent-policy-preview") == "manual-template"
