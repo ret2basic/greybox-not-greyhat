@@ -24437,6 +24437,7 @@ def build_evidence_gaps(
     source_peeks: dict[str, Any] | None = None,
     profile: dict[str, Any] | None = None,
     deployment_review: dict[str, Any] | None = None,
+    rewrite_response_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     burp_cluster_ids = observed_cluster_ids(build_traffic_index([], burp_history), clusters)
     results_by_cluster: dict[str, list[dict[str, Any]]] = {}
@@ -24557,6 +24558,77 @@ def build_evidence_gaps(
             ),
             "Source review only; do not invoke Server Actions, submit forms, sign wallets, or mutate state automatically.",
             review_candidates=[server_action_review_candidate(action)],
+        )
+
+    rewrite_response_items = (
+        rewrite_response_review.get("items", [])
+        if isinstance(rewrite_response_review, dict) and isinstance(rewrite_response_review.get("items"), list)
+        else []
+    )
+    for item in rewrite_response_items:
+        if not isinstance(item, dict):
+            continue
+        cluster_id = str(item.get("cluster_id") or "").strip()
+        if not cluster_id:
+            continue
+        approved_count = int(item.get("observed_approved_response_count") or 0)
+        candidate_impact_count = int(item.get("candidate_impact_observation_count") or 0)
+        if approved_count and candidate_impact_count:
+            continue
+        contracts = []
+        for contract in (item.get("observation_contracts", []) or [])[:3]:
+            if not isinstance(contract, dict):
+                continue
+            contracts.append(
+                {
+                    "path": contract.get("path"),
+                    "method": contract.get("method"),
+                    "candidate_id": contract.get("candidate_id"),
+                    "reviewed_profile": contract.get("reviewed_profile"),
+                    "command_count": len(contract.get("commands", []) or []),
+                    "stop_conditions": (contract.get("stop_conditions", []) or [])[:4],
+                }
+            )
+        if not approved_count and not contracts:
+            continue
+        missing_requirements = []
+        if not approved_count:
+            missing_requirements.append("single-approved-response-observed")
+        if not candidate_impact_count:
+            missing_requirements.append("concrete-sensitive-data-or-path-confusion-impact")
+        priority = str(item.get("priority") or "medium")
+        if priority not in {"high", "medium", "low"}:
+            priority = "medium"
+        add_gap(
+            f"GAP-{cluster_id}-rewrite-response-evidence",
+            cluster_id,
+            "Rewrite response impact evidence missing",
+            priority,
+            (
+                f"Rewrite response review for `{item.get('path') or cluster_id}` has not linked one approved "
+                "response to concrete sensitive-data exposure, path confusion, authorization bypass, or equivalent "
+                "impact. Static fixed-upstream routing or a successful status code is not enough."
+            ),
+            (
+                "Run rewrite-response-review with --show-observation-contract, promote exactly one reviewed read-only "
+                "path with --single-observation-plan, and collect at most one HTTP-only Burp observation only after "
+                "scope and resource gates are satisfied."
+            ),
+            (
+                "One approved HTTP request only; do not enumerate catch-all paths, do not use WebSocket upgrade "
+                "observation for this contract, and do not keep raw Burp history."
+            ),
+            review_candidates=[
+                {
+                    "id": f"review_{safe_probe_id(cluster_id)}_rewrite_response_contract",
+                    "type": "rewrite-response-evidence-review",
+                    "status": item.get("status"),
+                    "path": item.get("path"),
+                    "missing_requirements": missing_requirements,
+                    "observation_contracts": contracts,
+                    "next_step": item.get("next_step"),
+                }
+            ],
         )
 
     quote_rows = results_by_cluster.get("quote", [])
@@ -24948,6 +25020,24 @@ def evidence_gap_followup_commands(
                 "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check",
                 profile=profile,
             )
+        ]
+    if gap_id.endswith("-rewrite-response-evidence"):
+        return [
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "rewrite-review --no-write --show-next",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "rewrite-validation-checklist --no-write --show-candidates --show-commands",
+                profile=profile,
+            ),
         ]
     if gap_id.endswith("-burp-observation"):
         return [
@@ -44890,6 +44980,63 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and unsafe_command_classification.get("classification") == "unsafe-template"
             and "shell-angle-placeholder-or-redirection" in unsafe_command_classification.get("issues", [])
         )
+        rewrite_response_gap_id = "GAP-route-api-proxy-path-rewrite-response-evidence"
+        rewrite_response_evidence_gaps = build_evidence_gaps(
+            rewrite_clusters,
+            [],
+            [],
+            {"candidates_seen": 1},
+            profile=rewrite_profile,
+            rewrite_response_review={
+                "items": [
+                    {
+                        "status": "missing-approved-response",
+                        "priority": "high",
+                        "cluster_id": "route-api-proxy-path",
+                        "path": "/api/proxy/{path*}",
+                        "observed_approved_response_count": 0,
+                        "candidate_impact_observation_count": 0,
+                        "observation_contracts": [
+                            {
+                                "path": "/api/proxy/users/42",
+                                "method": "GET",
+                                "candidate_id": "review_observe_route_api_proxy_path_approved_path",
+                                "reviewed_profile": "reviewed-profile.json",
+                                "commands": [{"id": "single-burp-observe"}],
+                                "stop_conditions": ["Do not enumerate catch-all paths."],
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        rewrite_response_gap = next(
+            (
+                gap
+                for gap in rewrite_response_evidence_gaps.get("gaps", [])
+                if gap.get("id") == rewrite_response_gap_id
+            ),
+            None,
+        )
+        rewrite_response_gap_followups = evidence_gap_followup_commands(
+            rewrite_response_gap_id,
+            artifact_dir=queue_artifact_dir,
+            profile=rewrite_profile,
+        )
+        rewrite_response_gap_passed = (
+            rewrite_response_gap is not None
+            and rewrite_response_gap.get("priority") == "high"
+            and rewrite_response_gap.get("cluster_id") == "route-api-proxy-path"
+            and "single-approved-response-observed"
+            in (rewrite_response_gap.get("review_candidates", [{}])[0].get("missing_requirements", []) or [])
+            and "concrete-sensitive-data-or-path-confusion-impact"
+            in (rewrite_response_gap.get("review_candidates", [{}])[0].get("missing_requirements", []) or [])
+            and len(rewrite_response_gap_followups) == 3
+            and REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND in rewrite_response_gap_followups[0]
+            and "rewrite-review --no-write --show-next" in rewrite_response_gap_followups[1]
+            and "rewrite-validation-checklist --no-write --show-candidates --show-commands"
+            in rewrite_response_gap_followups[2]
+        )
         rewrite_source_peeks = build_source_peeks(
             rewrite_source_root,
             rewrite_profile,
@@ -45477,6 +45624,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and not any(str(cluster.get("id", "")).startswith("server_action") for cluster in rewrite_clusters.get("clusters", []))
             and any("updateWidget" in line and "deleteWidget" in line for line in rewrite_server_action_report_lines)
             and rewrite_server_action_gap_passed
+            and rewrite_response_gap_passed
             and rewrite_source_peek_requests_passed
             and rewrite_burp_observation_coverage_passed
             and any(
@@ -46835,6 +46983,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "queue_status": rewrite_server_action_queue.get("status"),
                 "queue_command_safety": rewrite_server_action_queue.get("summary", {}).get("command_safety", {}),
             },
+            "rewrite_response_evidence_gap": {
+                "status": "passed" if rewrite_response_gap_passed else "failed",
+                "gap": rewrite_response_gap,
+                "followup_commands": rewrite_response_gap_followups,
+                "summary": rewrite_response_evidence_gaps.get("summary", {}),
+            },
             "source_peek_requests": {
                 "status": "passed" if rewrite_source_peek_requests_passed else "failed",
                 "artifact_status": rewrite_source_peek_requests.get("status"),
@@ -47860,6 +48014,13 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
         write_json(deployment_review_path, sanitize_artifact_samples(deployment_review))
     orca_baseline = load_optional_json(artifact_dir / "orca-baseline.json")
     quote_collection = load_optional_json(artifact_dir / "quote-collection.json")
+    rewrite_response_review = load_optional_json(
+        artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT
+    ) or build_rewrite_response_review(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
     evidence_gaps = build_evidence_gaps(
         clusters,
         results,
@@ -47871,6 +48032,7 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
         source_peeks,
         profile=profile,
         deployment_review=deployment_review,
+        rewrite_response_review=rewrite_response_review,
     )
     evidence_gaps_path = artifact_dir / "evidence-gaps.json"
     if not no_write:
