@@ -169,6 +169,7 @@ REWRITE_RESPONSE_SIDECAR_ARTIFACT = "rewrite-response-sidecar.jsonl"
 REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT = "rewrite-response-sidecar-template.json"
 DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT = "deployment-resource-review.json"
 TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
+TRANSACTION_INTENT_BOUNDARY_ARTIFACT = "transaction-intent-boundary.json"
 TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
 TRANSACTION_SIDECAR_REVIEW_ARTIFACT = "transaction-sidecar-review.json"
 TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT = "transaction-intent-policy-templates.json"
@@ -276,6 +277,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT,
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
+    TRANSACTION_INTENT_BOUNDARY_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
     TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
     TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT,
@@ -382,6 +384,7 @@ INDEX_ARTIFACT_ORDER = [
     SCOPE_POLICY_ARTIFACT,
     WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT,
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
+    TRANSACTION_INTENT_BOUNDARY_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT,
@@ -23083,6 +23086,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     CLAIM_EVIDENCE_REQUESTS_ARTIFACT: "claim-evidence-requests",
     SECRET_EXPOSURE_REVIEW_ARTIFACT: "secret-exposure-review",
     BOUNTY_FRONTIER_ARTIFACT: "bounty-frontier",
+    TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
     ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT: "oracle-plan --write-sidecar-template",
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT: "rewrite-response-review --write-sidecar-template",
     "finding-gate.json": "gate",
@@ -23123,6 +23127,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "claim-evidence-requests",
     "secret-exposure-review",
     "bounty-frontier",
+    "transaction-intent-boundary",
     "rewrite-response-review --write-sidecar-template",
     "report",
     "transaction-corpus-checklist --write-policy-template --skip-current-resource-check",
@@ -23148,6 +23153,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "claim-evidence-requests": "claim-evidence-requests --no-write",
     "secret-exposure-review": "secret-exposure-review --no-write",
     "bounty-frontier": "bounty-frontier --no-write",
+    "transaction-intent-boundary": "transaction-intent-boundary --no-write",
     "rewrite-response-review --write-sidecar-template": (
         "rewrite-response-review --no-write --show-sidecar-template-json"
     ),
@@ -31700,6 +31706,325 @@ def build_transaction_flow_review(
         "safety": (
             "Offline bounded local source review only. It sends no requests, invokes no wallet, submits no transaction, "
             "and does not run Burp Scanner, Intruder, or fuzzing."
+        ),
+    }
+
+
+def transaction_intent_checks_by_suffix(transaction_intent: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
+    if not isinstance(transaction_intent, dict):
+        return {}
+    policy_checks = (
+        transaction_intent.get("intent_policy_checks")
+        if isinstance(transaction_intent.get("intent_policy_checks"), dict)
+        else {}
+    )
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for check in policy_checks.get("checks", []) or []:
+        if not isinstance(check, dict):
+            continue
+        suffix = transaction_intent_check_suffix(check)
+        grouped.setdefault(suffix, []).append(check)
+    return grouped
+
+
+def transaction_intent_boundary_decode_status(
+    *,
+    decoded_transactions: int,
+    checks_by_suffix: dict[str, list[dict[str, Any]]],
+    suffixes: list[str],
+) -> tuple[str, list[dict[str, Any]]]:
+    checks = [
+        check
+        for suffix in suffixes
+        for check in checks_by_suffix.get(suffix, [])
+        if isinstance(check, dict)
+    ]
+    if not suffixes:
+        return ("not-required", [])
+    if decoded_transactions <= 0:
+        return ("waiting-transaction-corpus", checks)
+    if not checks:
+        return ("decode-check-missing", checks)
+    if any(check.get("status") == "failed" and check.get("severity", "required") == "required" for check in checks):
+        return ("candidate-impact", checks)
+    if any(check.get("status") == "review" for check in checks):
+        return ("manual-review", checks)
+    if all(check.get("status") == "passed" for check in checks):
+        return ("passed", checks)
+    return ("needs-manual-review", checks)
+
+
+def build_transaction_intent_boundary(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    transaction_flow_review: dict[str, Any] | None,
+    transaction_intent: dict[str, Any] | None,
+    transaction_sidecar_review: dict[str, Any] | None,
+) -> dict[str, Any]:
+    flow_review = transaction_flow_review if isinstance(transaction_flow_review, dict) else {}
+    tx_intent = transaction_intent if isinstance(transaction_intent, dict) else {}
+    sidecar_review = transaction_sidecar_review if isinstance(transaction_sidecar_review, dict) else {}
+    source_contract = (
+        flow_review.get("quote_source_contract_review")
+        if isinstance(flow_review.get("quote_source_contract_review"), dict)
+        else {}
+    )
+    scaffold = (
+        flow_review.get("intent_policy_scaffold")
+        if isinstance(flow_review.get("intent_policy_scaffold"), dict)
+        else build_transaction_intent_policy_scaffold(profile)
+    )
+    dataflows = [
+        item for item in flow_review.get("dataflows", []) or [] if isinstance(item, dict)
+    ]
+    dataflow_by_id = {str(item.get("id") or ""): item for item in dataflows}
+    source_decisions = [
+        item for item in source_contract.get("decisions", []) or [] if isinstance(item, dict)
+    ]
+    source_decision_by_id = {str(item.get("id") or ""): item for item in source_decisions}
+    tx_summary = transaction_intent_review_summary(tx_intent)
+    decoded_transactions = int(tx_summary.get("decoded_transactions") or 0)
+    checks_by_suffix = transaction_intent_checks_by_suffix(tx_intent)
+    reportability_review = (
+        tx_intent.get("reportability_review")
+        if isinstance(tx_intent.get("reportability_review"), dict)
+        else {}
+    )
+    if not reportability_review and isinstance(tx_intent.get("intent_policy_checks"), dict):
+        policy = tx_intent.get("intent_policy") if isinstance(tx_intent.get("intent_policy"), dict) else {}
+        transactions = tx_intent.get("transactions") if isinstance(tx_intent.get("transactions"), list) else []
+        reportability_review = build_transaction_intent_reportability_review(
+            transactions,
+            policy,
+            tx_intent.get("intent_policy_checks"),
+        )
+
+    def source_status(decision_ids: list[str]) -> tuple[str, list[dict[str, Any]]]:
+        decisions = [source_decision_by_id.get(decision_id, {}) for decision_id in decision_ids]
+        missing = [
+            decision_id
+            for decision_id, decision in zip(decision_ids, decisions)
+            if not decision or str(decision.get("status") or "") == "missing-evidence"
+        ]
+        if missing:
+            return ("missing-source-contract", decisions)
+        if decisions:
+            return ("source-indexed", decisions)
+        return ("not-required", decisions)
+
+    def source_refs(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        refs = []
+        for decision in decisions:
+            if not isinstance(decision, dict):
+                continue
+            for ref in decision.get("evidence", []) or []:
+                if isinstance(ref, dict):
+                    refs.append(ref)
+        return ordered_unique_ref_dicts(refs)[:12]
+
+    boundary_specs = [
+        {
+            "id": "payload-shape-and-decodability",
+            "label": "Approved quote response contains SVM transaction payloads at the expected path",
+            "source_decisions": ["response-payload-extraction", "client-response-payload-contract"],
+            "decode_suffixes": ["decoded", "instructions-present"],
+            "candidate_severity": "medium",
+            "failure_impact": "Undecodable or structurally unexpected payloads can indicate provider/schema confusion, but need concrete user impact.",
+            "reportable_if": "A valid approved response produces executable payload material whose decoded structure contradicts the source contract.",
+        },
+        {
+            "id": "wallet-signer-binding",
+            "label": "Executing wallet remains the account and signer for the decoded transaction",
+            "source_decisions": ["client-wallet-binding", "server-sender-recipient-binding"],
+            "decode_suffixes": ["wallet-account", "wallet-signer"],
+            "candidate_severity": "high",
+            "failure_impact": "A different signer or missing user signer can prove a transaction-integrity or user-funds impact candidate.",
+            "reportable_if": "Decoded transaction signer/account evidence contradicts the approved wallet policy and finding-gate accepts concrete impact.",
+        },
+        {
+            "id": "mint-direction-binding",
+            "label": "Decoded source and destination mints match the approved buy/sell direction",
+            "source_decisions": ["server-mint-direction-policy", "profile-quote-intent-directions"],
+            "decode_suffixes": ["source-mint", "destination-mint"],
+            "candidate_severity": "high",
+            "failure_impact": "A mint mismatch can show the user is asked to sign a materially different swap than requested.",
+            "reportable_if": "Decoded mints contradict approved direction/mint policy and the mismatch changes transaction value or asset flow.",
+        },
+        {
+            "id": "amount-in-binding",
+            "label": "Decoded source-mint transfer amount matches requested amountIn",
+            "source_decisions": ["server-amount-bound"],
+            "decode_suffixes": ["amount-in"],
+            "candidate_severity": "high",
+            "failure_impact": "A source amount mismatch can prove value movement differs from user intent.",
+            "reportable_if": "Decoded token transfer amount differs from approved amountIn and is not explained by decimals/address-table review.",
+        },
+        {
+            "id": "program-allowlist-binding",
+            "label": "Decoded instruction programs match the approved program allowlist or manual program review",
+            "source_decisions": ["profile-quote-intent-directions"],
+            "decode_suffixes": ["program-allowlist"],
+            "candidate_severity": "high",
+            "failure_impact": "Unexpected programs can change transaction semantics or route funds through unapproved protocols.",
+            "reportable_if": "Decoded instruction program IDs are outside the approved allowlist and the extra programs create concrete unsafe behavior.",
+        },
+        {
+            "id": "quote-count-bound",
+            "label": "Server constrains quote count before executable payloads are requested",
+            "source_decisions": ["server-quote-count-bound"],
+            "decode_suffixes": [],
+            "candidate_severity": "medium",
+            "failure_impact": "Multiple executable quote payloads can complicate user intent review and widen provider impact.",
+            "reportable_if": "A captured response proves unexpected executable payload fanout with concrete impact.",
+        },
+        {
+            "id": "post-rewrite-blockhash-review",
+            "label": "Client blockhash refresh does not mask decoded intent changes",
+            "source_decisions": [],
+            "decode_suffixes": ["source-mint", "destination-mint", "amount-in", "program-allowlist"],
+            "candidate_severity": "medium",
+            "failure_impact": "Blockhash replacement should not change accounts, programs, or token movement; address lookup coverage may need review.",
+            "reportable_if": "Post-rewrite decoded intent differs from approved quote intent after resolving any address table lookups.",
+            "dataflow_id": "client-recent-blockhash-rewrite",
+        },
+    ]
+
+    boundaries = []
+    for spec in boundary_specs:
+        source_state, decisions = source_status(list(spec.get("source_decisions", [])))
+        dataflow = dataflow_by_id.get(str(spec.get("dataflow_id") or ""))
+        if spec.get("dataflow_id") and dataflow and source_state == "not-required":
+            source_state = "source-indexed"
+        decode_state, decode_checks = transaction_intent_boundary_decode_status(
+            decoded_transactions=decoded_transactions,
+            checks_by_suffix=checks_by_suffix,
+            suffixes=normalize_string_list(spec.get("decode_suffixes")),
+        )
+        if source_state == "missing-source-contract":
+            status = "missing-source-contract"
+        elif decode_state == "candidate-impact":
+            status = "candidate-transaction-integrity-impact"
+        elif decode_state == "manual-review":
+            status = "manual-review"
+        elif decode_state == "passed":
+            status = "passed"
+        elif decode_state == "not-required" and source_state == "source-indexed":
+            status = "source-indexed"
+        elif decode_state == "waiting-transaction-corpus":
+            status = "waiting-transaction-corpus"
+        else:
+            status = decode_state
+        boundaries.append(
+            {
+                "id": spec["id"],
+                "label": spec["label"],
+                "status": status,
+                "source_status": source_state,
+                "decode_status": decode_state,
+                "decode_check_suffixes": normalize_string_list(spec.get("decode_suffixes")),
+                "candidate_severity": spec["candidate_severity"],
+                "failure_impact": spec["failure_impact"],
+                "reportable_if": spec["reportable_if"],
+                "source_decisions": [
+                    {
+                        "id": decision.get("id"),
+                        "status": decision.get("status"),
+                        "review_question": decision.get("review_question"),
+                    }
+                    for decision in decisions
+                    if isinstance(decision, dict) and decision
+                ],
+                "source_refs": source_refs(decisions),
+                "dataflow": {
+                    "id": dataflow.get("id"),
+                    "status": dataflow.get("status"),
+                    "refs": dataflow.get("refs", [])[:6],
+                }
+                if dataflow
+                else None,
+                "decode_checks": compact_intent_check_evidence(decode_checks),
+                "finding_gate_ready": status == "candidate-transaction-integrity-impact",
+            }
+        )
+
+    status_counts: dict[str, int] = {}
+    severity_counts: dict[str, int] = {}
+    for row in boundaries:
+        increment_count(status_counts, str(row.get("status") or "unknown"))
+        increment_count(severity_counts, str(row.get("candidate_severity") or "unknown"))
+
+    candidate_rows = [row for row in boundaries if row.get("status") == "candidate-transaction-integrity-impact"]
+    missing_source_rows = [row for row in boundaries if row.get("status") == "missing-source-contract"]
+    waiting_rows = [row for row in boundaries if row.get("status") == "waiting-transaction-corpus"]
+    if candidate_rows:
+        status = "candidate-transaction-integrity-impact"
+    elif missing_source_rows:
+        status = "partial-source-boundary"
+    elif waiting_rows:
+        status = "ready-waiting-transaction-corpus"
+    elif boundaries:
+        status = "boundary-indexed"
+    else:
+        status = "no-transaction-intent-boundary"
+
+    payload_status = (
+        sidecar_review.get("summary", {}).get("candidate_count", 0)
+        if isinstance(sidecar_review.get("summary"), dict)
+        else 0
+    )
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-transaction-intent-boundary-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "boundaries": len(boundaries),
+            "candidate_boundaries": len(candidate_rows),
+            "missing_source_boundaries": len(missing_source_rows),
+            "waiting_transaction_corpus_boundaries": len(waiting_rows),
+            "decoded_transactions": decoded_transactions,
+            "payload_candidate_count": payload_status,
+            "policy_scaffold_status": scaffold.get("status"),
+            "program_allowlist_status": scaffold.get("program_allowlist_status"),
+            "source_contract_status": source_contract.get("status") or "missing",
+            "transaction_flow_status": flow_review.get("status") or "missing",
+            "transaction_sidecar_status": sidecar_review.get("status") or "missing",
+            "reportability_status": reportability_review.get("status") or "missing",
+            "status_counts": dict(sorted(status_counts.items())),
+            "severity_counts": dict(sorted(severity_counts.items())),
+        },
+        "boundaries": boundaries,
+        "policy_templates": transaction_corpus_policy_templates(profile, artifact_dir)[:4],
+        "required_official_evidence": [
+            repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl"),
+            repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json"),
+        ],
+        "decode_contract": {
+            "high_impact_failure_suffixes": [
+                "wallet-account",
+                "wallet-signer",
+                "source-mint",
+                "destination-mint",
+                "amount-in",
+                "program-allowlist",
+            ],
+            "reportability_gate": (
+                "Boundary failures are candidate signals only. Medium+/High requires decoded transaction evidence, "
+                "an approved intent policy, and finding-gate acceptance of concrete user-funds or transaction-integrity impact."
+            ),
+        },
+        "next_step": (
+            "Collect exactly one approved quote transaction payload and matching intent policy, then run transaction-sidecar-review and decode-transactions."
+            if status == "ready-waiting-transaction-corpus"
+            else "Review boundary rows before escalating; do not report without official transaction evidence."
+        ),
+        "safety": (
+            "Offline source and artifact synthesis only. It sends no target traffic, calls no Burp tool, invokes no wallet, "
+            "signs nothing, and submits no Solana transaction."
         ),
     }
 
@@ -47106,6 +47431,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("secret-exposure-review", "run_secret_exposure_review"),
         refresh_expectation("bounty-frontier", "run_bounty_frontier"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
+        refresh_expectation("transaction-intent-boundary", "run_transaction_intent_boundary"),
         refresh_expectation("transaction-sidecar-review", "run_transaction_sidecar_review"),
         refresh_expectation("transaction-corpus-checklist", "run_transaction_corpus_checklist"),
         refresh_expectation("prepare-transaction-intent-policy", "run_prepare_transaction_intent_policy"),
@@ -68947,6 +69273,111 @@ def run_transaction_flow_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_transaction_intent_boundary(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {}
+    transaction_flow_review = load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT)
+    if not isinstance(transaction_flow_review, dict) or not transaction_flow_review_artifact_has_current_schema(
+        transaction_flow_review
+    ):
+        transaction_flow_review = build_transaction_flow_review(
+            source_root,
+            profile,
+            transaction_intent=transaction_intent,
+            rpc_method_policy=load_optional_json(artifact_dir / "rpc-method-policy.json") or {},
+            operator_evidence=load_optional_json(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+            max_file_bytes=args.max_file_bytes,
+            max_files=args.max_files,
+        )
+    transaction_sidecar_review = load_optional_json(artifact_dir / TRANSACTION_SIDECAR_REVIEW_ARTIFACT)
+    if not isinstance(transaction_sidecar_review, dict):
+        transaction_sidecar_review = build_transaction_sidecar_review(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            max_input_bytes=args.max_input_bytes,
+        )
+    boundary = build_transaction_intent_boundary(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        transaction_flow_review=transaction_flow_review,
+        transaction_intent=transaction_intent,
+        transaction_sidecar_review=transaction_sidecar_review,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / TRANSACTION_INTENT_BOUNDARY_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(boundary))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="transaction-intent-boundary",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = boundary.get("summary", {}) if isinstance(boundary.get("summary"), dict) else {}
+    print(f"Transaction intent boundary: {boundary.get('status')}")
+    print(
+        "Boundaries: "
+        f"total={summary.get('boundaries', 0)} "
+        f"candidates={summary.get('candidate_boundaries', 0)} "
+        f"missing_source={summary.get('missing_source_boundaries', 0)} "
+        f"waiting_corpus={summary.get('waiting_transaction_corpus_boundaries', 0)} "
+        f"decoded={summary.get('decoded_transactions', 0)}"
+    )
+    print(
+        "Inputs: "
+        f"flow={summary.get('transaction_flow_status') or '-'} "
+        f"sidecar={summary.get('transaction_sidecar_status') or '-'} "
+        f"source_contract={summary.get('source_contract_status') or '-'} "
+        f"policy_scaffold={summary.get('policy_scaffold_status') or '-'} "
+        f"programs={summary.get('program_allowlist_status') or '-'}"
+    )
+    print(f"Statuses: {json.dumps(summary.get('status_counts', {}), sort_keys=True)}")
+    if getattr(args, "show_boundaries", False):
+        display_limit = max(0, int(args.top))
+        for row in (boundary.get("boundaries", []) or [])[:display_limit]:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('candidate_severity')} {row.get('status')} "
+                f"{row.get('id')} decode={row.get('decode_status')} source={row.get('source_status')}"
+            )
+            print(f"  label={inline_summary_text(row.get('label'), max_chars=220)}")
+            print(f"  impact={inline_summary_text(row.get('failure_impact'), max_chars=260)}")
+            if row.get("decode_check_suffixes"):
+                print(f"  checks={','.join(normalize_string_list(row.get('decode_check_suffixes')))}")
+        remaining = len(boundary.get("boundaries", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more boundary row(s); rerun without --no-write to write the full artifact")
+            else:
+                print(f"- {remaining} more boundary row(s) in {output_path}")
+    print(f"Next: {inline_summary_text(boundary.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and boundary.get("status") not in {
+        "ready-waiting-transaction-corpus",
+        "candidate-transaction-integrity-impact",
+        "boundary-indexed",
+    }:
+        return 1
+    return 0
+
+
 def run_credential_impact_checklist(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -73355,6 +73786,67 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless a remote transaction signing flow needs intent-corpus review.",
     )
     transaction_flow_review.set_defaults(func=run_transaction_flow_review)
+
+    transaction_intent_boundary = sub.add_parser(
+        "transaction-intent-boundary",
+        help="Build a decode-time transaction intent boundary from source and sidecar state without signing or submitting",
+    )
+    transaction_intent_boundary.add_argument(
+        "--output",
+        help=(
+            f"Where to write {TRANSACTION_INTENT_BOUNDARY_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{TRANSACTION_INTENT_BOUNDARY_ARTIFACT}."
+        ),
+    )
+    transaction_intent_boundary.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=DEFAULT_TRANSACTION_FLOW_REVIEW_MAX_FILE_BYTES,
+        help=(
+            "Maximum bytes to read per source file. "
+            f"Defaults to {DEFAULT_TRANSACTION_FLOW_REVIEW_MAX_FILE_BYTES}."
+        ),
+    )
+    transaction_intent_boundary.add_argument(
+        "--max-files",
+        type=positive_int,
+        default=256,
+        help="Maximum source files to scan. Defaults to 256.",
+    )
+    transaction_intent_boundary.add_argument(
+        "--max-input-bytes",
+        type=positive_int,
+        default=DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+        help=(
+            "Maximum bytes to read from each transaction sidecar input. "
+            f"Defaults to {DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES}."
+        ),
+    )
+    transaction_intent_boundary.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of boundary rows to print with --show-boundaries.",
+    )
+    transaction_intent_boundary.add_argument(
+        "--show-boundaries",
+        action="store_true",
+        help="Print transaction intent boundary rows.",
+    )
+    transaction_intent_boundary.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print transaction intent boundary only; do not write {TRANSACTION_INTENT_BOUNDARY_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    transaction_intent_boundary.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless a transaction intent boundary is indexed or ready for payload evidence.",
+    )
+    transaction_intent_boundary.set_defaults(func=run_transaction_intent_boundary)
 
     prepare_intent_policy = sub.add_parser(
         "prepare-transaction-intent-policy",
