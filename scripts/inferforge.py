@@ -20161,6 +20161,7 @@ EVIDENCE_PREP_REQUIRED_EVIDENCE_ARTIFACT_NAMES = {
 }
 
 EVIDENCE_PREP_TEMPLATE_ARTIFACT_NAMES = {
+    BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT,
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT,
     TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT,
     ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT,
@@ -26433,6 +26434,258 @@ def build_bounty_prep_sync(
     }
 
 
+def bounty_prep_command_row(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    subcommand: str,
+    source: str,
+    artifact: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    command = validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile)
+    ref = validation_command_ref(command, source=source, item_status="ready")
+    row = {
+        "command": command,
+        "source": source,
+        "classification": ref.get("classification"),
+        "risk": ref.get("risk"),
+    }
+    if artifact:
+        row["artifact"] = artifact
+    if reason:
+        row["reason"] = reason
+    return row
+
+
+def bounty_prep_action_required_artifacts(action: dict[str, Any]) -> list[str]:
+    artifacts = [bounty_prep_evidence_name(item) for item in normalize_string_list(action.get("requested_evidence"))]
+    lane = str(action.get("lane") or "")
+    if lane == "transaction-integrity":
+        artifacts.extend(["transaction-payloads.jsonl", "transaction-intent-policy.json"])
+    elif lane == "sensitive-response-impact":
+        artifacts.append(REWRITE_RESPONSE_SIDECAR_ARTIFACT)
+    elif lane in {"credentialed-provider-impact", "resource-control", "websocket-header-trust"}:
+        artifacts.append(OPERATOR_EVIDENCE_ARTIFACT)
+    return ordered_unique_strings([item for item in artifacts if item])
+
+
+def bounty_prep_approval_packet_for_action(
+    action: dict[str, Any],
+    authorization: dict[str, Any],
+    *,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    lane = str(action.get("lane") or authorization.get("lane") or "unknown")
+    required = bounty_prep_action_required_artifacts(action)
+    packet = {
+        "id": f"BOUNTY-PREP-{safe_probe_id(str(action.get('id') or lane))}",
+        "status": "waiting-approved-evidence",
+        "lane": lane,
+        "action_id": action.get("id"),
+        "authorization_request_id": action.get("authorization_request_id"),
+        "workorder_id": action.get("workorder_id"),
+        "gate_id": action.get("gate_id"),
+        "expected_severity": action.get("expected_severity"),
+        "required_artifacts": required,
+        "redacted_sidecar_required_fields": normalize_string_list(authorization.get("handoff_fields"))[:16],
+        "allowed_actions": normalize_string_list(authorization.get("allowed_actions"))[:8],
+        "forbidden_actions": normalize_string_list(authorization.get("forbidden_actions"))[:12],
+        "approval_question": authorization.get("question") or action.get("next_step"),
+        "reportability_boundary": action.get("reportability_boundary") or authorization.get("reportability_boundary"),
+    }
+    for artifact_name in required:
+        path = repo_relative_or_absolute(artifact_dir / artifact_name)
+        if artifact_name == "transaction-payloads.jsonl":
+            packet["payload_sidecar"] = path
+        elif artifact_name == "transaction-intent-policy.json":
+            packet["intent_policy_sidecar"] = path
+        elif artifact_name == REWRITE_RESPONSE_SIDECAR_ARTIFACT:
+            packet["sidecar"] = path
+        elif artifact_name == OPERATOR_EVIDENCE_ARTIFACT:
+            packet["operator_evidence_sidecar"] = path
+    return packet
+
+
+def build_bounty_prep_package(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    bounty_action_queue: dict[str, Any] | None,
+    bounty_evidence_authorization: dict[str, Any] | None,
+    top: int,
+) -> dict[str, Any]:
+    queue = bounty_action_queue if isinstance(bounty_action_queue, dict) else {}
+    authorization_doc = bounty_evidence_authorization if isinstance(bounty_evidence_authorization, dict) else {}
+    actions = [
+        row
+        for row in (queue.get("actions", []) or [])
+        if isinstance(row, dict)
+        and str(row.get("kind") or "") in {"collect-approved-evidence", "fix-evidence-intake", "validate-ready-evidence"}
+    ][: max(1, int(top))]
+    if not actions:
+        top_action = bounty_prep_top_action(queue)
+        actions = [top_action] if top_action else []
+    auth_by_id = {
+        str(row.get("id")): row
+        for row in (authorization_doc.get("authorization_requests", []) or [])
+        if isinstance(row, dict) and row.get("id")
+    }
+    primary = actions[0] if actions else {}
+    primary_auth = auth_by_id.get(str(primary.get("authorization_request_id") or ""), {})
+    required_artifacts = ordered_unique_strings(
+        [
+            artifact
+            for action in actions
+            for artifact in bounty_prep_action_required_artifacts(action)
+        ]
+    )
+    top_lane = str(primary.get("lane") or "")
+    first_missing = required_artifacts[0] if required_artifacts else None
+    approval_packets = [
+        bounty_prep_approval_packet_for_action(
+            action,
+            auth_by_id.get(str(action.get("authorization_request_id") or ""), {}),
+            artifact_dir=artifact_dir,
+        )
+        for action in actions
+        if action
+    ]
+    template_command = bounty_prep_command_row(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        subcommand="bounty-evidence-templates --show-templates --top 6",
+        source="bounty-prep-package:bounty-evidence-templates",
+        artifact=BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT,
+        reason=(
+            f"Write {BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT} as a draft-only template package; "
+            "it is not official evidence and cannot satisfy finding gates."
+        ),
+    )
+    template_safety_command = bounty_prep_command_row(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        subcommand="bounty-template-safety --no-write --strict --show-templates --show-files --top 8",
+        source="bounty-prep-package:bounty-template-safety",
+        artifact=BOUNTY_TEMPLATE_SAFETY_ARTIFACT,
+        reason="Review draft templates and official evidence paths before any operator fills evidence.",
+    )
+    status_command = bounty_prep_command_row(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        subcommand="evidence-prep-status --no-write --show-details --strict",
+        source="bounty-prep-package:evidence-prep-status",
+        artifact=EVIDENCE_PREP_STATUS_ARTIFACT,
+        reason="Recheck official evidence presence and validation status after the package is written.",
+    )
+    sync_command = bounty_prep_command_row(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        subcommand="bounty-prep-sync --no-write --strict --show-checks --top 8",
+        source="bounty-prep-package:bounty-prep-sync",
+        artifact=BOUNTY_PREP_SYNC_ARTIFACT,
+        reason="Confirm this prep package remains aligned with the current top bounty action.",
+    )
+    validation_commands = ordered_unique_strings(
+        [
+            str(primary.get("safe_offline_command") or ""),
+            *[
+                command
+                for packet in approval_packets
+                for command in normalize_string_list(
+                    auth_by_id.get(str(packet.get("authorization_request_id") or ""), {}).get(
+                        "after_evidence_validation_commands"
+                    )
+                )
+            ],
+            validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+        ]
+    )
+    command_rows = [template_command, template_safety_command, status_command, sync_command]
+    command_safety_refs = [
+        validation_command_ref(str(row.get("command") or ""), source=str(row.get("source") or "bounty-prep-package"))
+        for row in command_rows
+        if row.get("command")
+    ]
+    command_safety_refs.extend(
+        validation_command_ref(command, source="bounty-prep-package:after-evidence")
+        for command in validation_commands
+        if command
+    )
+    forbidden = ordered_unique_strings(
+        [
+            *normalize_string_list(primary_auth.get("forbidden_actions")),
+            "Do not treat this package or any template package as evidence.",
+            "Do not create official evidence sidecars from placeholders, synthetic fixtures, stale artifacts, or raw Burp history.",
+            "Do not report until lane readiness, finding-gate, and adjudication accept concrete approved evidence.",
+            "Do not send target traffic unless scope, approval, and resource gates are satisfied.",
+        ]
+    )
+    status = "ready-bounty-evidence-prep" if required_artifacts else "no-bounty-evidence-prep-actions"
+    return {
+        "schema": "inferforge-evidence-prep-package-v1",
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "assessment": {
+            "mode": "bounty-first",
+            "optimization_goal": "one valid Medium/High/Critical finding before broad coverage",
+            "objective_status": queue.get("status"),
+            "completion_unit": "valid-bounty-finding",
+        },
+        "top_unblocker": {
+            "validation_item_id": primary.get("gate_id") or primary.get("authorization_request_id") or primary.get("id"),
+            "lane": top_lane or None,
+            "actionability": primary.get("kind") or "collect-approved-evidence",
+            "evidence_package_id": f"bounty-{safe_probe_id(top_lane or 'evidence')}-evidence-package",
+            "package_status": "waiting-approved-official-evidence" if required_artifacts else "no-required-artifacts",
+            "oracle_type": top_lane or None,
+            "first_missing_artifact": first_missing,
+        },
+        "required_artifacts": required_artifacts,
+        "template_packages": [
+            {
+                "action_id": "bounty-evidence-templates",
+                "status": "template-only-not-evidence",
+                "kind": "draft-template-package",
+                "reason": "Use templates only as human/operator handoff aids; never as official evidence.",
+                "commands": [template_command, template_safety_command],
+            }
+        ],
+        "approval_packets": approval_packets[:8],
+        "command_plan": {
+            "objective_review": [status_command, sync_command],
+            "oracle_review": [],
+            "template_package_count": 1,
+            "commands": command_rows,
+            "after_evidence_validation_commands": validation_commands[:10],
+            "command_safety": command_safety_summary(command_safety_refs),
+        },
+        "active_validation_gate": {
+            "status": primary.get("kind"),
+            "reason": primary.get("next_step"),
+            "resource_status": "not-checked-by-bounty-prep-package",
+            "resource_budget_mode": "offline-only",
+        },
+        "forbidden_validation": forbidden,
+        "source_of_truth": (
+            "Generated from bounty-action-queue so the prep package follows the current highest-value bounty lane, "
+            "not stale iteration-decision focus."
+        ),
+        "reportability_rule": (
+            "This package is not evidence and is not a vulnerability report. It only names approved evidence that must be "
+            "provided before lane validation, finding-gate, and adjudication can promote a Medium+ finding."
+        ),
+        "next_step": primary.get("next_step") or "Refresh bounty-action-queue and rebuild the bounty prep package.",
+        "safety": (
+            "Offline evidence preparation package only. It sends no requests, calls no Burp tool, starts no browser, "
+            "creates no official evidence sidecars, signs no wallet, submits no transaction, and changes no infrastructure."
+        ),
+    }
+
+
 def bounty_brief_line(value: Any, *, max_chars: int = 360) -> str:
     text = inline_summary_text(value, max_chars=max_chars)
     return text.replace("\n", " ").strip()
@@ -28673,6 +28926,8 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT: "bounty-evidence-authorization",
     BOUNTY_EVIDENCE_INTAKE_ARTIFACT: "bounty-evidence-intake",
     BOUNTY_ACTION_QUEUE_ARTIFACT: "bounty-action-queue",
+    BOUNTY_PREP_SYNC_ARTIFACT: "bounty-prep-sync",
+    EVIDENCE_PREP_PACKAGE_ARTIFACT: "bounty-prep-package",
     BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT: "bounty-evidence-request",
     BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT: "bounty-evidence-templates",
     BOUNTY_TEMPLATE_SAFETY_ARTIFACT: "bounty-template-safety",
@@ -53864,6 +54119,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("bounty-evidence-authorization", "run_bounty_evidence_authorization"),
         refresh_expectation("bounty-evidence-intake", "run_bounty_evidence_intake"),
         refresh_expectation("bounty-action-queue", "run_bounty_action_queue"),
+        refresh_expectation("bounty-prep-package", "run_bounty_prep_package"),
         refresh_expectation("bounty-prep-sync", "run_bounty_prep_sync"),
         refresh_expectation("bounty-evidence-request", "run_bounty_evidence_request"),
         refresh_expectation("bounty-evidence-templates", "run_bounty_evidence_templates"),
@@ -79315,6 +79571,98 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_bounty_prep_package(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    queue = build_or_load_bounty_action_queue_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+        max_file_bytes=int(args.max_file_bytes),
+    )
+    authorization = build_or_load_bounty_evidence_authorization_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    package = build_bounty_prep_package(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_action_queue=queue,
+        bounty_evidence_authorization=authorization,
+        top=int(args.top),
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(package))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-prep-package",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    top_unblocker = package.get("top_unblocker") if isinstance(package.get("top_unblocker"), dict) else {}
+    command_plan = package.get("command_plan") if isinstance(package.get("command_plan"), dict) else {}
+    print(f"Bounty prep package: {package.get('status')}")
+    print(
+        "Package: "
+        f"lane={top_unblocker.get('lane') or '-'} "
+        f"action={top_unblocker.get('actionability') or '-'} "
+        f"first_missing={top_unblocker.get('first_missing_artifact') or '-'} "
+        f"required={len(package.get('required_artifacts', []) or [])} "
+        f"templates={command_plan.get('template_package_count', 0)} "
+        f"approval_packets={len(package.get('approval_packets', []) or [])}"
+    )
+    required = ", ".join(normalize_string_list(package.get("required_artifacts"))[:8])
+    if required:
+        print(f"Required evidence: {inline_summary_text(required, max_chars=420)}")
+    if getattr(args, "show_package", False):
+        print("Approval packets:")
+        for packet in (package.get("approval_packets", []) or [])[: max(0, int(args.top))]:
+            if not isinstance(packet, dict):
+                continue
+            print(
+                f"- {packet.get('id')}: lane={packet.get('lane')} status={packet.get('status')} "
+                f"needs={inline_summary_text(packet.get('required_artifacts'), max_chars=260)}"
+            )
+            question = packet.get("approval_question")
+            if question:
+                print(f"  question={inline_summary_text(question, max_chars=360)}")
+    if getattr(args, "show_commands", False):
+        print("Commands:")
+        for row in (command_plan.get("commands", []) or [])[: max(0, int(args.top))]:
+            if isinstance(row, dict) and row.get("command"):
+                print(f"- {inline_summary_text(row.get('command'), max_chars=460)}")
+        after = normalize_string_list(command_plan.get("after_evidence_validation_commands"))
+        if after:
+            print("After evidence:")
+            for command in after[: max(0, int(args.top))]:
+                print(f"- {inline_summary_text(command, max_chars=460)}")
+    print(f"Rule: {inline_summary_text(package.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(package.get('next_step'), max_chars=420)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and not package.get("required_artifacts"):
+        return 1
+    return 0
+
+
 def run_bounty_prep_sync(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -79415,7 +79763,7 @@ def run_bounty_prep_sync(args: argparse.Namespace) -> int:
     else:
         print(f"Wrote {output_path}")
         print_refreshed_manifests(refreshed_manifests)
-    if getattr(args, "strict", False) and sync.get("status") != "prep-sync-aligned-ready-for-validation":
+    if getattr(args, "strict", False) and str(sync.get("status") or "").startswith(("missing", "blocked")):
         return 1
     return 0
 
@@ -83309,6 +83657,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero when evidence intake redaction or format blockers must be fixed first.",
     )
     bounty_action_queue.set_defaults(func=run_bounty_action_queue)
+
+    bounty_prep_package = sub.add_parser(
+        "bounty-prep-package",
+        help="Write an evidence-prep package from the current top bounty action queue",
+    )
+    bounty_prep_package.add_argument(
+        "--output",
+        help=(
+            f"Where to write the bounty-aligned prep package. "
+            f"Defaults to --artifact-dir/{EVIDENCE_PREP_PACKAGE_ARTIFACT}."
+        ),
+    )
+    bounty_prep_package.add_argument(
+        "--top",
+        type=positive_int,
+        default=1,
+        help="Number of active bounty actions to include in the prep package.",
+    )
+    bounty_prep_package.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=262144,
+        help="Maximum bytes to read if evidence intake or action queue must be built. Defaults to 262144.",
+    )
+    bounty_prep_package.add_argument(
+        "--show-package",
+        action="store_true",
+        help="Print approval packets and required evidence for the generated package.",
+    )
+    bounty_prep_package.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print template, sync, and after-evidence validation commands.",
+    )
+    bounty_prep_package.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print bounty prep package only; do not write {EVIDENCE_PREP_PACKAGE_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    bounty_prep_package.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless the package names at least one required official evidence artifact.",
+    )
+    bounty_prep_package.set_defaults(func=run_bounty_prep_package)
 
     bounty_prep_sync = sub.add_parser(
         "bounty-prep-sync",
