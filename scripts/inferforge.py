@@ -23286,6 +23286,19 @@ def build_rpc_proxy_parity_review(
             detail="HTTP cluster path rejects unknown Solana clusters before proxying.",
         ),
         rpc_proxy_signal(
+            signal_id="http-host-derived-origin",
+            label="HTTP RPC derives an allowed origin from request Host and forwarded protocol",
+            present="const host = req.headers.get('host')" in http_source and "addOrigin(`${forwardedProto}://${host}`)" in http_source,
+            source_root=source_root,
+            path=http_path,
+            source=http_source,
+            tokens=["const host = req.headers.get('host')", "x-forwarded-proto", "addOrigin(`${forwardedProto}://${host}`)"],
+            detail=(
+                "HTTP allowed-origin calculation includes the request Host. This is safe only when the edge/runtime "
+                "canonicalizes Host or rejects untrusted Host values."
+            ),
+        ),
+        rpc_proxy_signal(
             signal_id="http-method-allowlist",
             label="HTTP RPC uses an allowlist and blocks transaction methods by default",
             present=all(token in http_source for token in ["DEFAULT_ALLOWED_METHODS", "BLOCKED_METHODS", "ALLOW_TRANSACTION_METHODS"]),
@@ -23369,6 +23382,19 @@ def build_rpc_proxy_parity_review(
             source=ws_source,
             tokens=["SOLANA_CLUSTERS", "getSolanaClusterFromPathname", "SOLANA_RPC_PATH_PREFIX"],
             detail="WebSocket upgrade routing only recognizes configured Solana clusters.",
+        ),
+        rpc_proxy_signal(
+            signal_id="ws-host-derived-origin",
+            label="WebSocket RPC derives an allowed origin from request Host and forwarded protocol",
+            present="const host = req.headers.host" in ws_source and "const origins = new Set(host ? [`${protocol}://${host}`] : [])" in ws_source,
+            source_root=source_root,
+            path=ws_path,
+            source=ws_source,
+            tokens=["const host = req.headers.host", "x-forwarded-proto", "const origins = new Set(host ? [`${protocol}://${host}`] : [])"],
+            detail=(
+                "WebSocket allowed-origin calculation includes the request Host. This needs deployment evidence that "
+                "the public edge does not accept arbitrary Host/origin pairings."
+            ),
         ),
         rpc_proxy_signal(
             signal_id="ws-method-allowlist",
@@ -23465,6 +23491,24 @@ def build_rpc_proxy_parity_review(
             reject_if=["Both HTTP and WebSocket paths reject disallowed origins and unknown clusters."],
         ),
         rpc_proxy_parity_check(
+            "host-derived-origin-trust-boundary",
+            "Origin allowlist includes request Host on HTTP and WebSocket RPC paths",
+            "review" if http_by_id["http-host-derived-origin"]["present"] or ws_by_id["ws-host-derived-origin"]["present"] else "passed",
+            severity="review",
+            http_signals=["http-host-derived-origin"],
+            ws_signals=["ws-host-derived-origin"],
+            evidence_refs=refs("http-host-derived-origin", "ws-host-derived-origin"),
+            promotion_gate=(
+                "Medium+ requires public-entry evidence that an attacker-controlled Host/Origin pair passes the edge "
+                "and reaches a credentialed RPC proxy with concrete provider, quota, billing, auth, or CORS impact."
+            ),
+            reject_if=[
+                "The deployment edge canonicalizes Host or rejects untrusted Host values before the app sees them.",
+                "Allowed origins are fixed by SOLANA_RPC_PROXY_ALLOWED_ORIGINS, NEXT_PUBLIC_APP_URL, VERCEL_URL, or equivalent edge policy.",
+                "The proxy can only be reached through canonical target hostnames from browsers.",
+            ],
+        ),
+        rpc_proxy_parity_check(
             "method-and-transaction-parity",
             "HTTP and WebSocket RPC both constrain dangerous methods before upstream proxying",
             "passed" if http_by_id["http-method-allowlist"]["present"] and ws_by_id["ws-method-allowlist"]["present"] else "missing-source-evidence",
@@ -23557,6 +23601,7 @@ def build_rpc_proxy_parity_review(
             "ws_signals": len(ws_signals),
             "skipped": len(skipped),
             "status_counts": dict(sorted(status_counts.items())),
+            "host_derived_origin_review": any(check.get("id") == "host-derived-origin-trust-boundary" and check.get("status") == "review" for check in checks),
             "header_forwarding_review": any(check.get("id") == "upstream-header-forwarding-parity" and check.get("status") == "review" for check in checks),
             "rate_connection_review": any(check.get("id") == "rate-and-connection-parity" and check.get("status") == "review" for check in checks),
         },
@@ -23592,11 +23637,12 @@ def build_rpc_proxy_parity_review(
         ],
         "finding_gate_ready": False,
         "finding_gate_boundary": (
-            "RPC proxy parity review is source-derived. Medium+ requires official operator/upstream evidence that a parity gap "
-            "creates concrete quota, billing, auth, logging, availability, or transaction-method impact."
+            "RPC proxy parity review is source-derived. Medium+ requires official edge/operator/upstream evidence that "
+            "a Host/origin trust issue or parity gap creates concrete quota, billing, auth, CORS, logging, availability, "
+            "or transaction-method impact."
         ),
         "next_step": (
-            "Collect operator/upstream evidence for WS forwarded headers and non-stress WS quota/connection impact, or close those lanes as non-impacting."
+            "Collect edge/operator/upstream evidence for Host canonicalization, WS forwarded headers, and non-stress WS quota/connection impact, or close those lanes as non-impacting."
             if review_checks
             else "No RPC proxy parity review blockers remain from local source."
         ),
@@ -72087,6 +72133,7 @@ def run_rpc_proxy_parity_review(args: argparse.Namespace) -> int:
     print(f"Statuses: {json.dumps(summary.get('status_counts', {}), sort_keys=True)}")
     print(
         "Review gates: "
+        f"host_origin={summary.get('host_derived_origin_review')} "
         f"header_forwarding={summary.get('header_forwarding_review')} "
         f"rate_connection={summary.get('rate_connection_review')}"
     )
