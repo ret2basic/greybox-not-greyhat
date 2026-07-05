@@ -15453,6 +15453,8 @@ def rewrite_response_observation_contracts(
                 "method": "GET",
                 "candidate_id": candidate_id,
                 "source_ref": candidate.get("source_ref"),
+                "client_path": candidate.get("client_path"),
+                "upstream_path": candidate.get("upstream_path"),
                 "path_sensitivity": candidate.get("sensitivity") or rewrite_path_candidate_sensitivity(local_path),
                 "reviewed_profile": reviewed_profile,
                 "commands": commands,
@@ -15720,14 +15722,18 @@ def rewrite_response_single_request_approval_packet(
     recommended = safe_options[0] if safe_options else {}
     recommended_path = str(recommended.get("path") or "")
     matching_contract = None
+    matching_item = None
     if recommended_path:
         for item in items:
             for contract in item.get("observation_contracts", []) or []:
                 if isinstance(contract, dict) and str(contract.get("path") or "") == recommended_path:
                     matching_contract = contract
+                    matching_item = item
                     break
             if matching_contract:
                 break
+            if recommended_path in {str(path) for path in item.get("approved_path_candidates", []) or []}:
+                matching_item = item
     contract_commands = (
         matching_contract.get("commands", [])
         if isinstance(matching_contract, dict) and isinstance(matching_contract.get("commands"), list)
@@ -15742,6 +15748,39 @@ def rewrite_response_single_request_approval_packet(
                     return command
         return None
 
+    def rewrite_source_context() -> dict[str, Any]:
+        if not isinstance(matching_item, dict):
+            return {}
+        rewrites = []
+        for rewrite in matching_item.get("rewrites", []) or []:
+            if not isinstance(rewrite, dict):
+                continue
+            rewrites.append(
+                {
+                    "source": rewrite.get("source"),
+                    "source_pattern": rewrite.get("source_pattern"),
+                    "destination_resolved": rewrite.get("destination_resolved"),
+                    "destination_template": rewrite.get("destination_template"),
+                    "phase": rewrite.get("phase"),
+                }
+            )
+            if len(rewrites) >= 3:
+                break
+        return {
+            "rewrite_review_id": matching_item.get("rewrite_review_id") or recommended.get("rewrite_review_id"),
+            "cluster_id": matching_item.get("cluster_id") or recommended.get("cluster_id"),
+            "rewrite_path": matching_item.get("path"),
+            "fixed_upstreams": normalize_string_list(matching_item.get("fixed_upstreams"))[:5],
+            "catch_all": bool(matching_item.get("catch_all")),
+            "source_refs": compact_source_refs(
+                [
+                    *normalize_string_list(matching_item.get("source_refs")),
+                    *([str(recommended.get("source_ref"))] if recommended.get("source_ref") else []),
+                ]
+            )[:8],
+            "rewrites": rewrites,
+        }
+
     status = "ready-offline-approval" if recommended_path else "waiting-for-reviewed-read-only-path"
     finding_gate_blockers = [
         "No approved redacted response observation is present yet.",
@@ -15755,10 +15794,15 @@ def rewrite_response_single_request_approval_packet(
         "recommended_request": {
             "method": str(recommended.get("method") or "GET") if recommended else None,
             "path": recommended_path or None,
+            "client_path": recommended.get("client_path") if recommended else None,
+            "upstream_path": recommended.get("upstream_path") if recommended else None,
+            "cluster_id": recommended.get("cluster_id") if recommended else None,
+            "rewrite_review_id": recommended.get("rewrite_review_id") if recommended else None,
             "source_ref": recommended.get("source_ref") if recommended else None,
             "source": recommended.get("source") if recommended else None,
             "sensitivity": recommended.get("sensitivity") if isinstance(recommended.get("sensitivity"), dict) else {},
         },
+        "source_context": rewrite_source_context(),
         "path_options_considered": len(safe_options),
         "sidecar_path": repo_relative_or_absolute(rewrite_response_sidecar_path(artifact_dir)),
         "redacted_sidecar_required_fields": [
@@ -15838,6 +15882,8 @@ def rewrite_response_sidecar_path_options(items: list[dict[str, Any]], *, limit:
         method: str = "GET",
         source_ref: Any = None,
         sensitivity: dict[str, Any] | None = None,
+        client_path: Any = None,
+        upstream_path: Any = None,
         source: str,
     ) -> None:
         if not is_safe_concrete_local_path(path):
@@ -15854,6 +15900,8 @@ def rewrite_response_sidecar_path_options(items: list[dict[str, Any]], *, limit:
                 "cluster_id": item.get("cluster_id"),
                 "rewrite_review_id": item.get("rewrite_review_id"),
                 "source_ref": source_ref,
+                "client_path": client_path,
+                "upstream_path": upstream_path,
                 "sensitivity": sensitivity or rewrite_path_candidate_sensitivity(path),
                 "source": source,
             }
@@ -15870,6 +15918,8 @@ def rewrite_response_sidecar_path_options(items: list[dict[str, Any]], *, limit:
                 method=str(contract.get("method") or "GET"),
                 path=str(contract.get("path") or ""),
                 source_ref=contract.get("source_ref"),
+                client_path=contract.get("client_path"),
+                upstream_path=contract.get("upstream_path"),
                 sensitivity=(
                     contract.get("path_sensitivity")
                     if isinstance(contract.get("path_sensitivity"), dict)
@@ -16176,6 +16226,10 @@ def build_rewrite_response_review(
                 "rewrite_review_id": rewrite_item.get("id"),
                 "cluster_id": cluster_id,
                 "path": rewrite_item.get("path"),
+                "fixed_upstreams": rewrite_item.get("fixed_upstreams", []) or [],
+                "catch_all": bool(rewrite_item.get("catch_all")),
+                "source_refs": rewrite_item.get("source_refs", []) or [],
+                "rewrites": rewrite_item.get("rewrites", []) or [],
                 "approved_path_candidates": sorted(approved_paths),
                 "observed_approved_response_count": len(approved_observations),
                 "candidate_impact_observation_count": len(candidate_impact_observations),
@@ -34833,6 +34887,10 @@ def finding_gate_preview_unblock_plan(
     profile: dict[str, Any] | None,
 ) -> dict[str, Any]:
     packet_type = str(preview.get("packet_type") or "").replace("_", "-")
+    assessment_policy = assessment_mode_policy(profile)
+    packet_context = preview.get("packet_context") if isinstance(preview.get("packet_context"), dict) else {}
+    assessment_rank = preview.get("assessment_rank") if isinstance(preview.get("assessment_rank"), dict) else {}
+    relative_focus = preview.get("relative_focus") if isinstance(preview.get("relative_focus"), dict) else {}
     common_subcommands = [
         "gate --no-write --show-items",
         "adjudicate --no-write",
@@ -34970,13 +35028,22 @@ def finding_gate_preview_unblock_plan(
             for subcommand in subcommands
         ]
     )
-    return {
+    plan = {
         "packet_type": packet_type or "unknown",
         "entrypoint": preview.get("entrypoint"),
         "kind": spec.get("kind") or "generic-finding-gate-evidence",
         "first_unblocker": spec.get("first_unblocker") or "Clear the listed finding-gate blockers with concrete evidence.",
         "evidence_artifacts": ordered_unique_strings(spec.get("evidence_artifacts", [])),
         "offline_commands": commands,
+        "assessment_context": {
+            "mode": assessment_policy.get("mode"),
+            "optimization_goal": assessment_policy.get("optimization_goal"),
+            "lead_selection_strategy": lead_dossier_ranking_strategy(assessment_policy),
+            "success_metric": assessment_policy.get("success_metric"),
+            "stop_condition": assessment_policy.get("stop_condition"),
+            "assessment_rank": assessment_rank,
+            "relative_focus": relative_focus,
+        },
         "reportability_boundary": (
             "Blocked previews are not findings. Only findings whose real gate item passes adjudication may enter findings.json."
         ),
@@ -34986,6 +35053,33 @@ def finding_gate_preview_unblock_plan(
             "No raw secrets, bearer tokens, cookies, private keys, raw account identifiers, or raw Burp history in sidecars.",
         ],
     }
+    if packet_context:
+        plan["approval_packet_context"] = packet_context
+    if packet_type == "rewrite-response":
+        recommended_request = (
+            packet_context.get("recommended_request")
+            if isinstance(packet_context.get("recommended_request"), dict)
+            else {}
+        )
+        source_context = (
+            packet_context.get("source_context")
+            if isinstance(packet_context.get("source_context"), dict)
+            else {}
+        )
+        plan["rewrite_response_context"] = {
+            "recommended_request": recommended_request,
+            "source_context": source_context,
+            "source_summary": packet_context.get("source_summary") if isinstance(packet_context.get("source_summary"), dict) else {},
+            "sidecar_path": packet_context.get("sidecar_path"),
+            "redacted_sidecar_required_fields": packet_context.get("redacted_sidecar_required_fields", []),
+            "path_options_considered": packet_context.get("path_options_considered"),
+            "approval_sequence": packet_context.get("approval_sequence", []),
+            "review_note": (
+                "Static source and path sensitivity only prioritize the next evidence step. "
+                "A valid finding still needs one approved redacted response observation with concrete impact."
+            ),
+        }
+    return plan
 
 
 def build_review_blockers(
@@ -35001,6 +35095,7 @@ def build_review_blockers(
     artifact_health: dict[str, Any] | None = None,
     finding_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    assessment_policy = assessment_mode_policy(profile)
     blockers: list[dict[str, Any]] = []
     seen: set[str] = set()
 
@@ -35192,6 +35287,9 @@ def build_review_blockers(
                 "packet_key": preview.get("packet_key"),
                 "packet_type": preview.get("packet_type"),
                 "packet_status": preview.get("packet_status"),
+                "packet_context": preview.get("packet_context", {}),
+                "assessment_rank": preview.get("assessment_rank", {}),
+                "relative_focus": preview.get("relative_focus", {}),
                 "validation_item_id": preview.get("validation_item_id"),
                 "blockers": blocker_strings,
                 "checks": preview.get("checks", []),
@@ -35318,10 +35416,14 @@ def build_review_blockers(
         "status": status,
         "target": target,
         "profile": profile_summary(profile),
+        "assessment_policy": assessment_policy,
         "artifact_dir": str(artifact_dir),
         "summary": {
             "blockers": len(blockers),
             "groups": len(groups),
+            "assessment_mode": assessment_policy.get("mode"),
+            "optimization_goal": assessment_policy.get("optimization_goal"),
+            "lead_selection_strategy": lead_dossier_ranking_strategy(assessment_policy),
             "status_counts": status_counts,
             "category_counts": category_counts,
             "group_status_counts": group_status_counts,
@@ -35361,6 +35463,7 @@ def build_review_blockers_rollup(
     check_dirs: list[Path],
     artifact_health: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    assessment_policy = assessment_mode_policy(profile)
     blockers: list[dict[str, Any]] = []
     runs = []
     missing = []
@@ -35449,6 +35552,7 @@ def build_review_blockers_rollup(
         "status": status,
         "target": target,
         "profile": profile_summary(profile),
+        "assessment_policy": assessment_policy,
         "artifact_dir": str(artifact_dir),
         "mode": "rollup",
         "summary": {
@@ -35456,6 +35560,9 @@ def build_review_blockers_rollup(
             "groups": len(groups),
             "runs": len(runs),
             "missing_review_blockers": missing,
+            "assessment_mode": assessment_policy.get("mode"),
+            "optimization_goal": assessment_policy.get("optimization_goal"),
+            "lead_selection_strategy": lead_dossier_ranking_strategy(assessment_policy),
             "status_counts": status_counts,
             "category_counts": category_counts,
             "group_status_counts": group_status_counts,
@@ -36030,6 +36137,9 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             "passed": (
                 gate_blockers.get("status") == "needs-human-review"
                 and gate_blockers.get("summary", {}).get("blocked_gate_previews") == 1
+                and gate_blockers.get("summary", {}).get("assessment_mode") == "greybox"
+                and gate_blockers.get("summary", {}).get("optimization_goal")
+                == "maximize-dangerous-surface-coverage"
                 and gate_blocker_group.get("priority") == "high"
                 and "POST /api/quote" in str(gate_blocker_group.get("title") or "")
                 and "approved quote transaction payload sidecar" in str(gate_blocker_group.get("next_action") or "")
@@ -36054,6 +36164,7 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             "passed": (
                 no_write_return_code == 0
                 and "Review blockers: needs-human-review" in no_write_stdout
+                and "Optimization: mode=greybox goal=maximize-dangerous-surface-coverage" in no_write_stdout
                 and "command_safety=commands=2" in no_write_stdout
                 and "command_templates:" in no_write_stdout
                 and "[manual-template]" in no_write_stdout
@@ -36071,6 +36182,20 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "return_code": no_write_return_code,
                 "stdout": no_write_stdout.splitlines(),
                 "outputs_exist": no_write_outputs_exist,
+            },
+        },
+        {
+            "id": "markdown-renders-assessment-optimization",
+            "passed": (
+                "Assessment mode: `greybox`" in markdown
+                and "Optimization goal: `maximize-dangerous-surface-coverage`" in markdown
+                and "Lead selection: `greybox-coverage-first`" in markdown
+            ),
+            "expected": "review-blockers markdown records whether the run is coverage-first or bounty-first",
+            "actual": {
+                "assessment_mode": "Assessment mode: `greybox`" in markdown,
+                "optimization_goal": "Optimization goal: `maximize-dangerous-surface-coverage`" in markdown,
+                "lead_selection": "Lead selection: `greybox-coverage-first`" in markdown,
             },
         },
         {
@@ -36150,6 +36275,11 @@ def markdown_text(value: Any) -> str:
 
 def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) -> None:
     summary = review_blockers.get("summary", {}) or {}
+    assessment_policy = (
+        review_blockers.get("assessment_policy")
+        if isinstance(review_blockers.get("assessment_policy"), dict)
+        else {}
+    )
     groups = review_blockers.get("groups", []) or []
     blockers = review_blockers.get("blockers", []) or []
     status_counts = summary.get("status_counts", {}) or {}
@@ -36231,6 +36361,9 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
         f"- Blockers: `{summary.get('blockers', 0)}`",
         f"- Blocker groups: `{summary.get('groups', len(groups))}`",
         f"- Mode: `{review_blockers.get('mode', 'single')}`",
+        f"- Assessment mode: `{assessment_policy.get('mode') or summary.get('assessment_mode') or '-'}`",
+        f"- Optimization goal: `{assessment_policy.get('optimization_goal') or summary.get('optimization_goal') or '-'}`",
+        f"- Lead selection: `{summary.get('lead_selection_strategy') or '-'}`",
         f"- Status counts: `{json.dumps(status_counts, sort_keys=True)}`",
         f"- Category counts: `{json.dumps(category_counts, sort_keys=True)}`",
         f"- Group status counts: `{json.dumps(group_status_counts, sort_keys=True)}`",
@@ -41736,6 +41869,21 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
         finding_gate_text = json.dumps(finding_gate, sort_keys=True)
         blocked_preview_gate_text = json.dumps(blocked_preview_gate, sort_keys=True)
         blocked_preview_adjudication_text = json.dumps(blocked_preview_adjudication, sort_keys=True)
+        blocked_preview_context = (
+            blocked_preview_item.get("packet_context")
+            if isinstance(blocked_preview_item, dict) and isinstance(blocked_preview_item.get("packet_context"), dict)
+            else {}
+        )
+        blocked_preview_request = (
+            blocked_preview_context.get("recommended_request")
+            if isinstance(blocked_preview_context.get("recommended_request"), dict)
+            else {}
+        )
+        blocked_preview_source_context = (
+            blocked_preview_context.get("source_context")
+            if isinstance(blocked_preview_context.get("source_context"), dict)
+            else {}
+        )
         followup_command_text = "\n".join(str(command) for command in review.get("followup_commands", []) or [])
         closure_command_text = "\n".join(
             str(command.get("command") or command)
@@ -42002,6 +42150,32 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             "actual": {
                 "blocked_preview": blocked_preview_item,
                 "summary": blocked_preview_gate.get("summary"),
+            },
+        },
+        {
+            "id": "finding-gate-blocked-preview-preserves-rewrite-approval-context",
+            "passed": (
+                blocked_preview_request.get("path") == approved_path
+                and blocked_preview_request.get("method") == "GET"
+                and blocked_preview_request.get("source_ref") == "src/store.ts:2"
+                and blocked_preview_request.get("client_path") == "/vault/balance"
+                and blocked_preview_request.get("upstream_path") == "/vault/balance"
+                and (blocked_preview_request.get("sensitivity") or {}).get("priority") == "high"
+                and blocked_preview_context.get("sidecar_path")
+                == repo_relative_or_absolute(rewrite_response_sidecar_path(root / "no-history-artifacts"))
+                and blocked_preview_context.get("path_options_considered") == 1
+                and "https://upstream.example" in (blocked_preview_source_context.get("fixed_upstreams") or [])
+                and blocked_preview_source_context.get("catch_all") is True
+                and "src/store.ts:2" in (blocked_preview_source_context.get("source_refs") or [])
+                and any(
+                    "impact_indicators" in str(item)
+                    for item in blocked_preview_context.get("redacted_sidecar_required_fields", []) or []
+                )
+            ),
+            "expected": "blocked rewrite-response finding-gate previews keep the source-derived request, upstream, sensitivity, and sidecar evidence context",
+            "actual": {
+                "packet_context": blocked_preview_context,
+                "source_context": blocked_preview_source_context,
             },
         },
         {
@@ -45275,6 +45449,63 @@ def approval_packet_finding_gate_entrypoint(packet: dict[str, Any]) -> str:
     return str(packet.get("entrypoint") or "-")
 
 
+def approval_packet_preview_context(packet_type: str, packet: dict[str, Any]) -> dict[str, Any]:
+    context: dict[str, Any] = {}
+    for key in ["recommended_request", "recommended_quote", "recommended_evidence"]:
+        value = packet.get(key)
+        if isinstance(value, dict) and value:
+            context[key] = json_clone(value)
+
+    for key in [
+        "sidecar_path",
+        "path_options_considered",
+        "redacted_sidecar_required_fields",
+        "source_context",
+    ]:
+        value = packet.get(key)
+        if isinstance(value, dict):
+            context[key] = json_clone(value)
+        elif isinstance(value, list):
+            context[key] = json_clone(value[:12])
+        elif value is not None and value != "":
+            context[key] = value
+
+    sequence = []
+    for row in packet.get("approval_sequence", []) or []:
+        if not isinstance(row, dict):
+            continue
+        sequence.append(
+            {
+                "id": row.get("id"),
+                "status": row.get("status"),
+                "command": row.get("command"),
+            }
+        )
+        if len(sequence) >= 6:
+            break
+    if sequence:
+        context["approval_sequence"] = sequence
+
+    if packet_type == "rewrite-response" and context.get("recommended_request"):
+        request = context["recommended_request"]
+        if isinstance(request, dict):
+            context["source_summary"] = {
+                "source_ref": request.get("source_ref"),
+                "path_sensitivity": request.get("sensitivity"),
+                "fixed_upstreams": (
+                    (context.get("source_context") or {}).get("fixed_upstreams")
+                    if isinstance(context.get("source_context"), dict)
+                    else []
+                ),
+                "catch_all": (
+                    (context.get("source_context") or {}).get("catch_all")
+                    if isinstance(context.get("source_context"), dict)
+                    else None
+                ),
+            }
+    return context
+
+
 def validation_plan_blocked_finding_gate_previews(
     validation_plan: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
@@ -45294,6 +45525,9 @@ def validation_plan_blocked_finding_gate_previews(
                 blocker_count_int = len(blockers)
             if blocker_count_int <= 0 and not blockers:
                 continue
+            packet_context = approval_packet_preview_context(packet_type, packet)
+            assessment_rank = item.get("assessment_rank") if isinstance(item.get("assessment_rank"), dict) else {}
+            relative_focus = item.get("relative_focus") if isinstance(item.get("relative_focus"), dict) else {}
             previews.append(
                 {
                     "suspicion_id": f"BLOCKED-{safe_probe_id(item_id)}-{safe_probe_id(packet_type)}",
@@ -45305,6 +45539,9 @@ def validation_plan_blocked_finding_gate_previews(
                     "packet_key": packet_key,
                     "packet_type": packet_type,
                     "packet_status": packet.get("status"),
+                    "packet_context": packet_context,
+                    "assessment_rank": assessment_rank,
+                    "relative_focus": relative_focus,
                     "title": "Approval packet is not ready for finding-gate review",
                     "checks": [
                         {
@@ -55448,6 +55685,19 @@ def run_review_blockers(args: argparse.Namespace) -> int:
         f"{review_blockers['summary']['blockers']} total, "
         f"status_counts={json.dumps(review_blockers['summary']['status_counts'], sort_keys=True)}"
     )
+    assessment_policy = (
+        review_blockers.get("assessment_policy")
+        if isinstance(review_blockers.get("assessment_policy"), dict)
+        else {}
+    )
+    if assessment_policy:
+        print(
+            "Optimization: "
+            f"mode={assessment_policy.get('mode') or '-'} "
+            f"goal={assessment_policy.get('optimization_goal') or '-'} "
+            f"selection={review_blockers['summary'].get('lead_selection_strategy') or '-'} "
+            f"success={inline_summary_text(assessment_policy.get('success_metric'), max_chars=180)}"
+        )
     if review_blockers.get("mode") == "rollup":
         print(
             "Runs: "
