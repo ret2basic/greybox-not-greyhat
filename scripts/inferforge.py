@@ -13250,6 +13250,11 @@ def rewrite_response_review_observation(
     if sensitivity.get("priority") == "high" and sample.strip():
         impact_indicators.append("high-sensitivity-path-nonempty-response")
     candidate_impact = bool(successful and approved_path and (field_markers or secret_pattern_seen))
+    impact_precheck_indicators = []
+    if successful and approved_path and sample.strip() and sensitivity.get("priority") in {"critical", "high"}:
+        impact_precheck_indicators.append("approved-high-sensitivity-path-nonempty-response")
+    impact_precheck = bool(impact_precheck_indicators)
+    manual_impact_review_hint = bool(impact_precheck and not candidate_impact)
     if candidate_impact:
         review_status = "candidate-impact-evidence"
     elif successful and approved_path:
@@ -13274,6 +13279,14 @@ def rewrite_response_review_observation(
         "json_field_paths": json_fields,
         "sensitive_field_markers": field_markers,
         "impact_indicators": impact_indicators,
+        "impact_precheck": impact_precheck,
+        "impact_precheck_indicators": impact_precheck_indicators,
+        "manual_impact_review_hint": manual_impact_review_hint,
+        "precheck_gate": (
+            "Manual review hint only. Do not enter finding-gate unless the response is tied to concrete sensitive-data, auth, path-confusion, or equivalent impact."
+            if impact_precheck
+            else "not-triggered"
+        ),
         "candidate_impact": candidate_impact,
         "evidence_ref": {
             "artifact": "burp-history-observations.jsonl",
@@ -13323,6 +13336,10 @@ def build_rewrite_response_review(
             )
         approved_observations = [row for row in observations if row.get("approved_path")]
         candidate_impact_observations = [row for row in observations if row.get("candidate_impact")]
+        impact_precheck_observations = [row for row in observations if row.get("impact_precheck")]
+        manual_impact_review_hint_observations = [
+            row for row in observations if row.get("manual_impact_review_hint")
+        ]
         promotion_preview_commands = rewrite_review_promotion_preview_commands(
             artifact_dir=artifact_dir,
             profile=profile,
@@ -13347,6 +13364,8 @@ def build_rewrite_response_review(
         next_step = (
             "Run gate --no-write --show-items, then adjudicate/evidence-chain only after manual review confirms authorization bypass, sensitive data exposure, path confusion, or equivalent concrete impact."
             if candidate_impact_observations
+            else "Review the approved high-sensitivity response shape manually; this precheck is not finding-gate evidence without concrete impact."
+            if manual_impact_review_hint_observations
             else "Run exactly one no-write promotion preview for an approved read-only path, then decide whether a single observed response is justified."
             if not approved_observations and promotion_preview_commands
             else "Observe exactly one approved read-only path after scope and resource gates; do not enumerate catch-all paths."
@@ -13372,6 +13391,8 @@ def build_rewrite_response_review(
                 "approved_path_candidates": sorted(approved_paths),
                 "observed_approved_response_count": len(approved_observations),
                 "candidate_impact_observation_count": len(candidate_impact_observations),
+                "impact_precheck_observation_count": len(impact_precheck_observations),
+                "manual_impact_review_hint_count": len(manual_impact_review_hint_observations),
                 "unapproved_observation_count": len(observations) - len(approved_observations),
                 "observations": observations[:10],
                 "observation_contracts": observation_contracts,
@@ -13383,12 +13404,16 @@ def build_rewrite_response_review(
     status_counts: dict[str, int] = {}
     approved_count = 0
     candidate_impact_count = 0
+    impact_precheck_count = 0
+    manual_impact_review_hint_count = 0
     observation_contract_count = 0
     followup_commands = []
     for item in items:
         increment_count(status_counts, str(item.get("status") or "unknown"))
         approved_count += int(item.get("observed_approved_response_count") or 0)
         candidate_impact_count += int(item.get("candidate_impact_observation_count") or 0)
+        impact_precheck_count += int(item.get("impact_precheck_observation_count") or 0)
+        manual_impact_review_hint_count += int(item.get("manual_impact_review_hint_count") or 0)
         observation_contract_count += len(item.get("observation_contracts", []) or [])
         followup_commands.extend(
             str(command)
@@ -13415,6 +13440,8 @@ def build_rewrite_response_review(
             "burp_observations": len(burp_history),
             "observed_approved_responses": approved_count,
             "candidate_impact_observations": candidate_impact_count,
+            "impact_precheck_observations": impact_precheck_count,
+            "manual_impact_review_hints": manual_impact_review_hint_count,
             "observation_contracts": observation_contract_count,
             "followup_commands": len(ordered_unique_strings(followup_commands)),
             "endpoint_clusters_source": endpoint_clusters_source,
@@ -35377,6 +35404,68 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             if isinstance(item, dict)
         ]
         no_history_contract_text = json.dumps(no_history_contracts, sort_keys=True)
+        precheck_artifact_dir = root / "precheck-artifacts"
+        append_jsonl(
+            precheck_artifact_dir / "burp-history-observations.jsonl",
+            [
+                {
+                    "method": "GET",
+                    "path": approved_path,
+                    "status": 200,
+                    "content_type": "application/json",
+                    "response_sample": json.dumps(
+                        {
+                            "status": "ok",
+                            "summary": {
+                                "available": True,
+                                "updatedAt": "2026-07-05T00:00:00Z",
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                },
+                {
+                    "method": "GET",
+                    "path": unapproved_path,
+                    "status": 200,
+                    "content_type": "application/json",
+                    "response_sample": json.dumps(
+                        {
+                            "status": "ok",
+                            "summary": {
+                                "available": True,
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                },
+            ],
+        )
+        precheck_review = build_rewrite_response_review(
+            target=target,
+            profile=profile,
+            artifact_dir=precheck_artifact_dir,
+        )
+        precheck_response_item = (
+            (precheck_review.get("items") or [{}])[0]
+            if precheck_review.get("items")
+            else {}
+        )
+        precheck_observations = [
+            item for item in precheck_response_item.get("observations", []) or [] if isinstance(item, dict)
+        ]
+        precheck_approved_observations = [
+            item for item in precheck_observations if item.get("approved_path")
+        ]
+        precheck_unapproved_observations = [
+            item for item in precheck_observations if not item.get("approved_path")
+        ]
+        precheck_finding_gate = build_finding_gate([], [], None, precheck_review)
+        precheck_rewrite_gate_items = [
+            item
+            for item in precheck_finding_gate.get("gates", []) or []
+            if item.get("classification") == "candidate-fixed-upstream-proxy-confusion-impact"
+        ]
         append_jsonl(
             artifact_dir / "burp-history-observations.jsonl",
             [
@@ -35545,6 +35634,32 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "approved-high-sensitivity-response-precheck-is-not-gate-evidence",
+            "passed": (
+                precheck_review.get("status") == "approved-response-observed"
+                and precheck_response_item.get("status") == "approved-response-observed"
+                and (precheck_review.get("summary") or {}).get("observed_approved_responses") == 1
+                and (precheck_review.get("summary") or {}).get("candidate_impact_observations") == 0
+                and (precheck_review.get("summary") or {}).get("impact_precheck_observations") == 1
+                and (precheck_review.get("summary") or {}).get("manual_impact_review_hints") == 1
+                and precheck_response_item.get("impact_precheck_observation_count") == 1
+                and precheck_response_item.get("manual_impact_review_hint_count") == 1
+                and len(precheck_approved_observations) == 1
+                and precheck_approved_observations[0].get("impact_precheck") is True
+                and precheck_approved_observations[0].get("manual_impact_review_hint") is True
+                and precheck_approved_observations[0].get("candidate_impact") is False
+                and all(not item.get("impact_precheck") for item in precheck_unapproved_observations)
+                and not precheck_rewrite_gate_items
+            ),
+            "expected": "approved high-sensitivity nonempty responses create a manual precheck hint but no finding-gate item without concrete impact indicators",
+            "actual": {
+                "review_status": precheck_review.get("status"),
+                "summary": precheck_review.get("summary"),
+                "item": precheck_response_item,
+                "gate_items": precheck_rewrite_gate_items,
+            },
+        },
+        {
             "id": "unapproved-sensitive-response-does-not-count-as-candidate-impact",
             "passed": (
                 response_item.get("unapproved_observation_count") == 1
@@ -35659,10 +35774,13 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             "finding_gate_items": len(finding_gate.get("gates", []) or []),
             "followup_commands": (review.get("summary") or {}).get("followup_commands"),
             "missing_response_followup_commands": (no_history_review.get("summary") or {}).get("followup_commands"),
+            "precheck_hints": (precheck_review.get("summary") or {}).get("manual_impact_review_hints"),
             "gate_no_write_return_code": gate_return_code,
         },
         "cases": {
             "no_history_rewrite_response_review": no_history_review,
+            "precheck_rewrite_response_review": precheck_review,
+            "precheck_finding_gate": precheck_finding_gate,
             "rewrite_review": rewrite_review,
             "rewrite_response_review": review,
             "rewrite_evidence_closure": closure,
@@ -38552,6 +38670,7 @@ def rewrite_response_review_gate_observation_summary(observation: dict[str, Any]
         "response_status": response.get("status"),
         "content_type": response.get("content_type"),
         "impact_indicators": observation.get("impact_indicators", []) or [],
+        "impact_precheck_indicators": observation.get("impact_precheck_indicators", []) or [],
         "sensitive_field_markers": observation.get("sensitive_field_markers", []) or [],
         "evidence_ref": observation.get("evidence_ref"),
     }
@@ -50408,6 +50527,8 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
         f"burp_observations={summary.get('burp_observations', 0)} "
         f"approved={summary.get('observed_approved_responses', 0)} "
         f"candidate_impact={summary.get('candidate_impact_observations', 0)} "
+        f"precheck={summary.get('impact_precheck_observations', 0)} "
+        f"hints={summary.get('manual_impact_review_hints', 0)} "
         f"contracts={summary.get('observation_contracts', 0)} "
         f"statuses={json.dumps(summary.get('status_counts', {}), sort_keys=True)}"
     )
@@ -50415,7 +50536,9 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
         print(
             f"- {item.get('priority')} {item.get('status')} "
             f"path={item.get('path') or '-'} approved={item.get('observed_approved_response_count', 0)} "
-            f"candidate_impact={item.get('candidate_impact_observation_count', 0)}"
+            f"candidate_impact={item.get('candidate_impact_observation_count', 0)} "
+            f"precheck={item.get('impact_precheck_observation_count', 0)} "
+            f"hints={item.get('manual_impact_review_hint_count', 0)}"
         )
         if args.show_observations:
             for observation in (item.get("observations", []) or [])[:3]:
@@ -50424,6 +50547,8 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
                     f"{observation.get('method')} {observation.get('path')} "
                     f"status={((observation.get('response') or {}).get('status'))} "
                     f"approved={observation.get('approved_path')} "
+                    f"precheck={observation.get('impact_precheck')} "
+                    f"hint={observation.get('manual_impact_review_hint')} "
                     f"indicators={','.join(observation.get('impact_indicators', []) or []) or '-'}"
                 )
                 markers = observation.get("sensitive_field_markers", []) or []
