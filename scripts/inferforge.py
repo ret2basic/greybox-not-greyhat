@@ -21999,6 +21999,48 @@ def build_transaction_payload_shape_guidance(
     }
 
 
+def empty_transaction_candidate_placeholder_summary(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    candidates = value.get("candidates")
+    if candidates not in ([], None):
+        return None
+    try:
+        candidate_count = int(value.get("candidate_count") or 0)
+    except (TypeError, ValueError):
+        return None
+    try:
+        quote_response_count = int(value.get("quote_response_count") or 0)
+    except (TypeError, ValueError):
+        return None
+    if candidate_count != 0 or quote_response_count != 0:
+        return None
+    source = str(value.get("source") or "").strip() or "unknown"
+    return {
+        "kind": "empty-transaction-candidate-placeholder",
+        "source": source,
+        "quote_response_count": quote_response_count,
+        "candidate_count": candidate_count,
+        "note": (
+            "This file records that no quote transaction candidates have been imported yet; "
+            "it is not an approved payload sidecar."
+        ),
+    }
+
+
+def transaction_sidecar_placeholder_summary(path: Path, max_input_bytes: int) -> dict[str, Any] | None:
+    if path.name != "burp-transaction-candidates.json":
+        return None
+    if transaction_candidate_input_skip_reason(path, max_input_bytes):
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        parsed = json.loads(text) if text.strip() else None
+    except (OSError, json.JSONDecodeError):
+        return None
+    return empty_transaction_candidate_placeholder_summary(parsed)
+
+
 def transaction_sidecar_file_status(path: Path, max_input_bytes: int) -> dict[str, Any]:
     rel = repo_relative_or_absolute(path)
     if not path.exists():
@@ -22022,13 +22064,18 @@ def transaction_sidecar_file_status(path: Path, max_input_bytes: int) -> dict[st
             "status": "stat-failed",
             "error": redacted_error_summary(error),
         }
-    return {
+    status = {
         "path": rel,
         "name": path.name,
         "status": "present" if size <= max_input_bytes else "too-large",
         "bytes": size,
         "max_input_bytes": max_input_bytes,
     }
+    placeholder = transaction_sidecar_placeholder_summary(path, max_input_bytes)
+    if placeholder:
+        status["status_detail"] = placeholder.get("kind")
+        status["placeholder"] = placeholder
+    return status
 
 
 def transaction_candidate_review_summary(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -22094,6 +22141,7 @@ def build_transaction_sidecar_review(
     )
     present_payload_files = [row for row in payload_files if row.get("status") == "present"]
     oversized_payload_files = [row for row in payload_files if row.get("status") == "too-large"]
+    placeholder_payload_files = [row for row in present_payload_files if row.get("placeholder")]
     candidate_sources = sorted({str(candidate.get("source") or "") for candidate in candidates})
 
     policy_path = artifact_dir / "transaction-intent-policy.json"
@@ -22181,6 +22229,18 @@ def build_transaction_sidecar_review(
             "evidence": [row.get("name") for row in present_payload_files],
         },
         {
+            "id": "payload-sidecar-not-empty-placeholder",
+            "status": "passed" if not placeholder_payload_files or candidates else "waiting",
+            "evidence": [
+                {
+                    "name": row.get("name"),
+                    "detail": row.get("status_detail"),
+                    "note": (row.get("placeholder") or {}).get("note"),
+                }
+                for row in placeholder_payload_files
+            ],
+        },
+        {
             "id": "payload-candidates-present",
             "status": "passed" if candidates else "waiting",
             "evidence": len(candidates),
@@ -22240,6 +22300,11 @@ def build_transaction_sidecar_review(
             "The sidecar has transaction-shaped payload fields outside the configured extraction paths. "
             "Review payload_shape_review.files[].records and update quote_response.transaction_candidate_paths if appropriate."
         )
+    elif placeholder_payload_files:
+        next_step = (
+            "Replace the empty burp-transaction-candidates.json placeholder with one approved quote response body "
+            "or extracted transaction payload sidecar."
+        )
     elif present_payload_files:
         next_step = (
             "Fix the payload sidecar shape; no base64 transaction candidates were extracted. "
@@ -22264,6 +22329,7 @@ def build_transaction_sidecar_review(
         "summary": {
             "payload_files_present": len(present_payload_files),
             "payload_files_oversized": len(oversized_payload_files),
+            "placeholder_payload_files": len(placeholder_payload_files),
             "candidate_bearing_payload_files": len(candidate_sources),
             "candidate_count": len(candidates),
             "intent_policy_configured": bool(policy.get("configured")),
@@ -36884,12 +36950,14 @@ def inspect_transaction_payload_shape_text(text: str, *, source: str, candidate_
     records: list[dict[str, Any]] = []
     configured_hits = 0
     parsed_json = False
+    placeholder = None
     try:
         parsed = json.loads(text) if text.strip() else None
     except json.JSONDecodeError:
         parsed = None
     if parsed is not None:
         parsed_json = True
+        placeholder = empty_transaction_candidate_placeholder_summary(parsed)
         for candidate_path in candidate_paths:
             configured_hits += sum(
                 1
@@ -36903,11 +36971,16 @@ def inspect_transaction_payload_shape_text(text: str, *, source: str, candidate_
         increment_count(kind_counts, str(record.get("kind") or "unknown"))
     return {
         "source": source,
-        "status": payload_shape_status(records, parsed_json=parsed_json, base64_regex_hits=base64_regex_hits),
+        "status": (
+            str(placeholder.get("kind"))
+            if placeholder
+            else payload_shape_status(records, parsed_json=parsed_json, base64_regex_hits=base64_regex_hits)
+        ),
         "parsed_json": parsed_json,
         "configured_candidate_path_hits": configured_hits,
         "base64_regex_hits": base64_regex_hits,
         "kind_counts": dict(sorted(kind_counts.items())),
+        "placeholder": placeholder,
         "records": records[:12],
     }
 
@@ -38485,13 +38558,39 @@ def build_transaction_decoder_selftest(
         if isinstance(sidecar_empty_review.get("payload_shape_guidance"), dict)
         else {}
     )
+    sidecar_empty_shape_review = (
+        sidecar_empty_review.get("payload_shape_review")
+        if isinstance(sidecar_empty_review.get("payload_shape_review"), dict)
+        else {}
+    )
+    sidecar_empty_file_statuses = {
+        item.get("name"): item
+        for item in sidecar_empty_review.get("payload_sidecars", []) or []
+        if isinstance(item, dict)
+    }
+    sidecar_empty_shape_files = {
+        item.get("source"): item
+        for item in sidecar_empty_shape_review.get("files", []) or []
+        if isinstance(item, dict)
+    }
     sidecar_empty_passed = (
         sidecar_empty_review.get("status") == "payload-sidecar-no-candidates"
+        and sidecar_empty_review.get("summary", {}).get("placeholder_payload_files") == 1
         and sidecar_empty_guidance.get("configured_candidate_paths") == quote_response_candidate_paths(profile)
         and len(sidecar_empty_guidance.get("examples", []) or []) >= 3
         and "empty burp-transaction-candidates.json" in str(sidecar_empty_guidance.get("empty_burp_candidate_note", ""))
+        and (
+            sidecar_empty_file_statuses.get("burp-transaction-candidates.json", {}).get("status_detail")
+            == "empty-transaction-candidate-placeholder"
+        )
+        and (
+            sidecar_empty_shape_files.get("burp-transaction-candidates.json", {}).get("status")
+            == "empty-transaction-candidate-placeholder"
+        )
         and methodology_check_statuses(sidecar_empty_review).get("payload-sidecar-present") == "passed"
+        and methodology_check_statuses(sidecar_empty_review).get("payload-sidecar-not-empty-placeholder") == "waiting"
         and methodology_check_statuses(sidecar_empty_review).get("payload-sidecar-candidate-bearing") == "waiting"
+        and "Replace the empty burp-transaction-candidates.json placeholder" in str(sidecar_empty_review.get("next_step") or "")
     )
     sidecar_evm_shape_review = (
         sidecar_evm_review.get("payload_shape_review")
@@ -51192,6 +51291,7 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
         "Sidecars: "
         f"payload_files={summary.get('payload_files_present', 0)} "
         f"oversized={summary.get('payload_files_oversized', 0)} "
+        f"placeholders={summary.get('placeholder_payload_files', 0)} "
         f"candidates={summary.get('candidate_count', 0)} "
         f"shape={summary.get('payload_shape_status') or 'unknown'} "
         f"contract={summary.get('payload_contract_status') or 'unknown'} "
@@ -51219,7 +51319,8 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
         for item in review.get("payload_sidecars", []) or []:
             print(
                 f"- {item.get('status')} {item.get('name')} "
-                f"bytes={item.get('bytes', '-')}"
+                f"bytes={item.get('bytes', '-')} "
+                f"detail={item.get('status_detail') or '-'}"
             )
     if args.show_candidates:
         print("Candidates:")
@@ -51303,6 +51404,9 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
                 f"- {file_row.get('source')} status={file_row.get('status')} "
                 f"configured_hits={file_row.get('configured_candidate_path_hits', 0)}"
             )
+            placeholder = file_row.get("placeholder") if isinstance(file_row.get("placeholder"), dict) else {}
+            if placeholder:
+                print(f"  placeholder={inline_summary_text(placeholder.get('note'), max_chars=220)}")
             for record in (file_row.get("records", []) or [])[:2]:
                 if not isinstance(record, dict):
                     continue
