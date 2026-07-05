@@ -9019,6 +9019,54 @@ def harness_stage(
     }
 
 
+def current_evidence_gaps_for_artifact_dir(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    artifact = load_optional_json(artifact_dir / "evidence-gaps.json") or {}
+    profile_doc = profile if isinstance(profile, dict) else load_optional_json(artifact_dir / TARGET_PROFILE_ARTIFACT) or {}
+    if not isinstance(profile_doc, dict) or not profile_doc or is_blackbox_profile_like(profile_doc):
+        return artifact
+    source_root = resolve_repo_path(profile_doc.get("default_source_root") or DEFAULT_SOURCE_ROOT)
+    if not source_root.exists():
+        return artifact
+    clusters = load_optional_json(artifact_dir / "endpoint-clusters.json") or build_clusters(profile_doc, source_root)
+    results = load_jsonl(artifact_dir / "probe-results.jsonl")
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {"candidates_seen": 0}
+    rpc_method_policy = load_optional_json(artifact_dir / "rpc-method-policy.json") or build_rpc_method_policy(
+        source_root,
+        results,
+        profile=profile_doc,
+    )
+    deployment_review = load_optional_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT) or build_deployment_resource_review(
+        source_root,
+        profile_doc,
+    )
+    rewrite_response_review = load_optional_json(
+        artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT
+    ) or build_rewrite_response_review(
+        target=target,
+        profile=profile_doc,
+        artifact_dir=artifact_dir,
+    )
+    return build_evidence_gaps(
+        clusters,
+        results,
+        burp_history,
+        transaction_intent,
+        rpc_method_policy,
+        load_optional_json(artifact_dir / "orca-baseline.json"),
+        load_optional_json(artifact_dir / "quote-collection.json"),
+        load_optional_json(artifact_dir / "source-peek-results.json"),
+        profile=profile_doc,
+        deployment_review=deployment_review,
+        rewrite_response_review=rewrite_response_review,
+    )
+
+
 def build_harness_loop_run(
     *,
     target: str,
@@ -9039,7 +9087,7 @@ def build_harness_loop_run(
     finding_gate = load_optional_json(artifact_dir / "finding-gate.json") or {}
     adjudication = load_optional_json(artifact_dir / "adjudication.json") or {}
     findings_doc = load_optional_json(artifact_dir / "findings.json") or {}
-    evidence_gaps = load_optional_json(artifact_dir / "evidence-gaps.json") or {}
+    evidence_gaps = current_evidence_gaps_for_artifact_dir(target=target, profile=profile, artifact_dir=artifact_dir)
     evidence_appendix = load_optional_json(artifact_dir / "evidence-appendix.json") or {}
     review_blockers_doc = load_optional_json(artifact_dir / REVIEW_BLOCKERS_ARTIFACT)
     review_blockers = review_blockers_doc or {}
