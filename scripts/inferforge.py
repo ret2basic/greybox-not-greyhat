@@ -156,6 +156,7 @@ VALIDATION_PLAN_ARTIFACT = "validation-plan.json"
 ITERATION_DECISION_ARTIFACT = "iteration-decision.json"
 EVIDENCE_PREP_PACKAGE_ARTIFACT = "evidence-prep-package.json"
 EVIDENCE_PREP_STATUS_ARTIFACT = "evidence-prep-status.json"
+EVIDENCE_SIDECAR_DRAFTS_ARTIFACT = "evidence-sidecar-drafts.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -255,8 +256,10 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     HYPOTHESIS_MATRIX_ARTIFACT,
     VALIDATION_PLAN_ARTIFACT,
     ITERATION_DECISION_ARTIFACT,
+    ORACLE_PLAN_ARTIFACT,
     EVIDENCE_PREP_PACKAGE_ARTIFACT,
     EVIDENCE_PREP_STATUS_ARTIFACT,
+    EVIDENCE_SIDECAR_DRAFTS_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -348,8 +351,10 @@ INDEX_ARTIFACT_ORDER = [
     PROFILE_VALIDATION_ARTIFACT,
     *DISCOVERY_ARTIFACTS,
     *REVIEW_ARTIFACTS,
+    ORACLE_PLAN_ARTIFACT,
     EVIDENCE_PREP_PACKAGE_ARTIFACT,
     EVIDENCE_PREP_STATUS_ARTIFACT,
+    EVIDENCE_SIDECAR_DRAFTS_ARTIFACT,
     "config.json",
     "collection-summary.json",
     "endpoint-clusters.json",
@@ -19823,6 +19828,8 @@ EVIDENCE_PREP_TEMPLATE_ARTIFACT_NAMES = {
     ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT,
 }
 
+EVIDENCE_SIDECAR_DRAFT_DIR_NAME = "evidence-sidecar-drafts"
+
 
 def evidence_prep_artifact_ref_path(ref: Any, artifact_dir: Path) -> Path:
     text = str(ref or "").strip()
@@ -20250,6 +20257,410 @@ def build_evidence_prep_status(
             "invokes no Burp tools, signs no wallets, submits no transactions, and is not a finding."
         ),
     }
+
+
+def evidence_sidecar_draft_path_for_artifact(name: str, draft_dir: Path) -> Path:
+    draft_names = {
+        REWRITE_RESPONSE_SIDECAR_ARTIFACT: "rewrite-response-sidecar.draft.jsonl",
+        "transaction-payloads.json": "transaction-payloads.draft.json",
+        "transaction-payloads.jsonl": "transaction-payloads.draft.jsonl",
+        "transaction-payloads.txt": "transaction-payloads.draft.txt",
+        "transaction-intent-policy.json": "transaction-intent-policy.draft.json",
+        OPERATOR_EVIDENCE_ARTIFACT: "operator-evidence.draft.json",
+    }
+    return draft_dir / draft_names.get(name, f"{Path(name).stem}.draft{Path(name).suffix or '.json'}")
+
+
+def evidence_sidecar_draft_output_path(path_text: str) -> Path:
+    path = Path(str(path_text or "").strip()).expanduser()
+    if path.is_absolute():
+        return path
+    return resolve_repo_path(str(path))
+
+
+def evidence_sidecar_draft_validation_commands(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    category: str,
+) -> list[str]:
+    commands = []
+    if category == "rewrite-response-sidecar":
+        commands.append(
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "rewrite-response-review --no-write --show-observations --show-sidecar-validation",
+                profile=profile,
+            )
+        )
+    elif category in {"transaction-payload-sidecar", "transaction-intent-policy"}:
+        commands.append(
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "transaction-sidecar-review --no-write --show-files --show-candidates --show-commands",
+                profile=profile,
+            )
+        )
+    elif category == "operator-evidence":
+        commands.append(
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "operator-evidence-review --no-write --show-missing --show-sidecar-validation --show-closure-contract",
+                profile=profile,
+            )
+        )
+    commands.append(
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "evidence-prep-status --no-write --show-details --strict",
+            profile=profile,
+        )
+    )
+    return ordered_unique_strings(commands)
+
+
+def evidence_sidecar_select_policy_template(templates: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = [row for row in templates if isinstance(row, dict)]
+    if not rows:
+        return {}
+
+    def rank(row: dict[str, Any]) -> tuple[int, int, str]:
+        direction = str(row.get("direction") or "")
+        direction_rank = {"buy": 0, "sell": 1}.get(direction, 2)
+        return (0 if row.get("status") == "ready" else 1, direction_rank, direction)
+
+    return sorted(rows, key=rank)[0]
+
+
+def evidence_sidecar_draft_content(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    category: str,
+    name: str,
+    reviews: dict[str, Any],
+) -> tuple[str, Any, list[str], dict[str, Any]]:
+    if category == "rewrite-response-sidecar":
+        review = reviews.get("rewrite_response_review")
+        if not isinstance(review, dict):
+            review = build_rewrite_response_review(target=target, profile=profile, artifact_dir=artifact_dir)
+            reviews["rewrite_response_review"] = review
+        template_doc = rewrite_response_sidecar_template_doc(review)
+        template = template_doc.get("template") if isinstance(template_doc.get("template"), dict) else {}
+        line = json_clone(template.get("line_template") if isinstance(template.get("line_template"), dict) else {})
+        if not line:
+            line = {
+                "approved": False,
+                "method": "GET",
+                "path": PLACEHOLDER_APPROVED_CONCRETE_PATH,
+                "status": 200,
+                "content_type": "application/json",
+                "impact_indicators": ["sensitive-data-exposure"],
+                "json_field_paths": ["$.REPLACE_WITH_REDACTED_FIELD_NAME"],
+                "impact_summary": "REPLACE_WITH_SHORT_REDACTED_IMPACT_SUMMARY",
+                "reviewer": "REPLACE_WITH_REVIEWER_OR_TICKET",
+                "source": "manual-approved-redacted-response-review",
+            }
+        line["approved"] = False
+        line["draft_only"] = True
+        line["review_required"] = "Set approved=true only after one reviewed in-scope read-only response is approved."
+        return (
+            "jsonl",
+            [line],
+            [
+                "Copy one reviewed row to rewrite-response-sidecar.jsonl only after replacing placeholders.",
+                "Set approved=true for exactly one safe read-only path after manual review.",
+                "Keep only field paths, status/content-type, indicators, and a short redacted impact summary.",
+            ],
+            {
+                "template_status": template_doc.get("status"),
+                "path_option_count": template_doc.get("path_option_count", 0),
+                "accepted_impact_indicators": template.get("accepted_impact_indicators", []),
+            },
+        )
+
+    if category == "transaction-payload-sidecar":
+        guidance = reviews.get("transaction_payload_shape_guidance")
+        if not isinstance(guidance, dict):
+            guidance = build_transaction_payload_shape_guidance(profile, artifact_dir)
+            reviews["transaction_payload_shape_guidance"] = guidance
+        examples = guidance.get("examples", []) if isinstance(guidance.get("examples"), list) else []
+        jsonl_line = next(
+            (
+                json_clone(example.get("line"))
+                for example in examples
+                if isinstance(example, dict) and example.get("file") == "transaction-payloads.jsonl"
+            ),
+            {
+                "payloads": [
+                    {
+                        "data": {
+                            "type": quote_response_expected_payload_type(profile) or "svm",
+                            "transaction": "REPLACE_WITH_BASE64_VERSIONED_TRANSACTION",
+                        },
+                    }
+                ],
+            },
+        )
+        if isinstance(jsonl_line, dict):
+            jsonl_line["draft_only"] = True
+            jsonl_line["approval_required"] = "Replace placeholders with exactly one approved quote response or extracted transaction payload."
+        if name == "transaction-payloads.txt":
+            content = "REPLACE_WITH_BASE64_VERSIONED_TRANSACTION\n"
+            kind = "text"
+        elif name == "transaction-payloads.json":
+            content = jsonl_line
+            kind = "json"
+        else:
+            content = [jsonl_line]
+            kind = "jsonl"
+        return (
+            kind,
+            content,
+            [
+                "Use exactly one approved quote response body or extracted transaction payload for the intended flow.",
+                "Do not include raw Burp history, cookies, bearer tokens, wallet secrets, signatures, or unrelated quote responses.",
+                "Do not approve wallet signing or submit transactions while collecting this evidence.",
+            ],
+            {
+                "quote_path": guidance.get("quote_path"),
+                "expected_payload_type": guidance.get("expected_payload_type"),
+                "configured_candidate_paths": normalize_string_list(guidance.get("configured_candidate_paths")),
+                "accepted_sidecars": normalize_string_list(guidance.get("accepted_sidecars")),
+            },
+        )
+
+    if category == "transaction-intent-policy":
+        templates = reviews.get("transaction_policy_templates")
+        if not isinstance(templates, list):
+            templates = transaction_corpus_policy_templates(profile, artifact_dir)
+            reviews["transaction_policy_templates"] = templates
+        selected = evidence_sidecar_select_policy_template(templates)
+        policy = json_clone(
+            selected.get("intent_policy_sidecar_template")
+            if isinstance(selected.get("intent_policy_sidecar_template"), dict)
+            else {}
+        )
+        if not policy:
+            policy = {
+                "direction": selected.get("direction") or "buy",
+                "wallet": PLACEHOLDER_REAL_WALLET,
+                "amountIn": "REPLACE_WITH_RAW_AMOUNT",
+                "sourceMint": selected.get("sourceMint") or "REPLACE_WITH_SOURCE_MINT",
+                "destinationMint": selected.get("destinationMint") or "REPLACE_WITH_DESTINATION_MINT",
+            }
+        policy["draft_only"] = True
+        policy["approval_required"] = (
+            "Replace wallet and amountIn with the approved public wallet and raw quote amount before copying "
+            "to transaction-intent-policy.json."
+        )
+        return (
+            "json",
+            policy,
+            [
+                "Copy exactly one approved direction policy to transaction-intent-policy.json.",
+                "Replace wallet and amountIn placeholders with the approved public wallet and raw amount.",
+                "Add allowedPrograms only after program allowlist review; otherwise decoded programs require manual review.",
+            ],
+            {
+                "selected_direction": selected.get("direction"),
+                "template_status": selected.get("status"),
+                "program_allowlist_status": selected.get("programAllowlistStatus"),
+                "prepare_preview_command": selected.get("prepare_policy_preview_command"),
+            },
+        )
+
+    if category == "operator-evidence":
+        operator_review = reviews.get("operator_evidence_review")
+        if not isinstance(operator_review, dict):
+            operator_evidence, operator_file = load_operator_evidence_sidecar(artifact_dir)
+            operator_review = build_operator_evidence_review(
+                target=target,
+                artifact_dir=artifact_dir,
+                operator_evidence=operator_evidence,
+                operator_evidence_file=operator_file,
+                deployment_review=load_optional_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT) or {},
+                rpc_method_policy=load_optional_json(artifact_dir / "rpc-method-policy.json") or {},
+                profile=profile,
+            )
+            reviews["operator_evidence_review"] = operator_review
+        template = json_clone(
+            operator_review.get("sidecar_template")
+            if isinstance(operator_review.get("sidecar_template"), dict)
+            else {}
+        )
+        if not template:
+            template = build_operator_evidence_sidecar_template(
+                target=target,
+                provider="deployment/operator",
+                missing_decisions=[],
+            )
+        template["draft_only"] = True
+        return (
+            "json",
+            template,
+            [
+                "Keep placeholder or uncertain rows as pending; pending rows do not count as evidence.",
+                "Set present/confirmed statuses only for reviewed redacted operator, provider, dashboard, ticket, or billing evidence.",
+                "Do not include provider API keys, bearer tokens, cookies, wallet secrets, or raw account identifiers.",
+            ],
+            {
+                "operator_review_status": operator_review.get("status"),
+                "missing_decisions": (operator_review.get("summary") or {}).get("missing_decisions", []),
+                "provider_missing": (operator_review.get("summary") or {}).get("provider_missing", []),
+                "accepted_present_statuses": operator_review.get("accepted_present_statuses", []),
+            },
+        )
+
+    return (
+        "json",
+        {"draft_only": True, "artifact": name, "instructions": "No specific draft generator is available."},
+        ["Create a redacted sidecar manually, then rerun evidence-prep-status --strict."],
+        {},
+    )
+
+
+def build_evidence_sidecar_drafts(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    package_path: Path | None = None,
+    package_doc: dict[str, Any] | None = None,
+    draft_dir: Path | None = None,
+) -> dict[str, Any]:
+    draft_dir = draft_dir or artifact_dir / EVIDENCE_SIDECAR_DRAFT_DIR_NAME
+    status_doc = build_evidence_prep_status(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        package_doc=package_doc,
+        package_path=package_path or artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT,
+    )
+    required_rows = [
+        row
+        for row in status_doc.get("required_evidence_artifacts", []) or []
+        if isinstance(row, dict)
+    ]
+    reviews: dict[str, Any] = {}
+    drafts = []
+    for row in required_rows:
+        name = str(row.get("name") or "").strip()
+        category = str(row.get("category") or "").strip()
+        readiness = str(row.get("readiness") or "")
+        if not name or category == "supporting-artifact" or readiness.startswith("ready-"):
+            continue
+        target_path = evidence_prep_artifact_ref_path(row.get("artifact"), artifact_dir)
+        draft_path = evidence_sidecar_draft_path_for_artifact(name, draft_dir)
+        content_kind, content, instructions, context = evidence_sidecar_draft_content(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            category=category,
+            name=name,
+            reviews=reviews,
+        )
+        target_resolved = str(target_path.resolve())
+        draft_resolved = str(draft_path.resolve())
+        drafts.append(
+            {
+                "artifact": row.get("artifact"),
+                "target_evidence_path": repo_relative_or_absolute(target_path),
+                "draft_path": repo_relative_or_absolute(draft_path),
+                "name": name,
+                "category": category,
+                "source_readiness": readiness,
+                "draft_status": "draft-ready" if target_resolved != draft_resolved else "unsafe-draft-path",
+                "content_kind": content_kind,
+                "content_preview": content,
+                "instructions": instructions,
+                "context": context,
+                "after_filling_validation_commands": evidence_sidecar_draft_validation_commands(
+                    artifact_dir=artifact_dir,
+                    profile=profile,
+                    category=category,
+                ),
+                "finding_gate_boundary": (
+                    "Draft files are placeholders only. They are not evidence, not findings, and are not read by "
+                    "finding-gate validators until reviewed content is copied into the required evidence path."
+                ),
+            }
+        )
+    draft_status_counts: dict[str, int] = {}
+    for row in drafts:
+        increment_count(draft_status_counts, str(row.get("draft_status") or "unknown"))
+    summary = status_doc.get("summary") if isinstance(status_doc.get("summary"), dict) else {}
+    if status_doc.get("status") == "missing-evidence-prep-package":
+        status = "missing-evidence-prep-package"
+    elif any(row.get("draft_status") == "unsafe-draft-path" for row in drafts):
+        status = "blocked-unsafe-draft-path"
+    elif drafts:
+        status = "drafts-ready"
+    else:
+        status = "no-drafts-needed"
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-evidence-sidecar-drafts-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "draft_dir": repo_relative_or_absolute(draft_dir),
+        "evidence_prep_status": status_doc.get("status"),
+        "summary": {
+            "required_evidence_artifacts": summary.get("required_evidence_artifacts", 0),
+            "missing_evidence_artifacts": summary.get("missing_evidence_artifacts", 0),
+            "invalid_evidence_artifacts": summary.get("invalid_evidence_artifacts", 0),
+            "waiting_evidence_artifacts": summary.get("waiting_evidence_artifacts", 0),
+            "drafts": len(drafts),
+            "draft_status_counts": dict(sorted(draft_status_counts.items())),
+        },
+        "drafts": drafts,
+        "write_behavior": {
+            "default": f"Write this workbook to {EVIDENCE_SIDECAR_DRAFTS_ARTIFACT} only.",
+            "write_drafts": (
+                f"With --write-drafts, write placeholder files under {repo_relative_or_absolute(draft_dir)}. "
+                "Those files use .draft names and are not read as evidence."
+            ),
+            "never_written_as_evidence": [
+                REWRITE_RESPONSE_SIDECAR_ARTIFACT,
+                "transaction-payloads.jsonl",
+                "transaction-intent-policy.json",
+                OPERATOR_EVIDENCE_ARTIFACT,
+            ],
+        },
+        "finding_gate_ready": False,
+        "next_step": (
+            "Review and fill the draft sidecars from approved/redacted evidence, copy reviewed content into the "
+            "required evidence paths, then rerun evidence-prep-status --strict."
+            if drafts
+            else status_doc.get("next_step")
+        ),
+        "safety": (
+            "Draft/workbook generation only. It reads local artifacts, writes only non-evidence draft files when "
+            "explicitly requested, sends no requests, invokes no Burp tools, signs no wallets, submits no transactions, "
+            "and is not a finding."
+        ),
+    }
+
+
+def write_evidence_sidecar_draft_files(draft_doc: dict[str, Any]) -> list[Path]:
+    written = []
+    for row in draft_doc.get("drafts", []) or []:
+        if not isinstance(row, dict) or row.get("draft_status") != "draft-ready":
+            continue
+        path = evidence_sidecar_draft_output_path(str(row.get("draft_path") or ""))
+        content_kind = str(row.get("content_kind") or "json")
+        content = row.get("content_preview")
+        if content_kind == "jsonl":
+            append_jsonl(path, [item for item in content if isinstance(item, dict)] if isinstance(content, list) else [])
+        elif content_kind == "text":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(str(content or ""), encoding="utf-8")
+        else:
+            write_json(path, content if isinstance(content, (dict, list)) else {"draft": content})
+        written.append(path)
+    return written
 
 
 VALIDATION_APPROVAL_PACKET_KEYS = [
@@ -44673,6 +45084,17 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("prepare-transaction-intent-policy", "run_prepare_transaction_intent_policy"),
         refresh_expectation("credential-impact-checklist", "run_credential_impact_checklist"),
         refresh_expectation("validation-plan", "run_validation_plan"),
+        {
+            "command": "oracle-plan",
+            "function": "run_oracle_plan",
+            "mode": "multi-directory-refresh",
+            "markers": {
+                "refresh_manifests_for_artifact_outputs(": 1,
+                "print_refreshed_manifests(": 1,
+            },
+        },
+        refresh_expectation("evidence-prep-status", "run_evidence_prep_status"),
+        refresh_expectation("evidence-sidecar-drafts", "run_evidence_sidecar_drafts"),
         refresh_expectation("iteration-decision", "run_iteration_decision"),
         refresh_expectation("collect", "run_collect"),
         refresh_expectation("burp-observe", "run_burp_observe", min_refreshes=3, min_prints=3),
@@ -55381,6 +55803,23 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             if isinstance(focused_iteration_evidence_prep_status.get("summary"), dict)
             else {}
         )
+        focused_iteration_evidence_sidecar_drafts = build_evidence_sidecar_drafts(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_run_dir,
+            package_doc=focused_iteration_evidence_prep_package,
+            draft_dir=harness_loop_run_dir / EVIDENCE_SIDECAR_DRAFT_DIR_NAME,
+        )
+        focused_iteration_evidence_sidecar_draft_summary = (
+            focused_iteration_evidence_sidecar_drafts.get("summary")
+            if isinstance(focused_iteration_evidence_sidecar_drafts.get("summary"), dict)
+            else {}
+        )
+        focused_iteration_evidence_sidecar_draft_rows = [
+            row
+            for row in focused_iteration_evidence_sidecar_drafts.get("drafts", []) or []
+            if isinstance(row, dict)
+        ]
         focused_iteration_preview_commands = [
             str(ref.get("command") or "")
             for action in focused_iteration_decision_sample.get("actions", [])
@@ -56654,6 +57093,27 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and focused_iteration_evidence_prep_status_summary.get("missing_evidence_artifacts", 0) >= 3
         and focused_iteration_evidence_prep_status_summary.get("template_artifacts", 0) == 3
         and focused_iteration_evidence_prep_status.get("finding_gate_ready") is False
+        and focused_iteration_evidence_sidecar_drafts.get("schema") == "inferforge-evidence-sidecar-drafts-v1"
+        and focused_iteration_evidence_sidecar_drafts.get("status") == "drafts-ready"
+        and focused_iteration_evidence_sidecar_draft_summary.get("drafts", 0) >= 3
+        and focused_iteration_evidence_sidecar_drafts.get("finding_gate_ready") is False
+        and all(
+            EVIDENCE_SIDECAR_DRAFT_DIR_NAME in str(row.get("draft_path") or "")
+            and str(row.get("draft_path") or "") != str(row.get("target_evidence_path") or "")
+            for row in focused_iteration_evidence_sidecar_draft_rows
+        )
+        and any(
+            row.get("name") == "transaction-payloads.jsonl"
+            and row.get("content_kind") == "jsonl"
+            and row.get("draft_status") == "draft-ready"
+            for row in focused_iteration_evidence_sidecar_draft_rows
+        )
+        and any(
+            row.get("name") == OPERATOR_EVIDENCE_ARTIFACT
+            and row.get("content_kind") == "json"
+            and row.get("draft_status") == "draft-ready"
+            for row in focused_iteration_evidence_sidecar_draft_rows
+        )
         and any(
             item.get("packet_type") == "transaction-corpus"
             and (item.get("packet") or {}).get("status") == "ready-offline-approval"
@@ -59973,6 +60433,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     and focused_iteration_evidence_prep_command_plan.get("template_package_count") == 3
                     and focused_iteration_evidence_prep_status.get("status") == "blocked-missing-evidence"
                     and focused_iteration_evidence_prep_status_summary.get("template_artifacts", 0) == 3
+                    and focused_iteration_evidence_sidecar_drafts.get("status") == "drafts-ready"
+                    and focused_iteration_evidence_sidecar_draft_summary.get("drafts", 0) >= 3
                     and not any(
                         command in focused_iteration_preview_commands
                         for command in focused_iteration_objective_preview_commands
@@ -60034,6 +60496,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                         "required_evidence_artifacts"
                     ),
                     "template_artifacts": focused_iteration_evidence_prep_status.get("template_artifacts"),
+                },
+                "evidence_sidecar_drafts": {
+                    "status": focused_iteration_evidence_sidecar_drafts.get("status"),
+                    "summary": focused_iteration_evidence_sidecar_draft_summary,
+                    "drafts": focused_iteration_evidence_sidecar_draft_rows,
                 },
                 "expected_commands": [
                     focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
@@ -67275,6 +67742,90 @@ def run_evidence_prep_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_evidence_sidecar_drafts(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    package_path = (
+        resolve_repo_path(args.package)
+        if getattr(args, "package", None)
+        else artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT
+    )
+    draft_dir = (
+        resolve_repo_path(args.draft_dir)
+        if getattr(args, "draft_dir", None)
+        else artifact_dir / EVIDENCE_SIDECAR_DRAFT_DIR_NAME
+    )
+    draft_doc = build_evidence_sidecar_drafts(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        package_path=package_path,
+        draft_dir=draft_dir,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / EVIDENCE_SIDECAR_DRAFTS_ARTIFACT
+    )
+    written_drafts: list[Path] = []
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(draft_doc))
+        if getattr(args, "write_drafts", False):
+            written_drafts = write_evidence_sidecar_draft_files(draft_doc)
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="evidence-sidecar-drafts",
+            output_paths=[
+                *target_profile_artifact_paths(artifact_dir),
+                output_path,
+                *written_drafts,
+            ],
+        )
+
+    summary = draft_doc.get("summary", {}) if isinstance(draft_doc.get("summary"), dict) else {}
+    print(f"Evidence sidecar drafts: {draft_doc.get('status')}")
+    print(
+        "Drafts: "
+        f"count={summary.get('drafts', 0)} "
+        f"prep_status={draft_doc.get('evidence_prep_status') or '-'} "
+        f"missing={summary.get('missing_evidence_artifacts', 0)} "
+        f"invalid={summary.get('invalid_evidence_artifacts', 0)} "
+        f"waiting={summary.get('waiting_evidence_artifacts', 0)}"
+    )
+    if getattr(args, "show_drafts", False):
+        for row in draft_doc.get("drafts", []) or []:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('draft_status')} {row.get('name')} "
+                f"target={row.get('target_evidence_path')} draft={row.get('draft_path')} "
+                f"kind={row.get('content_kind')}"
+            )
+            commands = normalize_string_list(row.get("after_filling_validation_commands"))
+            if commands:
+                print(f"  validate={inline_summary_text(commands[0], max_chars=420)}")
+    print(f"Next: {inline_summary_text(draft_doc.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        if getattr(args, "write_drafts", False):
+            for path in written_drafts:
+                print(f"Wrote draft {path}")
+        elif summary.get("drafts", 0):
+            print("Draft files not written; rerun with --write-drafts to create non-evidence .draft files.")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and draft_doc.get("status") != "drafts-ready":
+        return 1
+    return 0
+
+
 def run_iteration_decision(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -70305,6 +70856,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless all required evidence artifacts are ready for offline review.",
     )
     evidence_prep_status.set_defaults(func=run_evidence_prep_status)
+
+    evidence_sidecar_drafts = sub.add_parser(
+        "evidence-sidecar-drafts",
+        help="Build non-evidence draft sidecars for local evidence-prep blockers",
+    )
+    evidence_sidecar_drafts.add_argument(
+        "--package",
+        help=(
+            f"Evidence prep package to read. Defaults to --artifact-dir/{EVIDENCE_PREP_PACKAGE_ARTIFACT}."
+        ),
+    )
+    evidence_sidecar_drafts.add_argument(
+        "--output",
+        help=(
+            f"Where to write {EVIDENCE_SIDECAR_DRAFTS_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{EVIDENCE_SIDECAR_DRAFTS_ARTIFACT}."
+        ),
+    )
+    evidence_sidecar_drafts.add_argument(
+        "--draft-dir",
+        help=(
+            f"Where to write non-evidence draft files with --write-drafts. "
+            f"Defaults to --artifact-dir/{EVIDENCE_SIDECAR_DRAFT_DIR_NAME}/."
+        ),
+    )
+    evidence_sidecar_drafts.add_argument(
+        "--write-drafts",
+        action="store_true",
+        help="Write placeholder .draft files under --draft-dir; never write required evidence sidecars.",
+    )
+    evidence_sidecar_drafts.add_argument(
+        "--show-drafts",
+        action="store_true",
+        help="Print each draft target, draft path, and first validation command.",
+    )
+    evidence_sidecar_drafts.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print draft plan only; do not write {EVIDENCE_SIDECAR_DRAFTS_ARTIFACT}, draft files, "
+            "or refreshed manifests."
+        ),
+    )
+    evidence_sidecar_drafts.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless at least one safe non-evidence draft can be generated.",
+    )
+    evidence_sidecar_drafts.set_defaults(func=run_evidence_sidecar_drafts)
 
     iteration_decision = sub.add_parser(
         "iteration-decision",
