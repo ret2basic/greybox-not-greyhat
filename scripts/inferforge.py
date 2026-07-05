@@ -158,6 +158,7 @@ EVIDENCE_PREP_PACKAGE_ARTIFACT = "evidence-prep-package.json"
 EVIDENCE_PREP_STATUS_ARTIFACT = "evidence-prep-status.json"
 EVIDENCE_SIDECAR_DRAFTS_ARTIFACT = "evidence-sidecar-drafts.json"
 CLAIM_EVIDENCE_LEDGER_ARTIFACT = "claim-evidence-ledger.json"
+CLAIM_WITNESS_LADDER_ARTIFACT = "claim-witness-ladder.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -262,6 +263,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     EVIDENCE_PREP_STATUS_ARTIFACT,
     EVIDENCE_SIDECAR_DRAFTS_ARTIFACT,
     CLAIM_EVIDENCE_LEDGER_ARTIFACT,
+    CLAIM_WITNESS_LADDER_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -358,6 +360,7 @@ INDEX_ARTIFACT_ORDER = [
     EVIDENCE_PREP_STATUS_ARTIFACT,
     EVIDENCE_SIDECAR_DRAFTS_ARTIFACT,
     CLAIM_EVIDENCE_LEDGER_ARTIFACT,
+    CLAIM_WITNESS_LADDER_ARTIFACT,
     "config.json",
     "collection-summary.json",
     "endpoint-clusters.json",
@@ -21331,6 +21334,304 @@ def build_claim_evidence_ledger(
     }
 
 
+def claim_witness_ladder_draft_index(draft_doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+    for row in draft_doc.get("drafts", []) or []:
+        if not isinstance(row, dict):
+            continue
+        for value in [row.get("target_evidence_path"), row.get("name"), row.get("artifact")]:
+            text = str(value or "").strip()
+            if text:
+                index[text] = row
+                index[Path(text).name] = row
+    return index
+
+
+def claim_witness_evidence_summary(evidence_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    blocking = [row for row in evidence_rows if claim_ledger_required_evidence_is_blocking(row)]
+    status_counts: dict[str, int] = {}
+    category_counts: dict[str, int] = {}
+    for row in evidence_rows:
+        increment_count(status_counts, str(row.get("status") or "unknown"))
+        increment_count(category_counts, str(row.get("category") or "unknown"))
+    blocking_statuses = {str(row.get("status") or "") for row in blocking}
+    if not blocking:
+        status = "no-blocking-evidence-required"
+    elif "invalid-evidence" in blocking_statuses:
+        status = "blocked-invalid-evidence"
+    elif "missing-evidence" in blocking_statuses:
+        status = "blocked-missing-evidence"
+    elif all(status.startswith("ready-") for status in blocking_statuses):
+        status = "evidence-ready"
+    else:
+        status = "waiting-evidence-review"
+    return {
+        "status": status,
+        "evidence_rows": len(evidence_rows),
+        "blocking_evidence_rows": len(blocking),
+        "missing_evidence_rows": sum(1 for row in blocking if row.get("status") == "missing-evidence"),
+        "invalid_evidence_rows": sum(1 for row in blocking if row.get("status") == "invalid-evidence"),
+        "ready_evidence_rows": sum(1 for row in blocking if str(row.get("status") or "").startswith("ready-")),
+        "status_counts": dict(sorted(status_counts.items())),
+        "category_counts": dict(sorted(category_counts.items())),
+    }
+
+
+def claim_witness_draft_rows_for_evidence(
+    evidence_rows: list[dict[str, Any]],
+    *,
+    draft_index: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    drafts = []
+    seen: set[str] = set()
+    for row in evidence_rows:
+        if not isinstance(row, dict):
+            continue
+        if not claim_ledger_required_evidence_is_blocking(row):
+            continue
+        draft = (
+            draft_index.get(str(row.get("path") or ""))
+            or draft_index.get(str(row.get("artifact") or ""))
+            or draft_index.get(str(row.get("name") or ""))
+        )
+        if not isinstance(draft, dict):
+            continue
+        key = str(draft.get("draft_path") or draft.get("name") or json.dumps(draft, sort_keys=True))
+        if key in seen:
+            continue
+        seen.add(key)
+        drafts.append(
+            {
+                "name": draft.get("name"),
+                "category": draft.get("category"),
+                "draft_status": draft.get("draft_status"),
+                "target_evidence_path": draft.get("target_evidence_path"),
+                "draft_path": draft.get("draft_path"),
+                "content_kind": draft.get("content_kind"),
+                "after_filling_validation_commands": normalize_string_list(
+                    draft.get("after_filling_validation_commands")
+                )[:4],
+                "finding_gate_boundary": draft.get("finding_gate_boundary"),
+            }
+        )
+    return drafts
+
+
+def claim_witness_stage_statuses(
+    *,
+    claim: dict[str, Any],
+    evidence_summary: dict[str, Any],
+    draft_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str]:
+    contract = claim.get("evidence_contract") if isinstance(claim.get("evidence_contract"), dict) else {}
+    contract_status = "completed" if contract.get("kind") or contract.get("status") else "blocked-missing-contract"
+    evidence_status = str(evidence_summary.get("status") or "unknown")
+    claim_readiness = str(claim.get("readiness") or "")
+    official_stage_status = {
+        "evidence-ready": "completed",
+        "blocked-missing-evidence": "blocked-missing-evidence",
+        "blocked-invalid-evidence": "blocked-invalid-evidence",
+        "waiting-evidence-review": "waiting-evidence-review",
+        "no-blocking-evidence-required": "blocked-no-evidence-contract",
+    }.get(evidence_status, evidence_status)
+    missing_count = int(evidence_summary.get("missing_evidence_rows") or 0)
+    if missing_count and draft_rows:
+        draft_status = "ready-non-evidence-draft"
+    elif missing_count:
+        draft_status = "blocked-no-draft"
+    elif draft_rows:
+        draft_status = "supporting-draft-present"
+    else:
+        draft_status = "not-needed"
+    verifier_commands = normalize_string_list(claim.get("verification_commands"))
+    if claim_readiness == "ready-for-finding-gate-review":
+        verifier_status = "ready"
+        gate_status = "ready"
+    elif verifier_commands:
+        verifier_status = "blocked-upstream-evidence"
+        gate_status = "blocked-upstream-evidence"
+    else:
+        verifier_status = "blocked-no-verifier"
+        gate_status = "blocked-no-verifier"
+    stages = [
+        {
+            "id": "claim-contract",
+            "status": contract_status,
+            "description": "Atomic claim, impact oracle, acceptance criteria, and reject conditions are defined.",
+            "evidence_contract": contract,
+        },
+        {
+            "id": "official-evidence-sidecars",
+            "status": official_stage_status,
+            "description": "Required official approved/redacted sidecars exist and pass their local validators.",
+            "summary": evidence_summary,
+        },
+        {
+            "id": "draft-assist",
+            "status": draft_status,
+            "description": "Non-evidence drafts are available to help create official sidecars without being counted as proof.",
+            "drafts": draft_rows,
+            "finding_gate_boundary": "Drafts are placeholders only and never satisfy reportability gates.",
+        },
+        {
+            "id": "offline-verifier",
+            "status": verifier_status,
+            "description": "Local verifier commands can evaluate the official evidence sidecars without target traffic.",
+            "commands": verifier_commands[:6],
+        },
+        {
+            "id": "finding-gate-adjudication",
+            "status": gate_status,
+            "description": "Finding gate and adjudication can run only after official evidence is ready.",
+            "commands": [
+                command
+                for command in verifier_commands
+                if " gate " in f" {command} " or " adjudicate " in f" {command} "
+            ][:4],
+        },
+    ]
+    next_stage = "complete"
+    for stage in stages:
+        if stage.get("status") not in {"completed", "not-needed"}:
+            next_stage = str(stage.get("id") or "unknown")
+            break
+    return stages, next_stage
+
+
+def build_claim_witness_ladder(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    ledger_doc: dict[str, Any] | None = None,
+    package_doc: dict[str, Any] | None = None,
+    package_path: Path | None = None,
+    draft_doc: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    package_file = package_path or artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT
+    if package_doc is None:
+        package_doc = load_optional_json(package_file) if package_file.exists() else None
+    if not isinstance(package_doc, dict):
+        package_doc = None
+    if ledger_doc is None:
+        ledger_doc = build_claim_evidence_ledger(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            package_doc=package_doc,
+            package_path=package_file,
+        )
+    if draft_doc is None:
+        draft_doc = build_evidence_sidecar_drafts(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            package_doc=package_doc,
+            package_path=package_file,
+            draft_dir=artifact_dir / EVIDENCE_SIDECAR_DRAFT_DIR_NAME,
+        )
+    draft_index = claim_witness_ladder_draft_index(draft_doc if isinstance(draft_doc, dict) else {})
+    ladders = []
+    next_stage_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    draft_status_counts: dict[str, int] = {}
+    for claim in ledger_doc.get("claims", []) or []:
+        if not isinstance(claim, dict):
+            continue
+        evidence_rows = [row for row in claim.get("required_evidence", []) or [] if isinstance(row, dict)]
+        evidence_summary = claim_witness_evidence_summary(evidence_rows)
+        draft_rows = claim_witness_draft_rows_for_evidence(evidence_rows, draft_index=draft_index)
+        stages, next_stage = claim_witness_stage_statuses(
+            claim=claim,
+            evidence_summary=evidence_summary,
+            draft_rows=draft_rows,
+        )
+        readiness = str(claim.get("readiness") or "unknown")
+        increment_count(status_counts, readiness)
+        increment_count(next_stage_counts, next_stage)
+        for draft in draft_rows:
+            increment_count(draft_status_counts, str(draft.get("draft_status") or "unknown"))
+        ladders.append(
+            {
+                "claim_id": claim.get("id"),
+                "entrypoint": claim.get("entrypoint"),
+                "oracle_type": claim.get("oracle_type"),
+                "impact_claim": claim.get("impact_claim"),
+                "claim_readiness": readiness,
+                "next_stage": next_stage,
+                "top_blocker": claim.get("first_unblocker") or claim.get("blocker_reason"),
+                "stages": stages,
+                "required_evidence": evidence_rows,
+                "acceptance_criteria": claim.get("acceptance_criteria", []),
+                "reject_if": claim.get("reject_if", []),
+                "finding_gate_boundary": claim.get("finding_gate_boundary"),
+            }
+        )
+    if not ladders:
+        status = "no-claim-ladders"
+    elif any(row.get("claim_readiness") == "invalid-evidence" for row in ladders):
+        status = "blocked-invalid-evidence"
+    elif any(row.get("claim_readiness") == "missing-evidence" for row in ladders):
+        status = "blocked-missing-evidence"
+    elif any(row.get("claim_readiness") == "waiting-evidence-review" for row in ladders):
+        status = "waiting-evidence-review"
+    elif all(row.get("claim_readiness") == "ready-for-finding-gate-review" for row in ladders):
+        status = "ready-for-finding-gate-review"
+    else:
+        status = "blocked-claim-evidence"
+    ready_ladders = sum(1 for row in ladders if row.get("claim_readiness") == "ready-for-finding-gate-review")
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-claim-witness-ladder-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "assessment_policy": assessment_mode_policy(profile),
+        "finding_gate_ready": bool(ladders) and ready_ladders == len(ladders),
+        "summary": {
+            "ladders": len(ladders),
+            "ready_ladders": ready_ladders,
+            "blocked_ladders": len(ladders) - ready_ladders,
+            "readiness_counts": dict(sorted(status_counts.items())),
+            "next_stage_counts": dict(sorted(next_stage_counts.items())),
+            "draft_status_counts": dict(sorted(draft_status_counts.items())),
+            "draft_ready_claims": sum(
+                1
+                for row in ladders
+                if any(
+                    stage.get("id") == "draft-assist"
+                    and stage.get("status") in {"ready-non-evidence-draft", "supporting-draft-present"}
+                    for stage in row.get("stages", [])
+                    if isinstance(stage, dict)
+                )
+            ),
+            "ledger_status": ledger_doc.get("status"),
+            "draft_status": draft_doc.get("status") if isinstance(draft_doc, dict) else None,
+        },
+        "ladders": ladders,
+        "claim_evidence_ledger_status": ledger_doc.get("status"),
+        "evidence_sidecar_drafts_status": draft_doc.get("status") if isinstance(draft_doc, dict) else None,
+        "next_step": (
+            "Fill and review the non-evidence drafts, copy approved/redacted content into official sidecar paths, "
+            "then rerun claim-witness-ladder --strict."
+            if status == "blocked-missing-evidence"
+            else "Fix invalid official sidecars, then rerun claim-witness-ladder --strict."
+            if status == "blocked-invalid-evidence"
+            else "Run finding gate and adjudication no-write after every ladder is ready."
+            if status == "ready-for-finding-gate-review"
+            else "Refresh claim-evidence-ledger and evidence-sidecar-drafts, then close the next blocked ladder stage."
+        ),
+        "finding_gate_boundary": (
+            "Witness ladders organize proof work only. They are not evidence, not a PoC, and not a finding."
+        ),
+        "safety": (
+            "Offline witness ladder only. It reads local artifacts and draft metadata, sends no requests, invokes no Burp tools, "
+            "runs no scanners, signs no wallets, submits no transactions, and creates no official evidence sidecars."
+        ),
+    }
+
+
 VALIDATION_APPROVAL_PACKET_KEYS = [
     ("transaction_corpus_approval_packet", "transaction-corpus"),
     ("credential_impact_approval_packet", "credential-impact"),
@@ -21737,6 +22038,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     REVIEW_BLOCKERS_MARKDOWN_ARTIFACT: "review-blockers",
     ORACLE_PLAN_ARTIFACT: "oracle-plan",
     CLAIM_EVIDENCE_LEDGER_ARTIFACT: "claim-evidence-ledger",
+    CLAIM_WITNESS_LADDER_ARTIFACT: "claim-witness-ladder",
     ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT: "oracle-plan --write-sidecar-template",
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT: "rewrite-response-review --write-sidecar-template",
     "finding-gate.json": "gate",
@@ -21773,6 +22075,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "review-blockers",
     "oracle-plan",
     "claim-evidence-ledger",
+    "claim-witness-ladder",
     "rewrite-response-review --write-sidecar-template",
     "report",
     "transaction-corpus-checklist --write-policy-template --skip-current-resource-check",
@@ -21794,6 +22097,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "review-blockers": "review-blockers --no-write",
     "oracle-plan": "oracle-plan --no-write",
     "claim-evidence-ledger": "claim-evidence-ledger --no-write",
+    "claim-witness-ladder": "claim-witness-ladder --no-write",
     "rewrite-response-review --write-sidecar-template": (
         "rewrite-response-review --no-write --show-sidecar-template-json"
     ),
@@ -45767,6 +46071,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("evidence-prep-status", "run_evidence_prep_status"),
         refresh_expectation("evidence-sidecar-drafts", "run_evidence_sidecar_drafts"),
         refresh_expectation("claim-evidence-ledger", "run_claim_evidence_ledger"),
+        refresh_expectation("claim-witness-ladder", "run_claim_witness_ladder"),
         refresh_expectation("iteration-decision", "run_iteration_decision"),
         refresh_expectation("collect", "run_collect"),
         refresh_expectation("burp-observe", "run_burp_observe", min_refreshes=3, min_prints=3),
@@ -56515,6 +56820,24 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for row in focused_iteration_claim_evidence_ledger.get("claims", []) or []
             if isinstance(row, dict)
         ]
+        focused_iteration_claim_witness_ladder = build_claim_witness_ladder(
+            target="https://blackbox.test",
+            profile=blackbox_normalized_profile,
+            artifact_dir=harness_loop_run_dir,
+            package_doc=focused_iteration_evidence_prep_package,
+            ledger_doc=focused_iteration_claim_evidence_ledger,
+            draft_doc=focused_iteration_evidence_sidecar_drafts,
+        )
+        focused_iteration_claim_witness_summary = (
+            focused_iteration_claim_witness_ladder.get("summary")
+            if isinstance(focused_iteration_claim_witness_ladder.get("summary"), dict)
+            else {}
+        )
+        focused_iteration_claim_witness_rows = [
+            row
+            for row in focused_iteration_claim_witness_ladder.get("ladders", []) or []
+            if isinstance(row, dict)
+        ]
         focused_iteration_preview_commands = [
             str(ref.get("command") or "")
             for action in focused_iteration_decision_sample.get("actions", [])
@@ -57810,6 +58133,25 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and all(
             "not a finding" in str(row.get("finding_gate_boundary") or "")
             for row in focused_iteration_claim_rows
+        )
+        and focused_iteration_claim_witness_ladder.get("schema") == "inferforge-claim-witness-ladder-v1"
+        and focused_iteration_claim_witness_ladder.get("status") == "blocked-missing-evidence"
+        and focused_iteration_claim_witness_summary.get("ladders", 0) >= 3
+        and focused_iteration_claim_witness_summary.get("blocked_ladders", 0) >= 3
+        and focused_iteration_claim_witness_summary.get("draft_ready_claims", 0) >= 3
+        and focused_iteration_claim_witness_summary.get("next_stage_counts", {}).get("official-evidence-sidecars", 0)
+        >= 3
+        and focused_iteration_claim_witness_ladder.get("finding_gate_ready") is False
+        and any(
+            stage.get("id") == "draft-assist"
+            and stage.get("status") in {"ready-non-evidence-draft", "supporting-draft-present"}
+            for row in focused_iteration_claim_witness_rows
+            for stage in row.get("stages", [])
+            if isinstance(stage, dict)
+        )
+        and all(
+            "not a finding" in str(row.get("finding_gate_boundary") or "")
+            for row in focused_iteration_claim_witness_rows
         )
         and all(
             EVIDENCE_SIDECAR_DRAFT_DIR_NAME in str(row.get("draft_path") or "")
@@ -61221,6 +61563,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     "summary": focused_iteration_claim_ledger_summary,
                     "claims": focused_iteration_claim_rows,
                     "finding_gate_ready": focused_iteration_claim_evidence_ledger.get("finding_gate_ready"),
+                },
+                "claim_witness_ladder": {
+                    "status": focused_iteration_claim_witness_ladder.get("status"),
+                    "summary": focused_iteration_claim_witness_summary,
+                    "ladders": focused_iteration_claim_witness_rows,
+                    "finding_gate_ready": focused_iteration_claim_witness_ladder.get("finding_gate_ready"),
                 },
                 "expected_commands": [
                     focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
@@ -68637,6 +68985,100 @@ def run_claim_evidence_ledger(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_claim_witness_ladder(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    package_path = (
+        resolve_repo_path(args.package)
+        if getattr(args, "package", None)
+        else artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT
+    )
+    ledger_path = (
+        resolve_repo_path(args.ledger)
+        if getattr(args, "ledger", None)
+        else artifact_dir / CLAIM_EVIDENCE_LEDGER_ARTIFACT
+    )
+    drafts_path = (
+        resolve_repo_path(args.drafts)
+        if getattr(args, "drafts", None)
+        else artifact_dir / EVIDENCE_SIDECAR_DRAFTS_ARTIFACT
+    )
+    ledger_doc = load_optional_json(ledger_path) if ledger_path.exists() else None
+    draft_doc = load_optional_json(drafts_path) if drafts_path.exists() else None
+    ladder = build_claim_witness_ladder(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        package_path=package_path,
+        ledger_doc=ledger_doc if isinstance(ledger_doc, dict) else None,
+        draft_doc=draft_doc if isinstance(draft_doc, dict) else None,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / CLAIM_WITNESS_LADDER_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(ladder))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="claim-witness-ladder",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = ladder.get("summary", {}) if isinstance(ladder.get("summary"), dict) else {}
+    print(f"Claim witness ladder: {ladder.get('status')}")
+    print(
+        "Ladders: "
+        f"total={summary.get('ladders', 0)} "
+        f"ready={summary.get('ready_ladders', 0)} "
+        f"blocked={summary.get('blocked_ladders', 0)} "
+        f"draft_ready_claims={summary.get('draft_ready_claims', 0)}"
+    )
+    print(
+        "Inputs: "
+        f"ledger={summary.get('ledger_status') or '-'} "
+        f"drafts={summary.get('draft_status') or '-'} "
+        f"next_stages={json.dumps(summary.get('next_stage_counts', {}), sort_keys=True)}"
+    )
+    if getattr(args, "show_ladders", False):
+        display_limit = max(0, int(args.top))
+        for ladder_row in (ladder.get("ladders", []) or [])[:display_limit]:
+            if not isinstance(ladder_row, dict):
+                continue
+            print(
+                f"- {ladder_row.get('claim_id')}: {ladder_row.get('claim_readiness')} "
+                f"next={ladder_row.get('next_stage')} "
+                f"oracle={ladder_row.get('oracle_type')} "
+                f"entrypoint={ladder_row.get('entrypoint') or '-'}"
+            )
+            for stage in [row for row in ladder_row.get("stages", []) or [] if isinstance(row, dict)][:5]:
+                print(f"  stage={stage.get('id')} status={stage.get('status')}")
+            if ladder_row.get("top_blocker"):
+                print(f"  blocker={inline_summary_text(ladder_row.get('top_blocker'), max_chars=300)}")
+        remaining = len(ladder.get("ladders", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more ladder(s); rerun without --no-write to write the full ladder artifact")
+            else:
+                print(f"- {remaining} more ladder(s) in {output_path}")
+    print(f"Next: {inline_summary_text(ladder.get('next_step'), max_chars=380)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and ladder.get("status") != "ready-for-finding-gate-review":
+        return 1
+    return 0
+
+
 def run_iteration_decision(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -71759,6 +72201,61 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless every claim is ready for finding-gate review.",
     )
     claim_evidence_ledger.set_defaults(func=run_claim_evidence_ledger)
+
+    claim_witness_ladder = sub.add_parser(
+        "claim-witness-ladder",
+        help="Build offline witness ladders from claim evidence status to finding-gate readiness",
+    )
+    claim_witness_ladder.add_argument(
+        "--package",
+        help=(
+            f"Evidence prep package to read. Defaults to --artifact-dir/{EVIDENCE_PREP_PACKAGE_ARTIFACT}."
+        ),
+    )
+    claim_witness_ladder.add_argument(
+        "--ledger",
+        help=(
+            f"Claim evidence ledger to read when present. Defaults to --artifact-dir/{CLAIM_EVIDENCE_LEDGER_ARTIFACT}."
+        ),
+    )
+    claim_witness_ladder.add_argument(
+        "--drafts",
+        help=(
+            f"Evidence sidecar drafts workbook to read when present. Defaults to --artifact-dir/{EVIDENCE_SIDECAR_DRAFTS_ARTIFACT}."
+        ),
+    )
+    claim_witness_ladder.add_argument(
+        "--output",
+        help=(
+            f"Where to write {CLAIM_WITNESS_LADDER_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{CLAIM_WITNESS_LADDER_ARTIFACT}."
+        ),
+    )
+    claim_witness_ladder.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of witness ladders to print with --show-ladders.",
+    )
+    claim_witness_ladder.add_argument(
+        "--show-ladders",
+        action="store_true",
+        help="Print each ladder's next blocked stage and stage statuses.",
+    )
+    claim_witness_ladder.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print witness ladder only; do not write {CLAIM_WITNESS_LADDER_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    claim_witness_ladder.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless every witness ladder is ready for finding-gate review.",
+    )
+    claim_witness_ladder.set_defaults(func=run_claim_witness_ladder)
 
     iteration_decision = sub.add_parser(
         "iteration-decision",
