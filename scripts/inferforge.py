@@ -37115,10 +37115,62 @@ def review_blocker_oracle_dependency_kind(oracle: dict[str, Any]) -> str:
     return "evidence-triage"
 
 
-def review_blocker_oracle_work_item(group: dict[str, Any], oracle: dict[str, Any]) -> dict[str, Any]:
+def review_blocker_artifact_ref_path(artifact_dir: Path, artifact_ref: str) -> Path | None:
+    text = str(artifact_ref or "").strip()
+    if not text or "://" in text:
+        return None
+    path = Path(text).expanduser()
+    if path.is_absolute():
+        return path
+    if "/" in text or "\\" in text:
+        return resolve_repo_path(path)
+    return (artifact_dir / path).resolve()
+
+
+def review_blocker_oracle_artifact_status(group: dict[str, Any], *, artifact_dir: Path) -> dict[str, Any]:
+    refs = sorted_unique_strings(group.get("artifact_refs", []) or [])
+    existing = []
+    missing = []
+    unresolved = []
+    for ref in refs:
+        path = review_blocker_artifact_ref_path(artifact_dir, ref)
+        if path is None:
+            unresolved.append(ref)
+            continue
+        if path.exists():
+            existing.append(ref)
+        else:
+            missing.append(ref)
+    if not refs:
+        status = "no-artifact-refs"
+    elif missing:
+        status = "missing-artifacts"
+    else:
+        status = "all-artifacts-present"
+    return {
+        "status": status,
+        "artifact_refs": refs[:12],
+        "artifact_ref_count": len(refs),
+        "existing_artifacts": existing[:12],
+        "existing_artifact_count": len(existing),
+        "missing_artifacts": missing[:12],
+        "missing_artifact_count": len(missing),
+        "unresolved_artifacts": unresolved[:12],
+        "unresolved_artifact_count": len(unresolved),
+        "first_missing_artifact": missing[0] if missing else None,
+    }
+
+
+def review_blocker_oracle_work_item(
+    group: dict[str, Any],
+    oracle: dict[str, Any],
+    *,
+    artifact_dir: Path,
+) -> dict[str, Any]:
     acceptance_checks = normalize_string_list(oracle.get("acceptance_checks"))
     reject_if = normalize_string_list(oracle.get("reject_if"))
     command_safety = (group.get("command_safety", {}) or {}).get("summary", {}) or {}
+    artifact_status = review_blocker_oracle_artifact_status(group, artifact_dir=artifact_dir)
     return {
         "group_id": group.get("id"),
         "group_key": group.get("key"),
@@ -37137,18 +37189,24 @@ def review_blocker_oracle_work_item(group: dict[str, Any], oracle: dict[str, Any
         "reject_if": reject_if[:3],
         "acceptance_check_count": len(acceptance_checks),
         "reject_condition_count": len(reject_if),
+        "artifact_status": artifact_status,
+        "artifact_status_label": artifact_status.get("status"),
+        "missing_artifact_count": artifact_status.get("missing_artifact_count", 0),
+        "first_missing_artifact": artifact_status.get("first_missing_artifact"),
         "command_safety": command_safety,
         "command_count": int(command_safety.get("commands") or 0) if command_safety else 0,
     }
 
 
-def build_review_blocker_oracle_summary(groups: list[dict[str, Any]]) -> dict[str, Any]:
+def build_review_blocker_oracle_summary(groups: list[dict[str, Any]], *, artifact_dir: Path) -> dict[str, Any]:
     type_counts: dict[str, int] = {}
     status_counts: dict[str, int] = {}
     dependency_counts: dict[str, int] = {}
+    artifact_status_counts: dict[str, int] = {}
     work_items = []
     acceptance_check_count = 0
     reject_condition_count = 0
+    missing_artifact_count = 0
     groups_with_oracles = 0
 
     for group in groups:
@@ -37169,7 +37227,13 @@ def build_review_blocker_oracle_summary(groups: list[dict[str, Any]]) -> dict[st
             increment_count(dependency_counts, dependency_kind)
             acceptance_check_count += len(normalize_string_list(oracle.get("acceptance_checks")))
             reject_condition_count += len(normalize_string_list(oracle.get("reject_if")))
-            work_items.append(review_blocker_oracle_work_item(group, oracle))
+            work_item = review_blocker_oracle_work_item(group, oracle, artifact_dir=artifact_dir)
+            increment_count(artifact_status_counts, str(work_item.get("artifact_status_label") or "unknown"))
+            try:
+                missing_artifact_count += int(work_item.get("missing_artifact_count") or 0)
+            except (TypeError, ValueError):
+                pass
+            work_items.append(work_item)
 
     work_items.sort(
         key=lambda item: (
@@ -37187,10 +37251,12 @@ def build_review_blocker_oracle_summary(groups: list[dict[str, Any]]) -> dict[st
         "type_counts": dict(sorted(type_counts.items())),
         "status_counts": dict(sorted(status_counts.items())),
         "dependency_counts": dict(sorted(dependency_counts.items())),
+        "artifact_status_counts": dict(sorted(artifact_status_counts.items())),
         "operator_dependency_count": int(dependency_counts.get("operator-or-deployment-evidence") or 0),
         "sidecar_dependency_count": int(dependency_counts.get("approved-sidecar-or-single-observation") or 0),
         "finding_gate_dependency_count": int(dependency_counts.get("finding-gate-review") or 0),
         "triage_dependency_count": int(dependency_counts.get("evidence-triage") or 0),
+        "missing_artifact_count": missing_artifact_count,
         "acceptance_check_count": acceptance_check_count,
         "reject_condition_count": reject_condition_count,
         "top_oracle": top_oracle,
@@ -37769,7 +37835,7 @@ def build_review_blockers(
     for group in groups:
         increment_count(group_status_counts, str(group.get("status") or "unknown"))
         increment_count(group_category_counts, str(group.get("category") or "unknown"))
-    oracle_summary = build_review_blocker_oracle_summary(groups)
+    oracle_summary = build_review_blocker_oracle_summary(groups, artifact_dir=artifact_dir)
 
     return {
         "generated_at": utc_now(),
@@ -37792,8 +37858,10 @@ def build_review_blockers(
             "oracle_type_counts": oracle_summary.get("type_counts", {}),
             "oracle_status_counts": oracle_summary.get("status_counts", {}),
             "oracle_dependency_counts": oracle_summary.get("dependency_counts", {}),
+            "oracle_artifact_status_counts": oracle_summary.get("artifact_status_counts", {}),
             "operator_dependency_count": oracle_summary.get("operator_dependency_count", 0),
             "sidecar_dependency_count": oracle_summary.get("sidecar_dependency_count", 0),
+            "oracle_missing_artifact_count": oracle_summary.get("missing_artifact_count", 0),
             "top_oracle": oracle_summary.get("top_oracle", {}),
             "discovery_coverage": (discovery_coverage or {}).get("status"),
             "burp_observation_coverage": (burp_observation_coverage or {}).get("status"),
@@ -37913,7 +37981,7 @@ def build_review_blockers_rollup(
     for group in groups:
         increment_count(group_status_counts, str(group.get("status") or "unknown"))
         increment_count(group_category_counts, str(group.get("category") or "unknown"))
-    oracle_summary = build_review_blocker_oracle_summary(groups)
+    oracle_summary = build_review_blocker_oracle_summary(groups, artifact_dir=artifact_dir)
 
     return {
         "generated_at": utc_now(),
@@ -37940,8 +38008,10 @@ def build_review_blockers_rollup(
             "oracle_type_counts": oracle_summary.get("type_counts", {}),
             "oracle_status_counts": oracle_summary.get("status_counts", {}),
             "oracle_dependency_counts": oracle_summary.get("dependency_counts", {}),
+            "oracle_artifact_status_counts": oracle_summary.get("artifact_status_counts", {}),
             "operator_dependency_count": oracle_summary.get("operator_dependency_count", 0),
             "sidecar_dependency_count": oracle_summary.get("sidecar_dependency_count", 0),
+            "oracle_missing_artifact_count": oracle_summary.get("missing_artifact_count", 0),
             "top_oracle": oracle_summary.get("top_oracle", {}),
             "artifact_health": (artifact_health or {}).get("status"),
         },
@@ -38581,9 +38651,14 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 and gate_oracle_summary.get("dependency_counts", {}).get("approved-sidecar-or-single-observation") == 1
                 and gate_oracle_summary.get("sidecar_dependency_count") == 1
                 and gate_oracle_summary.get("operator_dependency_count") == 0
+                and gate_oracle_summary.get("artifact_status_counts", {}).get("missing-artifacts") == 1
+                and int(gate_oracle_summary.get("missing_artifact_count") or 0) > 0
                 and gate_top_oracle.get("oracle_type") == "transaction-intent"
                 and gate_top_oracle.get("dependency_kind") == "approved-sidecar-or-single-observation"
+                and gate_top_oracle.get("artifact_status_label") == "missing-artifacts"
+                and gate_top_oracle.get("first_missing_artifact")
                 and gate_blockers.get("summary", {}).get("oracle_type_counts", {}).get("transaction-intent") == 1
+                and gate_blockers.get("summary", {}).get("oracle_artifact_status_counts", {}).get("missing-artifacts") == 1
                 and gate_blockers.get("summary", {}).get("top_oracle", {}).get("oracle_type") == "transaction-intent"
             ),
             "expected": "review-blockers summarizes validation oracle types, statuses, dependency classes, and top oracle",
@@ -38625,6 +38700,8 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 and '"transaction-intent": 1' in gate_no_write_stdout
                 and "operator_deps=0" in gate_no_write_stdout
                 and "sidecar_deps=1" in gate_no_write_stdout
+                and "missing_artifacts=" in gate_no_write_stdout
+                and "first_missing=" in gate_no_write_stdout
                 and "top=transaction-intent" in gate_no_write_stdout
                 and "approved quote transaction payload sidecar" in gate_no_write_stdout_text
                 and "No files written (--no-write)." in gate_no_write_stdout
@@ -38857,9 +38934,12 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
         f"- Oracle type counts: `{json.dumps(oracle_summary.get('type_counts', {}), sort_keys=True)}`",
         f"- Oracle status counts: `{json.dumps(oracle_summary.get('status_counts', {}), sort_keys=True)}`",
         f"- Oracle dependency counts: `{json.dumps(oracle_summary.get('dependency_counts', {}), sort_keys=True)}`",
+        f"- Oracle artifact status counts: `{json.dumps(oracle_summary.get('artifact_status_counts', {}), sort_keys=True)}`",
         f"- Operator/deployment oracle deps: `{oracle_summary.get('operator_dependency_count', 0)}`",
         f"- Sidecar/single-observation oracle deps: `{oracle_summary.get('sidecar_dependency_count', 0)}`",
+        f"- Oracle missing artifacts: `{oracle_summary.get('missing_artifact_count', 0)}`",
         f"- Top oracle: `{top_oracle.get('oracle_type') or '-'}` group=`{top_oracle.get('group_id') or '-'}`",
+        f"- Top oracle first missing artifact: `{top_oracle.get('first_missing_artifact') or '-'}`",
         "",
         "## Safety",
         "",
@@ -58800,10 +58880,13 @@ def run_review_blockers(args: argparse.Namespace) -> int:
             f"types={json.dumps(oracle_summary.get('type_counts', {}), sort_keys=True)} "
             f"statuses={json.dumps(oracle_summary.get('status_counts', {}), sort_keys=True)} "
             f"deps={json.dumps(oracle_summary.get('dependency_counts', {}), sort_keys=True)} "
+            f"artifact_statuses={json.dumps(oracle_summary.get('artifact_status_counts', {}), sort_keys=True)} "
             f"operator_deps={oracle_summary.get('operator_dependency_count', 0)} "
             f"sidecar_deps={oracle_summary.get('sidecar_dependency_count', 0)} "
+            f"missing_artifacts={oracle_summary.get('missing_artifact_count', 0)} "
             f"top={top_oracle.get('oracle_type') or '-'} "
             f"group={top_oracle.get('group_id') or '-'} "
+            f"first_missing={top_oracle.get('first_missing_artifact') or '-'} "
             f"next={inline_summary_text(top_oracle.get('next_step'), max_chars=220)}"
         )
     if review_blockers.get("mode") == "rollup":

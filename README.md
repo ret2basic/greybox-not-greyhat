@@ -1569,13 +1569,14 @@ templates for credential/resource impact. The same group summary carries
 finding-gate or adjudication can accept a Medium+ claim. The run-level
 `oracle_summary` also rolls up oracle type/status counts, operator/deployment
 dependencies, sidecar or single-observation dependencies, and the current top
-oracle. This keeps greybox runs focused on remaining coverage evidence classes
-while blackbox runs can choose the shortest valid high-impact bounty path without
-reading every blocker first. Rewrite-response unblock plans also carry the
-selected read-only request, source reference, fixed upstreams, path-sensitivity
-score, sidecar path, and redacted required fields, so reviewers can understand
-why the path is high-value without re-running the lower-level rewrite review
-first. `audit` and
+oracle. It also summarizes whether the referenced local evidence artifacts are
+present and names the first missing artifact for the top oracle. This keeps
+greybox runs focused on remaining coverage evidence classes while blackbox runs
+can choose the shortest valid high-impact bounty path without reading every
+blocker first. Rewrite-response unblock plans also carry the selected read-only
+request, source reference, fixed upstreams, path-sensitivity score, sidecar path,
+and redacted required fields, so reviewers can understand why the path is
+high-value without re-running the lower-level rewrite review first. `audit` and
 `verification-queue` refresh it automatically.
 The Markdown playbook is useful as the first artifact to inspect after a
 regression run because it keeps the approved-path, source-only review, missing
