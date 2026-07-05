@@ -154,6 +154,7 @@ LEAD_DOSSIER_ARTIFACT = "lead-dossier.json"
 HYPOTHESIS_MATRIX_ARTIFACT = "hypothesis-matrix.json"
 VALIDATION_PLAN_ARTIFACT = "validation-plan.json"
 ITERATION_DECISION_ARTIFACT = "iteration-decision.json"
+EVIDENCE_PREP_PACKAGE_ARTIFACT = "evidence-prep-package.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -253,6 +254,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     HYPOTHESIS_MATRIX_ARTIFACT,
     VALIDATION_PLAN_ARTIFACT,
     ITERATION_DECISION_ARTIFACT,
+    EVIDENCE_PREP_PACKAGE_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -344,6 +346,7 @@ INDEX_ARTIFACT_ORDER = [
     PROFILE_VALIDATION_ARTIFACT,
     *DISCOVERY_ARTIFACTS,
     *REVIEW_ARTIFACTS,
+    EVIDENCE_PREP_PACKAGE_ARTIFACT,
     "config.json",
     "collection-summary.json",
     "endpoint-clusters.json",
@@ -19581,6 +19584,227 @@ def iteration_action(
     }
 
 
+EVIDENCE_PREP_TEMPLATE_ACTION_IDS = {
+    "rewrite-response-template-package",
+    "transaction-policy-template-package",
+    "operator-sidecar-template-package",
+}
+
+
+def evidence_prep_command_rows(action: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    for ref in action.get("commands", []) or []:
+        if not isinstance(ref, dict):
+            continue
+        rows.append(
+            {
+                "command": ref.get("command"),
+                "classification": ref.get("classification"),
+                "runnable": ref.get("runnable"),
+                "source": ref.get("source"),
+                "artifact": ref.get("artifact"),
+                "template_count": ref.get("template_count"),
+                "reason": ref.get("reason"),
+            }
+        )
+    return rows
+
+
+def compact_evidence_prep_approval_packet(row: dict[str, Any]) -> dict[str, Any]:
+    packet = row.get("packet") if isinstance(row.get("packet"), dict) else {}
+    packet_type = str(row.get("packet_type") or "")
+    compact: dict[str, Any] = {
+        "validation_item_id": row.get("validation_item_id"),
+        "packet_type": packet_type,
+        "status": packet.get("status"),
+        "finding_gate_blockers": len(packet.get("finding_gate_blockers", []) or []),
+    }
+    if packet_type == "rewrite-response":
+        recommended = (
+            packet.get("recommended_request")
+            if isinstance(packet.get("recommended_request"), dict)
+            else {}
+        )
+        compact.update(
+            {
+                "recommended_request": {
+                    key: recommended.get(key)
+                    for key in ["method", "path", "client_path", "upstream_path", "cluster_id", "source_ref"]
+                    if recommended.get(key) is not None
+                },
+                "sidecar": packet.get("sidecar_path"),
+                "required_fields": normalize_string_list(packet.get("redacted_sidecar_required_fields"))[:8],
+            }
+        )
+    elif packet_type == "transaction-corpus":
+        recommended = (
+            packet.get("recommended_quote")
+            if isinstance(packet.get("recommended_quote"), dict)
+            else {}
+        )
+        compact.update(
+            {
+                "recommended_quote": {
+                    key: recommended.get(key)
+                    for key in ["method", "path", "direction", "expectedPayloadType", "programAllowlistStatus"]
+                    if recommended.get(key) is not None
+                },
+                "payload_sidecar": packet.get("payload_sidecar"),
+                "intent_policy_sidecar": packet.get("intent_policy_sidecar"),
+                "required_fields": normalize_string_list(packet.get("redacted_sidecar_required_fields"))[:8],
+            }
+        )
+    else:
+        recommended = (
+            packet.get("recommended_evidence")
+            if isinstance(packet.get("recommended_evidence"), dict)
+            else {}
+        )
+        compact.update(
+            {
+                "recommended_evidence": {
+                    key: recommended.get(key)
+                    for key in ["entrypoint", "provider", "route_count", "policy_posture"]
+                    if recommended.get(key) is not None
+                },
+                "operator_evidence_sidecar": (
+                    packet.get("operator_evidence_sidecar")
+                    or packet.get("resource_control_sidecar")
+                    or packet.get("websocket_header_evidence_sidecar")
+                ),
+                "missing_decision_ids": normalize_string_list(
+                    recommended.get("missing_decision_ids")
+                    or packet.get("missing_decision_ids")
+                )[:12],
+                "required_fields": normalize_string_list(packet.get("redacted_sidecar_required_fields"))[:8],
+            }
+        )
+    return compact
+
+
+def build_iteration_evidence_preparation_package(decision: dict[str, Any]) -> dict[str, Any]:
+    summary = decision.get("summary") if isinstance(decision.get("summary"), dict) else {}
+    objective = (
+        decision.get("objective_satisfaction")
+        if isinstance(decision.get("objective_satisfaction"), dict)
+        else {}
+    )
+    top_unblocker = (
+        objective.get("top_unblocker")
+        if isinstance(objective.get("top_unblocker"), dict)
+        else {}
+    )
+    evidence_package = (
+        top_unblocker.get("evidence_package")
+        if isinstance(top_unblocker.get("evidence_package"), dict)
+        else {}
+    )
+    actions = [action for action in decision.get("actions", []) or [] if isinstance(action, dict)]
+    template_actions = [
+        action
+        for action in actions
+        if str(action.get("id") or "") in EVIDENCE_PREP_TEMPLATE_ACTION_IDS
+    ]
+    objective_action = next((action for action in actions if action.get("id") == "objective-evidence-package"), {})
+    oracle_action = next((action for action in actions if action.get("id") == "oracle-evidence-plan"), {})
+    active_action = next((action for action in actions if action.get("id") == "active-validation"), {})
+    approval_packets = [
+        compact_evidence_prep_approval_packet(row)
+        for row in decision.get("approval_packets", []) or []
+        if isinstance(row, dict)
+    ]
+    template_packages = [
+        {
+            "action_id": action.get("id"),
+            "status": action.get("status"),
+            "kind": action.get("kind"),
+            "reason": action.get("reason"),
+            "commands": evidence_prep_command_rows(action),
+        }
+        for action in template_actions
+    ]
+    command_refs = []
+    for action in [objective_action, oracle_action, *template_actions]:
+        if isinstance(action, dict) and action:
+            command_refs.extend(evidence_prep_command_rows(action))
+    status = "no-evidence-prep-actions"
+    if template_packages:
+        status = "ready-template-prep"
+    elif objective_action:
+        status = "ready-objective-review"
+    elif active_action:
+        status = "waiting-active-gate"
+    first_missing_artifact = summary.get("top_oracle_first_missing") or top_unblocker.get("first_missing_artifact")
+    return {
+        "schema": "inferforge-evidence-prep-package-v1",
+        "status": status,
+        "target": decision.get("target"),
+        "artifact_dir": decision.get("artifact_dir"),
+        "assessment": {
+            "mode": summary.get("assessment_mode"),
+            "optimization_goal": summary.get("optimization_goal"),
+            "objective_status": summary.get("objective_status"),
+            "completion_unit": summary.get("objective_completion_unit"),
+        },
+        "top_unblocker": {
+            "validation_item_id": objective.get("top_open_id"),
+            "lane": top_unblocker.get("lane"),
+            "actionability": top_unblocker.get("actionability"),
+            "evidence_package_id": top_unblocker.get("evidence_package_id"),
+            "package_status": top_unblocker.get("package_status"),
+            "oracle_type": top_unblocker.get("oracle_type"),
+            "first_missing_artifact": first_missing_artifact,
+        },
+        "required_artifacts": ordered_unique_strings(
+            [
+                *normalize_string_list(evidence_package.get("required_artifacts")),
+                *([str(first_missing_artifact)] if first_missing_artifact else []),
+            ]
+        ),
+        "template_packages": template_packages,
+        "approval_packets": approval_packets[:8],
+        "command_plan": {
+            "objective_review": evidence_prep_command_rows(objective_action) if isinstance(objective_action, dict) else [],
+            "oracle_review": evidence_prep_command_rows(oracle_action) if isinstance(oracle_action, dict) else [],
+            "template_package_count": len(template_packages),
+            "commands": command_refs,
+            "command_safety": command_safety_summary(
+                [
+                    ref
+                    for action in [objective_action, oracle_action, *template_actions]
+                    if isinstance(action, dict)
+                    for ref in action.get("commands", []) or []
+                    if isinstance(ref, dict)
+                ]
+            ),
+        },
+        "active_validation_gate": {
+            "status": active_action.get("status") if isinstance(active_action, dict) else None,
+            "reason": active_action.get("reason") if isinstance(active_action, dict) else None,
+            "resource_status": summary.get("current_resource_snapshot"),
+            "resource_budget_mode": summary.get("resource_budget_mode"),
+        },
+        "forbidden_validation": ordered_unique_strings(
+            [
+                *normalize_string_list(evidence_package.get("forbidden_validation")),
+                "Do not treat template packages as evidence.",
+                "Do not enter finding-gate until concrete approved evidence exists.",
+                "Do not send target traffic unless scope, approval, and resource gates are satisfied.",
+                "Do not include raw Burp history, cookies, bearer tokens, private keys, wallet signatures, or full response bodies.",
+            ]
+        ),
+        "next_step": (
+            "Run the listed template package commands first; then collect only the approved evidence named by required_artifacts."
+            if template_packages
+            else "Run the objective review commands and keep active validation gated."
+        ),
+        "safety": (
+            "Evidence preparation package only. It does not execute commands, send requests, invoke Burp, "
+            "sign wallets, submit transactions, or convert templates into findings."
+        ),
+    }
+
+
 VALIDATION_APPROVAL_PACKET_KEYS = [
     ("transaction_corpus_approval_packet", "transaction-corpus"),
     ("credential_impact_approval_packet", "credential-impact"),
@@ -20483,7 +20707,7 @@ def build_iteration_decision_from_plan(
     except (TypeError, ValueError):
         oracle_plan_action_count = len(oracle_plan_actions)
 
-    return {
+    decision = {
         "generated_at": utc_now(),
         "status": status,
         "target": target,
@@ -20589,6 +20813,8 @@ def build_iteration_decision_from_plan(
             "run scanners, sign wallets, submit transactions, or fetch external hosts."
         ),
     }
+    decision["evidence_preparation_package"] = build_iteration_evidence_preparation_package(decision)
+    return decision
 
 
 def build_iteration_decision(
@@ -54684,6 +54910,19 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             limit=8,
             oracle_plan=focused_iteration_oracle_plan_sample,
         )
+        focused_iteration_evidence_prep_package = (
+            focused_iteration_decision_sample.get("evidence_preparation_package")
+            if isinstance(focused_iteration_decision_sample.get("evidence_preparation_package"), dict)
+            else {}
+        )
+        focused_iteration_evidence_prep_command_plan = (
+            focused_iteration_evidence_prep_package.get("command_plan")
+            if isinstance(focused_iteration_evidence_prep_package.get("command_plan"), dict)
+            else {}
+        )
+        focused_iteration_evidence_prep_forbidden = "\n".join(
+            normalize_string_list(focused_iteration_evidence_prep_package.get("forbidden_validation"))
+        )
         focused_iteration_preview_commands = [
             str(ref.get("command") or "")
             for action in focused_iteration_decision_sample.get("actions", [])
@@ -55939,6 +56178,18 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         == "approved-quote-transaction-corpus"
         and focused_iteration_decision_sample.get("summary", {}).get("top_oracle_first_missing")
         == "transaction-intent-policy.json"
+        and focused_iteration_evidence_prep_package.get("schema") == "inferforge-evidence-prep-package-v1"
+        and focused_iteration_evidence_prep_package.get("status") == "ready-template-prep"
+        and focused_iteration_evidence_prep_package.get("top_unblocker", {}).get("lane")
+        == "approved-transaction-payload"
+        and focused_iteration_evidence_prep_command_plan.get("template_package_count") == 3
+        and any(
+            artifact in focused_iteration_evidence_prep_package.get("required_artifacts", [])
+            for artifact in ["transaction-intent-policy.json", "transaction-payloads.jsonl"]
+        )
+        and "Do not treat template packages as evidence" in focused_iteration_evidence_prep_forbidden
+        and focused_iteration_evidence_prep_package.get("active_validation_gate", {}).get("resource_budget_mode")
+        == "critical"
         and any(
             item.get("packet_type") == "transaction-corpus"
             and (item.get("packet") or {}).get("status") == "ready-offline-approval"
@@ -59126,6 +59377,80 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "focus_stage_counts",
                 {},
             ),
+            "lead_portfolio": {
+                "status": blackbox_lead_portfolio_sample.get("status"),
+                "summary": blackbox_lead_portfolio_sample.get("summary", {}),
+            },
+            "lead_rollup": {
+                "status": blackbox_lead_rollup_sample.get("status"),
+                "mode": blackbox_lead_rollup_sample.get("mode"),
+                "summary": blackbox_lead_rollup_sample.get("summary", {}),
+                "discovered_dirs": blackbox_lead_rollup_discovered_dirs,
+            },
+            "hypothesis_matrix": {
+                "status": blackbox_hypothesis_matrix_sample.get("status"),
+                "summary": blackbox_hypothesis_matrix_sample.get("summary", {}),
+                "rollup_status": blackbox_hypothesis_matrix_rollup_sample.get("status"),
+                "rollup_summary": blackbox_hypothesis_matrix_rollup_sample.get("summary", {}),
+                "fallback_summary": blackbox_profile_fallback_hypothesis_matrix_sample.get("summary", {}),
+            },
+            "validation_plan": {
+                "status": blackbox_validation_plan_sample.get("status"),
+                "summary": blackbox_validation_plan_sample.get("summary", {}),
+                "replacement_count": blackbox_validation_replacement_count,
+                "rollup_summary": blackbox_validation_plan_rollup_sample.get("summary", {}),
+            },
+            "iteration_decision": {
+                "status": blackbox_iteration_decision_sample.get("status"),
+                "summary": blackbox_iteration_decision_sample.get("summary", {}),
+                "objective_satisfaction": blackbox_iteration_decision_sample.get("objective_satisfaction", {}),
+                "top_focus_scorecard": blackbox_iteration_top_focus_scorecard,
+                "action_overview": [
+                    {
+                        "id": action.get("id"),
+                        "status": action.get("status"),
+                        "kind": action.get("kind"),
+                        "commands": len(action.get("commands", []) or []),
+                    }
+                    for action in blackbox_iteration_decision_sample.get("actions", []) or []
+                    if isinstance(action, dict)
+                ],
+            },
+            "artifact_repair_iteration": {
+                "status": artifact_repair_iteration_decision_sample.get("status"),
+                "summary": artifact_repair_iteration_decision_sample.get("summary", {}),
+                "action_overview": [
+                    {
+                        "id": action.get("id"),
+                        "status": action.get("status"),
+                        "kind": action.get("kind"),
+                        "commands": len(action.get("commands", []) or []),
+                    }
+                    for action in artifact_repair_iteration_decision_sample.get("actions", []) or []
+                    if isinstance(action, dict)
+                ],
+                "command_text": artifact_repair_iteration_command_text_sample,
+            },
+            "asset_candidate_profile": {
+                "profile_flag": blackbox_asset_clusters_sample.get("profile", {}).get("asset_candidate_profile"),
+                "verification_has_safe_audit": (
+                    BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_verification_command_text
+                ),
+                "verification_has_external_audit": (
+                    EXTERNAL_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_verification_command_text
+                ),
+                "followup_has_safe_audit": (
+                    BLACKBOX_ASSET_VERIFICATION_AUDIT_SUBCOMMAND in blackbox_asset_followup_command_text
+                ),
+                "followup_has_include_external": "--include-external" in blackbox_asset_followup_command_text,
+                "followup_has_ws_resource_probes": "--ws-resource-probes" in blackbox_asset_followup_command_text,
+                "observed_selection": blackbox_asset_observed_selection_sample,
+                "profile_contains_orders": "/api/orders" in blackbox_asset_profile_text_sample,
+                "profile_contains_markets": "/api/v1/markets" in blackbox_asset_profile_text_sample,
+                "profile_contains_ws_quotes": "/ws/v1/quotes" in blackbox_asset_profile_text_sample,
+                "profile_contains_homepage_value": "homepage" in blackbox_asset_profile_text_sample,
+                "candidate_count": len(blackbox_asset_map_sample.get("candidates", []) or []),
+            },
             "resource_gated_queue": {
                 "status": "passed"
                 if (
@@ -59178,6 +59503,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     and focused_iteration_decision_sample.get("summary", {}).get("oracle_sidecar_template_commands")
                     == 1
                     and focused_iteration_decision_sample.get("summary", {}).get("top_oracle") == "transaction-intent"
+                    and focused_iteration_evidence_prep_package.get("schema")
+                    == "inferforge-evidence-prep-package-v1"
+                    and focused_iteration_evidence_prep_package.get("status") == "ready-template-prep"
+                    and focused_iteration_evidence_prep_command_plan.get("template_package_count") == 3
                     and not any(
                         command in focused_iteration_preview_commands
                         for command in focused_iteration_objective_preview_commands
@@ -59221,6 +59550,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "transaction_policy_template_action": focused_iteration_transaction_policy_template_action,
                 "sidecar_template_commands": focused_iteration_sidecar_template_commands,
                 "sidecar_template_action": focused_iteration_sidecar_template_action,
+                "evidence_prep": {
+                    "schema": focused_iteration_evidence_prep_package.get("schema"),
+                    "status": focused_iteration_evidence_prep_package.get("status"),
+                    "top_unblocker": focused_iteration_evidence_prep_package.get("top_unblocker"),
+                    "required_artifacts": focused_iteration_evidence_prep_package.get("required_artifacts"),
+                    "command_plan": focused_iteration_evidence_prep_command_plan,
+                    "active_validation_gate": focused_iteration_evidence_prep_package.get("active_validation_gate"),
+                    "forbidden_validation": normalize_string_list(
+                        focused_iteration_evidence_prep_package.get("forbidden_validation")
+                    ),
+                },
                 "expected_commands": [
                     focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
                     focused_iteration_command(TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND),
@@ -66405,12 +66745,24 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
     )
 
     output_path = resolve_repo_path(args.output) if args.output else artifact_dir / ITERATION_DECISION_ARTIFACT
+    evidence_prep_output_path = (
+        resolve_repo_path(args.evidence_prep_output)
+        if getattr(args, "evidence_prep_output", None)
+        else artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT
+    )
     refreshed_manifests = []
     if not no_write:
+        output_paths = [output_path]
         write_json(output_path, decision)
+        if getattr(args, "write_evidence_prep_package", False):
+            write_json(
+                evidence_prep_output_path,
+                sanitize_artifact_samples(decision.get("evidence_preparation_package", {})),
+            )
+            output_paths.append(evidence_prep_output_path)
         if deduped_dirs:
             refreshed_manifests = refresh_manifests_for_artifact_outputs(
-                output_paths=[output_path],
+                output_paths=output_paths,
                 artifact_dir=artifact_dir,
                 check_dirs=deduped_dirs,
                 target=target,
@@ -66421,7 +66773,7 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
                 artifact_dir=artifact_dir,
                 target=target,
                 command="iteration-decision",
-                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+                output_paths=[*target_profile_artifact_paths(artifact_dir), *output_paths],
             )
 
     summary = decision.get("summary", {}) or {}
@@ -66473,6 +66825,24 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
             f"package_status={top_unblocker.get('package_status') or '-'} "
             f"oracle={top_unblocker.get('oracle_type') or '-'} "
             f"commands={len(objective_satisfaction.get('safe_offline_commands', []) or [])}"
+        )
+    evidence_prep = (
+        decision.get("evidence_preparation_package")
+        if isinstance(decision.get("evidence_preparation_package"), dict)
+        else {}
+    )
+    if evidence_prep:
+        command_plan = (
+            evidence_prep.get("command_plan")
+            if isinstance(evidence_prep.get("command_plan"), dict)
+            else {}
+        )
+        print(
+            "Evidence prep: "
+            f"status={evidence_prep.get('status') or '-'} "
+            f"required={len(evidence_prep.get('required_artifacts', []) or [])} "
+            f"templates={command_plan.get('template_package_count', 0)} "
+            f"commands={len(command_plan.get('commands', []) or [])}"
         )
     if resource_preflight and resource_preflight.get("status") != "not-run":
         warnings = resource_preflight.get("warnings", []) or []
@@ -66611,6 +66981,8 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
         print("No files written (--no-write).")
     else:
         print(f"Wrote {output_path}")
+        if getattr(args, "write_evidence_prep_package", False):
+            print(f"Wrote {evidence_prep_output_path}")
         print_refreshed_manifests(refreshed_manifests)
 
     if decision["status"] in {"blocked-artifact-health", "blocked-command-safety"}:
@@ -69365,6 +69737,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-commands",
         action="store_true",
         help="Print command previews for each decision action.",
+    )
+    iteration_decision.add_argument(
+        "--write-evidence-prep-package",
+        action="store_true",
+        help=(
+            f"Also write {EVIDENCE_PREP_PACKAGE_ARTIFACT}; this is a template/evidence preparation package, "
+            "not proof of a finding."
+        ),
+    )
+    iteration_decision.add_argument(
+        "--evidence-prep-output",
+        help=(
+            f"Where to write {EVIDENCE_PREP_PACKAGE_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{EVIDENCE_PREP_PACKAGE_ARTIFACT}."
+        ),
     )
     iteration_decision.add_argument(
         "--skip-current-resource-check",
