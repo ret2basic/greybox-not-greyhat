@@ -33021,6 +33021,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--no-write",
                     "--show-files",
                     "--show-commands",
+                    "--show-payload-template-json",
                 ]
             )
             transaction_corpus_checklist_return_code, transaction_corpus_checklist_stdout = run_cli(
@@ -33037,6 +33038,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--no-write",
                     "--show-commands",
                     "--show-steps",
+                    "--show-payload-template-json",
                     "--skip-current-resource-check",
                 ]
             )
@@ -33947,6 +33949,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Transaction sidecar review:" in transaction_sidecar_review_stdout_text
                 and "Sidecars:" in transaction_sidecar_review_stdout_text
                 and "Intent policy:" in transaction_sidecar_review_stdout_text
+                and "Payload sidecar template JSON:" in transaction_sidecar_review_stdout_text
+                and "REPLACE_WITH_BASE64_VERSIONED_TRANSACTION" in transaction_sidecar_review_stdout_text
                 and "No files written (--no-write)." in transaction_sidecar_review_stdout
                 and not any(
                     output_paths[key]
@@ -33972,6 +33976,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 transaction_corpus_checklist_return_code == 0
                 and "Transaction corpus checklist:" in transaction_corpus_checklist_stdout_text
                 and "Capture gate:" in transaction_corpus_checklist_stdout_text
+                and "Payload sidecar template JSON:" in transaction_corpus_checklist_stdout_text
+                and "REPLACE_WITH_BASE64_VERSIONED_TRANSACTION" in transaction_corpus_checklist_stdout_text
                 and "No files written (--no-write)." in transaction_corpus_checklist_stdout
                 and not any(
                     output_paths[key]
@@ -49874,6 +49880,53 @@ def print_transaction_payload_shape_guidance(guidance: dict[str, Any], *, top: i
         print(f"- note={inline_summary_text(guidance.get('empty_burp_candidate_note'), max_chars=320)}")
 
 
+def print_transaction_payload_template_json(guidance: dict[str, Any]) -> None:
+    if not isinstance(guidance, dict) or not guidance:
+        return
+    accepted_sidecars = normalize_string_list(guidance.get("accepted_sidecars"))
+    examples = guidance.get("examples", []) if isinstance(guidance.get("examples"), list) else []
+    template = {
+        "status": "template",
+        "accepted_sidecars": accepted_sidecars,
+        "recommended_file": "transaction-payloads.json",
+        "expected_payload_type": guidance.get("expected_payload_type"),
+        "configured_candidate_paths": normalize_string_list(guidance.get("configured_candidate_paths")),
+        "transaction_payloads_json": next(
+            (
+                example.get("object")
+                for example in examples
+                if isinstance(example, dict) and example.get("file") == "transaction-payloads.json"
+            ),
+            {},
+        ),
+        "transaction_payloads_jsonl_line": next(
+            (
+                example.get("line")
+                for example in examples
+                if isinstance(example, dict) and example.get("file") == "transaction-payloads.jsonl"
+            ),
+            {},
+        ),
+        "transaction_payloads_txt": next(
+            (
+                example.get("text")
+                for example in examples
+                if isinstance(example, dict) and example.get("file") == "transaction-payloads.txt"
+            ),
+            "REPLACE_WITH_BASE64_VERSIONED_TRANSACTION",
+        ),
+        "instructions": [
+            "Use exactly one approved quote response body or one extracted transaction payload for the intended flow.",
+            "Replace REPLACE_WITH_BASE64_VERSIONED_TRANSACTION with the approved response transaction value only after manual review.",
+            "Keep raw Burp history, private keys, seed phrases, signatures, cookies, bearer tokens, and unrelated quote responses out of sidecars.",
+            "Run transaction-sidecar-review --no-write --show-files --show-commands after creating the sidecar.",
+        ],
+        "safety": "Offline template only. It contains placeholders and sends no requests, signs no wallets, and submits no transactions.",
+    }
+    print("Payload sidecar template JSON:")
+    print(json.dumps(sanitize_artifact_samples(template), indent=2, sort_keys=False))
+
+
 def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -49973,6 +50026,8 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
             review.get("payload_shape_guidance", {}),
             top=args.top,
         )
+    if args.show_payload_template_json:
+        print_transaction_payload_template_json(review.get("payload_shape_guidance", {}))
     shape_review = review.get("payload_shape_review") if isinstance(review.get("payload_shape_review"), dict) else {}
     if args.show_commands and shape_review and shape_review.get("status") not in {"no-payload-sidecars"}:
         shape_summary = shape_review.get("summary", {}) if isinstance(shape_review.get("summary"), dict) else {}
@@ -50123,6 +50178,8 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
             checklist.get("payload_shape_guidance", {}),
             top=args.top,
         )
+    if args.show_payload_template_json:
+        print_transaction_payload_template_json(checklist.get("payload_shape_guidance", {}))
     if args.show_steps:
         print("Capture steps:")
         for step in checklist.get("capture_steps", []) or []:
@@ -52760,6 +52817,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print decode-transactions commands when sidecars are ready.",
     )
     transaction_sidecar_review.add_argument(
+        "--show-payload-template-json",
+        action="store_true",
+        help="Print a placeholder JSON payload sidecar template for an approved quote response.",
+    )
+    transaction_sidecar_review.add_argument(
         "--no-write",
         action="store_true",
         help=(
@@ -52800,6 +52862,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-steps",
         action="store_true",
         help="Print the capture checklist steps.",
+    )
+    transaction_corpus_checklist.add_argument(
+        "--show-payload-template-json",
+        action="store_true",
+        help="Print a placeholder JSON payload sidecar template for an approved quote response.",
     )
     transaction_corpus_checklist.add_argument(
         "--skip-current-resource-check",

@@ -1007,6 +1007,9 @@ matching `prepare-transaction-intent-policy --no-write`, write, and
 `decode-transactions` command sequence for each profile direction.
 An empty `burp-transaction-candidates.json` placeholder counts only as a present
 file; it does not satisfy the candidate-bearing sidecar evidence gate.
+Add `--show-payload-template-json` to print placeholder JSON/JSONL/TXT sidecar
+templates for the single approved quote response before creating a local
+payload sidecar.
 
 `transaction-corpus-checklist` is the offline bridge between source-flow review
 and decoding. It reads the current quote collection, Burp transaction candidate,
