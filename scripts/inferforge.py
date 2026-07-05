@@ -10096,7 +10096,10 @@ def build_resource_evidence_closure(
     commands = []
     for source, subcommand in [
         ("deployment", "deployment-review --no-write --top 8"),
-        ("operator-evidence", "operator-evidence-review --no-write --show-missing --show-template"),
+        (
+            "operator-evidence",
+            "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
+        ),
         ("validation-plan", "validation-plan --no-write --top 8 --show-commands --skip-current-resource-check"),
     ]:
         ref = methodology_command_ref(
@@ -14542,7 +14545,10 @@ def validation_allowed_commands(
         allowed_now_commands.insert(3, command("rewrite-validation-checklist --no-write --show-candidates --show-commands"))
         allowed_now_commands.insert(4, command(REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND))
     if hypothesis.get("type") == "resource-abuse-review" or hypothesis.get("impact") == "resource-exhaustion":
-        allowed_now_commands.insert(3, command("operator-evidence-review --no-write --show-missing --show-template"))
+        allowed_now_commands.insert(
+            3,
+            command("operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract"),
+        )
         allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
     if hypothesis.get("type") == "transaction-flow-review" or hypothesis.get("impact") == "transaction-integrity":
         allowed_now_commands.insert(3, command("transaction-flow-review --no-write --top 8"))
