@@ -171,6 +171,7 @@ REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
 REWRITE_RESPONSE_SIDECAR_ARTIFACT = "rewrite-response-sidecar.jsonl"
 REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT = "rewrite-response-sidecar-template.json"
+RESPONSE_EVIDENCE_READINESS_ARTIFACT = "response-evidence-readiness.json"
 DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT = "deployment-resource-review.json"
 TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
 TRANSACTION_INTENT_BOUNDARY_ARTIFACT = "transaction-intent-boundary.json"
@@ -285,6 +286,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT,
+    RESPONSE_EVIDENCE_READINESS_ARTIFACT,
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT,
@@ -18783,6 +18785,267 @@ def build_rewrite_response_review(
     }
 
 
+def response_evidence_invalidity_row(invalidity_review: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(invalidity_review, dict):
+        return {}
+    rows = invalidity_review.get("invalidity_rows")
+    if not isinstance(rows, list):
+        return {}
+    for row in rows:
+        if isinstance(row, dict) and row.get("bounty_lane") == "sensitive-response-impact":
+            return row
+    return {}
+
+
+def response_evidence_gate_row(bounty_validation_gates: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(bounty_validation_gates, dict):
+        return {}
+    gates = bounty_validation_gates.get("gates")
+    if not isinstance(gates, list):
+        return {}
+    for gate in gates:
+        if isinstance(gate, dict) and gate.get("bounty_lane") == "sensitive-response-impact":
+            return gate
+    return {}
+
+
+def response_evidence_readiness_check(
+    check_id: str,
+    label: str,
+    status: str,
+    evidence: Any,
+    next_step: str,
+) -> dict[str, Any]:
+    return {
+        "id": check_id,
+        "label": label,
+        "status": status,
+        "evidence": evidence,
+        "next_step": next_step,
+    }
+
+
+def response_evidence_recommended_request(rewrite_response_review: dict[str, Any]) -> dict[str, Any]:
+    approval_packet = (
+        rewrite_response_review.get("single_request_approval_packet")
+        if isinstance(rewrite_response_review.get("single_request_approval_packet"), dict)
+        else {}
+    )
+    return (
+        approval_packet.get("recommended_request")
+        if isinstance(approval_packet.get("recommended_request"), dict)
+        else {}
+    )
+
+
+def build_response_evidence_readiness(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    rewrite_response_review: dict[str, Any] | None,
+    bounty_validation_gates: dict[str, Any] | None,
+    bounty_invalidity_review: dict[str, Any] | None,
+) -> dict[str, Any]:
+    review = rewrite_response_review if isinstance(rewrite_response_review, dict) else {}
+    summary = review.get("summary") if isinstance(review.get("summary"), dict) else {}
+    sidecar_file = review.get("sidecar_file") if isinstance(review.get("sidecar_file"), dict) else {}
+    sidecar_validation = (
+        review.get("sidecar_validation")
+        if isinstance(review.get("sidecar_validation"), dict)
+        else {}
+    )
+    gate = response_evidence_gate_row(bounty_validation_gates)
+    invalidity_row = response_evidence_invalidity_row(bounty_invalidity_review)
+    recommended = response_evidence_recommended_request(review)
+    sidecar_status = str(summary.get("sidecar_status") or sidecar_file.get("status") or "missing")
+    sidecar_validation_status = str(summary.get("sidecar_validation_status") or sidecar_validation.get("status") or "missing")
+    approved_rows = int(sidecar_validation.get("approved_rows") or 0)
+    valid_candidate_rows = int(sidecar_validation.get("valid_candidate_rows") or 0)
+    invalid_rows = int(sidecar_validation.get("invalid_rows") or summary.get("sidecar_validation_invalid_rows") or 0)
+    warning_rows = int(sidecar_validation.get("warning_rows") or summary.get("sidecar_validation_warning_rows") or 0)
+    candidate_impact = int(summary.get("candidate_impact_observations") or 0)
+    approved_observations = int(summary.get("observed_approved_responses") or 0)
+    path_options = int(sidecar_validation.get("path_options") or 0)
+    sidecar_shape_ready = (
+        sidecar_status == "present"
+        and sidecar_validation_status == "valid-candidate-impact"
+        and approved_rows == 1
+        and valid_candidate_rows == 1
+        and invalid_rows == 0
+    )
+    impact_ready = sidecar_shape_ready and candidate_impact > 0
+    invalidity_present = bool(invalidity_row)
+    invalid_now = bool(invalidity_row.get("invalid_if_reported_now"))
+    checks = [
+        response_evidence_readiness_check(
+            "approved-response-sidecar",
+            "Exactly one approved redacted rewrite response sidecar row exists.",
+            "passed" if sidecar_shape_ready else sidecar_status if sidecar_status != "present" else sidecar_validation_status,
+            {
+                "sidecar_path": review.get("sidecar_path") or repo_relative_or_absolute(artifact_dir / REWRITE_RESPONSE_SIDECAR_ARTIFACT),
+                "sidecar_file_status": sidecar_status,
+                "sidecar_validation_status": sidecar_validation_status,
+                "approved_rows": approved_rows,
+                "valid_candidate_rows": valid_candidate_rows,
+                "invalid_rows": invalid_rows,
+                "warning_rows": warning_rows,
+            },
+            "Create exactly one approved redacted rewrite-response-sidecar.jsonl row from a reviewed in-scope read-only response.",
+        ),
+        response_evidence_readiness_check(
+            "response-impact-indicators",
+            "The approved response sidecar carries concrete sensitive-data, auth, tenant, wallet/account, or path-confusion impact indicators.",
+            "passed" if impact_ready else "waiting",
+            {
+                "candidate_impact_observations": candidate_impact,
+                "observed_approved_responses": approved_observations,
+                "accepted_impact_indicators": sidecar_validation.get("accepted_impact_indicators", []),
+            },
+            "Fill impact_indicators, sensitive field markers, and a short redacted impact_summary; status/path alone is not enough.",
+        ),
+        response_evidence_readiness_check(
+            "single-response-scope-and-redaction",
+            "The evidence is scoped to one reviewed read-only path and contains no raw response bodies or secrets.",
+            "passed" if impact_ready else "waiting",
+            {
+                "recommended_request": recommended,
+                "path_options": path_options,
+                "first_missing": sidecar_validation.get("first_missing_field"),
+                "first_invalid": sidecar_validation.get("first_invalid_field"),
+            },
+            "Use one reviewed path from the template; keep only field paths, status/content type, indicators, and redacted summary.",
+        ),
+        response_evidence_readiness_check(
+            "sensitive-response-bounty-gate",
+            "Bounty validation gate accepts the approved response as concrete sensitive-response impact.",
+            "passed" if impact_ready and invalidity_present and not invalid_now else "blocked",
+            {
+                "gate_id": gate.get("id"),
+                "gate_status": gate.get("gate_status"),
+                "invalid_if_reported_now": invalid_now,
+                "primary_invalidity_category": invalidity_row.get("primary_invalidity_category"),
+            },
+            invalidity_row.get("minimum_fix")
+            or "Rerun rewrite-response-review, bounty-validation-gates, gate, and adjudicate after valid response evidence exists.",
+        ),
+    ]
+    failed_or_waiting = [check for check in checks if check.get("status") != "passed"]
+    if not gate:
+        status = "no-sensitive-response-gate"
+    elif sidecar_status == "missing":
+        status = "waiting-approved-response-sidecar"
+    elif invalid_rows or sidecar_validation_status == "invalid":
+        status = "invalid-response-sidecar"
+    elif impact_ready and (invalid_now or not invalidity_present):
+        status = "ready-to-rerun-response-validation-gate"
+    elif impact_ready and invalidity_present:
+        status = "ready-for-response-finding-gate-review"
+    elif sidecar_status == "present":
+        status = "partial-response-sidecar"
+    else:
+        status = "waiting-approved-response-sidecar"
+    minimum_package = {
+        "response_sidecar": review.get("sidecar_path") or repo_relative_or_absolute(artifact_dir / REWRITE_RESPONSE_SIDECAR_ARTIFACT),
+        "format": "jsonl",
+        "selection_rule": "Exactly one approved=true row for one reviewed in-scope read-only response.",
+        "recommended_request": {
+            "method": recommended.get("method") or "GET",
+            "path": recommended.get("path") or "/api/infrafi/vault/solana/dry-powder",
+            "sensitivity": recommended.get("sensitivity") if isinstance(recommended.get("sensitivity"), dict) else {},
+        },
+        "required_fields": [
+            "approved=true",
+            "method",
+            "path",
+            "2xx status",
+            "content_type",
+            "impact_indicators",
+            "sensitive_field_markers or json_field_paths",
+            "short redacted impact_summary",
+            "reviewer/source/ticket reference",
+        ],
+        "accepted_impact_indicators": sorted(REWRITE_RESPONSE_SIDECAR_IMPACT_INDICATORS),
+        "forbidden_fields": [
+            "raw Burp history",
+            "cookies",
+            "bearer tokens",
+            "API keys",
+            "private keys",
+            "seed phrases",
+            "wallet signatures",
+            "full response bodies",
+            "raw body/body_sample/raw_body fields",
+        ],
+    }
+    commands = [
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "rewrite-response-review --no-write --show-observations --show-sidecar-validation --show-sidecar-template-json",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "bounty-validation-gates --no-write --show-gates",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "bounty-invalidity-review --no-write --show-reasons",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+        validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+    ]
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-response-evidence-readiness-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "checks": len(checks),
+            "passed": sum(1 for check in checks if check.get("status") == "passed"),
+            "waiting_or_blocked": len(failed_or_waiting),
+            "sidecar_status": sidecar_status,
+            "sidecar_validation_status": sidecar_validation_status,
+            "sidecar_shape_ready": sidecar_shape_ready,
+            "impact_ready": impact_ready,
+            "approved_rows": approved_rows,
+            "valid_candidate_rows": valid_candidate_rows,
+            "candidate_impact_observations": candidate_impact,
+            "invalid_rows": invalid_rows,
+            "warning_rows": warning_rows,
+            "invalid_if_reported_now": invalid_now,
+            "rewrite_response_status": review.get("status") or "missing",
+            "bounty_gate_status": gate.get("gate_status") or "missing",
+            "invalidity_status": (
+                bounty_invalidity_review.get("status")
+                if isinstance(bounty_invalidity_review, dict)
+                else "missing"
+            ),
+        },
+        "minimum_official_evidence_package": minimum_package,
+        "checks": checks,
+        "first_blocker": failed_or_waiting[0] if failed_or_waiting else None,
+        "commands": commands,
+        "reportability_rule": (
+            "This readiness artifact is not evidence. Sensitive-response promotion requires exactly one approved redacted "
+            "response sidecar, concrete impact indicators, finding-gate acceptance, and final adjudication."
+        ),
+        "next_step": (
+            failed_or_waiting[0].get("next_step")
+            if failed_or_waiting
+            else "Rerun finding-gate and adjudication with the validated response evidence."
+        ),
+        "safety": (
+            "Offline response-evidence readiness only. It reads local redacted review artifacts, sends no target traffic, "
+            "does not query Burp, reads no raw history, and creates no official response sidecar."
+        ),
+    }
+
+
 def validation_allowed_commands(
     *,
     artifact_dir: Path,
@@ -24739,6 +25002,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     OPERATOR_IMPACT_READINESS_ARTIFACT: "operator-impact-readiness",
     ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT: "oracle-plan --write-sidecar-template",
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT: "rewrite-response-review --write-sidecar-template",
+    RESPONSE_EVIDENCE_READINESS_ARTIFACT: "response-evidence-readiness",
     "finding-gate.json": "gate",
     "adjudication.json": "adjudicate",
     "findings.json": "adjudicate",
@@ -24785,6 +25049,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "transaction-evidence-readiness",
     "operator-impact-readiness",
     "rewrite-response-review --write-sidecar-template",
+    "response-evidence-readiness",
     "report",
     "transaction-corpus-checklist --write-policy-template --skip-current-resource-check",
     "decode-transactions",
@@ -24819,6 +25084,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "rewrite-response-review --write-sidecar-template": (
         "rewrite-response-review --no-write --show-sidecar-template-json"
     ),
+    "response-evidence-readiness": "response-evidence-readiness --no-write",
     "transaction-corpus-checklist --write-policy-template --skip-current-resource-check": (
         "transaction-corpus-checklist --no-write --show-policy-template-json --skip-current-resource-check"
     ),
@@ -49883,6 +50149,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("rewrite-review", "run_rewrite_review"),
         refresh_expectation("rewrite-validation-checklist", "run_rewrite_validation_checklist"),
         refresh_expectation("rewrite-response-review", "run_rewrite_response_review"),
+        refresh_expectation("response-evidence-readiness", "run_response_evidence_readiness"),
         refresh_expectation("deployment-review", "run_deployment_review"),
         refresh_expectation("operator-evidence-review", "run_operator_evidence_review"),
         refresh_expectation("operator-impact-readiness", "run_operator_impact_readiness"),
@@ -71329,6 +71596,135 @@ def run_rewrite_response_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_response_evidence_readiness(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    rewrite_review = build_rewrite_response_review(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
+    gates = build_or_load_bounty_validation_gates_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    invalidity_review = load_optional_json(artifact_dir / BOUNTY_INVALIDITY_REVIEW_ARTIFACT)
+    if not isinstance(invalidity_review, dict):
+        invalidity_review = build_bounty_invalidity_review(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            bounty_validation_gates=gates,
+            adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+        )
+    readiness = build_response_evidence_readiness(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        rewrite_response_review=rewrite_review,
+        bounty_validation_gates=gates,
+        bounty_invalidity_review=invalidity_review,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / RESPONSE_EVIDENCE_READINESS_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(readiness))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="response-evidence-readiness",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = readiness.get("summary", {}) if isinstance(readiness.get("summary"), dict) else {}
+    print(f"Response evidence readiness: {readiness.get('status')}")
+    print(
+        "Readiness: "
+        f"checks={summary.get('checks', 0)} "
+        f"passed={summary.get('passed', 0)} "
+        f"waiting={summary.get('waiting_or_blocked', 0)} "
+        f"sidecar={summary.get('sidecar_status') or '-'} "
+        f"validation={summary.get('sidecar_validation_status') or '-'} "
+        f"approved_rows={summary.get('approved_rows', 0)} "
+        f"candidate_impact={summary.get('candidate_impact_observations', 0)} "
+        f"invalid_now={summary.get('invalid_if_reported_now')}"
+    )
+    print(
+        "Inputs: "
+        f"rewrite={summary.get('rewrite_response_status') or '-'} "
+        f"gate={summary.get('bounty_gate_status') or '-'} "
+        f"invalidity={summary.get('invalidity_status') or '-'}"
+    )
+    package = (
+        readiness.get("minimum_official_evidence_package")
+        if isinstance(readiness.get("minimum_official_evidence_package"), dict)
+        else {}
+    )
+    recommended = package.get("recommended_request") if isinstance(package.get("recommended_request"), dict) else {}
+    print(
+        "Minimum package: "
+        f"sidecar={package.get('response_sidecar') or '-'} "
+        f"request={recommended.get('method') or '-'} {recommended.get('path') or '-'} "
+        f"indicators={','.join(normalize_string_list(package.get('accepted_impact_indicators'))[:5]) or '-'}"
+    )
+    top_count = max(0, int(args.top))
+    if args.show_checks:
+        print("Checks:")
+        for check in (readiness.get("checks", []) or [])[:top_count]:
+            if not isinstance(check, dict):
+                continue
+            print(
+                f"- {check.get('status')} {check.get('id')}: "
+                f"{inline_summary_text(check.get('label'), max_chars=220)}"
+            )
+            if args.show_next:
+                print(f"  next={inline_summary_text(check.get('next_step'), max_chars=300)}")
+    if args.show_package:
+        print("Package:")
+        for field in normalize_string_list(package.get("required_fields"))[:top_count]:
+            print(f"- required={field}")
+        for field in normalize_string_list(package.get("forbidden_fields"))[:top_count]:
+            print(f"- forbidden={field}")
+    if args.show_commands:
+        print("Commands:")
+        for command_text in normalize_string_list(readiness.get("commands"))[:top_count]:
+            print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    first_blocker = (
+        readiness.get("first_blocker")
+        if isinstance(readiness.get("first_blocker"), dict)
+        else {}
+    )
+    if first_blocker:
+        print(
+            "First blocker: "
+            f"{first_blocker.get('id')} status={first_blocker.get('status')} "
+            f"next={inline_summary_text(first_blocker.get('next_step'), max_chars=300)}"
+        )
+    print(f"Rule: {inline_summary_text(readiness.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(readiness.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if args.strict and readiness.get("status") not in {
+        "ready-to-rerun-response-validation-gate",
+        "ready-for-response-finding-gate-review",
+    }:
+        return 1
+    return 0
+
+
 def run_deployment_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -76923,6 +77319,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless an approved rewrite response has candidate impact indicators.",
     )
     rewrite_response_review.set_defaults(func=run_rewrite_response_review)
+
+    response_evidence_readiness = sub.add_parser(
+        "response-evidence-readiness",
+        help="Summarize rewrite-response-sidecar.jsonl readiness for sensitive-response bounty gates",
+    )
+    response_evidence_readiness.add_argument(
+        "--output",
+        help=(
+            f"Where to write {RESPONSE_EVIDENCE_READINESS_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{RESPONSE_EVIDENCE_READINESS_ARTIFACT}."
+        ),
+    )
+    response_evidence_readiness.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of checks, package fields, or commands to print.",
+    )
+    response_evidence_readiness.add_argument(
+        "--show-checks",
+        action="store_true",
+        help="Print response evidence readiness checks.",
+    )
+    response_evidence_readiness.add_argument(
+        "--show-next",
+        action="store_true",
+        help="Print next action per readiness check.",
+    )
+    response_evidence_readiness.add_argument(
+        "--show-package",
+        action="store_true",
+        help="Print required and forbidden response sidecar package fields.",
+    )
+    response_evidence_readiness.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print safe offline response evidence verification commands.",
+    )
+    response_evidence_readiness.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print response evidence readiness only; do not write {RESPONSE_EVIDENCE_READINESS_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    response_evidence_readiness.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless response evidence is ready to rerun validation gates or finding-gate review.",
+    )
+    response_evidence_readiness.set_defaults(func=run_response_evidence_readiness)
 
     deployment_review = sub.add_parser(
         "deployment-review",
