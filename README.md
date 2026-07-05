@@ -444,6 +444,12 @@ while memory or swap pressure is warning unless `--allow-resource-warning` is
 passed after explicit review. It is coverage evidence, not a vulnerability
 finding.
 
+The same command also performs a bounded offline source review for WebSocket
+proxies that forward client request headers to an upstream socket. A
+`needs-source-header-review` result is a lead only: it requires authentication
+context, browser/client header constraints, and upstream trust or disclosure
+evidence before it can become a reportable finding.
+
 For takeover-oriented Web/App scope checks, keep the host list explicit:
 
 ```bash

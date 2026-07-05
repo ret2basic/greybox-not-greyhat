@@ -7451,13 +7451,331 @@ def websocket_candidate_url(candidate: dict[str, Any], target: str) -> str:
     return urllib.parse.urlunparse((scheme, host, path, "", "", ""))
 
 
+WEBSOCKET_HEADER_FORWARDING_REQUIRED_FILTERS = {"authorization", "cookie"}
+WEBSOCKET_HEADER_FORWARDING_CONTEXT_HEADERS = {
+    "cf-connecting-ip",
+    "forwarded",
+    "x-forwarded-for",
+    "x-real-ip",
+}
+
+
+def websocket_header_forwarding_source_tokens() -> dict[str, list[str]]:
+    return {
+        "request_header_iteration": [
+            "Object.entries(req.headers)",
+            "Object.keys(req.headers)",
+            ".headers.forEach",
+        ],
+        "dynamic_header_assignment": [
+            "headers[key] = value",
+            "headers[name] = value",
+            ".set(key, value)",
+            ".append(key, value)",
+        ],
+        "upstream_websocket_headers": [
+            "new WebSocket(",
+            "headers:",
+            "headers: getWsForwardHeaders",
+        ],
+        "hop_by_hop_filter": [
+            "HOP_BY_HOP_HEADERS",
+            "hop-by-hop",
+            "proxy-authorization",
+            "sec-websocket-key",
+        ],
+        "sensitive_header_filter": [
+            "'authorization'",
+            '"authorization"',
+            "'cookie'",
+            '"cookie"',
+        ],
+        "browser_or_proxy_header_context": [
+            "x-forwarded-for",
+            "cf-connecting-ip",
+            "x-real-ip",
+            "forwarded",
+        ],
+    }
+
+
+def explicit_header_filter_literals(text: str, headers: set[str]) -> list[str]:
+    found = []
+    for header in sorted(headers):
+        if re.search(rf"['\"]{re.escape(header)}['\"]", text, re.IGNORECASE):
+            found.append(header)
+    return found
+
+
+def build_websocket_header_forwarding_review(
+    source_root: Path,
+    *,
+    max_file_bytes: int = DEFAULT_SOURCE_PEEK_MAX_FILE_BYTES,
+    max_files: int = 160,
+) -> dict[str, Any]:
+    tokens = websocket_header_forwarding_source_tokens()
+    category_matches: dict[str, list[dict[str, Any]]] = {category: [] for category in tokens}
+    files = []
+    skipped = []
+    leads = []
+    if not source_root.is_dir():
+        return {
+            "generated_at": utc_now(),
+            "status": "source-root-unavailable",
+            "source_root": repo_relative_or_absolute(source_root),
+            "summary": {
+                "files_scanned": 0,
+                "skipped": 0,
+                "interesting_files": 0,
+                "lead_count": 0,
+                "filtered_forwarding_files": 0,
+                "missing_sensitive_header_filters": sorted(WEBSOCKET_HEADER_FORWARDING_REQUIRED_FILTERS),
+                "category_match_counts": {category: 0 for category in tokens},
+            },
+            "files": [],
+            "skipped": [],
+            "leads": [],
+            "reportability_gate": (
+                "No source root was available. This review cannot prove or dismiss WebSocket header-forwarding impact."
+            ),
+            "safety": "Offline source review only. No WebSocket handshakes, frames, target traffic, or Burp calls are sent.",
+        }
+
+    scanned = 0
+    seen_paths: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(source_root):
+        dirnames[:] = sorted(
+            dirname
+            for dirname in dirnames
+            if dirname not in SOURCE_SCAN_SKIP_DIRS and not dirname.startswith(".")
+        )
+        for filename in sorted(filenames):
+            if scanned >= max_files:
+                break
+            path = Path(dirpath) / filename
+            if path.suffix not in SOURCE_SCAN_SUFFIXES or path.name.endswith(".d.ts"):
+                continue
+            key = str(path.resolve())
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            rel = source_root_relative_or_repo(path, source_root)
+            try:
+                stat = path.stat()
+            except OSError as error:
+                skipped.append({"file": rel, "reason": "stat-failed", "error": redacted_error_summary(error)})
+                continue
+            if stat.st_size > max_file_bytes:
+                skipped.append(
+                    {
+                        "file": rel,
+                        "reason": "file-too-large",
+                        "bytes": stat.st_size,
+                        "max_file_bytes": max_file_bytes,
+                    }
+                )
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as error:
+                skipped.append({"file": rel, "reason": "read-failed", "error": redacted_error_summary(error)})
+                continue
+
+            scanned += 1
+            lowered_text = text.lower()
+            request_header_iteration = bool(
+                re.search(r"Object\.(?:entries|keys|values)\(\s*[A-Za-z_$][\w$]*\.headers\s*\)", text)
+                or re.search(r"for\s*\([^)]*\bin\s+[A-Za-z_$][\w$]*\.headers\b", text)
+                or re.search(r"\b[A-Za-z_$][\w$]*\.headers\.forEach\s*\(", text)
+            )
+            dynamic_header_assignment = bool(
+                re.search(r"\b[A-Za-z_$][\w$]*\s*\[\s*(?:key|name|header|headerName)\s*\]\s*=", text)
+                or re.search(r"\.(?:set|append)\(\s*(?:key|name|header|headerName)\s*,", text)
+            )
+            upstream_websocket_headers = bool(
+                re.search(r"new\s+WebSocket\s*\([\s\S]{0,2400}?headers\s*:", text)
+            )
+            filtered_headers = explicit_header_filter_literals(
+                text,
+                WEBSOCKET_HEADER_FORWARDING_REQUIRED_FILTERS | {"origin"},
+            )
+            missing_sensitive_filters = sorted(
+                WEBSOCKET_HEADER_FORWARDING_REQUIRED_FILTERS - set(filtered_headers)
+            )
+            context_headers = explicit_header_filter_literals(text, WEBSOCKET_HEADER_FORWARDING_CONTEXT_HEADERS)
+            hop_by_hop_filter = "hop_by_hop_headers" in lowered_text or "hop-by-hop" in lowered_text
+            file_category_matches: dict[str, list[dict[str, Any]]] = {category: [] for category in tokens}
+            for line_no, line in enumerate(text.splitlines(), start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                lowered_line = stripped.lower()
+                for category, category_tokens in tokens.items():
+                    for token in category_tokens:
+                        if token.lower() not in lowered_line:
+                            continue
+                        match = {
+                            "file": rel,
+                            "line": line_no,
+                            "token": token,
+                            "sample": redact_text(stripped, max_chars=220) or "",
+                        }
+                        file_category_matches[category].append(match)
+                        if len(category_matches[category]) < 12:
+                            category_matches[category].append(match)
+                        break
+
+            forwarding_pattern = request_header_iteration and dynamic_header_assignment and upstream_websocket_headers
+            partial_forwarding_pattern = (
+                sum(bool(value) for value in [request_header_iteration, dynamic_header_assignment, upstream_websocket_headers])
+                >= 2
+            )
+            if forwarding_pattern and missing_sensitive_filters:
+                file_status = "needs-header-trust-review"
+            elif forwarding_pattern:
+                file_status = "header-forwarding-filtered"
+            elif partial_forwarding_pattern:
+                file_status = "header-forwarding-pattern-needs-review"
+            else:
+                file_status = "no-websocket-header-forwarding-evidence"
+
+            interesting = file_status != "no-websocket-header-forwarding-evidence" or "getwsforwardheaders" in lowered_text
+            if not interesting:
+                continue
+
+            evidence = [
+                match
+                for matches in file_category_matches.values()
+                for match in matches[:4]
+            ][:16]
+            file_review = {
+                "file": rel,
+                "bytes": stat.st_size,
+                "status": file_status,
+                "signals": {
+                    "request_header_iteration": request_header_iteration,
+                    "dynamic_header_assignment": dynamic_header_assignment,
+                    "upstream_websocket_headers": upstream_websocket_headers,
+                    "hop_by_hop_filter": hop_by_hop_filter,
+                },
+                "filtered_headers": filtered_headers,
+                "missing_sensitive_header_filters": missing_sensitive_filters,
+                "context_headers_seen": context_headers,
+                "match_counts": {
+                    category: len(matches)
+                    for category, matches in sorted(file_category_matches.items())
+                    if matches
+                },
+                "evidence": evidence,
+            }
+            files.append(file_review)
+            if file_status in {"needs-header-trust-review", "header-forwarding-pattern-needs-review"}:
+                leads.append(
+                    {
+                        "id": f"websocket-header-forwarding:{safe_probe_id(rel)}",
+                        "status": file_status,
+                        "priority": "medium",
+                        "file": rel,
+                        "missing_sensitive_header_filters": missing_sensitive_filters,
+                        "context_headers_seen": context_headers,
+                        "evidence": evidence,
+                        "required_evidence": [
+                            "Confirm whether the application sets cookies, session tokens, or Authorization material on the WebSocket origin.",
+                            "Confirm whether the upstream WebSocket provider receives, logs, or trusts forwarded client headers.",
+                            "Confirm browser constraints versus non-browser clients for any header needed to demonstrate impact.",
+                            "Show concrete disclosure, trust-boundary confusion, quota/account attribution, or authorization impact before filing.",
+                        ],
+                        "reportability_gate": (
+                            "Source-level forwarding of request headers to an upstream WebSocket is not reportable by itself. "
+                            "Escalate only with authentication/header-context and upstream trust or disclosure evidence."
+                        ),
+                    }
+                )
+        if scanned >= max_files:
+            break
+
+    status_counts: dict[str, int] = {}
+    for file_review in files:
+        increment_count(status_counts, str(file_review.get("status") or "unknown"))
+    if leads:
+        status = "needs-header-trust-review"
+    elif any(file_review.get("status") == "header-forwarding-filtered" for file_review in files):
+        status = "header-forwarding-filtered"
+    elif files:
+        status = "no-unfiltered-websocket-header-forwarding"
+    else:
+        status = "no-websocket-header-forwarding-evidence"
+
+    all_missing_filters = sorted(
+        {
+            header
+            for file_review in files
+            for header in file_review.get("missing_sensitive_header_filters", []) or []
+            if file_review.get("status") in {"needs-header-trust-review", "header-forwarding-pattern-needs-review"}
+        }
+    )
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "source_root": repo_relative_or_absolute(source_root),
+        "summary": {
+            "files_scanned": scanned,
+            "skipped": len(skipped),
+            "interesting_files": len(files),
+            "lead_count": len(leads),
+            "filtered_forwarding_files": sum(1 for item in files if item.get("status") == "header-forwarding-filtered"),
+            "status_counts": dict(sorted(status_counts.items())),
+            "missing_sensitive_header_filters": all_missing_filters,
+            "category_match_counts": {
+                category: len(matches)
+                for category, matches in sorted(category_matches.items())
+            },
+        },
+        "files": files,
+        "skipped": skipped,
+        "leads": leads,
+        "reportability_gate": (
+            "This source review only identifies WebSocket header-forwarding patterns and is not reportable by itself. "
+            "It does not prove a vulnerability without auth/header context, browser/client constraints, and upstream "
+            "trust or disclosure evidence."
+        ),
+        "safety": (
+            "Offline bounded source scan only. It skips generated/vendor directories, caps file size/count, sends no "
+            "WebSocket handshakes or frames, and does not call Burp or target services."
+        ),
+    }
+
+
 def build_websocket_candidate_review(
     *,
     target: str,
     asset_candidates_doc: dict[str, Any] | None,
     scope_policy: dict[str, Any] | None,
+    source_root: Path | None = None,
+    websocket_source_review: dict[str, Any] | None = None,
     baseline_results: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    if isinstance(websocket_source_review, dict):
+        source_review = websocket_source_review
+    elif source_root is not None:
+        source_review = build_websocket_header_forwarding_review(source_root)
+    else:
+        source_review = {
+            "generated_at": utc_now(),
+            "status": "not-run",
+            "summary": {
+                "files_scanned": 0,
+                "skipped": 0,
+                "interesting_files": 0,
+                "lead_count": 0,
+                "filtered_forwarding_files": 0,
+                "missing_sensitive_header_filters": [],
+            },
+            "files": [],
+            "skipped": [],
+            "leads": [],
+            "safety": "No source root was provided to websocket-candidate-review.",
+        }
     scope_decisions = scope_policy_decision_map(scope_policy)
     baseline_by_id = {
         str(item.get("candidate_id") or ""): item
@@ -7508,6 +7826,11 @@ def build_websocket_candidate_review(
         for item in candidates
         if item.get("decision") not in {"handshake-baseline-ready", "out-of-scope-by-default"}
     ]
+    source_review_status = str(source_review.get("status") or "not-run")
+    source_review_unresolved = source_review_status in {
+        "needs-header-trust-review",
+        "header-forwarding-pattern-needs-review",
+    }
     ready_count = sum(1 for item in candidates if item.get("decision") == "handshake-baseline-ready")
     baseline_expected = [
         item
@@ -7516,7 +7839,7 @@ def build_websocket_candidate_review(
     ]
     status = "no-websocket-candidates"
     if candidates:
-        if unresolved:
+        if unresolved or source_review_unresolved:
             status = "needs-human-review"
         elif ready_count and len(baseline_expected) == ready_count:
             status = "baseline-complete"
@@ -7524,6 +7847,8 @@ def build_websocket_candidate_review(
             status = "ready-for-handshake-baseline"
         else:
             status = "complete"
+    elif source_review_unresolved:
+        status = "needs-source-header-review"
     return {
         "generated_at": utc_now(),
         "status": status,
@@ -7534,8 +7859,13 @@ def build_websocket_candidate_review(
             "unresolved_count": len(unresolved),
             "decision_counts": dict(sorted(decision_counts.items())),
             "baseline_status_counts": dict(sorted(baseline_status_counts.items())),
+            "source_review_status": source_review_status,
+            "source_review_unresolved": source_review_unresolved,
+            "source_header_forwarding_leads": len(source_review.get("leads", []) or []),
+            "source_header_forwarding_files": (source_review.get("summary") or {}).get("interesting_files", 0),
         },
         "candidates": candidates,
+        "source_review": source_review,
         "safety": (
             "WebSocket candidate review only. Handshake baselines, when requested, perform one HTTP Upgrade "
             "attempt per in-scope candidate and send no WebSocket frames, subscriptions, wallet payloads, or trade messages."
@@ -29806,6 +30136,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         transaction_corpus_checklist_output_dir = root / "transaction-corpus-checklist-output"
         credential_impact_checklist_output_dir = root / "credential-impact-checklist-output"
         operator_evidence_review_output_dir = root / "operator-evidence-review-output"
+        websocket_candidate_review_output_dir = root / "websocket-candidate-review-output"
         decode_transactions_output_dir = root / "decode-transactions-output"
         promote_output_dir = root / "promote-output"
         invalid_promote_output_dir = root / "invalid-promote-output"
@@ -30037,6 +30368,20 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--show-missing",
                 ]
             )
+            websocket_candidate_review_return_code, websocket_candidate_review_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(websocket_candidate_review_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "websocket-candidate-review",
+                    "--no-write",
+                ]
+            )
             decode_transactions_return_code, decode_transactions_stdout = run_cli(
                 [
                     "--profile",
@@ -30219,6 +30564,16 @@ def build_no_write_selftest() -> dict[str, Any]:
             "operator_evidence_review_manifest": (
                 operator_evidence_review_output_dir / MANIFEST_NAME
             ).exists(),
+            "websocket_candidate_review_dir": websocket_candidate_review_output_dir.exists(),
+            "websocket_candidate_review_target_profile_json": (
+                websocket_candidate_review_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "websocket_candidate_review_json": (
+                websocket_candidate_review_output_dir / WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT
+            ).exists(),
+            "websocket_candidate_review_manifest": (
+                websocket_candidate_review_output_dir / MANIFEST_NAME
+            ).exists(),
             "decode_transactions_dir": decode_transactions_output_dir.exists(),
             "decode_transactions_target_profile_json": (
                 decode_transactions_output_dir / TARGET_PROFILE_ARTIFACT
@@ -30264,6 +30619,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     transaction_corpus_checklist_stdout_text = "\n".join(transaction_corpus_checklist_stdout)
     credential_impact_checklist_stdout_text = "\n".join(credential_impact_checklist_stdout)
     operator_evidence_review_stdout_text = "\n".join(operator_evidence_review_stdout)
+    websocket_candidate_review_stdout_text = "\n".join(websocket_candidate_review_stdout)
     decode_transactions_stdout_text = "\n".join(decode_transactions_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
     invalid_promote_stdout_text = "\n".join(invalid_promote_stdout)
@@ -30929,6 +31285,32 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": operator_evidence_review_return_code,
                 "stdout": operator_evidence_review_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "websocket-candidate-review-no-write-skips-artifacts",
+            "passed": (
+                websocket_candidate_review_return_code == 0
+                and "WebSocket candidate review:" in websocket_candidate_review_stdout_text
+                and "Candidates:" in websocket_candidate_review_stdout_text
+                and "Source review:" in websocket_candidate_review_stdout_text
+                and "No files written (--no-write)." in websocket_candidate_review_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "websocket_candidate_review_dir",
+                        "websocket_candidate_review_target_profile_json",
+                        "websocket_candidate_review_json",
+                        "websocket_candidate_review_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in websocket_candidate_review_stdout)
+            ),
+            "expected": "websocket-candidate-review --no-write prints candidate/source review without writing artifacts or manifests",
+            "actual": {
+                "return_code": websocket_candidate_review_return_code,
+                "stdout": websocket_candidate_review_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -37207,6 +37589,110 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and (operator_placeholder_evidence_review.get("summary") or {}).get("classification_counts", {}).get("pending") == 1
             and not (operator_placeholder_evidence_review.get("summary") or {}).get("present_decision_ids", [])
         )
+    websocket_header_forwarding_bad_review: dict[str, Any] = {}
+    websocket_header_forwarding_filtered_review: dict[str, Any] = {}
+    websocket_header_forwarding_candidate_review: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory(prefix="inferforge-ws-header-forwarding-selftest-") as ws_header_temp_dir:
+        ws_header_root = Path(ws_header_temp_dir)
+        bad_root = ws_header_root / "bad"
+        filtered_root = ws_header_root / "filtered"
+        bad_root.mkdir()
+        filtered_root.mkdir()
+        (bad_root / "server.js").write_text(
+            textwrap.dedent(
+                """
+                import { WebSocket } from 'ws'
+
+                const HOP_BY_HOP_HEADERS = new Set(['connection', 'host', 'upgrade'])
+
+                function getWsForwardHeaders(req) {
+                  const headers = {}
+
+                  Object.entries(req.headers).forEach(([key, value]) => {
+                    if (value === undefined || HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
+                      return
+                    }
+                    if (key.toLowerCase() === 'origin') {
+                      return
+                    }
+
+                    headers[key] = value
+                  })
+
+                  return headers
+                }
+
+                function connect(req) {
+                  return new WebSocket('wss://rpc.example.invalid', undefined, {
+                    headers: getWsForwardHeaders(req),
+                    perMessageDeflate: false,
+                  })
+                }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (filtered_root / "server.js").write_text(
+            textwrap.dedent(
+                """
+                import { WebSocket } from 'ws'
+
+                const HOP_BY_HOP_HEADERS = new Set(['connection', 'host', 'upgrade'])
+
+                function getWsForwardHeaders(req) {
+                  const headers = {}
+
+                  Object.entries(req.headers).forEach(([key, value]) => {
+                    if (value === undefined || HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
+                      return
+                    }
+                    if (['origin', 'cookie', 'authorization'].includes(key.toLowerCase())) {
+                      return
+                    }
+
+                    headers[key] = value
+                  })
+
+                  return headers
+                }
+
+                function connect(req) {
+                  return new WebSocket('wss://rpc.example.invalid', undefined, {
+                    headers: getWsForwardHeaders(req),
+                    perMessageDeflate: false,
+                  })
+                }
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (bad_root / "node_modules").mkdir()
+        (bad_root / "node_modules/generated.js").write_text(
+            "Object.entries(req.headers).forEach(([key, value]) => { headers[key] = value })\n"
+            "new WebSocket('wss://ignored.example.invalid', undefined, { headers })\n",
+            encoding="utf-8",
+        )
+        websocket_header_forwarding_bad_review = build_websocket_header_forwarding_review(bad_root)
+        websocket_header_forwarding_filtered_review = build_websocket_header_forwarding_review(filtered_root)
+        websocket_header_forwarding_candidate_review = build_websocket_candidate_review(
+            target="https://ws-header-forwarding.test",
+            asset_candidates_doc={"candidates": []},
+            scope_policy={"policy": {"allowed_hosts": ["ws-header-forwarding.test"]}},
+            source_root=bad_root,
+        )
+    websocket_header_forwarding_passed = (
+        websocket_header_forwarding_bad_review.get("status") == "needs-header-trust-review"
+        and (websocket_header_forwarding_bad_review.get("summary") or {}).get("lead_count") == 1
+        and set((websocket_header_forwarding_bad_review.get("summary") or {}).get("missing_sensitive_header_filters", []))
+        == {"authorization", "cookie"}
+        and websocket_header_forwarding_filtered_review.get("status") == "header-forwarding-filtered"
+        and (websocket_header_forwarding_filtered_review.get("summary") or {}).get("lead_count") == 0
+        and (websocket_header_forwarding_candidate_review.get("status") == "needs-source-header-review")
+        and (websocket_header_forwarding_candidate_review.get("summary") or {}).get("source_review_unresolved") is True
+        and "not reportable by itself" in str(websocket_header_forwarding_bad_review.get("reportability_gate", ""))
+    )
     blackbox_asset_profile_paths = {
         cluster.get("path")
         for cluster in blackbox_asset_profile_sample.get("clusters", [])
@@ -39877,6 +40363,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and empty_replay_queue_passed
         and resource_release_candidates_passed
         and operator_evidence_sidecar_passed
+        and websocket_header_forwarding_passed
         and transaction_gate_ingestion_passed
         and transaction_corpus_gate_checklist_passed
         )
@@ -40176,6 +40663,23 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "operator_evidence": operator_sidecar_review.get("operator_evidence", {}),
             "operator_review": operator_sidecar_evidence_review.get("summary", {}),
             "placeholder_operator_review": operator_placeholder_evidence_review.get("summary", {}),
+        },
+        "websocket_header_forwarding_source_review": {
+            "status": "passed" if websocket_header_forwarding_passed else "failed",
+            "bad_review": {
+                "status": websocket_header_forwarding_bad_review.get("status"),
+                "summary": websocket_header_forwarding_bad_review.get("summary", {}),
+                "leads": websocket_header_forwarding_bad_review.get("leads", []),
+            },
+            "filtered_review": {
+                "status": websocket_header_forwarding_filtered_review.get("status"),
+                "summary": websocket_header_forwarding_filtered_review.get("summary", {}),
+                "files": websocket_header_forwarding_filtered_review.get("files", []),
+            },
+            "candidate_review": {
+                "status": websocket_header_forwarding_candidate_review.get("status"),
+                "summary": websocket_header_forwarding_candidate_review.get("summary", {}),
+            },
         },
         "active_observation_validation": {
             "status": "passed" if unsafe_observation_validation_passed else "failed",
@@ -43491,14 +43995,16 @@ def run_scope_policy(args: argparse.Namespace) -> int:
 
 def run_websocket_candidate_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    if not args.no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     asset_candidates_doc = load_optional_json(artifact_dir / BLACKBOX_ASSET_CANDIDATES_ARTIFACT)
     scope_policy = load_optional_json(artifact_dir / SCOPE_POLICY_ARTIFACT)
     review = build_websocket_candidate_review(
         target=target,
         asset_candidates_doc=asset_candidates_doc,
         scope_policy=scope_policy,
+        source_root=source_root,
     )
     proxy = None if args.no_proxy else args.proxy
     if args.handshake_baseline:
@@ -43568,6 +44074,10 @@ def run_websocket_candidate_review(args: argparse.Namespace) -> int:
                     baseline_results.append(result)
         except RuntimeError as error:
             output_path = artifact_dir / "target-probe-lock.json"
+            if args.no_write:
+                print(f"Target probe lock blocked websocket-candidate-review: {error}")
+                print("No target-probe-lock file written (--no-write).")
+                return 2
             write_json(
                 output_path,
                 target_probe_lock_blocked_payload(
@@ -43591,6 +44101,7 @@ def run_websocket_candidate_review(args: argparse.Namespace) -> int:
             target=target,
             asset_candidates_doc=asset_candidates_doc,
             scope_policy=scope_policy,
+            source_root=source_root,
             baseline_results=baseline_results,
         )
         review["handshake_baseline"] = {
@@ -43619,6 +44130,15 @@ def run_websocket_candidate_review(args: argparse.Namespace) -> int:
     )
     if args.handshake_baseline:
         print(f"Handshake baseline results: {json.dumps(review['summary'].get('baseline_status_counts', {}), sort_keys=True)}")
+    source_review = review.get("source_review", {}) if isinstance(review.get("source_review"), dict) else {}
+    source_summary = source_review.get("summary", {}) if isinstance(source_review.get("summary"), dict) else {}
+    print(
+        "Source review: "
+        f"{source_review.get('status', 'not-run')} "
+        f"files={source_summary.get('interesting_files', 0)} "
+        f"leads={source_summary.get('lead_count', 0)} "
+        f"missing_filters={','.join(source_summary.get('missing_sensitive_header_filters', []) or []) or '(none)'}"
+    )
     if args.no_write:
         print("No files written (--no-write).")
     else:
