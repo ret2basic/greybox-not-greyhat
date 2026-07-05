@@ -34826,6 +34826,168 @@ def finding_gate_preview_review_priority(preview: dict[str, Any]) -> str:
     return "low"
 
 
+def finding_gate_preview_unblock_plan(
+    preview: dict[str, Any],
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    packet_type = str(preview.get("packet_type") or "").replace("_", "-")
+    common_subcommands = [
+        "gate --no-write --show-items",
+        "adjudicate --no-write",
+    ]
+    specs: dict[str, dict[str, Any]] = {
+        "rewrite-response": {
+            "kind": "approved-redacted-response-impact",
+            "evidence_artifacts": [
+                REWRITE_RESPONSE_REVIEW_ARTIFACT,
+                repo_relative_or_absolute(rewrite_response_sidecar_path(artifact_dir)),
+                "finding-gate.json",
+                "adjudication.json",
+            ],
+            "subcommands": [
+                REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND,
+                "rewrite-validation-checklist --no-write --show-candidates --show-commands",
+                "rewrite-review --no-write --show-next",
+                *common_subcommands,
+            ],
+            "first_unblocker": (
+                "Approve or provide one redacted read-only response observation that proves concrete "
+                "sensitive-data, path-confusion, authorization-bypass, tenant-data, wallet/account-data, "
+                "or equivalent impact."
+            ),
+        },
+        "transaction-corpus": {
+            "kind": "approved-quote-transaction-corpus",
+            "evidence_artifacts": [
+                TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
+                "transaction-payloads.jsonl",
+                "transaction-payloads.json",
+                "transaction-intent-policy.json",
+                "transaction-intent.json",
+                "finding-gate.json",
+                "adjudication.json",
+            ],
+            "subcommands": [
+                TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND,
+                TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND,
+                "transaction-flow-review --no-write --top 8",
+                *common_subcommands,
+            ],
+            "first_unblocker": (
+                "Prepare one approved quote transaction payload sidecar, review the intent policy, "
+                "and decode only offline before any reportability claim."
+            ),
+        },
+        "credential-impact": {
+            "kind": "provider-operator-cost-impact",
+            "evidence_artifacts": [
+                OPERATOR_EVIDENCE_ARTIFACT,
+                OPERATOR_EVIDENCE_REVIEW_ARTIFACT,
+                "credential-impact-checklist.json",
+                "finding-gate.json",
+                "adjudication.json",
+            ],
+            "subcommands": [
+                "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
+                "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check --show-evidence-contract",
+                "deployment-review --no-write --top 8",
+                *common_subcommands,
+            ],
+            "first_unblocker": (
+                "Fill a redacted operator-evidence sidecar with provider quota, rate-limit, billing/credit, "
+                "usage-monitoring, or equivalent account-impact evidence."
+            ),
+        },
+        "resource-control": {
+            "kind": "deployment-resource-control-impact",
+            "evidence_artifacts": [
+                OPERATOR_EVIDENCE_ARTIFACT,
+                OPERATOR_EVIDENCE_REVIEW_ARTIFACT,
+                DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
+                "resource-snapshot.json",
+                "finding-gate.json",
+                "adjudication.json",
+            ],
+            "subcommands": [
+                "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
+                "deployment-review --no-write --top 8",
+                "resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict",
+                *common_subcommands,
+            ],
+            "first_unblocker": (
+                "Provide redacted deployment/operator evidence for external rate-limit storage, proxy/header trust, "
+                "rate-limit bounds, fallback monitoring, and concrete non-DoS impact."
+            ),
+        },
+        "rpc-proxy-abuse": {
+            "kind": "rpc-method-boundary-impact",
+            "evidence_artifacts": [
+                "rpc-method-policy.json",
+                OPERATOR_EVIDENCE_ARTIFACT,
+                OPERATOR_EVIDENCE_REVIEW_ARTIFACT,
+                DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
+                "finding-gate.json",
+                "adjudication.json",
+            ],
+            "subcommands": [
+                "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
+                "deployment-review --no-write --top 8",
+                "methodology-review --no-write --limit 8 --skip-current-resource-check",
+                *common_subcommands,
+            ],
+            "first_unblocker": (
+                "Tie one exact RPC method/control boundary to concrete user, funds, quota/account, "
+                "availability, or sensitive-data impact without method enumeration or stress traffic."
+            ),
+        },
+        "websocket-header-forwarding": {
+            "kind": "websocket-header-trust-impact",
+            "evidence_artifacts": [
+                "websocket-candidate-review.json",
+                OPERATOR_EVIDENCE_ARTIFACT,
+                OPERATOR_EVIDENCE_REVIEW_ARTIFACT,
+                "finding-gate.json",
+                "adjudication.json",
+            ],
+            "subcommands": [
+                "websocket-candidate-review --no-write",
+                "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract",
+                *common_subcommands,
+            ],
+            "first_unblocker": (
+                "Prove that a sensitive browser-controlled credential/header is forwarded and that the upstream "
+                "provider receives, trusts, logs, bills, or authorizes based on it."
+            ),
+        },
+    }
+    spec = specs.get(packet_type, {})
+    subcommands = spec.get("subcommands") or [*common_subcommands]
+    commands = ordered_unique_strings(
+        [
+            validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile)
+            for subcommand in subcommands
+        ]
+    )
+    return {
+        "packet_type": packet_type or "unknown",
+        "entrypoint": preview.get("entrypoint"),
+        "kind": spec.get("kind") or "generic-finding-gate-evidence",
+        "first_unblocker": spec.get("first_unblocker") or "Clear the listed finding-gate blockers with concrete evidence.",
+        "evidence_artifacts": ordered_unique_strings(spec.get("evidence_artifacts", [])),
+        "offline_commands": commands,
+        "reportability_boundary": (
+            "Blocked previews are not findings. Only findings whose real gate item passes adjudication may enter findings.json."
+        ),
+        "forbidden_validation": [
+            "No Burp Scanner, Intruder, broad fuzzing, floods, stress traffic, or provider quota depletion.",
+            "No wallet signing, transaction submission, trading, fund movement, or real user/account state mutation.",
+            "No raw secrets, bearer tokens, cookies, private keys, raw account identifiers, or raw Burp history in sidecars.",
+        ],
+    }
+
+
 def build_review_blockers(
     *,
     target: str,
@@ -34992,6 +35154,11 @@ def build_review_blockers(
             continue
         preview_id = str(preview.get("suspicion_id") or preview.get("id") or "blocked-gate-preview")
         blocker_strings = finding_gate_preview_blocker_strings(preview)
+        unblock_plan = finding_gate_preview_unblock_plan(
+            preview,
+            artifact_dir=artifact_dir,
+            profile=profile,
+        )
         next_action = "; ".join(blocker_strings[:4]) if blocker_strings else None
         add_blocker(
             blocker_id=f"GATE-{preview_id}",
@@ -35007,9 +35174,17 @@ def build_review_blockers(
                 "Approval packet is blocked before finding-gate. This is not a finding; "
                 "clear the listed blockers before any reportability claim."
             ),
-            next_action=next_action,
+            next_action=unblock_plan.get("first_unblocker") or next_action,
             cluster_id=preview.get("cluster_id"),
-            artifact_refs=["finding-gate.json", VALIDATION_PLAN_ARTIFACT, "adjudication.json"],
+            artifact_refs=ordered_unique_strings(
+                [
+                    "finding-gate.json",
+                    VALIDATION_PLAN_ARTIFACT,
+                    "adjudication.json",
+                    *(unblock_plan.get("evidence_artifacts", []) or []),
+                ]
+            ),
+            commands=unblock_plan.get("offline_commands", []),
             evidence={
                 "entrypoint": preview.get("entrypoint"),
                 "classification": preview.get("classification"),
@@ -35020,6 +35195,7 @@ def build_review_blockers(
                 "validation_item_id": preview.get("validation_item_id"),
                 "blockers": blocker_strings,
                 "checks": preview.get("checks", []),
+                "unblock_plan": unblock_plan,
                 "safety": preview.get("safety"),
             },
             group_key=(
@@ -35856,7 +36032,15 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 and gate_blockers.get("summary", {}).get("blocked_gate_previews") == 1
                 and gate_blocker_group.get("priority") == "high"
                 and "POST /api/quote" in str(gate_blocker_group.get("title") or "")
-                and "No approved transaction payload sidecar" in str(gate_blocker_group.get("next_action") or "")
+                and "approved quote transaction payload sidecar" in str(gate_blocker_group.get("next_action") or "")
+                and any(
+                    TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND in command
+                    for command in gate_blocker_group.get("commands", []) or []
+                )
+                and any(
+                    TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND in command
+                    for command in gate_blocker_group.get("commands", []) or []
+                )
             ),
             "expected": "blocked finding-gate previews are exposed as high-priority review blockers without becoming findings",
             "actual": {

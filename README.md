@@ -1491,7 +1491,12 @@ coverage, Burp observation coverage, verification queue, source-peek requests,
 environment readiness, artifact health, and blocked finding-gate previews.
 Blocked previews enter the `finding-gate-blocker` category with the missing
 evidence, severity, entrypoint, and packet type, but remain explicitly
-non-reportable until a real finding gate passes. `audit` and
+non-reportable until a real finding gate passes. Each finding-gate blocker also
+stores an `unblock_plan` with the nearest evidence artifacts, the first concrete
+evidence item to collect, and no-write command templates for the matching
+contract: rewrite-response sidecars for fixed-upstream impact, transaction
+sidecars and corpus checklists for quote integrity, and operator-evidence
+templates for credential/resource impact. `audit` and
 `verification-queue` refresh it automatically.
 The Markdown playbook is useful as the first artifact to inspect after a
 regression run because it keeps the approved-path, source-only review, missing
