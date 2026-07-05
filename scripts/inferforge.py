@@ -21669,6 +21669,23 @@ def transaction_corpus_policy_templates(
         if not direction:
             continue
         allowed_programs = normalize_string_list(row.get("allowedPrograms"))
+        program_allowlist_review = {
+            "status": "configured" if allowed_programs else "manual-review-required",
+            "allowedPrograms_count": len(allowed_programs),
+            "decode_gate": (
+                "configured-program-allowlist"
+                if allowed_programs
+                else "manual-program-allowlist-review-required"
+            ),
+            "next_step": (
+                "Decoded instruction program IDs will be compared with the configured allowedPrograms list."
+                if allowed_programs
+                else (
+                    "Decode will require manual review of every decoded instruction program ID before program "
+                    "behavior can be treated as passed or finding-gate ready."
+                )
+            ),
+        }
         prepare_parts = [
             "prepare-transaction-intent-policy",
             "--direction",
@@ -21700,6 +21717,7 @@ def transaction_corpus_policy_templates(
                 "destinationMint": row.get("destinationMint"),
                 "allowedPrograms": allowed_programs,
                 "programAllowlistStatus": "configured" if allowed_programs else "manual-review-required",
+                "program_allowlist_review": program_allowlist_review,
                 "missing_runtime_fields": row.get("missing_runtime_fields", []),
                 "intent_policy_sidecar_template": row.get("sidecar_template", {}),
                 "prepare_policy_preview_command": validation_command_for_artifact_dir(
@@ -22195,6 +22213,7 @@ def build_transaction_sidecar_review(
                     "sourceMint": row.get("sourceMint"),
                     "destinationMint": row.get("destinationMint"),
                     "programAllowlistStatus": row.get("programAllowlistStatus"),
+                    "program_allowlist_review": row.get("program_allowlist_review", {}),
                     "prepare_preview_command": row.get("prepare_policy_preview_command"),
                     "prepare_command": row.get("prepare_policy_command"),
                     "decode_preview_command": row.get("decode_preview_command"),
@@ -38416,6 +38435,34 @@ def build_transaction_decoder_selftest(
         and no_allowlist_reportability_review.get("ready_for_finding_gate") is False
         and any(check.get("status") == "review" for check in no_allowlist_program_reviews)
     )
+    no_program_profile = json_clone(profile or default_target_profile())
+    no_program_quote_intent = (
+        no_program_profile.get("quote_intent")
+        if isinstance(no_program_profile.get("quote_intent"), dict)
+        else {}
+    )
+    no_program_quote_intent.pop("allowedPrograms", None)
+    no_program_quote_intent.pop("allowed_programs", None)
+    for direction_config in (no_program_quote_intent.get("directions") or {}).values():
+        if isinstance(direction_config, dict):
+            direction_config.pop("allowedPrograms", None)
+            direction_config.pop("allowed_programs", None)
+    no_program_profile["quote_intent"] = no_program_quote_intent
+    no_program_policy_templates = transaction_corpus_policy_templates(no_program_profile, artifact_dir)
+    no_program_template_review_passed = (
+        bool(no_program_policy_templates)
+        and all(
+            (template.get("program_allowlist_review") or {}).get("decode_gate")
+            == "manual-program-allowlist-review-required"
+            for template in no_program_policy_templates
+            if template.get("status") == "ready"
+        )
+        and all(
+            template.get("programAllowlistStatus") == "manual-review-required"
+            for template in no_program_policy_templates
+            if template.get("status") == "ready"
+        )
+    )
     decoded_count = sum(1 for item in transactions if item.get("decoded"))
     sidecar_ready_review: dict[str, Any] = {}
     sidecar_missing_policy_review: dict[str, Any] = {}
@@ -38718,6 +38765,7 @@ def build_transaction_decoder_selftest(
         and mismatch_gate_passed
         and amount_mismatch_gate_passed
         and no_allowlist_gate_passed
+        and no_program_template_review_passed
         and sidecar_guard_passed
         and sidecar_ready_passed
         and sidecar_missing_policy_passed
@@ -38759,6 +38807,10 @@ def build_transaction_decoder_selftest(
             "status": "passed" if no_allowlist_gate_passed else "failed",
             "intent_policy_checks": no_allowlist_policy_checks,
             "reportability_review": no_allowlist_reportability_review,
+        },
+        "program_allowlist_template_selftest": {
+            "status": "passed" if no_program_template_review_passed else "failed",
+            "policy_templates": no_program_policy_templates,
         },
         "sidecar_input_guard": {
             "status": "passed" if sidecar_guard_passed else "failed",
@@ -51441,6 +51493,17 @@ def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
                 f"source={row.get('sourceMint') or '-'} destination={row.get('destinationMint') or '-'} "
                 f"program_policy={row.get('programAllowlistStatus') or 'unknown'}"
             )
+            program_review = (
+                row.get("program_allowlist_review")
+                if isinstance(row.get("program_allowlist_review"), dict)
+                else {}
+            )
+            if program_review:
+                print(
+                    "  program_review="
+                    f"{program_review.get('decode_gate') or program_review.get('status')} "
+                    f"next={inline_summary_text(program_review.get('next_step'), max_chars=260)}"
+                )
             if row.get("prepare_preview_command"):
                 print(f"  prepare_preview={inline_summary_text(row.get('prepare_preview_command'), max_chars=420)}")
             if row.get("prepare_command"):
@@ -51621,6 +51684,17 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
             f"allowed_programs={len(row.get('allowedPrograms', []) or [])} "
             f"program_policy={row.get('programAllowlistStatus') or 'unknown'}"
         )
+        program_review = (
+            row.get("program_allowlist_review")
+            if isinstance(row.get("program_allowlist_review"), dict)
+            else {}
+        )
+        if program_review:
+            print(
+                "  program_review="
+                f"{program_review.get('decode_gate') or program_review.get('status')} "
+                f"next={inline_summary_text(program_review.get('next_step'), max_chars=260)}"
+            )
         if args.show_commands and row.get("prepare_policy_preview_command"):
             print(f"  prepare_preview={inline_summary_text(row.get('prepare_policy_preview_command'), max_chars=420)}")
         if args.show_commands and row.get("prepare_policy_command"):
@@ -52314,6 +52388,11 @@ def run_prepare_transaction_intent_policy(args: argparse.Namespace) -> int:
         f"destination={policy.get('destinationMint')}"
     )
     print(f"Program allowlist: {program_status} count={len(allowed_programs)}")
+    if not allowed_programs:
+        print(
+            "Program review: decode will require manual review of every decoded instruction program ID "
+            "before program behavior can be treated as passed."
+        )
     if no_write:
         print("Policy JSON:")
         print(json.dumps(policy, indent=2, sort_keys=True))
