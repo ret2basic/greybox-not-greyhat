@@ -26182,6 +26182,116 @@ def build_discovery_coverage(
     }
 
 
+DISCOVERY_SURFACE_DISPLAY_STATUS_PRIORITY = {
+    "uncovered": 0,
+    "review-gated": 1,
+    "source-only-context": 2,
+    "covered-by-profile-cluster": 3,
+    "covered-by-active-observation": 4,
+    "covered-by-probe-result": 5,
+    "covered-by-burp-history": 6,
+}
+
+
+def discovery_coverage_display_surfaces(coverage: dict[str, Any]) -> list[dict[str, Any]]:
+    indexed = [
+        (index, surface)
+        for index, surface in enumerate(coverage.get("surfaces", []) or [])
+        if isinstance(surface, dict)
+    ]
+    indexed.sort(
+        key=lambda item: (
+            DISCOVERY_SURFACE_DISPLAY_STATUS_PRIORITY.get(str(item[1].get("status") or ""), 50),
+            item[0],
+        )
+    )
+    return [surface for _index, surface in indexed]
+
+
+def discovery_coverage_surface_followup_commands(
+    surface: dict[str, Any],
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> list[str]:
+    status = str(surface.get("status") or "")
+    surface_type = str(surface.get("type") or "")
+    strategy_set = str(surface.get("strategy_set") or "")
+    commands: list[str] = []
+
+    def add(subcommand: str) -> None:
+        commands.append(validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile))
+
+    if status == "uncovered":
+        add("discover-profile --no-write")
+        add("discovery-coverage --no-write --show-surfaces --show-commands --top 12")
+    elif status == "review-gated":
+        add("review-candidates --no-write")
+        if surface_type == "rewrite" or strategy_set == "fixed-upstream-proxy":
+            add("rewrite-review --no-write --show-next")
+            add("rewrite-validation-checklist --no-write --show-candidates --show-commands")
+    elif status in {"covered-by-profile-cluster", "covered-by-active-observation"}:
+        add("burp-observation-coverage --no-write --show-clusters --show-actions")
+    elif status == "source-only-context":
+        add("source-peek-requests --no-write --top 8")
+        add("source-peek --no-write --top 8")
+
+    return ordered_unique_strings(commands)
+
+
+def print_discovery_coverage_surface(
+    surface: dict[str, Any],
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    show_commands: bool,
+) -> None:
+    methods = ",".join(str(method) for method in surface.get("methods", []) or []) or "-"
+    profile_cluster_ids = ",".join(str(item) for item in surface.get("profile_cluster_ids", []) or []) or "-"
+    source_refs = ",".join(compact_source_refs(surface.get("source_refs", []) or [])[:4]) or "-"
+    print(
+        f"- {surface.get('type') or 'surface'} {surface.get('path') or surface.get('id') or '-'} "
+        f"{surface.get('status') or 'unknown'} methods={methods} "
+        f"kind={surface.get('kind') or '-'} clusters={profile_cluster_ids} "
+        f"active={surface.get('active_observation_count', 0)} "
+        f"review_candidates={surface.get('review_candidate_count', 0)}"
+    )
+    if surface.get("declared_cluster_id"):
+        print(f"  declared_cluster={surface.get('declared_cluster_id')}")
+    if source_refs != "-":
+        print(f"  source_refs={source_refs}")
+    if surface.get("next_action"):
+        print(f"  next={inline_summary_text(surface.get('next_action'), max_chars=260)}")
+    if surface.get("active_observations"):
+        for observation in (surface.get("active_observations", []) or [])[:3]:
+            if not isinstance(observation, dict):
+                continue
+            print(
+                "  observation="
+                f"{observation.get('method') or '-'} {observation.get('path') or '-'} "
+                f"id={observation.get('id') or '-'}"
+            )
+    if surface.get("review_candidates"):
+        candidate_ids = [
+            str(candidate.get("id") or candidate.get("candidate_id") or "-")
+            for candidate in surface.get("review_candidates", []) or []
+            if isinstance(candidate, dict)
+        ]
+        if candidate_ids:
+            print(f"  review_candidate_ids={','.join(candidate_ids[:5])}")
+    if show_commands:
+        commands = discovery_coverage_surface_followup_commands(
+            surface,
+            artifact_dir=artifact_dir,
+            profile=profile,
+        )
+        if commands:
+            for command_text in commands:
+                print(f"  command={inline_summary_text(command_text, max_chars=420)}")
+        else:
+            print("  command=none-mapped")
+
+
 def build_discovery_coverage_selftest_profile() -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -34253,6 +34363,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         source_peek_requests_output_dir = root / "source-peek-requests-output"
         evidence_gaps_output_dir = root / "evidence-gaps-output"
         burp_observation_coverage_output_dir = root / "burp-observation-coverage-output"
+        discovery_coverage_output_dir = root / "discovery-coverage-output"
         report_output_dir = root / "report-output"
         methodology_review_output_dir = root / "methodology-review-output"
         transaction_sidecar_review_output_dir = root / "transaction-sidecar-review-output"
@@ -34267,6 +34378,80 @@ def build_no_write_selftest() -> dict[str, Any]:
         import_history_output_dir = root / "import-history-output"
         oversized_history_path = root / "oversized-burp-history.txt"
         oversized_history_path.write_text("x" * 64, encoding="utf-8")
+        discovery_route_inventory_path = root / "discovery-route-inventory.json"
+        write_json(
+            discovery_route_inventory_path,
+            {
+                "generated_at": utc_now(),
+                "status": "discovered",
+                "source_root": str(root),
+                "app_root": str(root / "app"),
+                "app_roots": [str(root / "app")],
+                "pages_api_roots": [],
+                "summary": {
+                    "route_count": 2,
+                    "app_router_route_count": 2,
+                    "pages_router_api_route_count": 0,
+                    "rewrite_count": 1,
+                    "custom_server_entrypoint_count": 0,
+                    "middleware_count": 0,
+                    "server_action_file_count": 0,
+                    "server_action_export_count": 0,
+                    "redirect_count": 0,
+                    "header_route_count": 0,
+                    "route_policy_count": 0,
+                    "entrypoint_count": 3,
+                    "surface_count": 3,
+                    "api_route_count": 2,
+                    "strategy_sets": ["fixed-upstream-proxy", "nextjs-api-routes"],
+                },
+                "next_config": {},
+                "routes": [
+                    discovery_coverage_selftest_route(
+                        cluster_id="no-write",
+                        path="/api/no-write/status",
+                        methods=["GET"],
+                    ),
+                    discovery_coverage_selftest_route(
+                        cluster_id="unprofiled",
+                        path="/api/unprofiled",
+                        methods=["GET"],
+                    ),
+                ],
+                "rewrites": [
+                    {
+                        "cluster_id": "no-write",
+                        "path": "/api/no-write/{path*}",
+                        "source_path": "/api/no-write/{path*}",
+                        "methods": [],
+                        "file": "no-write.config.ts",
+                        "repo_file": "no-write.config.ts",
+                        "dynamic_segments": ["path*"],
+                        "fixed_upstreams": ["https://example.test"],
+                        "strategy_set": "fixed-upstream-proxy",
+                        "kind": "rewrite-proxy",
+                        "priority": "medium",
+                        "inference_reasons": ["no-write-self-test-rewrite"],
+                        "match": {
+                            "path_patterns": ["/api/no-write/{path*}"],
+                            "path_prefixes": ["/api/no-write/"],
+                        },
+                        "rewrite": {
+                            "source": "/api/no-write/:path*",
+                            "source_pattern": "/api/no-write/{path*}",
+                            "destination_resolved": "https://example.test/:path*",
+                        },
+                        "next_config": {"path": "/api/no-write/{path*}", "variants": ["/api/no-write/{path*}"]},
+                    }
+                ],
+                "custom_server_entrypoints": [],
+                "middleware": [],
+                "server_actions": [],
+                "redirects": [],
+                "headers": [],
+                "safety": "Synthetic no-write route inventory. No requests are sent.",
+            },
+        )
 
         original_build_capabilities = globals()["build_capabilities"]
         try:
@@ -34414,6 +34599,26 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--no-write",
                     "--show-clusters",
                     "--show-actions",
+                ]
+            )
+            discovery_coverage_return_code, discovery_coverage_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(discovery_coverage_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "discovery-coverage",
+                    "--route-inventory",
+                    str(discovery_route_inventory_path),
+                    "--no-write",
+                    "--show-surfaces",
+                    "--show-commands",
+                    "--top",
+                    "8",
                 ]
             )
             report_return_code, report_stdout = run_cli(
@@ -34690,6 +34895,19 @@ def build_no_write_selftest() -> dict[str, Any]:
             "burp_observation_coverage_manifest": (
                 burp_observation_coverage_output_dir / MANIFEST_NAME
             ).exists(),
+            "discovery_coverage_dir": discovery_coverage_output_dir.exists(),
+            "discovery_coverage_target_profile_json": (
+                discovery_coverage_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "discovery_coverage_json": (
+                discovery_coverage_output_dir / DISCOVERY_COVERAGE_ARTIFACT
+            ).exists(),
+            "discovery_coverage_route_inventory": (
+                discovery_coverage_output_dir / ROUTE_INVENTORY_ARTIFACT
+            ).exists(),
+            "discovery_coverage_manifest": (
+                discovery_coverage_output_dir / MANIFEST_NAME
+            ).exists(),
             "report_dir": report_output_dir.exists(),
             "report_target_profile_json": (report_output_dir / TARGET_PROFILE_ARTIFACT).exists(),
             "report_markdown": (report_output_dir / "report.md").exists(),
@@ -34801,6 +35019,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     source_peek_requests_stdout_text = "\n".join(source_peek_requests_stdout)
     evidence_gaps_stdout_text = "\n".join(evidence_gaps_stdout)
     burp_observation_coverage_stdout_text = "\n".join(burp_observation_coverage_stdout)
+    discovery_coverage_stdout_text = "\n".join(discovery_coverage_stdout)
     report_stdout_text = "\n".join(report_stdout)
     methodology_review_stdout_text = "\n".join(methodology_review_stdout)
     transaction_sidecar_review_stdout_text = "\n".join(transaction_sidecar_review_stdout)
@@ -35420,6 +35639,39 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": burp_observation_coverage_return_code,
                 "stdout": burp_observation_coverage_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "discovery-coverage-no-write-surfaces-and-followups",
+            "passed": (
+                discovery_coverage_return_code == 1
+                and "Discovery coverage: uncovered" in discovery_coverage_stdout_text
+                and "Discovery surfaces:" in discovery_coverage_stdout_text
+                and "- route /api/unprofiled uncovered" in discovery_coverage_stdout_text
+                and "- rewrite /api/no-write/{path*} review-gated" in discovery_coverage_stdout_text
+                and "next=Add this static surface to the target profile" in discovery_coverage_stdout_text
+                and "command=python3 scripts/inferforge.py" in discovery_coverage_stdout_text
+                and "discover-profile --no-write" in discovery_coverage_stdout_text
+                and "review-candidates --no-write" in discovery_coverage_stdout_text
+                and "rewrite-review --no-write --show-next" in discovery_coverage_stdout_text
+                and "No files written (--no-write)." in discovery_coverage_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "discovery_coverage_dir",
+                        "discovery_coverage_target_profile_json",
+                        "discovery_coverage_json",
+                        "discovery_coverage_route_inventory",
+                        "discovery_coverage_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in discovery_coverage_stdout)
+            ),
+            "expected": "discovery-coverage --no-write prints prioritized surfaces and safe follow-up commands without writing artifacts",
+            "actual": {
+                "return_code": discovery_coverage_return_code,
+                "stdout": discovery_coverage_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -47999,6 +48251,38 @@ def run_discovery_coverage(args: argparse.Namespace) -> int:
         f"status_counts={json.dumps(coverage['summary']['status_counts'], sort_keys=True)}"
     )
     print(f"Route inventory: {route_inventory_path}")
+    display_surfaces = discovery_coverage_display_surfaces(coverage)
+    top_count = max(0, int(args.top))
+    if args.show_surfaces:
+        print("Discovery surfaces:")
+        for surface in display_surfaces[:top_count]:
+            print_discovery_coverage_surface(
+                surface,
+                artifact_dir=artifact_dir,
+                profile=profile,
+                show_commands=bool(args.show_commands),
+            )
+        if len(display_surfaces) > top_count:
+            print(f"- ... +{len(display_surfaces) - top_count} more surface(s)")
+    elif args.show_commands:
+        followup_commands: list[str] = []
+        for surface in display_surfaces:
+            followup_commands.extend(
+                discovery_coverage_surface_followup_commands(
+                    surface,
+                    artifact_dir=artifact_dir,
+                    profile=profile,
+                )
+            )
+        followup_commands = ordered_unique_strings(followup_commands)
+        if followup_commands:
+            print("Follow-up commands:")
+            for command_text in followup_commands[:top_count]:
+                print(f"- {inline_summary_text(command_text, max_chars=420)}")
+            if len(followup_commands) > top_count:
+                print(f"- ... +{len(followup_commands) - top_count} more command(s)")
+        else:
+            print("Follow-up commands: none-mapped")
     if no_write:
         print("No files written (--no-write).")
     else:
@@ -49856,10 +50140,13 @@ def run_promote_observation_candidate(args: argparse.Namespace) -> int:
 
 def run_discover_profile(args: argparse.Namespace) -> int:
     base_profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    no_write = bool(getattr(args, "no_write", False))
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
     seed_profile = base_profile if args.profile else None
     route_inventory = discover_nextjs_routes(source_root, seed_profile)
-    write_json(artifact_dir / ROUTE_INVENTORY_ARTIFACT, route_inventory)
+    if not no_write:
+        write_json(artifact_dir / ROUTE_INVENTORY_ARTIFACT, route_inventory)
 
     default_name = re.sub(r"[^A-Za-z0-9_-]+", "-", source_root.name.lower()).strip("-") or "discovered-target"
     name = args.name or default_name
@@ -49874,7 +50161,7 @@ def run_discover_profile(args: argparse.Namespace) -> int:
     )
     output_path = Path(args.output).resolve() if args.output else artifact_dir / DISCOVERED_PROFILE_ARTIFACT
     explicit_output = bool(args.output)
-    if explicit_output and output_path.exists() and not args.force:
+    if not no_write and explicit_output and output_path.exists() and not args.force:
         print(f"Refusing to overwrite existing profile without --force: {output_path}")
         print(f"Wrote {artifact_dir / ROUTE_INVENTORY_ARTIFACT}")
         print_refreshed_manifests(
@@ -49887,11 +50174,13 @@ def run_discover_profile(args: argparse.Namespace) -> int:
         )
         return 2
 
-    write_json(output_path, discovered_profile)
+    if not no_write:
+        write_json(output_path, discovered_profile)
     normalized = normalize_target_profile(discovered_profile, profile_path=output_path)
     clusters = build_clusters(normalized, source_root)
     validation = build_profile_validation_artifact(normalized, clusters, source_root)
-    write_json(artifact_dir / "discovered-profile-validation.json", validation)
+    if not no_write:
+        write_json(artifact_dir / "discovered-profile-validation.json", validation)
 
     print(f"Discovered routes: {route_inventory.get('summary', {}).get('route_count', 0)}")
     print(f"Discovered rewrites: {route_inventory.get('summary', {}).get('rewrite_count', 0)}")
@@ -49903,6 +50192,15 @@ def run_discover_profile(args: argparse.Namespace) -> int:
     print(f"Suggested strategy sets: {', '.join(discovered_profile.get('strategy_sets', [])) or '(none)'}")
     print(f"Suggested clusters: {len(discovered_profile.get('clusters', []))}")
     print(f"Generated profile validation: {validation['status']}")
+    if no_write:
+        print(f"Route inventory output: {artifact_dir / ROUTE_INVENTORY_ARTIFACT}")
+        print(f"Output profile: {output_path}")
+        print(f"Validation output: {artifact_dir / 'discovered-profile-validation.json'}")
+        print("No files written (--no-write).")
+        if route_inventory.get("status") != "discovered":
+            return 1
+        return 0 if validation["status"] != "failed" else 1
+
     print(f"Wrote {artifact_dir / ROUTE_INVENTORY_ARTIFACT}")
     print(f"Wrote {output_path}")
     print(f"Wrote {artifact_dir / 'discovered-profile-validation.json'}")
@@ -53778,6 +54076,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow overwriting an explicit --output profile path",
     )
+    discover_profile.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print discovered profile summary only; do not write route inventory, generated profile, validation, or manifests.",
+    )
     discover_profile.set_defaults(func=run_discover_profile)
 
     blackbox_profile = sub.add_parser(
@@ -54266,6 +54569,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict",
         action="store_true",
         help="Return non-zero unless every discovered surface is fully covered with no human-review gates.",
+    )
+    discovery_coverage.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of discovery surfaces or follow-up commands to print.",
+    )
+    discovery_coverage.add_argument(
+        "--show-surfaces",
+        action="store_true",
+        help="Print per-surface discovery coverage rows, prioritized by uncovered/review-gated status.",
+    )
+    discovery_coverage.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print safe no-write follow-up command previews for actionable surfaces.",
     )
     discovery_coverage.add_argument(
         "--no-write",
