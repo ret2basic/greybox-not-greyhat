@@ -26822,6 +26822,64 @@ def build_command_safety_selftest() -> dict[str, Any]:
             }
         )
     assertions.extend(queue_assertions)
+    provider_ready_checklist = build_credential_impact_checklist(
+        target="http://127.0.0.1:9997",
+        profile=None,
+        artifact_dir=Path(".greybox/command-safety-selftest"),
+        transaction_flow_review={
+            "server_credential_proxy_review": {
+                "status": "needs-cost-abuse-review",
+                "files": [
+                    {
+                        "file": "src/app/api/quote/route.ts",
+                        "status": "needs-cost-abuse-review",
+                        "credential_refs": ["M0_ORCHESTRATION_API_KEY"],
+                        "external_upstream_refs": ["https://api.m0.xyz"],
+                        "auth_guard_refs": [],
+                        "rate_limit_guard_refs": [],
+                        "request_validation_refs": [],
+                        "review_question": "Synthetic credentialed upstream proxy review.",
+                    }
+                ],
+            }
+        },
+        deployment_review={
+            "credential_provider_review": {
+                "status": "provider-evidence-indexed",
+                "provider": "M0",
+                "summary": {
+                    "missing_provider_evidence": [],
+                },
+                "decisions": [
+                    {
+                        "id": "credentialed-upstream-quota-policy",
+                        "status": "evidence-present",
+                        "operator_evidence_needed": [],
+                        "evidence": [{"source": "operator-evidence.json"}],
+                    }
+                ],
+            }
+        },
+    )
+    provider_ready_commands = "\n".join(
+        str(command_text) for command_text in provider_ready_checklist.get("followup_commands", []) or []
+    )
+    assertions.append(
+        {
+            "id": "credential-impact-ready-emits-gate-followups",
+            "passed": (
+                provider_ready_checklist.get("status") == "provider-impact-ready-for-gate"
+                and "gate --no-write --show-items" in provider_ready_commands
+                and "adjudicate --no-write" in provider_ready_commands
+                and "evidence-chain --no-write" in provider_ready_commands
+            ),
+            "expected": "ready provider-impact evidence exposes offline gate/adjudicate/evidence-chain follow-up commands",
+            "actual": {
+                "status": provider_ready_checklist.get("status"),
+                "followup_commands": provider_ready_checklist.get("followup_commands", []),
+            },
+        }
+    )
     failed = [item for item in assertions if not item["passed"]]
     return {
         "generated_at": utc_now(),
@@ -26836,6 +26894,7 @@ def build_command_safety_selftest() -> dict[str, Any]:
             "queue_classification_counts": queue_counts,
             "queue_unsafe_template_count": queue_summary.get("unsafe_template_count"),
             "exit_code_cases": len(exit_code_cases),
+            "credential_impact_ready_status": provider_ready_checklist.get("status"),
         },
         "cases": results,
         "queue": {
@@ -41172,6 +41231,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         operator_sidecar_provider: dict[str, Any] = {}
         operator_sidecar_evidence_review: dict[str, Any] = {}
         operator_placeholder_evidence_review: dict[str, Any] = {}
+        operator_sidecar_credential_checklist: dict[str, Any] = {}
         with tempfile.TemporaryDirectory(prefix="inferforge-operator-evidence-selftest-") as operator_temp_dir:
             operator_sidecar_source_root = Path(operator_temp_dir) / "operator-sidecar-source"
             operator_sidecar_source_root.mkdir()
@@ -41208,6 +41268,29 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 deployment_review=operator_sidecar_review,
             )
             operator_sidecar_provider = operator_sidecar_review.get("credential_provider_review", {})
+            operator_sidecar_credential_checklist = build_credential_impact_checklist(
+                target=DEFAULT_TARGET,
+                profile=test_profile,
+                artifact_dir=operator_sidecar_source_root,
+                transaction_flow_review={
+                    "server_credential_proxy_review": {
+                        "status": "needs-cost-abuse-review",
+                        "files": [
+                            {
+                                "file": "src/app/api/quote/route.ts",
+                                "status": "needs-cost-abuse-review",
+                                "credential_refs": ["M0_ORCHESTRATION_API_KEY"],
+                                "external_upstream_refs": ["https://api.m0.xyz"],
+                                "auth_guard_refs": [],
+                                "rate_limit_guard_refs": [],
+                                "request_validation_refs": [],
+                                "review_question": "Synthetic credentialed upstream proxy review.",
+                            }
+                        ],
+                    }
+                },
+                deployment_review=operator_sidecar_review,
+            )
             operator_placeholder = {
                 "evidence_items": [
                     {
@@ -41241,6 +41324,20 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and operator_placeholder_evidence_review.get("status") == "pending-only"
             and (operator_placeholder_evidence_review.get("summary") or {}).get("classification_counts", {}).get("pending") == 1
             and not (operator_placeholder_evidence_review.get("summary") or {}).get("present_decision_ids", [])
+        )
+        operator_sidecar_checklist_commands = "\n".join(
+            str(command_text)
+            for command_text in operator_sidecar_credential_checklist.get("followup_commands", []) or []
+        )
+        operator_evidence_checklist_gate_passed = (
+            operator_sidecar_credential_checklist.get("status") == "provider-impact-ready-for-gate"
+            and (
+                operator_sidecar_credential_checklist.get("summary", {}).get("missing_provider_evidence")
+                == []
+            )
+            and "gate --no-write --show-items" in operator_sidecar_checklist_commands
+            and "adjudicate --no-write" in operator_sidecar_checklist_commands
+            and "evidence-chain --no-write" in operator_sidecar_checklist_commands
         )
     websocket_header_forwarding_bad_review: dict[str, Any] = {}
     websocket_header_forwarding_filtered_review: dict[str, Any] = {}
@@ -44656,12 +44753,19 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "swap_pressure_budget": resource_budget_swap_pressure_sample,
         },
         "operator_evidence_sidecar": {
-            "status": "passed" if operator_evidence_sidecar_passed else "failed",
+            "status": "passed"
+            if operator_evidence_sidecar_passed and operator_evidence_checklist_gate_passed
+            else "failed",
             "provider_review": operator_sidecar_provider,
             "placeholder_provider_review": operator_placeholder_review.get("credential_provider_review", {}),
             "operator_evidence": operator_sidecar_review.get("operator_evidence", {}),
             "operator_review": operator_sidecar_evidence_review.get("summary", {}),
             "placeholder_operator_review": operator_placeholder_evidence_review.get("summary", {}),
+            "credential_checklist": {
+                "status": operator_sidecar_credential_checklist.get("status"),
+                "summary": operator_sidecar_credential_checklist.get("summary", {}),
+                "followup_commands": operator_sidecar_credential_checklist.get("followup_commands", []),
+            },
         },
         "websocket_header_forwarding_source_review": {
             "status": "passed" if websocket_header_forwarding_passed else "failed",
