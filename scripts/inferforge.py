@@ -33390,6 +33390,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         source_peek_output_dir = root / "source-peek-output"
         source_peek_requests_output_dir = root / "source-peek-requests-output"
         evidence_gaps_output_dir = root / "evidence-gaps-output"
+        burp_observation_coverage_output_dir = root / "burp-observation-coverage-output"
         report_output_dir = root / "report-output"
         methodology_review_output_dir = root / "methodology-review-output"
         transaction_sidecar_review_output_dir = root / "transaction-sidecar-review-output"
@@ -33531,6 +33532,20 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--source-root",
                     str(root),
                     "evidence-gaps",
+                    "--no-write",
+                ]
+            )
+            burp_observation_coverage_return_code, burp_observation_coverage_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(burp_observation_coverage_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "burp-observation-coverage",
                     "--no-write",
                 ]
             )
@@ -33797,6 +33812,16 @@ def build_no_write_selftest() -> dict[str, Any]:
                 evidence_gaps_output_dir / "source-peek-requests.json"
             ).exists(),
             "evidence_gaps_manifest": (evidence_gaps_output_dir / MANIFEST_NAME).exists(),
+            "burp_observation_coverage_dir": burp_observation_coverage_output_dir.exists(),
+            "burp_observation_coverage_target_profile_json": (
+                burp_observation_coverage_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "burp_observation_coverage_json": (
+                burp_observation_coverage_output_dir / "burp-observation-coverage.json"
+            ).exists(),
+            "burp_observation_coverage_manifest": (
+                burp_observation_coverage_output_dir / MANIFEST_NAME
+            ).exists(),
             "report_dir": report_output_dir.exists(),
             "report_target_profile_json": (report_output_dir / TARGET_PROFILE_ARTIFACT).exists(),
             "report_markdown": (report_output_dir / "report.md").exists(),
@@ -33907,6 +33932,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     source_peek_stdout_text = "\n".join(source_peek_stdout)
     source_peek_requests_stdout_text = "\n".join(source_peek_requests_stdout)
     evidence_gaps_stdout_text = "\n".join(evidence_gaps_stdout)
+    burp_observation_coverage_stdout_text = "\n".join(burp_observation_coverage_stdout)
     report_stdout_text = "\n".join(report_stdout)
     methodology_review_stdout_text = "\n".join(methodology_review_stdout)
     transaction_sidecar_review_stdout_text = "\n".join(transaction_sidecar_review_stdout)
@@ -34445,6 +34471,31 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": evidence_gaps_return_code,
                 "stdout": evidence_gaps_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "burp-observation-coverage-no-write-skips-artifacts",
+            "passed": (
+                burp_observation_coverage_return_code in {0, 1}
+                and "Burp observation coverage:" in burp_observation_coverage_stdout_text
+                and "Clusters:" in burp_observation_coverage_stdout_text
+                and "No files written (--no-write)." in burp_observation_coverage_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "burp_observation_coverage_dir",
+                        "burp_observation_coverage_target_profile_json",
+                        "burp_observation_coverage_json",
+                        "burp_observation_coverage_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in burp_observation_coverage_stdout)
+            ),
+            "expected": "burp-observation-coverage --no-write prints coverage without writing artifacts or manifests",
+            "actual": {
+                "return_code": burp_observation_coverage_return_code,
+                "stdout": burp_observation_coverage_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -46538,8 +46589,10 @@ def run_coverage(args: argparse.Namespace) -> int:
 
 def run_burp_observation_coverage(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
     clusters_path = artifact_dir / "endpoint-clusters.json"
     clusters = json.loads(read_text(clusters_path)) if clusters_path.exists() else build_clusters(profile, source_root)
     coverage = build_burp_observation_coverage(
@@ -46551,22 +46604,25 @@ def run_burp_observation_coverage(args: argparse.Namespace) -> int:
         load_optional_json(artifact_dir / "evidence-gaps.json"),
     )
     output_path = artifact_dir / "burp-observation-coverage.json"
-    write_json(output_path, coverage)
     print(f"Burp observation coverage: {coverage['status']}")
     print(
         "Clusters: "
         f"{coverage['summary']['clusters']} total, "
         f"status_counts={json.dumps(coverage['summary']['status_counts'], sort_keys=True)}"
     )
-    print(f"Wrote {output_path}")
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="burp-observation-coverage",
-            output_paths=[output_path],
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        write_json(output_path, coverage)
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="burp-observation-coverage",
+                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+            )
         )
-    )
     return 0 if coverage["status"] in {"covered", "needs-burp-sync"} else 1
 
 
@@ -46886,7 +46942,7 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
             if gap_id.endswith("-burp-observation"):
                 return validation_command_for_artifact_dir(
                     artifact_dir,
-                    "burp-observation-coverage",
+                    "burp-observation-coverage --no-write",
                     profile=profile,
                 )
             if gap_id == "GAP-quote-business-policy-probes":
@@ -52602,6 +52658,11 @@ def build_parser() -> argparse.ArgumentParser:
     burp_observation_coverage = sub.add_parser(
         "burp-observation-coverage",
         help="Recompute Burp browser observation coverage from current artifacts",
+    )
+    burp_observation_coverage.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print Burp observation coverage only; do not write burp-observation-coverage.json or refreshed manifests.",
     )
     burp_observation_coverage.set_defaults(func=run_burp_observation_coverage)
 

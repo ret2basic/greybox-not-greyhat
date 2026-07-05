@@ -1195,8 +1195,10 @@ observation or reviewed probe target is added. Their evidence gaps include
 review-only observation candidates that state the concrete approval needed
 before automation is allowed.
 
-`burp-observation-coverage` writes `.greybox/burp-observation-coverage.json`.
-It is a read-only Burp workflow index that shows, per cluster, whether Burp
+`burp-observation-coverage --no-write` previews the same coverage without
+writing artifacts; without `--no-write`, `burp-observation-coverage` writes
+`.greybox/burp-observation-coverage.json`. It is a read-only Burp workflow
+index that shows, per cluster, whether Burp
 Proxy history already covers the surface, whether `burp-observe` generated a
 flow that still needs history import, whether the profile has an active
 observation path ready for `burp-sync --observe`, or whether a review-only
