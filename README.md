@@ -32,6 +32,19 @@ curl http://127.0.0.1:3100/health
 does safe HTTP/WebSocket probes, source-peek mapping, endpoint clustering, and
 report generation without extra Python dependencies.
 
+InferForge treats `assessment_mode` as an optimization target, not only as a
+data-source switch:
+
+- `greybox` is audit/coverage-first. The goal is maximum dangerous-surface
+  coverage across source-derived routes, rewrites, Server Actions, RPC methods,
+  transaction flows, resource controls, and evidence gaps. A single finding does
+  not end the review if other high-risk surfaces remain uncovered.
+- `blackbox` is bounty/validity-first. The goal is to produce at least one
+  in-scope, valid, reproducible, high-impact report with the strongest expected
+  payout. Complete coverage is secondary; low-impact, weakly reportable,
+  uncertain-scope, or high-traffic leads should be parked when a better
+  high-confidence bounty lead exists.
+
 Target-specific routing, source references, Burp observation requests, enabled
 strategy sets, and cluster metadata are described by a target profile. The
 default profile is:

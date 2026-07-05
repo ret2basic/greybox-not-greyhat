@@ -1039,6 +1039,39 @@ def assessment_mode(profile: dict[str, Any] | None) -> str:
     return mode or "greybox"
 
 
+ASSESSMENT_MODE_POLICIES: dict[str, dict[str, Any]] = {
+    "greybox": {
+        "mode": "greybox",
+        "optimization_goal": "maximize-dangerous-surface-coverage",
+        "success_metric": "High-risk routes, rewrites, actions, RPC methods, transaction flows, and resource-control paths are covered or explicitly closed by evidence.",
+        "lead_selection": [
+            "Prefer broad dangerous-surface coverage before declaring the project reviewed.",
+            "Keep low-volume validation plans for every high-risk source-derived boundary.",
+            "Treat missing coverage as an audit gap even when another valid finding already exists.",
+        ],
+        "stop_condition": "Stop only when dangerous surfaces are covered, evidence gaps are accepted, or scope/resource gates block further safe work.",
+        "reporting_bias": "Complete audit coverage and hardening notes matter alongside reportable findings.",
+    },
+    "blackbox": {
+        "mode": "blackbox",
+        "optimization_goal": "maximize-valid-high-bounty-finding",
+        "success_metric": "At least one in-scope, valid, high-impact, reproducible bounty finding is ready for report submission.",
+        "lead_selection": [
+            "Prioritize the highest expected payout and reportability, not complete endpoint coverage.",
+            "Prefer leads with concrete user, funds, account, quota, auth, sensitive-data, or takeover impact.",
+            "Drop or park leads that need broad scanning, high traffic, uncertain scope, weak impact, or non-reportable configuration-only evidence.",
+        ],
+        "stop_condition": "A single high-confidence High/Critical reportable finding can be enough; continue only if the next lead has better expected payout or clearer validity.",
+        "reporting_bias": "Exploitability, scope fit, program rules, reproducibility, and bounty impact dominate coverage completeness.",
+    },
+}
+
+
+def assessment_mode_policy(profile: dict[str, Any] | None) -> dict[str, Any]:
+    mode = assessment_mode(profile)
+    return json_clone(ASSESSMENT_MODE_POLICIES.get(mode, ASSESSMENT_MODE_POLICIES["greybox"]))
+
+
 def is_blackbox_assessment(profile: dict[str, Any] | None) -> bool:
     return assessment_mode(profile) == "blackbox"
 
@@ -10790,11 +10823,14 @@ def build_methodology_review(
 
     focus = harness_loop.get("focus") if isinstance(harness_loop.get("focus"), dict) else {}
     resource_budget = resource_budget_for_snapshot(resource_snapshot)
+    assessment_policy = assessment_mode_policy(profile)
     summary = {
         "harness_status": harness_loop.get("status"),
         "focus_stage": focus.get("stage"),
         "focus_status": focus.get("status"),
         "unattended_policy": focus.get("unattended_policy"),
+        "assessment_mode": assessment_policy.get("mode"),
+        "optimization_goal": assessment_policy.get("optimization_goal"),
         "resource_status": resource_status,
         "resource_budget_mode": resource_budget.get("mode") or resource_status,
         "hypotheses": (hypothesis_matrix.get("summary", {}) or {}).get("hypotheses", 0),
@@ -10816,6 +10852,7 @@ def build_methodology_review(
         "profile": profile_summary(profile),
         "artifact_dir": str(artifact_dir),
         "summary": summary,
+        "assessment_policy": assessment_policy,
         "research_sources": METHODOLOGY_RESEARCH_SOURCES,
         "stage_reviews": stage_reviews,
         "business_logic_map": business_logic_map,
@@ -11458,6 +11495,11 @@ def build_lead_dossier(
         if isinstance(methodology.get("business_logic_map"), dict)
         else {}
     )
+    assessment_policy = (
+        methodology.get("assessment_policy")
+        if isinstance(methodology.get("assessment_policy"), dict)
+        else assessment_mode_policy(profile)
+    )
     leads = []
     priority_counts: dict[str, int] = {}
     status_counts: dict[str, int] = {}
@@ -11533,6 +11575,7 @@ def build_lead_dossier(
             "methodology_status": methodology.get("status"),
         },
         "research_alignment": {
+            "assessment_policy": assessment_policy,
             "source_note": (
                 "Lead dossier applies the observed Codex bug-bounty harness pattern: read code, use scope/docs "
                 "as constraints, create candidate paths, and keep leads tied to evidence and validation gates."
@@ -36073,6 +36116,14 @@ def build_no_write_selftest() -> dict[str, Any]:
         invalid_profile = json_clone(profile)
         invalid_profile["strategy_sets"] = []
         write_json(invalid_profile_path, invalid_profile)
+        greybox_assessment_policy = assessment_mode_policy(profile)
+        blackbox_assessment_policy = assessment_mode_policy(
+            {
+                "assessment_mode": "blackbox",
+                "target_type": "blackbox-web-app",
+                "strategy_sets": ["blackbox-http-observed"],
+            }
+        )
         review_candidates_output_dir = root / "review-candidates-output"
         plan_output_dir = root / "plan-output"
         capabilities_output_dir = root / "capabilities-output"
@@ -37199,6 +37250,27 @@ def build_no_write_selftest() -> dict[str, Any]:
                 "return_code": plan_return_code,
                 "stdout": plan_stdout,
                 "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "assessment-mode-policies-encode-distinct-goals",
+            "passed": (
+                greybox_assessment_policy.get("mode") == "greybox"
+                and greybox_assessment_policy.get("optimization_goal") == "maximize-dangerous-surface-coverage"
+                and "covered or explicitly closed"
+                in str(greybox_assessment_policy.get("success_metric") or "")
+                and blackbox_assessment_policy.get("mode") == "blackbox"
+                and blackbox_assessment_policy.get("optimization_goal") == "maximize-valid-high-bounty-finding"
+                and "At least one" in str(blackbox_assessment_policy.get("success_metric") or "")
+                and any(
+                    "expected payout" in str(item)
+                    for item in blackbox_assessment_policy.get("lead_selection", []) or []
+                )
+            ),
+            "expected": "greybox optimizes coverage while blackbox optimizes one valid high-bounty finding",
+            "actual": {
+                "greybox_policy": greybox_assessment_policy,
+                "blackbox_policy": blackbox_assessment_policy,
             },
         },
         {
@@ -53546,6 +53618,7 @@ def run_methodology_review(args: argparse.Namespace) -> int:
 
     summary = review.get("summary", {}) or {}
     resource_preflight = review.get("resource_preflight", {}) or {}
+    assessment_policy = review.get("assessment_policy", {}) if isinstance(review.get("assessment_policy"), dict) else {}
     print(f"Methodology review: {review['status']}")
     print(
         "Loop: "
@@ -53555,6 +53628,13 @@ def run_methodology_review(args: argparse.Namespace) -> int:
         f"resource={summary.get('resource_budget_mode') or summary.get('resource_status') or '-'} "
         f"high_value_threads={summary.get('high_value_threads', 0)}"
     )
+    if assessment_policy:
+        print(
+            "Assessment policy: "
+            f"mode={assessment_policy.get('mode') or '-'} "
+            f"goal={assessment_policy.get('optimization_goal') or '-'} "
+            f"success={inline_summary_text(assessment_policy.get('success_metric'), max_chars=180)}"
+        )
     if resource_preflight and resource_preflight.get("status") != "not-run":
         for candidate in (resource_preflight.get("release_candidates", []) or [])[:2]:
             print(
@@ -53692,6 +53772,12 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
         write_json(output_path, dossier)
 
     summary = dossier.get("summary", {}) or {}
+    alignment = dossier.get("research_alignment", {}) if isinstance(dossier.get("research_alignment"), dict) else {}
+    assessment_policy = (
+        alignment.get("assessment_policy")
+        if isinstance(alignment.get("assessment_policy"), dict)
+        else {}
+    )
     print(f"Lead dossier: {dossier['status']}")
     print(
         "Leads: "
@@ -53700,6 +53786,13 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
         f"priorities={json.dumps(summary.get('priority_counts', {}), sort_keys=True)} "
         f"closures={json.dumps(summary.get('closure_status_counts', {}), sort_keys=True)}"
     )
+    if assessment_policy:
+        print(
+            "Assessment policy: "
+            f"mode={assessment_policy.get('mode') or '-'} "
+            f"goal={assessment_policy.get('optimization_goal') or '-'} "
+            f"success={inline_summary_text(assessment_policy.get('success_metric'), max_chars=180)}"
+        )
     for lead in (dossier.get("leads", []) or [])[: max(0, int(args.limit))]:
         print(
             f"- {lead.get('priority')} {lead.get('closure_status')} "
