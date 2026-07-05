@@ -37104,6 +37104,100 @@ def build_review_blocker_groups(blockers: list[dict[str, Any]]) -> list[dict[str
     return groups
 
 
+def review_blocker_oracle_dependency_kind(oracle: dict[str, Any]) -> str:
+    oracle_type = str(oracle.get("type") or oracle.get("id") or "").strip()
+    if oracle_type in {"provider-impact", "resource-control"}:
+        return "operator-or-deployment-evidence"
+    if oracle_type in {"transaction-intent", "single-response-impact"}:
+        return "approved-sidecar-or-single-observation"
+    if oracle_type == "finding-gate":
+        return "finding-gate-review"
+    return "evidence-triage"
+
+
+def review_blocker_oracle_work_item(group: dict[str, Any], oracle: dict[str, Any]) -> dict[str, Any]:
+    acceptance_checks = normalize_string_list(oracle.get("acceptance_checks"))
+    reject_if = normalize_string_list(oracle.get("reject_if"))
+    command_safety = (group.get("command_safety", {}) or {}).get("summary", {}) or {}
+    return {
+        "group_id": group.get("id"),
+        "group_key": group.get("key"),
+        "status": group.get("status"),
+        "category": group.get("category"),
+        "priority": group.get("priority"),
+        "cluster_id": group.get("cluster_id"),
+        "title": group.get("title"),
+        "oracle_id": oracle.get("id"),
+        "oracle_type": oracle.get("type") or oracle.get("id"),
+        "oracle_status": oracle.get("status") or "unknown",
+        "dependency_kind": review_blocker_oracle_dependency_kind(oracle),
+        "impact_claim": oracle.get("impact_claim"),
+        "next_step": oracle.get("next_step"),
+        "acceptance_checks": acceptance_checks[:3],
+        "reject_if": reject_if[:3],
+        "acceptance_check_count": len(acceptance_checks),
+        "reject_condition_count": len(reject_if),
+        "command_safety": command_safety,
+        "command_count": int(command_safety.get("commands") or 0) if command_safety else 0,
+    }
+
+
+def build_review_blocker_oracle_summary(groups: list[dict[str, Any]]) -> dict[str, Any]:
+    type_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    dependency_counts: dict[str, int] = {}
+    work_items = []
+    acceptance_check_count = 0
+    reject_condition_count = 0
+    groups_with_oracles = 0
+
+    for group in groups:
+        validation_oracles = [
+            oracle
+            for oracle in group.get("validation_oracles", []) or []
+            if isinstance(oracle, dict)
+        ]
+        if not validation_oracles:
+            continue
+        groups_with_oracles += 1
+        for oracle in validation_oracles:
+            oracle_type = str(oracle.get("type") or oracle.get("id") or "unknown")
+            oracle_status = str(oracle.get("status") or "unknown")
+            dependency_kind = review_blocker_oracle_dependency_kind(oracle)
+            increment_count(type_counts, oracle_type)
+            increment_count(status_counts, oracle_status)
+            increment_count(dependency_counts, dependency_kind)
+            acceptance_check_count += len(normalize_string_list(oracle.get("acceptance_checks")))
+            reject_condition_count += len(normalize_string_list(oracle.get("reject_if")))
+            work_items.append(review_blocker_oracle_work_item(group, oracle))
+
+    work_items.sort(
+        key=lambda item: (
+            review_blocker_status_rank(str(item.get("status") or "")),
+            review_blocker_priority_rank(str(item.get("priority") or "")),
+            str(item.get("cluster_id") or ""),
+            str(item.get("group_id") or ""),
+            str(item.get("oracle_type") or ""),
+        )
+    )
+    top_oracle = work_items[0] if work_items else {}
+    return {
+        "groups_with_oracles": groups_with_oracles,
+        "oracle_count": len(work_items),
+        "type_counts": dict(sorted(type_counts.items())),
+        "status_counts": dict(sorted(status_counts.items())),
+        "dependency_counts": dict(sorted(dependency_counts.items())),
+        "operator_dependency_count": int(dependency_counts.get("operator-or-deployment-evidence") or 0),
+        "sidecar_dependency_count": int(dependency_counts.get("approved-sidecar-or-single-observation") or 0),
+        "finding_gate_dependency_count": int(dependency_counts.get("finding-gate-review") or 0),
+        "triage_dependency_count": int(dependency_counts.get("evidence-triage") or 0),
+        "acceptance_check_count": acceptance_check_count,
+        "reject_condition_count": reject_condition_count,
+        "top_oracle": top_oracle,
+        "work_items": work_items[:8],
+    }
+
+
 def finding_gate_preview_blocker_strings(preview: dict[str, Any]) -> list[str]:
     blockers: list[Any] = []
     for check in preview.get("checks", []) or []:
@@ -37675,6 +37769,7 @@ def build_review_blockers(
     for group in groups:
         increment_count(group_status_counts, str(group.get("status") or "unknown"))
         increment_count(group_category_counts, str(group.get("category") or "unknown"))
+    oracle_summary = build_review_blocker_oracle_summary(groups)
 
     return {
         "generated_at": utc_now(),
@@ -37694,6 +37789,12 @@ def build_review_blockers(
             "group_status_counts": group_status_counts,
             "group_category_counts": group_category_counts,
             "source_counts": source_counts,
+            "oracle_type_counts": oracle_summary.get("type_counts", {}),
+            "oracle_status_counts": oracle_summary.get("status_counts", {}),
+            "oracle_dependency_counts": oracle_summary.get("dependency_counts", {}),
+            "operator_dependency_count": oracle_summary.get("operator_dependency_count", 0),
+            "sidecar_dependency_count": oracle_summary.get("sidecar_dependency_count", 0),
+            "top_oracle": oracle_summary.get("top_oracle", {}),
             "discovery_coverage": (discovery_coverage or {}).get("status"),
             "burp_observation_coverage": (burp_observation_coverage or {}).get("status"),
             "verification_queue": (verification_queue or {}).get("status"),
@@ -37705,6 +37806,7 @@ def build_review_blockers(
                 len((finding_gate or {}).get("blocked_gate_previews", []) or []),
             ),
         },
+        "oracle_summary": oracle_summary,
         "groups": groups,
         "blockers": blockers,
         "artifact_refs": {
@@ -37811,6 +37913,7 @@ def build_review_blockers_rollup(
     for group in groups:
         increment_count(group_status_counts, str(group.get("status") or "unknown"))
         increment_count(group_category_counts, str(group.get("category") or "unknown"))
+    oracle_summary = build_review_blocker_oracle_summary(groups)
 
     return {
         "generated_at": utc_now(),
@@ -37834,9 +37937,16 @@ def build_review_blockers_rollup(
             "group_category_counts": group_category_counts,
             "source_counts": source_counts,
             "run_status_counts": run_status_counts,
+            "oracle_type_counts": oracle_summary.get("type_counts", {}),
+            "oracle_status_counts": oracle_summary.get("status_counts", {}),
+            "oracle_dependency_counts": oracle_summary.get("dependency_counts", {}),
+            "operator_dependency_count": oracle_summary.get("operator_dependency_count", 0),
+            "sidecar_dependency_count": oracle_summary.get("sidecar_dependency_count", 0),
+            "top_oracle": oracle_summary.get("top_oracle", {}),
             "artifact_health": (artifact_health or {}).get("status"),
         },
         "runs": runs,
+        "oracle_summary": oracle_summary,
         "groups": groups,
         "blockers": blockers,
         "artifact_refs": {
@@ -38177,6 +38287,33 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             REVIEW_BLOCKERS_MARKDOWN_ARTIFACT: (no_write_output_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT).exists(),
             MANIFEST_NAME: (no_write_output_dir / MANIFEST_NAME).exists(),
         }
+        gate_no_write_output_dir = root / "gate-no-write-output"
+        write_json(gate_no_write_output_dir / "finding-gate.json", finding_gate_with_blocked_preview)
+        gate_no_write_args = parser.parse_args(
+            [
+                "--profile",
+                str(profile_path),
+                "--artifact-dir",
+                str(gate_no_write_output_dir),
+                "--target",
+                target,
+                "--source-root",
+                str(root),
+                "review-blockers",
+                "--no-write",
+                "--top",
+                "4",
+            ]
+        )
+        gate_stdout_buffer = io.StringIO()
+        with contextlib.redirect_stdout(gate_stdout_buffer):
+            gate_no_write_return_code = gate_no_write_args.func(gate_no_write_args)
+        gate_no_write_stdout = gate_stdout_buffer.getvalue()
+        gate_no_write_outputs_exist = {
+            REVIEW_BLOCKERS_ARTIFACT: (gate_no_write_output_dir / REVIEW_BLOCKERS_ARTIFACT).exists(),
+            REVIEW_BLOCKERS_MARKDOWN_ARTIFACT: (gate_no_write_output_dir / REVIEW_BLOCKERS_MARKDOWN_ARTIFACT).exists(),
+            MANIFEST_NAME: (gate_no_write_output_dir / MANIFEST_NAME).exists(),
+        }
         discover_no_write_args = parser.parse_args(
             [
                 "--profile",
@@ -38226,6 +38363,9 @@ def build_review_blockers_selftest() -> dict[str, Any]:
     rollup_readiness_group_followups = review_blocker_group_followup_preview_lines(rollup_readiness_group)
     rollup_readiness_group_followup_text = "\n".join(rollup_readiness_group_followups)
     rollup_top_group_summaries = top_review_blocker_group_summaries(rollup, limit=2)
+    gate_oracle_summary = gate_blockers.get("oracle_summary", {}) or {}
+    gate_top_oracle = gate_oracle_summary.get("top_oracle", {}) or {}
+    gate_no_write_stdout_text = " ".join(gate_no_write_stdout.split())
     assertions = [
         {
             "id": "default-status-external-only",
@@ -38433,6 +38573,26 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "finding-gate-oracle-summary-renders-dependencies",
+            "passed": (
+                gate_oracle_summary.get("oracle_count") == 1
+                and gate_oracle_summary.get("type_counts", {}).get("transaction-intent") == 1
+                and gate_oracle_summary.get("status_counts", {}).get("waiting-evidence") == 1
+                and gate_oracle_summary.get("dependency_counts", {}).get("approved-sidecar-or-single-observation") == 1
+                and gate_oracle_summary.get("sidecar_dependency_count") == 1
+                and gate_oracle_summary.get("operator_dependency_count") == 0
+                and gate_top_oracle.get("oracle_type") == "transaction-intent"
+                and gate_top_oracle.get("dependency_kind") == "approved-sidecar-or-single-observation"
+                and gate_blockers.get("summary", {}).get("oracle_type_counts", {}).get("transaction-intent") == 1
+                and gate_blockers.get("summary", {}).get("top_oracle", {}).get("oracle_type") == "transaction-intent"
+            ),
+            "expected": "review-blockers summarizes validation oracle types, statuses, dependency classes, and top oracle",
+            "actual": {
+                "oracle_summary": gate_oracle_summary,
+                "summary": gate_blockers.get("summary"),
+            },
+        },
+        {
             "id": "cli-no-write-skips-review-blocker-outputs",
             "passed": (
                 no_write_return_code == 0
@@ -38455,6 +38615,26 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "return_code": no_write_return_code,
                 "stdout": no_write_stdout.splitlines(),
                 "outputs_exist": no_write_outputs_exist,
+            },
+        },
+        {
+            "id": "cli-no-write-renders-oracle-summary",
+            "passed": (
+                gate_no_write_return_code == 0
+                and "Oracle summary:" in gate_no_write_stdout
+                and '"transaction-intent": 1' in gate_no_write_stdout
+                and "operator_deps=0" in gate_no_write_stdout
+                and "sidecar_deps=1" in gate_no_write_stdout
+                and "top=transaction-intent" in gate_no_write_stdout
+                and "approved quote transaction payload sidecar" in gate_no_write_stdout_text
+                and "No files written (--no-write)." in gate_no_write_stdout
+                and not any(gate_no_write_outputs_exist.values())
+            ),
+            "expected": "review-blockers --no-write prints oracle rollup and top evidence dependency without writing derived artifacts",
+            "actual": {
+                "return_code": gate_no_write_return_code,
+                "stdout": gate_no_write_stdout.splitlines(),
+                "outputs_exist": gate_no_write_outputs_exist,
             },
         },
         {
@@ -38560,6 +38740,16 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
     group_status_counts = summary.get("group_status_counts", {}) or {}
     group_category_counts = summary.get("group_category_counts", {}) or {}
     source_counts = summary.get("source_counts", {}) or {}
+    oracle_summary = (
+        review_blockers.get("oracle_summary")
+        if isinstance(review_blockers.get("oracle_summary"), dict)
+        else {}
+    )
+    top_oracle = (
+        oracle_summary.get("top_oracle")
+        if isinstance(oracle_summary.get("top_oracle"), dict)
+        else {}
+    )
     grouped_actionable = [
         item
         for item in groups
@@ -38664,6 +38854,12 @@ def write_review_blockers_markdown(path: Path, review_blockers: dict[str, Any]) 
         f"- Group status counts: `{json.dumps(group_status_counts, sort_keys=True)}`",
         f"- Group category counts: `{json.dumps(group_category_counts, sort_keys=True)}`",
         f"- Source counts: `{json.dumps(source_counts, sort_keys=True)}`",
+        f"- Oracle type counts: `{json.dumps(oracle_summary.get('type_counts', {}), sort_keys=True)}`",
+        f"- Oracle status counts: `{json.dumps(oracle_summary.get('status_counts', {}), sort_keys=True)}`",
+        f"- Oracle dependency counts: `{json.dumps(oracle_summary.get('dependency_counts', {}), sort_keys=True)}`",
+        f"- Operator/deployment oracle deps: `{oracle_summary.get('operator_dependency_count', 0)}`",
+        f"- Sidecar/single-observation oracle deps: `{oracle_summary.get('sidecar_dependency_count', 0)}`",
+        f"- Top oracle: `{top_oracle.get('oracle_type') or '-'}` group=`{top_oracle.get('group_id') or '-'}`",
         "",
         "## Safety",
         "",
@@ -58587,6 +58783,28 @@ def run_review_blockers(args: argparse.Namespace) -> int:
             f"goal={assessment_policy.get('optimization_goal') or '-'} "
             f"selection={review_blockers['summary'].get('lead_selection_strategy') or '-'} "
             f"success={inline_summary_text(assessment_policy.get('success_metric'), max_chars=180)}"
+        )
+    oracle_summary = (
+        review_blockers.get("oracle_summary")
+        if isinstance(review_blockers.get("oracle_summary"), dict)
+        else {}
+    )
+    top_oracle = (
+        oracle_summary.get("top_oracle")
+        if isinstance(oracle_summary.get("top_oracle"), dict)
+        else {}
+    )
+    if oracle_summary and int(oracle_summary.get("oracle_count") or 0):
+        print(
+            "Oracle summary: "
+            f"types={json.dumps(oracle_summary.get('type_counts', {}), sort_keys=True)} "
+            f"statuses={json.dumps(oracle_summary.get('status_counts', {}), sort_keys=True)} "
+            f"deps={json.dumps(oracle_summary.get('dependency_counts', {}), sort_keys=True)} "
+            f"operator_deps={oracle_summary.get('operator_dependency_count', 0)} "
+            f"sidecar_deps={oracle_summary.get('sidecar_dependency_count', 0)} "
+            f"top={top_oracle.get('oracle_type') or '-'} "
+            f"group={top_oracle.get('group_id') or '-'} "
+            f"next={inline_summary_text(top_oracle.get('next_step'), max_chars=220)}"
         )
     if review_blockers.get("mode") == "rollup":
         print(
