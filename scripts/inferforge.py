@@ -21943,6 +21943,11 @@ def build_credential_impact_checklist(
     ]
 
     followup_commands = [
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "operator-evidence-review --no-write --show-missing --show-template",
+            profile=profile,
+        ),
         validation_command_for_artifact_dir(artifact_dir, "deployment-review --no-write --top 8", profile=profile),
         validation_command_for_artifact_dir(artifact_dir, "transaction-flow-review --no-write --top 8", profile=profile),
     ]
@@ -33753,6 +33758,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Credential impact checklist:" in credential_impact_checklist_stdout_text
                 and "Credential proxy:" in credential_impact_checklist_stdout_text
                 and "Provider missing:" in credential_impact_checklist_stdout_text
+                and "operator-evidence-review --no-write --show-missing --show-template" in credential_impact_checklist_stdout_text
                 and "No files written (--no-write)." in credential_impact_checklist_stdout
                 and not any(
                     output_paths[key]
