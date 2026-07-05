@@ -24897,9 +24897,34 @@ def build_source_peek_requests(
         deduped.append(item)
     requests = deduped
 
+    summary = source_peek_request_summary(requests, observed_clusters=observed_clusters)
+    return {
+        "generated_at": utc_now(),
+        "status": summary["status"],
+        "methodology": "Source-peek requests explain why source context was consulted: concrete observed endpoints, suspicions, source-only Server Actions, or evidence gaps. This artifact is read-only and does not run probes.",
+        "summary": summary["summary"],
+        "requests": requests,
+        "artifact_refs": {
+            "traffic_index": "traffic-index.json",
+            "source_peeks": "source-peek-results.json",
+            "suspicions": "suspicions.json",
+            "evidence_gaps": "evidence-gaps.json",
+            "endpoint_clusters": "endpoint-clusters.json",
+        },
+        "safety": "Read-only source-context planning artifact. It does not send HTTP requests, invoke Server Actions, sign wallets, or submit transactions.",
+    }
+
+
+def source_peek_request_summary(
+    requests: list[dict[str, Any]],
+    *,
+    observed_clusters: set[str] | None = None,
+) -> dict[str, Any]:
     trigger_counts: dict[str, int] = {}
     status_counts: dict[str, int] = {}
     for item in requests:
+        if not isinstance(item, dict):
+            continue
         trigger = str(item.get("trigger") or "unknown")
         status = str(item.get("status") or "unknown")
         trigger_counts[trigger] = trigger_counts.get(trigger, 0) + 1
@@ -24913,27 +24938,48 @@ def build_source_peek_requests(
         status = "answered-with-manual-review"
     else:
         status = "answered"
-
     return {
-        "generated_at": utc_now(),
         "status": status,
-        "methodology": "Source-peek requests explain why source context was consulted: concrete observed endpoints, suspicions, source-only Server Actions, or evidence gaps. This artifact is read-only and does not run probes.",
         "summary": {
             "requests": len(requests),
             "trigger_counts": trigger_counts,
             "status_counts": status_counts,
-            "observed_clusters": sorted(observed_clusters),
+            "observed_clusters": sorted(observed_clusters or set()),
         },
-        "requests": requests,
-        "artifact_refs": {
-            "traffic_index": "traffic-index.json",
-            "source_peeks": "source-peek-results.json",
-            "suspicions": "suspicions.json",
-            "evidence_gaps": "evidence-gaps.json",
-            "endpoint_clusters": "endpoint-clusters.json",
-        },
-        "safety": "Read-only source-context planning artifact. It does not send HTTP requests, invoke Server Actions, sign wallets, or submit transactions.",
     }
+
+
+def merge_missing_source_peek_requests(
+    existing: dict[str, Any] | None,
+    generated: dict[str, Any] | None,
+    *,
+    triggers: set[str] | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(existing, dict) or not isinstance(generated, dict):
+        return existing
+    existing_requests = [item for item in existing.get("requests", []) or [] if isinstance(item, dict)]
+    generated_requests = [item for item in generated.get("requests", []) or [] if isinstance(item, dict)]
+    seen_ids = {str(item.get("id") or "") for item in existing_requests if item.get("id")}
+    merged = json_clone(existing)
+    merged_requests = list(existing_requests)
+    for item in generated_requests:
+        request_id = str(item.get("id") or "")
+        if not request_id or request_id in seen_ids:
+            continue
+        if triggers is not None and str(item.get("trigger") or "") not in triggers:
+            continue
+        seen_ids.add(request_id)
+        merged_requests.append(item)
+    merged["requests"] = merged_requests
+    observed_clusters = set(
+        str(cluster_id)
+        for cluster_id in ((existing.get("summary") or {}).get("observed_clusters") or [])
+        if str(cluster_id)
+    )
+    summary = source_peek_request_summary(merged_requests, observed_clusters=observed_clusters)
+    merged["status"] = summary["status"]
+    merged["summary"] = summary["summary"]
+    return merged
 
 
 def observation_run_cluster_ids(burp_observation_run: dict[str, Any] | None) -> set[str]:
@@ -47190,18 +47236,25 @@ def run_source_peek(args: argparse.Namespace) -> int:
 
     source_peek_requests_path = artifact_dir / "source-peek-requests.json"
     source_peek_requests = load_optional_json(source_peek_requests_path)
+    generated_source_peek_requests = build_source_peek_requests(
+        clusters,
+        traffic_index,
+        load_optional_json(artifact_dir / "source-peek-results.json"),
+        (load_optional_json(artifact_dir / "suspicions.json") or {}).get("suspicions", []),
+        load_optional_json(artifact_dir / "evidence-gaps.json"),
+        rewrite_review=build_rewrite_review_run(target=target, profile=profile, artifact_dir=artifact_dir),
+    )
     if source_peek_requests is None:
-        source_peek_requests = build_source_peek_requests(
-            clusters,
-            traffic_index,
-            load_optional_json(artifact_dir / "source-peek-results.json"),
-            (load_optional_json(artifact_dir / "suspicions.json") or {}).get("suspicions", []),
-            load_optional_json(artifact_dir / "evidence-gaps.json"),
-            rewrite_review=build_rewrite_review_run(target=target, profile=profile, artifact_dir=artifact_dir),
-        )
+        source_peek_requests = generated_source_peek_requests
         if not no_write:
             write_json(source_peek_requests_path, source_peek_requests)
             output_paths.append(source_peek_requests_path)
+    else:
+        source_peek_requests = merge_missing_source_peek_requests(
+            source_peek_requests,
+            generated_source_peek_requests,
+            triggers={"rewrite-source-review"},
+        )
 
     source_peek_results = build_source_peek_results(
         source_root,
