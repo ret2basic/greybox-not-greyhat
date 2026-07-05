@@ -343,9 +343,10 @@ payoff dominate. Blackbox lead sets also include `relative_focus`: when one
 dominant bounty candidate is strong enough, weaker broad-coverage leads are
 parked behind it until that candidate stalls or closes. Each lead also prints a
 strict validation checklist status for scope, attacker control, concrete impact,
-minimal evidence, safe reproduction, counter-evidence, and severity/report path;
-the lead stays blocked before finding gate until all seven questions are
-satisfied. Transaction leads also print a `transaction-evidence-closure` plan
+minimal evidence, safe reproduction, counter-evidence, severity/report path, and
+the active `assessment_mode` objective. The lead stays blocked before finding
+gate until all eight questions are satisfied. Transaction leads also print a
+`transaction-evidence-closure` plan
 that turns payload sidecar, candidate extraction, payload contract, intent
 policy, decode review, and finding-gate blockers into ordered, redacted artifact
 steps:

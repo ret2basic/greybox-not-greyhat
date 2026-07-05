@@ -13752,6 +13752,8 @@ def lead_dossier_strict_validation_checklist(
     command_safety = command_safety_summary(next_commands)
     forbidden = normalize_string_list((thread.get("forbidden", []) or []))
     reportability_gate = str(thread.get("reportability_gate") or "")
+    assessment_policy = assessment_mode_policy(profile)
+    assessment_mode_value = str(assessment_policy.get("mode") or "greybox")
     scope_status = "passed"
     if str(thread.get("status") or "").startswith("needs-scope"):
         scope_status = "waiting"
@@ -13769,6 +13771,20 @@ def lead_dossier_strict_validation_checklist(
         reproduction_status = safe_command_status
     contract_status = "passed" if evidence_contract else "waiting"
     severity_status = "passed" if gate_ready and str(thread.get("priority") or "") in {"critical", "high", "medium"} else "waiting"
+    if assessment_mode_value == "blackbox":
+        mode_objective_status = (
+            "passed"
+            if gate_ready and str(thread.get("priority") or "") in {"critical", "high", "medium"}
+            else "waiting"
+        )
+        mode_objective_next_step = (
+            "In blackbox mode, park broad coverage work until one valid high-impact bounty report path has concrete gate-ready evidence."
+        )
+    else:
+        mode_objective_status = evidence_status
+        mode_objective_next_step = (
+            "In greybox mode, keep the dangerous surface open until every source-derived evidence gap is covered or explicitly closed."
+        )
     questions = [
         methodology_requirement(
             "scope-authorized",
@@ -13839,6 +13855,19 @@ def lead_dossier_strict_validation_checklist(
             },
             "Only report Medium/High/Critical after finding-gate and adjudication accept the evidence and severity.",
         ),
+        methodology_requirement(
+            "assessment-mode-objective-satisfied",
+            mode_objective_status,
+            {
+                "assessment_mode": assessment_mode_value,
+                "optimization_goal": assessment_policy.get("optimization_goal"),
+                "success_metric": assessment_policy.get("success_metric"),
+                "gate_ready": gate_ready,
+                "missing_requirements": missing_requirements,
+                "priority": thread.get("priority"),
+            },
+            mode_objective_next_step,
+        ),
     ]
     blocking_questions = [
         str(item.get("id"))
@@ -13859,6 +13888,7 @@ def lead_dossier_strict_validation_checklist(
             "validate-before-report",
             "minimal-reproduction",
             "counter-evidence-review",
+            "assessment-mode-objective",
         ],
         "safety": (
             "Offline validation checklist only. It does not send requests, read raw Burp history, "
@@ -40664,13 +40694,12 @@ def build_no_write_selftest() -> dict[str, Any]:
         invalid_profile["strategy_sets"] = []
         write_json(invalid_profile_path, invalid_profile)
         greybox_assessment_policy = assessment_mode_policy(profile)
-        blackbox_assessment_policy = assessment_mode_policy(
-            {
-                "assessment_mode": "blackbox",
-                "target_type": "blackbox-web-app",
-                "strategy_sets": ["blackbox-http-observed"],
-            }
-        )
+        blackbox_mode_profile = {
+            "assessment_mode": "blackbox",
+            "target_type": "blackbox-web-app",
+            "strategy_sets": ["blackbox-http-observed"],
+        }
+        blackbox_assessment_policy = assessment_mode_policy(blackbox_mode_profile)
         ranking_sample_leads = [
             {
                 "id": "coverage-resource-exhaustion",
@@ -40710,6 +40739,63 @@ def build_no_write_selftest() -> dict[str, Any]:
         blackbox_ranking_strategy, blackbox_ranked_sample = apply_lead_dossier_assessment_ranking(
             json_clone(ranking_sample_leads),
             blackbox_assessment_policy,
+        )
+        mode_strict_thread = {
+            "id": "mode-strict-selftest",
+            "status": "ready-for-offline-review",
+            "priority": "high",
+            "type": "cluster-strategy",
+            "host": "127.0.0.1",
+            "path": "/api/mode-strict",
+            "impact": "fixed-upstream-proxy-confusion",
+            "validation_question": "Can this mode-specific lead satisfy the active assessment objective?",
+            "minimal_poc_plan": {"status": "ready-for-finding-gate-review"},
+        }
+        mode_strict_contract = {
+            "id": "mode-strict-evidence-contract",
+            "not_reportable_when": [],
+        }
+        greybox_mode_strict_validation = lead_dossier_strict_validation_checklist(
+            {
+                **mode_strict_thread,
+                "evidence_closure": {
+                    "gate_ready": False,
+                    "missing_requirements": ["source-derived-coverage-gap"],
+                    "evidence_contract": mode_strict_contract,
+                    "next_safe_commands": [],
+                },
+            },
+            target=target,
+            profile=profile,
+            artifact_dir=root,
+        )
+        blackbox_waiting_mode_strict_validation = lead_dossier_strict_validation_checklist(
+            {
+                **mode_strict_thread,
+                "evidence_closure": {
+                    "gate_ready": False,
+                    "missing_requirements": [],
+                    "evidence_contract": mode_strict_contract,
+                    "next_safe_commands": [],
+                },
+            },
+            target=target,
+            profile=blackbox_mode_profile,
+            artifact_dir=root,
+        )
+        blackbox_ready_mode_strict_validation = lead_dossier_strict_validation_checklist(
+            {
+                **mode_strict_thread,
+                "evidence_closure": {
+                    "gate_ready": True,
+                    "missing_requirements": [],
+                    "evidence_contract": mode_strict_contract,
+                    "next_safe_commands": [],
+                },
+            },
+            target=target,
+            profile=blackbox_mode_profile,
+            artifact_dir=root,
         )
         provider_context_docs_review = build_quote_provider_public_docs_review(default_target_profile())
         review_candidates_output_dir = root / "review-candidates-output"
@@ -41854,11 +41940,27 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "expected payout" in str(item)
                     for item in blackbox_assessment_policy.get("lead_selection", []) or []
                 )
+                and "assessment-mode-objective-satisfied"
+                in (greybox_mode_strict_validation.get("blocking_questions", []) or [])
+                and "assessment-mode-objective-satisfied"
+                in (blackbox_waiting_mode_strict_validation.get("blocking_questions", []) or [])
+                and "assessment-mode-objective-satisfied"
+                not in (blackbox_ready_mode_strict_validation.get("blocking_questions", []) or [])
+                and blackbox_ready_mode_strict_validation.get("total") == 8
             ),
-            "expected": "greybox optimizes coverage while blackbox optimizes one valid high-bounty finding",
+            "expected": "greybox optimizes coverage while blackbox optimizes one valid high-bounty finding, including strict checklist gates",
             "actual": {
                 "greybox_policy": greybox_assessment_policy,
                 "blackbox_policy": blackbox_assessment_policy,
+                "greybox_mode_strict_blocking": greybox_mode_strict_validation.get("blocking_questions", []),
+                "blackbox_waiting_mode_strict_blocking": blackbox_waiting_mode_strict_validation.get(
+                    "blocking_questions",
+                    [],
+                ),
+                "blackbox_ready_mode_strict_blocking": blackbox_ready_mode_strict_validation.get(
+                    "blocking_questions",
+                    [],
+                ),
             },
         },
         {
