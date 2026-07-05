@@ -131,6 +131,7 @@ TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
 TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
 CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT = "credential-impact-checklist.json"
 OPERATOR_EVIDENCE_ARTIFACT = "operator-evidence.json"
+OPERATOR_EVIDENCE_REVIEW_ARTIFACT = "operator-evidence-review.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -7971,6 +7972,7 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
         "evidence-gaps --no-write",
         "validation-plan --no-write --limit 8 --show-commands",
         "credential-impact-checklist --no-write --show-commands --show-evidence",
+        "operator-evidence-review --no-write --show-missing --show-template",
         "transaction-corpus-checklist --no-write --show-commands",
         "deployment-review --no-write --top 8",
         "transaction-flow-review --no-write --top 8",
@@ -16665,6 +16667,182 @@ def operator_evidence_refs_for_decision(
             }
         )
     return refs[:8]
+
+
+def operator_evidence_item_id(item: dict[str, Any]) -> str:
+    return str(item.get("id") or item.get("decision_id") or "").strip()
+
+
+def operator_evidence_placeholder(value: Any) -> bool:
+    text = str(value or "").strip()
+    return not text or text.startswith("REPLACE_WITH_") or bool(COMMAND_PLACEHOLDER_RE.search(text))
+
+
+def classify_operator_evidence_item(item: dict[str, Any]) -> dict[str, Any]:
+    decision_id = operator_evidence_item_id(item)
+    status = str(item.get("status") or "").strip().lower()
+    summary = str(item.get("summary") or item.get("statement") or "").strip()
+    source_ref = str(item.get("source_ref") or item.get("reference") or "").strip()
+    summary_placeholder = operator_evidence_placeholder(summary)
+    source_placeholder = bool(source_ref and operator_evidence_placeholder(source_ref))
+    accepted_present = status in OPERATOR_EVIDENCE_PRESENT_STATUSES
+    if not decision_id:
+        classification = "invalid-missing-decision-id"
+    elif accepted_present and summary_placeholder:
+        classification = "invalid-present-placeholder"
+    elif accepted_present:
+        classification = "present"
+    elif status in {"", "pending", "todo", "draft", "placeholder", "needs-review", "manual-review"}:
+        classification = "pending"
+    else:
+        classification = "unknown-status"
+    return {
+        "id": decision_id,
+        "status": status or "missing",
+        "classification": classification,
+        "evidence_type": item.get("evidence_type") or item.get("type") or "operator-statement",
+        "summary": None if summary_placeholder else redact_text(summary, max_chars=220),
+        "source_ref": None if source_placeholder else redact_text(source_ref, max_chars=160),
+        "summary_placeholder": summary_placeholder,
+        "source_ref_placeholder": source_placeholder,
+        "accepted_present_status": accepted_present,
+    }
+
+
+def build_operator_evidence_review(
+    *,
+    target: str,
+    artifact_dir: Path,
+    operator_evidence: dict[str, Any] | None,
+    deployment_review: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    raw_items = operator_evidence_items(operator_evidence)
+    classified_items = [classify_operator_evidence_item(item) for item in raw_items]
+    classification_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    for item in classified_items:
+        increment_count(classification_counts, str(item.get("classification") or "unknown"))
+        increment_count(status_counts, str(item.get("status") or "unknown"))
+
+    present_decision_ids = sorted(
+        {
+            str(item.get("id") or "")
+            for item in classified_items
+            if item.get("classification") == "present" and item.get("id")
+        }
+    )
+    pending_decision_ids = sorted(
+        {
+            str(item.get("id") or "")
+            for item in classified_items
+            if item.get("classification") == "pending" and item.get("id")
+        }
+    )
+    invalid_items = [
+        item
+        for item in classified_items
+        if str(item.get("classification") or "").startswith("invalid")
+        or item.get("classification") == "unknown-status"
+    ]
+
+    decisions = (
+        deployment_review.get("decisions", [])
+        if isinstance(deployment_review, dict) and isinstance(deployment_review.get("decisions"), list)
+        else []
+    )
+    decision_coverage = []
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            continue
+        decision_id = str(decision.get("id") or "").strip()
+        if not decision_id:
+            continue
+        refs = operator_evidence_refs_for_decision(operator_evidence, decision_id)
+        decision_coverage.append(
+            {
+                "id": decision_id,
+                "deployment_status": decision.get("status"),
+                "operator_evidence_status": "present" if refs else "missing",
+                "operator_evidence_refs": refs,
+                "operator_evidence_needed": decision.get("operator_evidence_needed", []),
+            }
+        )
+
+    missing_decisions = [
+        item
+        for item in decision_coverage
+        if item.get("deployment_status") == "missing-evidence"
+        and item.get("operator_evidence_status") != "present"
+    ]
+    provider_review = (
+        deployment_review.get("credential_provider_review")
+        if isinstance(deployment_review, dict) and isinstance(deployment_review.get("credential_provider_review"), dict)
+        else {}
+    )
+    provider_summary = provider_review.get("summary", {}) if isinstance(provider_review.get("summary"), dict) else {}
+    provider_missing = provider_summary.get("missing_provider_evidence", []) or []
+    critical_missing = (
+        (deployment_review.get("summary", {}) or {}).get("critical_missing", [])
+        if isinstance(deployment_review, dict) and isinstance(deployment_review.get("summary"), dict)
+        else []
+    )
+
+    if not isinstance(operator_evidence, dict):
+        status = "missing"
+    elif invalid_items:
+        status = "invalid"
+    elif not raw_items:
+        status = "empty"
+    elif present_decision_ids:
+        status = "indexed-with-open-gaps" if missing_decisions or provider_missing else "indexed"
+    else:
+        status = "pending-only"
+
+    missing_sidecar_decisions = [
+        {
+            "id": item.get("id"),
+            "deployment_status": item.get("deployment_status"),
+            "operator_evidence_needed": item.get("operator_evidence_needed", []),
+        }
+        for item in missing_decisions
+    ]
+    sidecar_template = build_operator_evidence_sidecar_template(
+        target=target,
+        provider="deployment/operator",
+        missing_decisions=missing_sidecar_decisions,
+    )
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "sidecar_path": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+        "summary": {
+            "items": len(raw_items),
+            "classification_counts": dict(sorted(classification_counts.items())),
+            "status_counts": dict(sorted(status_counts.items())),
+            "present_decision_ids": present_decision_ids,
+            "pending_decision_ids": pending_decision_ids,
+            "invalid_items": len(invalid_items),
+            "decision_coverage": len(decision_coverage),
+            "missing_decisions": [str(item.get("id")) for item in missing_decisions],
+            "provider_missing": [str(item) for item in provider_missing],
+            "critical_missing": [str(item) for item in critical_missing],
+        },
+        "items": classified_items,
+        "decision_coverage": decision_coverage,
+        "missing_decisions": missing_sidecar_decisions,
+        "sidecar_template": sidecar_template,
+        "accepted_present_statuses": sorted(OPERATOR_EVIDENCE_PRESENT_STATUSES),
+        "reportability_gate": (
+            "Only present operator evidence with a non-placeholder redacted summary is indexed. "
+            "Pending, unknown, placeholder, or invalid items do not satisfy reportability gates."
+        ),
+        "safety": (
+            "Offline sidecar review only. It reads local JSON and redacts summaries/source references; "
+            "it sends no target, provider, Burp, wallet, or transaction traffic."
+        ),
+    }
 
 
 def build_operator_evidence_sidecar_template(
@@ -28920,6 +29098,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("hypothesis-matrix", "run_hypothesis_matrix"),
         refresh_expectation("rewrite-review", "run_rewrite_review"),
         refresh_expectation("deployment-review", "run_deployment_review"),
+        refresh_expectation("operator-evidence-review", "run_operator_evidence_review"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-corpus-checklist", "run_transaction_corpus_checklist"),
         refresh_expectation("credential-impact-checklist", "run_credential_impact_checklist"),
@@ -29166,6 +29345,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         methodology_review_output_dir = root / "methodology-review-output"
         transaction_corpus_checklist_output_dir = root / "transaction-corpus-checklist-output"
         credential_impact_checklist_output_dir = root / "credential-impact-checklist-output"
+        operator_evidence_review_output_dir = root / "operator-evidence-review-output"
         decode_transactions_output_dir = root / "decode-transactions-output"
         promote_output_dir = root / "promote-output"
         invalid_promote_output_dir = root / "invalid-promote-output"
@@ -29365,6 +29545,22 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--skip-current-resource-check",
                 ]
             )
+            operator_evidence_review_return_code, operator_evidence_review_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(operator_evidence_review_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "operator-evidence-review",
+                    "--no-write",
+                    "--show-template",
+                    "--show-missing",
+                ]
+            )
             decode_transactions_return_code, decode_transactions_stdout = run_cli(
                 [
                     "--profile",
@@ -29527,6 +29723,16 @@ def build_no_write_selftest() -> dict[str, Any]:
             "credential_impact_checklist_manifest": (
                 credential_impact_checklist_output_dir / MANIFEST_NAME
             ).exists(),
+            "operator_evidence_review_dir": operator_evidence_review_output_dir.exists(),
+            "operator_evidence_review_target_profile_json": (
+                operator_evidence_review_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "operator_evidence_review_json": (
+                operator_evidence_review_output_dir / OPERATOR_EVIDENCE_REVIEW_ARTIFACT
+            ).exists(),
+            "operator_evidence_review_manifest": (
+                operator_evidence_review_output_dir / MANIFEST_NAME
+            ).exists(),
             "decode_transactions_dir": decode_transactions_output_dir.exists(),
             "decode_transactions_target_profile_json": (
                 decode_transactions_output_dir / TARGET_PROFILE_ARTIFACT
@@ -29570,6 +29776,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     methodology_review_stdout_text = "\n".join(methodology_review_stdout)
     transaction_corpus_checklist_stdout_text = "\n".join(transaction_corpus_checklist_stdout)
     credential_impact_checklist_stdout_text = "\n".join(credential_impact_checklist_stdout)
+    operator_evidence_review_stdout_text = "\n".join(operator_evidence_review_stdout)
     decode_transactions_stdout_text = "\n".join(decode_transactions_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
     invalid_promote_stdout_text = "\n".join(invalid_promote_stdout)
@@ -30183,6 +30390,32 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": credential_impact_checklist_return_code,
                 "stdout": credential_impact_checklist_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "operator-evidence-review-no-write-skips-artifacts",
+            "passed": (
+                operator_evidence_review_return_code == 0
+                and "Operator evidence review:" in operator_evidence_review_stdout_text
+                and "Coverage:" in operator_evidence_review_stdout_text
+                and "Sidecar template:" in operator_evidence_review_stdout_text
+                and "No files written (--no-write)." in operator_evidence_review_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "operator_evidence_review_dir",
+                        "operator_evidence_review_target_profile_json",
+                        "operator_evidence_review_json",
+                        "operator_evidence_review_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in operator_evidence_review_stdout)
+            ),
+            "expected": "operator-evidence-review --no-write prints sidecar coverage without writing artifacts or manifests",
+            "actual": {
+                "return_code": operator_evidence_review_return_code,
+                "stdout": operator_evidence_review_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -36236,6 +36469,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         operator_sidecar_review: dict[str, Any] = {}
         operator_placeholder_review: dict[str, Any] = {}
         operator_sidecar_provider: dict[str, Any] = {}
+        operator_sidecar_evidence_review: dict[str, Any] = {}
+        operator_placeholder_evidence_review: dict[str, Any] = {}
         with tempfile.TemporaryDirectory(prefix="inferforge-operator-evidence-selftest-") as operator_temp_dir:
             operator_sidecar_source_root = Path(operator_temp_dir) / "operator-sidecar-source"
             operator_sidecar_source_root.mkdir()
@@ -36265,27 +36500,46 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 test_profile,
                 operator_evidence=operator_sidecar,
             )
+            operator_sidecar_evidence_review = build_operator_evidence_review(
+                target=DEFAULT_TARGET,
+                artifact_dir=operator_sidecar_source_root,
+                operator_evidence=operator_sidecar,
+                deployment_review=operator_sidecar_review,
+            )
             operator_sidecar_provider = operator_sidecar_review.get("credential_provider_review", {})
+            operator_placeholder = {
+                "evidence_items": [
+                    {
+                        "id": "credentialed-upstream-quota-policy",
+                        "status": "pending",
+                        "summary": "REPLACE_WITH_REDACTED_OPERATOR_OR_PROVIDER_EVIDENCE_SUMMARY",
+                    }
+                ]
+            }
             operator_placeholder_review = build_deployment_resource_review(
                 operator_sidecar_source_root,
                 test_profile,
-                operator_evidence={
-                    "evidence_items": [
-                        {
-                            "id": "credentialed-upstream-quota-policy",
-                            "status": "pending",
-                            "summary": "REPLACE_WITH_REDACTED_OPERATOR_OR_PROVIDER_EVIDENCE_SUMMARY",
-                        }
-                    ]
-                },
+                operator_evidence=operator_placeholder,
+            )
+            operator_placeholder_evidence_review = build_operator_evidence_review(
+                target=DEFAULT_TARGET,
+                artifact_dir=operator_sidecar_source_root,
+                operator_evidence=operator_placeholder,
+                deployment_review=operator_placeholder_review,
             )
         operator_evidence_sidecar_passed = (
             operator_sidecar_provider.get("status") == "provider-evidence-indexed"
             and (operator_sidecar_provider.get("summary") or {}).get("missing_provider_evidence") == []
             and (operator_sidecar_provider.get("summary") or {}).get("evidence_counts", {}).get("operator_sidecar") == 4
             and operator_sidecar_review.get("operator_evidence", {}).get("status") == "indexed"
+            and operator_sidecar_evidence_review.get("status") in {"indexed", "indexed-with-open-gaps"}
+            and (operator_sidecar_evidence_review.get("summary") or {}).get("classification_counts", {}).get("present") == 4
+            and len((operator_sidecar_evidence_review.get("summary") or {}).get("present_decision_ids", []) or []) == 4
             and operator_placeholder_review.get("credential_provider_review", {}).get("status")
             == "needs-provider-operator-evidence"
+            and operator_placeholder_evidence_review.get("status") == "pending-only"
+            and (operator_placeholder_evidence_review.get("summary") or {}).get("classification_counts", {}).get("pending") == 1
+            and not (operator_placeholder_evidence_review.get("summary") or {}).get("present_decision_ids", [])
         )
     blackbox_asset_profile_paths = {
         cluster.get("path")
@@ -39201,6 +39455,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "provider_review": operator_sidecar_provider,
             "placeholder_provider_review": operator_placeholder_review.get("credential_provider_review", {}),
             "operator_evidence": operator_sidecar_review.get("operator_evidence", {}),
+            "operator_review": operator_sidecar_evidence_review.get("summary", {}),
+            "placeholder_operator_review": operator_placeholder_evidence_review.get("summary", {}),
         },
         "active_observation_validation": {
             "status": "passed" if unsafe_observation_validation_passed else "failed",
@@ -43283,6 +43539,91 @@ def run_deployment_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_operator_evidence_review(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    operator_evidence = load_optional_json(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
+    deployment_review = build_deployment_resource_review(
+        source_root,
+        profile,
+        max_file_bytes=args.max_file_bytes,
+        max_files=args.max_files,
+        operator_evidence=operator_evidence,
+    )
+    review = build_operator_evidence_review(
+        target=target,
+        artifact_dir=artifact_dir,
+        operator_evidence=operator_evidence,
+        deployment_review=deployment_review,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / OPERATOR_EVIDENCE_REVIEW_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(review))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="operator-evidence-review",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = review.get("summary", {}) or {}
+    print(f"Operator evidence review: {review['status']}")
+    print(
+        "Items: "
+        f"total={summary.get('items', 0)} "
+        f"classifications={json.dumps(summary.get('classification_counts', {}), sort_keys=True)}"
+    )
+    print(
+        "Coverage: "
+        f"decisions={summary.get('decision_coverage', 0)} "
+        f"missing={','.join(summary.get('missing_decisions', []) or []) or 'none'} "
+        f"provider_missing={','.join(summary.get('provider_missing', []) or []) or 'none'}"
+    )
+    top_count = max(0, int(args.top))
+    if top_count:
+        print("Evidence items:")
+        for item in (review.get("items", []) or [])[:top_count]:
+            print(
+                f"- {item.get('classification')} {item.get('id') or '-'} "
+                f"status={item.get('status')} type={item.get('evidence_type')}"
+            )
+            if args.show_evidence and item.get("summary"):
+                print(f"  summary={inline_summary_text(item.get('summary'), max_chars=220)}")
+        if args.show_missing:
+            print("Missing decisions:")
+            for item in (review.get("missing_decisions", []) or [])[:top_count]:
+                print(f"- {item.get('id')} status={item.get('deployment_status')}")
+                for needed in (item.get("operator_evidence_needed", []) or [])[:2]:
+                    print(f"  needed={inline_summary_text(needed, max_chars=180)}")
+    if args.show_template:
+        template = review.get("sidecar_template") if isinstance(review.get("sidecar_template"), dict) else {}
+        print(
+            "Sidecar template: "
+            f"path={review.get('sidecar_path')} "
+            f"items={len(template.get('evidence_items', []) or [])} "
+            f"accepted_statuses={','.join(review.get('accepted_present_statuses', []) or [])}"
+        )
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if review["status"] == "invalid":
+        return 1
+    if args.strict and review["status"] not in {"indexed", "indexed-with-open-gaps"}:
+        return 1
+    return 0
+
+
 def run_transaction_flow_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -45861,6 +46202,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless all deployment evidence categories are indexed.",
     )
     deployment_review.set_defaults(func=run_deployment_review)
+
+    operator_evidence_review = sub.add_parser(
+        "operator-evidence-review",
+        help="Review operator-evidence.json sidecar coverage without target or provider traffic",
+    )
+    operator_evidence_review.add_argument(
+        "--output",
+        help=f"Where to write {OPERATOR_EVIDENCE_REVIEW_ARTIFACT}. Defaults to --artifact-dir/{OPERATOR_EVIDENCE_REVIEW_ARTIFACT}.",
+    )
+    operator_evidence_review.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES,
+        help=f"Maximum bytes to read per allowlisted deployment file. Defaults to {DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES}.",
+    )
+    operator_evidence_review.add_argument(
+        "--max-files",
+        type=positive_int,
+        default=32,
+        help="Maximum allowlisted deployment files to scan for evidence context. Defaults to 32.",
+    )
+    operator_evidence_review.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of evidence items or missing decisions to print.",
+    )
+    operator_evidence_review.add_argument(
+        "--show-evidence",
+        action="store_true",
+        help="Print redacted evidence summaries for top sidecar items.",
+    )
+    operator_evidence_review.add_argument(
+        "--show-missing",
+        action="store_true",
+        help="Print missing deployment/operator evidence decisions.",
+    )
+    operator_evidence_review.add_argument(
+        "--show-template",
+        action="store_true",
+        help="Print sidecar template metadata for missing decisions.",
+    )
+    operator_evidence_review.add_argument(
+        "--no-write",
+        action="store_true",
+        help=f"Print operator evidence review only; do not write {OPERATOR_EVIDENCE_REVIEW_ARTIFACT} or refreshed manifests.",
+    )
+    operator_evidence_review.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless present non-placeholder operator evidence is indexed.",
+    )
+    operator_evidence_review.set_defaults(func=run_operator_evidence_review)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
