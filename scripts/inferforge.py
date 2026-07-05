@@ -17958,6 +17958,7 @@ def build_operator_evidence_review(
     artifact_dir: Path,
     operator_evidence: dict[str, Any] | None,
     deployment_review: dict[str, Any] | None = None,
+    rpc_method_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     raw_items = operator_evidence_items(operator_evidence)
     classified_items = [classify_operator_evidence_item(item) for item in raw_items]
@@ -18008,6 +18009,37 @@ def build_operator_evidence_review(
                 "operator_evidence_status": "present" if refs else "missing",
                 "operator_evidence_refs": refs,
                 "operator_evidence_needed": decision.get("operator_evidence_needed", []),
+            }
+        )
+
+    rate_limit_review = (
+        rpc_method_policy.get("rate_limit_resource_review")
+        if isinstance(rpc_method_policy, dict)
+        and isinstance(rpc_method_policy.get("rate_limit_resource_review"), dict)
+        else {}
+    )
+    client_ip_trust_review = (
+        rate_limit_review.get("client_ip_trust_review")
+        if isinstance(rate_limit_review.get("client_ip_trust_review"), dict)
+        else {}
+    )
+    rpc_client_ip_trust_missing = client_ip_trust_review.get("status") == "needs-proxy-trust-evidence"
+    if rpc_client_ip_trust_missing:
+        decision_id = "rpc-client-ip-header-trust-model"
+        refs = operator_evidence_refs_for_decision(operator_evidence, decision_id)
+        decision_coverage.append(
+            {
+                "id": decision_id,
+                "deployment_status": "missing-evidence",
+                "operator_evidence_status": "present" if refs else "missing",
+                "operator_evidence_refs": refs,
+                "operator_evidence_needed": client_ip_trust_review.get("operator_evidence_needed", []),
+                "source_review": {
+                    "status": client_ip_trust_review.get("status"),
+                    "header_tokens": client_ip_trust_review.get("header_tokens", []),
+                    "forwarded_for_ref_count": client_ip_trust_review.get("forwarded_for_ref_count", 0),
+                    "memory_fallback_ref_count": client_ip_trust_review.get("memory_fallback_ref_count", 0),
+                },
             }
         )
 
@@ -18071,6 +18103,8 @@ def build_operator_evidence_review(
             "missing_decisions": [str(item.get("id")) for item in missing_decisions],
             "provider_missing": [str(item) for item in provider_missing],
             "critical_missing": [str(item) for item in critical_missing],
+            "rpc_client_ip_trust_status": client_ip_trust_review.get("status") or "missing",
+            "rpc_client_ip_trust_missing": bool(rpc_client_ip_trust_missing),
         },
         "items": classified_items,
         "decision_coverage": decision_coverage,
@@ -46876,11 +46910,16 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
         max_files=args.max_files,
         operator_evidence=operator_evidence,
     )
+    rpc_method_policy, _rpc_method_policy_source = rpc_method_policy_for_hypothesis_matrix(
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
     review = build_operator_evidence_review(
         target=target,
         artifact_dir=artifact_dir,
         operator_evidence=operator_evidence,
         deployment_review=deployment_review,
+        rpc_method_policy=rpc_method_policy,
     )
     output_path = (
         resolve_repo_path(args.output)
@@ -46908,7 +46947,8 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
         "Coverage: "
         f"decisions={summary.get('decision_coverage', 0)} "
         f"missing={','.join(summary.get('missing_decisions', []) or []) or 'none'} "
-        f"provider_missing={','.join(summary.get('provider_missing', []) or []) or 'none'}"
+        f"provider_missing={','.join(summary.get('provider_missing', []) or []) or 'none'} "
+        f"rpc_client_ip_trust={summary.get('rpc_client_ip_trust_status') or 'missing'}"
     )
     top_count = max(0, int(args.top))
     if top_count:

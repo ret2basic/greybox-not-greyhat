@@ -375,7 +375,10 @@ requirements; this artifact is triage, not a reportable resource-exhaustion
 finding. `operator-evidence-review --no-write --show-missing --show-template`
 prints the redacted `operator-evidence.json` sidecar path plus template item
 IDs, evidence questions, accepted present statuses, and redaction reminders for
-the missing decisions.
+the missing decisions. When RPC source shows rate-limit buckets keyed from
+`x-forwarded-for`, that template also includes
+`rpc-client-ip-header-trust-model`, which asks for production edge/header
+overwrite and direct-to-app reachability evidence without rate or DoS testing.
 
 Use `rewrite-review` for the dedicated fixed-upstream rewrite/proxy review:
 
