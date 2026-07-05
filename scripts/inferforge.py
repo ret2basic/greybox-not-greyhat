@@ -129,6 +129,7 @@ REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT = "deployment-resource-review.json"
 TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
 TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
+TRANSACTION_SIDECAR_REVIEW_ARTIFACT = "transaction-sidecar-review.json"
 CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT = "credential-impact-checklist.json"
 OPERATOR_EVIDENCE_ARTIFACT = "operator-evidence.json"
 OPERATOR_EVIDENCE_REVIEW_ARTIFACT = "operator-evidence-review.json"
@@ -219,6 +220,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
+    TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
     CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT,
     OPERATOR_EVIDENCE_ARTIFACT,
     "artifact-health.json",
@@ -248,6 +250,7 @@ REPORT_FRESHNESS_INPUTS = [
     "source-peek-requests.json",
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
+    TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
     "evidence-chain.json",
     "evidence-appendix.json",
     "adjudication.json",
@@ -312,6 +315,7 @@ INDEX_ARTIFACT_ORDER = [
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
+    TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
     CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT,
     OPERATOR_EVIDENCE_ARTIFACT,
     "response-delta-analysis.json",
@@ -7963,6 +7967,7 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
     ],
     "finding-identification": [
         "response-deltas --no-write",
+        "transaction-sidecar-review --no-write --show-files --show-commands",
         "transaction-corpus-checklist --no-write --show-commands",
         "transaction-flow-review --no-write --top 8",
         "hypothesis-matrix --no-write --show-next",
@@ -7973,6 +7978,7 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
         "validation-plan --no-write --limit 8 --show-commands",
         "credential-impact-checklist --no-write --show-commands --show-evidence",
         "operator-evidence-review --no-write --show-missing --show-template",
+        "transaction-sidecar-review --no-write --show-files --show-commands",
         "transaction-corpus-checklist --no-write --show-commands",
         "deployment-review --no-write --top 8",
         "transaction-flow-review --no-write --top 8",
@@ -18427,6 +18433,223 @@ def transaction_corpus_policy_templates(profile: dict[str, Any] | None, artifact
     return templates
 
 
+def transaction_payload_sidecar_paths(artifact_dir: Path) -> list[Path]:
+    return [
+        artifact_dir / "transaction-payloads.json",
+        artifact_dir / "transaction-payloads.jsonl",
+        artifact_dir / "transaction-payloads.txt",
+        artifact_dir / "burp-transaction-candidates.json",
+    ]
+
+
+def transaction_sidecar_file_status(path: Path, max_input_bytes: int) -> dict[str, Any]:
+    rel = repo_relative_or_absolute(path)
+    if not path.exists():
+        return {
+            "path": rel,
+            "name": path.name,
+            "status": "missing",
+        }
+    if not path.is_file():
+        return {
+            "path": rel,
+            "name": path.name,
+            "status": "not-a-file",
+        }
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        return {
+            "path": rel,
+            "name": path.name,
+            "status": "stat-failed",
+            "error": redacted_error_summary(error),
+        }
+    return {
+        "path": rel,
+        "name": path.name,
+        "status": "present" if size <= max_input_bytes else "too-large",
+        "bytes": size,
+        "max_input_bytes": max_input_bytes,
+    }
+
+
+def transaction_candidate_review_summary(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": candidate.get("id"),
+        "source": candidate.get("source"),
+        "json_path": candidate.get("json_path"),
+        "configured_json_path": candidate.get("configured_json_path"),
+        "base64_length": candidate.get("base64_length"),
+        "base64_sha256": candidate.get("base64_sha256"),
+        "decoded_byte_length": candidate.get("decoded_byte_length"),
+    }
+
+
+def transaction_policy_review_summary(policy: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "configured": bool(policy.get("configured")),
+        "valid": bool(policy.get("valid")),
+        "issues": policy.get("issues", []),
+        "sources": policy.get("sources", []),
+        "direction": policy.get("direction"),
+        "wallet_present": bool(policy.get("wallet")),
+        "amountIn_present": bool(policy.get("amountIn")),
+        "sourceMint": policy.get("sourceMint"),
+        "destinationMint": policy.get("destinationMint"),
+        "allowedPrograms_count": len(policy.get("allowedPrograms", []) or []),
+    }
+
+
+def build_transaction_sidecar_review(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    max_input_bytes: int = DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+) -> dict[str, Any]:
+    warnings: list[str] = []
+    candidates = collect_transaction_candidates(
+        artifact_dir,
+        [],
+        profile=profile,
+        warnings=warnings,
+        max_input_bytes=max_input_bytes,
+    )
+    payload_files = [
+        transaction_sidecar_file_status(path, max_input_bytes)
+        for path in transaction_payload_sidecar_paths(artifact_dir)
+    ]
+    present_payload_files = [row for row in payload_files if row.get("status") == "present"]
+    oversized_payload_files = [row for row in payload_files if row.get("status") == "too-large"]
+
+    policy_path = artifact_dir / "transaction-intent-policy.json"
+    policy_file = transaction_sidecar_file_status(policy_path, max_input_bytes)
+    policy_error = None
+    try:
+        policy = load_transaction_intent_policy(artifact_dir, profile=profile)
+    except Exception as error:
+        policy = {
+            "configured": True,
+            "valid": False,
+            "issues": ["transaction-intent-policy.json could not be parsed"],
+            "sources": [repo_relative_or_absolute(policy_path)] if policy_path.exists() else [],
+        }
+        policy_error = redacted_error_summary(error)
+
+    policy_summary = transaction_policy_review_summary(policy)
+    ready_for_decode = bool(candidates) and bool(policy.get("valid"))
+    if ready_for_decode:
+        status = "ready-for-decode"
+    elif policy_error is not None:
+        status = "invalid-intent-policy-sidecar"
+    elif candidates and not policy.get("configured"):
+        status = "needs-intent-policy"
+    elif candidates and not policy.get("valid"):
+        status = "invalid-intent-policy"
+    elif policy.get("valid") and not candidates:
+        status = "needs-payload-sidecar"
+    elif present_payload_files and not candidates:
+        status = "payload-sidecar-no-candidates"
+    elif oversized_payload_files:
+        status = "payload-sidecar-too-large"
+    else:
+        status = "missing-sidecars"
+
+    decode_commands = []
+    if ready_for_decode:
+        decode_commands.append(
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                f"decode-transactions --no-write --max-input-bytes {max_input_bytes}",
+                profile=profile,
+            )
+        )
+    elif candidates:
+        decode_commands.extend(
+            row.get("decode_command")
+            for row in transaction_corpus_policy_templates(profile, artifact_dir)
+            if row.get("decode_command")
+        )
+
+    acceptance_checks = [
+        {
+            "id": "payload-sidecar-present",
+            "status": "passed" if present_payload_files else "waiting",
+            "evidence": [row.get("name") for row in present_payload_files],
+        },
+        {
+            "id": "payload-candidates-present",
+            "status": "passed" if candidates else "waiting",
+            "evidence": len(candidates),
+        },
+        {
+            "id": "intent-policy-sidecar-valid",
+            "status": "passed" if policy.get("valid") else "failed" if policy.get("configured") else "waiting",
+            "evidence": policy_summary,
+        },
+        {
+            "id": "decode-ready",
+            "status": "passed" if ready_for_decode else "waiting",
+            "evidence": {
+                "candidate_count": len(candidates),
+                "policy_valid": bool(policy.get("valid")),
+            },
+        },
+    ]
+    if ready_for_decode:
+        next_step = "Run decode-transactions --no-write and review signer, account, mint, amount, and program checks."
+    elif candidates and not policy.get("configured"):
+        next_step = "Write transaction-intent-policy.json for the approved direction, wallet, amountIn, mints, and reviewed allowedPrograms."
+    elif candidates:
+        next_step = "Fix transaction-intent-policy.json, then rerun transaction-sidecar-review."
+    elif present_payload_files:
+        next_step = "Inspect the payload sidecar shape; no base64 transaction candidates were extracted."
+    else:
+        next_step = "Add one approved quote response or extracted transaction payload sidecar before wallet signing."
+
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "summary": {
+            "payload_files_present": len(present_payload_files),
+            "payload_files_oversized": len(oversized_payload_files),
+            "candidate_count": len(candidates),
+            "intent_policy_configured": bool(policy.get("configured")),
+            "intent_policy_valid": bool(policy.get("valid")),
+            "ready_for_decode": ready_for_decode,
+            "warnings": len(warnings),
+        },
+        "payload_sidecars": payload_files,
+        "intent_policy_sidecar": {
+            "path": repo_relative_or_absolute(policy_path),
+            "file": policy_file,
+            "policy": policy_summary,
+            "error": policy_error,
+        },
+        "candidate_summaries": [
+            transaction_candidate_review_summary(candidate)
+            for candidate in candidates[:20]
+        ],
+        "candidate_sources": sorted({str(candidate.get("source") or "") for candidate in candidates}),
+        "warnings": warnings,
+        "acceptance_checks": acceptance_checks,
+        "decode_commands": decode_commands,
+        "reportability_gate": (
+            "This review only proves the offline sidecars are ready to decode. It does not prove a vulnerability; "
+            "only decoded intent mismatches or another concrete user-funds impact can advance the finding gate."
+        ),
+        "next_step": next_step,
+        "safety": (
+            "Offline sidecar readiness review only. Base64 transaction payloads are not written into this review, "
+            "no wallet is invoked, and no Solana transaction is signed or submitted."
+        ),
+    }
+
+
 def transaction_corpus_capture_gate(resource_snapshot: dict[str, Any] | None) -> dict[str, Any]:
     preflight = validation_resource_preflight_summary(resource_snapshot)
     status = str(preflight.get("status") or "not-run")
@@ -18646,6 +18869,11 @@ def build_transaction_corpus_checklist(
         },
     ]
     post_decode_commands = []
+    sidecar_review_command = validation_command_for_artifact_dir(
+        artifact_dir,
+        "transaction-sidecar-review --no-write --show-files --show-commands",
+        profile=profile,
+    )
     if reportability_review.get("ready_for_finding_gate"):
         post_decode_commands = [
             validation_command_for_artifact_dir(artifact_dir, "gate --no-write", profile=profile),
@@ -18701,6 +18929,7 @@ def build_transaction_corpus_checklist(
         },
         "sidecar_jsonl_example": sidecar_example,
         "acceptance_checks": acceptance_checks,
+        "sidecar_review_command": sidecar_review_command,
         "decode_commands": [row.get("decode_command") for row in policy_templates if row.get("decode_command")],
         "post_decode_commands": post_decode_commands,
         "reportability_gate": (
@@ -29100,6 +29329,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("deployment-review", "run_deployment_review"),
         refresh_expectation("operator-evidence-review", "run_operator_evidence_review"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
+        refresh_expectation("transaction-sidecar-review", "run_transaction_sidecar_review"),
         refresh_expectation("transaction-corpus-checklist", "run_transaction_corpus_checklist"),
         refresh_expectation("credential-impact-checklist", "run_credential_impact_checklist"),
         refresh_expectation("validation-plan", "run_validation_plan"),
@@ -29343,6 +29573,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         evidence_gaps_output_dir = root / "evidence-gaps-output"
         report_output_dir = root / "report-output"
         methodology_review_output_dir = root / "methodology-review-output"
+        transaction_sidecar_review_output_dir = root / "transaction-sidecar-review-output"
         transaction_corpus_checklist_output_dir = root / "transaction-corpus-checklist-output"
         credential_impact_checklist_output_dir = root / "credential-impact-checklist-output"
         operator_evidence_review_output_dir = root / "operator-evidence-review-output"
@@ -29508,6 +29739,22 @@ def build_no_write_selftest() -> dict[str, Any]:
                     str(root),
                     "methodology-review",
                     "--no-write",
+                    "--show-commands",
+                ]
+            )
+            transaction_sidecar_review_return_code, transaction_sidecar_review_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(transaction_sidecar_review_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "transaction-sidecar-review",
+                    "--no-write",
+                    "--show-files",
                     "--show-commands",
                 ]
             )
@@ -29703,6 +29950,16 @@ def build_no_write_selftest() -> dict[str, Any]:
             ).exists(),
             "methodology_review_json": (methodology_review_output_dir / METHODOLOGY_REVIEW_ARTIFACT).exists(),
             "methodology_review_manifest": (methodology_review_output_dir / MANIFEST_NAME).exists(),
+            "transaction_sidecar_review_dir": transaction_sidecar_review_output_dir.exists(),
+            "transaction_sidecar_review_target_profile_json": (
+                transaction_sidecar_review_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "transaction_sidecar_review_json": (
+                transaction_sidecar_review_output_dir / TRANSACTION_SIDECAR_REVIEW_ARTIFACT
+            ).exists(),
+            "transaction_sidecar_review_manifest": (
+                transaction_sidecar_review_output_dir / MANIFEST_NAME
+            ).exists(),
             "transaction_corpus_checklist_dir": transaction_corpus_checklist_output_dir.exists(),
             "transaction_corpus_checklist_target_profile_json": (
                 transaction_corpus_checklist_output_dir / TARGET_PROFILE_ARTIFACT
@@ -29774,6 +30031,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     evidence_gaps_stdout_text = "\n".join(evidence_gaps_stdout)
     report_stdout_text = "\n".join(report_stdout)
     methodology_review_stdout_text = "\n".join(methodology_review_stdout)
+    transaction_sidecar_review_stdout_text = "\n".join(transaction_sidecar_review_stdout)
     transaction_corpus_checklist_stdout_text = "\n".join(transaction_corpus_checklist_stdout)
     credential_impact_checklist_stdout_text = "\n".join(credential_impact_checklist_stdout)
     operator_evidence_review_stdout_text = "\n".join(operator_evidence_review_stdout)
@@ -30339,6 +30597,32 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": methodology_review_return_code,
                 "stdout": methodology_review_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "transaction-sidecar-review-no-write-skips-artifacts",
+            "passed": (
+                transaction_sidecar_review_return_code == 0
+                and "Transaction sidecar review:" in transaction_sidecar_review_stdout_text
+                and "Sidecars:" in transaction_sidecar_review_stdout_text
+                and "Intent policy:" in transaction_sidecar_review_stdout_text
+                and "No files written (--no-write)." in transaction_sidecar_review_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "transaction_sidecar_review_dir",
+                        "transaction_sidecar_review_target_profile_json",
+                        "transaction_sidecar_review_json",
+                        "transaction_sidecar_review_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in transaction_sidecar_review_stdout)
+            ),
+            "expected": "transaction-sidecar-review --no-write prints sidecar readiness without writing artifacts or manifests",
+            "actual": {
+                "return_code": transaction_sidecar_review_return_code,
+                "stdout": transaction_sidecar_review_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -32739,6 +33023,7 @@ def build_transaction_decoder_selftest(
         and int(mismatch_reportability_review.get("high_impact_failure_count") or 0) >= 2
     )
     decoded_count = sum(1 for item in transactions if item.get("decoded"))
+    sidecar_ready_review: dict[str, Any] = {}
     with tempfile.TemporaryDirectory() as temp_dir:
         guard_artifact_dir = Path(temp_dir) / "transaction-sidecar-guard"
         guard_artifact_dir.mkdir()
@@ -32753,10 +33038,49 @@ def build_transaction_decoder_selftest(
             extra_inputs=[oversized_input],
             max_input_bytes=32,
         )
+        ready_artifact_dir = Path(temp_dir) / "transaction-sidecar-ready"
+        ready_artifact_dir.mkdir()
+        write_json(
+            ready_artifact_dir / "transaction-payloads.json",
+            {
+                "payloads": [
+                    {
+                        "data": {
+                            "transaction": payload["base64"],
+                        }
+                    }
+                ]
+            },
+        )
+        write_json(
+            ready_artifact_dir / "transaction-intent-policy.json",
+            {
+                "direction": direction,
+                "wallet": payload["wallet"],
+                "amountIn": amount_in,
+                "sourceMint": payload["sourceMint"],
+                "destinationMint": payload["destinationMint"],
+                "allowedPrograms": [payload["allowedProgram"]],
+            },
+        )
+        sidecar_ready_review = build_transaction_sidecar_review(
+            target=DEFAULT_TARGET,
+            profile=profile,
+            artifact_dir=ready_artifact_dir,
+        )
     sidecar_guard_passed = (
         sidecar_guard_intent.get("candidates_seen") == 0
         and sidecar_guard_intent.get("resource_limits", {}).get("max_transaction_candidate_input_bytes") == 32
         and any("exceeds max_transaction_candidate_input_bytes=32" in item for item in sidecar_guard_intent.get("warnings", []))
+    )
+    sidecar_ready_text = json.dumps(sidecar_ready_review, sort_keys=True)
+    sidecar_ready_passed = (
+        sidecar_ready_review.get("status") == "ready-for-decode"
+        and sidecar_ready_review.get("summary", {}).get("candidate_count") == 1
+        and sidecar_ready_review.get("summary", {}).get("intent_policy_valid") is True
+        and sidecar_ready_review.get("summary", {}).get("ready_for_decode") is True
+        and payload["base64"] not in sidecar_ready_text
+        and sidecar_ready_review.get("decode_commands")
     )
     status = (
         "passed"
@@ -32765,6 +33089,7 @@ def build_transaction_decoder_selftest(
         and reportability_review.get("status") == "intent-checks-passed"
         and mismatch_gate_passed
         and sidecar_guard_passed
+        and sidecar_ready_passed
         else "failed"
     )
     return {
@@ -32794,6 +33119,13 @@ def build_transaction_decoder_selftest(
             "status": "passed" if sidecar_guard_passed else "failed",
             "resource_limits": sidecar_guard_intent.get("resource_limits", {}),
             "warnings": sidecar_guard_intent.get("warnings", []),
+        },
+        "sidecar_ready_review": {
+            "status": "passed" if sidecar_ready_passed else "failed",
+            "review_status": sidecar_ready_review.get("status"),
+            "summary": sidecar_ready_review.get("summary", {}),
+            "candidate_summaries": sidecar_ready_review.get("candidate_summaries", []),
+            "decode_commands": sidecar_ready_review.get("decode_commands", []),
         },
         "transactions": transactions,
         "note": "This self-test proves decoder mechanics only; it does not satisfy GAP-quote-transaction-corpus.",
@@ -43849,6 +44181,88 @@ def run_credential_impact_checklist(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    review = build_transaction_sidecar_review(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        max_input_bytes=args.max_input_bytes,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / TRANSACTION_SIDECAR_REVIEW_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(review))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="transaction-sidecar-review",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = review.get("summary", {}) or {}
+    print(f"Transaction sidecar review: {review['status']}")
+    print(
+        "Sidecars: "
+        f"payload_files={summary.get('payload_files_present', 0)} "
+        f"oversized={summary.get('payload_files_oversized', 0)} "
+        f"candidates={summary.get('candidate_count', 0)} "
+        f"policy_configured={summary.get('intent_policy_configured')} "
+        f"policy_valid={summary.get('intent_policy_valid')} "
+        f"ready_for_decode={summary.get('ready_for_decode')}"
+    )
+    policy = (
+        review.get("intent_policy_sidecar", {}).get("policy", {})
+        if isinstance(review.get("intent_policy_sidecar"), dict)
+        else {}
+    )
+    print(
+        "Intent policy: "
+        f"direction={policy.get('direction') or '-'} "
+        f"wallet_present={policy.get('wallet_present')} "
+        f"amount_present={policy.get('amountIn_present')} "
+        f"allowed_programs={policy.get('allowedPrograms_count', 0)} "
+        f"issues={len(policy.get('issues', []) or [])}"
+    )
+    if args.show_files:
+        print("Payload files:")
+        for item in review.get("payload_sidecars", []) or []:
+            print(
+                f"- {item.get('status')} {item.get('name')} "
+                f"bytes={item.get('bytes', '-')}"
+            )
+    if args.show_candidates:
+        print("Candidates:")
+        for item in (review.get("candidate_summaries", []) or [])[: max(0, int(args.top))]:
+            print(
+                f"- {item.get('id')} source={item.get('source')} "
+                f"path={item.get('json_path')} bytes={item.get('decoded_byte_length')} "
+                f"sha256={item.get('base64_sha256')}"
+            )
+    if args.show_commands and review.get("decode_commands"):
+        print("Decode commands:")
+        for command_text in (review.get("decode_commands", []) or [])[: max(0, int(args.top))]:
+            print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    print(f"Next: {inline_summary_text(review.get('next_step'), max_chars=260)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if args.strict and review["status"] != "ready-for-decode":
+        return 1
+    return 0
+
+
 def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -43929,6 +44343,9 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
         if args.show_commands and row.get("decode_command"):
             print(f"  decode={inline_summary_text(row.get('decode_command'), max_chars=420)}")
     post_decode_commands = checklist.get("post_decode_commands", []) or []
+    if args.show_commands and checklist.get("sidecar_review_command"):
+        print("Sidecar review command:")
+        print(f"- {inline_summary_text(checklist.get('sidecar_review_command'), max_chars=420)}")
     if args.show_commands and post_decode_commands:
         print("Post-decode commands:")
         for command_text in post_decode_commands[:3]:
@@ -46296,6 +46713,62 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless a remote transaction signing flow needs intent-corpus review.",
     )
     transaction_flow_review.set_defaults(func=run_transaction_flow_review)
+
+    transaction_sidecar_review = sub.add_parser(
+        "transaction-sidecar-review",
+        help="Review transaction payload and intent-policy sidecars before offline decoding",
+    )
+    transaction_sidecar_review.add_argument(
+        "--output",
+        help=(
+            f"Where to write {TRANSACTION_SIDECAR_REVIEW_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{TRANSACTION_SIDECAR_REVIEW_ARTIFACT}."
+        ),
+    )
+    transaction_sidecar_review.add_argument(
+        "--max-input-bytes",
+        type=positive_int,
+        default=DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+        help=(
+            "Maximum bytes to read from each transaction sidecar input. "
+            f"Defaults to {DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES}."
+        ),
+    )
+    transaction_sidecar_review.add_argument(
+        "--top",
+        type=positive_int,
+        default=6,
+        help="Number of candidate summaries or commands to print.",
+    )
+    transaction_sidecar_review.add_argument(
+        "--show-files",
+        action="store_true",
+        help="Print transaction sidecar file statuses.",
+    )
+    transaction_sidecar_review.add_argument(
+        "--show-candidates",
+        action="store_true",
+        help="Print redacted transaction candidate summaries without base64 payloads.",
+    )
+    transaction_sidecar_review.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print decode-transactions commands when sidecars are ready.",
+    )
+    transaction_sidecar_review.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print transaction sidecar review only; do not write {TRANSACTION_SIDECAR_REVIEW_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    transaction_sidecar_review.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless payload and intent-policy sidecars are ready for decode-transactions.",
+    )
+    transaction_sidecar_review.set_defaults(func=run_transaction_sidecar_review)
 
     transaction_corpus_checklist = sub.add_parser(
         "transaction-corpus-checklist",
