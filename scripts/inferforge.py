@@ -9417,7 +9417,7 @@ def hypothesis_from_queue_item(
         return None
     command_safety = dict_summary(dict_summary(item.get("command_safety")).get("summary"))
     external_commands = int(command_safety.get("blocked_external", 0) or 0)
-    offline_only = not bool(item.get("commands"))
+    offline_only = bool(item.get("offline_only")) or not bool(item.get("commands"))
     if item_id.startswith("VERIFY-evidence") or item_id.startswith("VERIFY-reportability"):
         offline_only = True
     priority = hypothesis_priority_from_values(item.get("priority"), "medium")
@@ -9436,12 +9436,16 @@ def hypothesis_from_queue_item(
         "priority": priority,
         "host": None,
         "path": None,
+        "impact": item.get("impact"),
         "queue_item_id": item_id,
         "cluster_id": item.get("cluster_id"),
         "scope_decision": "in-scope-explicit-host",
         "source_status": status,
-        "impact_hypothesis": "Use this queued step to deepen or refresh evidence for a concrete impact hypothesis.",
-        "reportability_gate": "Queue item is procedural; reportability still requires a validated finding gate decision.",
+        "offline_only": offline_only,
+        "impact_hypothesis": item.get("impact_hypothesis")
+        or "Use this queued step to deepen or refresh evidence for a concrete impact hypothesis.",
+        "reportability_gate": item.get("reportability_gate")
+        or "Queue item is procedural; reportability still requires a validated finding gate decision.",
         "next_step": (
             "Preview command safety and remove external-probe flags before unattended execution."
             if external_commands
@@ -9451,6 +9455,7 @@ def hypothesis_from_queue_item(
                 else "Run only after resource-snapshot --strict is healthy and scope gates are still satisfied."
             )
         ),
+        "required_evidence": item.get("required_evidence", []),
         "evidence_refs": ["verification-queue.json", "reproduction-steps.md"],
         "safety": "Queue-derived hypothesis. It is a next-step candidate, not vulnerability evidence.",
     }
@@ -11082,6 +11087,8 @@ def validation_question_for_hypothesis(hypothesis: dict[str, Any]) -> str:
         return "Can resource-control fallback behavior create availability impact under the real deployment proxy trust model?"
     if impact == "credentialed-upstream-cost-abuse":
         return "Can unauthenticated requests consume a server-side credentialed upstream provider, quota, billing allocation, or availability budget?"
+    if impact == "websocket-header-forwarding":
+        return "Can WebSocket upstream header forwarding disclose app auth material or create a trust-boundary, quota attribution, or authorization impact?"
     if impact == "fixed-upstream-proxy-confusion":
         return "Can fixed upstream routing be confused into SSRF, path traversal, or sensitive upstream data exposure?"
     if impact == "browser-route-exposure":
@@ -11096,6 +11103,13 @@ def required_evidence_for_hypothesis(hypothesis: dict[str, Any]) -> list[str]:
         "A finding-gate decision showing concrete impact rather than configuration presence.",
         "A reproduction note that avoids credentials, wallet signing, transaction submission, and high-volume probing.",
     ]
+    custom_evidence = [
+        str(item)
+        for item in hypothesis.get("required_evidence", []) or []
+        if str(item).strip()
+    ]
+    if custom_evidence:
+        return ordered_unique_strings([*custom_evidence, *common])
     if impact == "unauthorized-state-change":
         return [
             "Evidence that a protected action, order, account state, or equivalent user-controlled state changes unexpectedly.",
@@ -11303,6 +11317,7 @@ def validation_allowed_commands(
     queue_item_id = str(hypothesis.get("queue_item_id") or "")
     queue_item = validation_queue_items_by_id(verification_queue).get(queue_item_id)
     if queue_item:
+        queue_command_target = allowed_now_commands if hypothesis.get("offline_only") else allowed_after_gate_commands
         for index, command in enumerate(queue_item.get("commands", []) or [], start=1):
             command_text = str(command)
             source = f"{hypothesis.get('id')}:queue_command[{index}]"
@@ -11333,7 +11348,7 @@ def validation_allowed_commands(
             if blocked_ref.get("classification") in {"unsafe-template", "manual-template", "review-gated"}:
                 blocked_commands.append(blocked_ref)
                 continue
-            allowed_after_gate_commands.append(command_text)
+            queue_command_target.append(command_text)
     elif hypothesis.get("type") == "cluster-strategy":
         allowed_after_gate_commands.append(
             command("audit --max-probes 1 --no-ws --observed-only")
@@ -25038,6 +25053,70 @@ def build_verification_queue(
         else None
     )
     asset_candidates = (asset_candidates_doc or {}).get("candidates", []) or []
+    websocket_source_review = (
+        websocket_candidate_review_doc.get("source_review")
+        if isinstance(websocket_candidate_review_doc, dict)
+        and isinstance(websocket_candidate_review_doc.get("source_review"), dict)
+        else {}
+    )
+    websocket_header_forwarding_leads = [
+        item
+        for item in websocket_source_review.get("leads", []) or []
+        if isinstance(item, dict)
+    ]
+    if websocket_header_forwarding_leads:
+        websocket_source_summary = websocket_source_review.get("summary", {}) if isinstance(websocket_source_review.get("summary"), dict) else {}
+        add_item(
+            "REVIEW-websocket-header-forwarding",
+            "Review WebSocket upstream header forwarding",
+            "manual-review",
+            "medium",
+            (
+                f"{len(websocket_header_forwarding_leads)} WebSocket source lead(s) forward client request headers "
+                "toward an upstream socket without enough evidence to classify impact."
+            ),
+            commands=[cmd("websocket-candidate-review --no-write")],
+            evidence_refs=[WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT],
+            prerequisites=[
+                "Confirm whether the application sets cookies, session tokens, or Authorization material on the WebSocket origin.",
+                "Confirm whether the upstream WebSocket provider receives, logs, or trusts forwarded client headers.",
+                "Confirm browser constraints versus non-browser clients for any header needed to demonstrate impact.",
+                "Do not run WebSocket handshakes, subscriptions, resource probes, or browser automation from this queue item.",
+            ],
+            safety=(
+                "Offline source and artifact review only. This queue item does not authorize WebSocket connections, "
+                "frames, subscriptions, wallet payloads, target traffic, or Burp automation."
+            ),
+            extra={
+                "offline_only": True,
+                "impact": "websocket-header-forwarding",
+                "impact_hypothesis": (
+                    "Can upstream WebSocket header forwarding disclose app auth material or create a trust-boundary, "
+                    "quota attribution, or authorization impact?"
+                ),
+                "reportability_gate": websocket_source_review.get("reportability_gate")
+                or "WebSocket header forwarding is not reportable without auth/header context and upstream trust evidence.",
+                "required_evidence": [
+                    "Authentication context showing whether cookies, sessions, or Authorization material exist on the WebSocket origin.",
+                    "Evidence that the upstream provider receives, logs, or trusts forwarded headers.",
+                    "Browser/client constraint analysis for the exact header needed to demonstrate impact.",
+                    "A finding-gate decision showing concrete disclosure, trust-boundary, quota/account, or authorization impact.",
+                ],
+                "websocket_source_review_status": websocket_source_review.get("status"),
+                "websocket_source_review_summary": websocket_source_summary,
+                "websocket_header_forwarding_leads": [
+                    {
+                        "id": lead.get("id"),
+                        "status": lead.get("status"),
+                        "file": lead.get("file"),
+                        "missing_sensitive_header_filters": lead.get("missing_sensitive_header_filters", []),
+                        "context_headers_seen": lead.get("context_headers_seen", []),
+                        "evidence": lead.get("evidence", [])[:4],
+                    }
+                    for lead in websocket_header_forwarding_leads[:6]
+                ],
+            },
+        )
     external_scripts_doc = (asset_candidates_doc or {}).get("external_scripts", {}) if isinstance(asset_candidates_doc, dict) else {}
     if isinstance(external_scripts_doc, dict) and external_scripts_doc.get("review_required"):
         external_hosts = [str(host) for host in (external_scripts_doc.get("host_counts", {}) or {})]
@@ -37592,12 +37671,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
     websocket_header_forwarding_bad_review: dict[str, Any] = {}
     websocket_header_forwarding_filtered_review: dict[str, Any] = {}
     websocket_header_forwarding_candidate_review: dict[str, Any] = {}
+    websocket_header_forwarding_queue: dict[str, Any] = {}
+    websocket_header_forwarding_matrix: dict[str, Any] = {}
+    websocket_header_forwarding_validation: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(prefix="inferforge-ws-header-forwarding-selftest-") as ws_header_temp_dir:
         ws_header_root = Path(ws_header_temp_dir)
         bad_root = ws_header_root / "bad"
         filtered_root = ws_header_root / "filtered"
+        ws_header_artifact_dir = ws_header_root / "artifacts"
         bad_root.mkdir()
         filtered_root.mkdir()
+        ws_header_artifact_dir.mkdir()
         (bad_root / "server.js").write_text(
             textwrap.dedent(
                 """
@@ -37682,6 +37766,58 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             scope_policy={"policy": {"allowed_hosts": ["ws-header-forwarding.test"]}},
             source_root=bad_root,
         )
+        write_json(ws_header_artifact_dir / WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT, websocket_header_forwarding_candidate_review)
+        websocket_header_forwarding_queue = build_verification_queue(
+            target,
+            clusters,
+            None,
+            {"gaps": []},
+            {"status": "covered"},
+            {"status": "no-reportable-findings", "external_blockers": [], "decisions": []},
+            {"status": "ready"},
+            ws_header_artifact_dir,
+        )
+        write_json(ws_header_artifact_dir / "verification-queue.json", websocket_header_forwarding_queue)
+        websocket_header_forwarding_matrix = build_hypothesis_matrix_run(
+            target=target,
+            profile=test_profile,
+            artifact_dir=ws_header_artifact_dir,
+        )
+        websocket_header_forwarding_validation = build_validation_plan_run(
+            target=target,
+            profile=test_profile,
+            artifact_dir=ws_header_artifact_dir,
+            limit=40,
+        )
+    websocket_queue_item = next(
+        (
+            item
+            for item in websocket_header_forwarding_queue.get("items", []) or []
+            if item.get("id") == "REVIEW-websocket-header-forwarding"
+        ),
+        {},
+    )
+    websocket_matrix_hypothesis = next(
+        (
+            item
+            for item in websocket_header_forwarding_matrix.get("hypotheses", []) or []
+            if item.get("queue_item_id") == "REVIEW-websocket-header-forwarding"
+        ),
+        {},
+    )
+    websocket_validation_item = next(
+        (
+            item
+            for item in websocket_header_forwarding_validation.get("items", []) or []
+            if item.get("hypothesis_id") == websocket_matrix_hypothesis.get("id")
+        ),
+        {},
+    )
+    websocket_validation_allowed_now = "\n".join(
+        str(ref.get("command") or "")
+        for ref in websocket_validation_item.get("allowed_now", []) or []
+        if isinstance(ref, dict)
+    )
     websocket_header_forwarding_passed = (
         websocket_header_forwarding_bad_review.get("status") == "needs-header-trust-review"
         and (websocket_header_forwarding_bad_review.get("summary") or {}).get("lead_count") == 1
@@ -37692,6 +37828,15 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and (websocket_header_forwarding_candidate_review.get("status") == "needs-source-header-review")
         and (websocket_header_forwarding_candidate_review.get("summary") or {}).get("source_review_unresolved") is True
         and "not reportable by itself" in str(websocket_header_forwarding_bad_review.get("reportability_gate", ""))
+        and websocket_queue_item.get("status") == "manual-review"
+        and websocket_queue_item.get("offline_only") is True
+        and websocket_queue_item.get("impact") == "websocket-header-forwarding"
+        and "websocket-candidate-review --no-write" in "\n".join(websocket_queue_item.get("commands", []) or [])
+        and websocket_matrix_hypothesis.get("status") == "ready-for-offline-review"
+        and websocket_matrix_hypothesis.get("offline_only") is True
+        and websocket_matrix_hypothesis.get("impact") == "websocket-header-forwarding"
+        and websocket_validation_item.get("status") == "ready-offline"
+        and "websocket-candidate-review --no-write" in websocket_validation_allowed_now
     )
     blackbox_asset_profile_paths = {
         cluster.get("path")
@@ -40680,6 +40825,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "status": websocket_header_forwarding_candidate_review.get("status"),
                 "summary": websocket_header_forwarding_candidate_review.get("summary", {}),
             },
+            "queue_item": websocket_queue_item,
+            "matrix_hypothesis": websocket_matrix_hypothesis,
+            "validation_item": websocket_validation_item,
         },
         "active_observation_validation": {
             "status": "passed" if unsafe_observation_validation_passed else "failed",
