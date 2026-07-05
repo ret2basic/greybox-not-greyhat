@@ -9289,6 +9289,492 @@ def methodology_next_command_for_hypothesis(
     return ref if ref.get("classification") == "ready" else None
 
 
+def methodology_command_ref(
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    subcommand: str,
+    *,
+    source: str,
+) -> dict[str, Any] | None:
+    ref = validation_command_ref(
+        validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile),
+        source=source,
+    )
+    return ref if ref.get("classification") == "ready" else None
+
+
+def methodology_check_statuses(review: dict[str, Any]) -> dict[str, str]:
+    statuses: dict[str, str] = {}
+    for check in review.get("acceptance_checks", []) or []:
+        if not isinstance(check, dict):
+            continue
+        check_id = str(check.get("id") or "").strip()
+        if check_id:
+            statuses[check_id] = str(check.get("status") or "unknown")
+    return statuses
+
+
+def methodology_requirement(
+    requirement_id: str,
+    status: str,
+    evidence: Any,
+    next_step: str,
+) -> dict[str, Any]:
+    return {
+        "id": requirement_id,
+        "status": status,
+        "evidence": evidence,
+        "next_step": next_step,
+    }
+
+
+def methodology_closure_status(requirements: list[dict[str, Any]], *, gate_ready: bool = False) -> str:
+    statuses = {str(item.get("status") or "") for item in requirements if isinstance(item, dict)}
+    if gate_ready:
+        return "ready-for-finding-gate-review"
+    if "blocked-resource" in statuses:
+        return "blocked-resource"
+    if "failed" in statuses:
+        return "needs-correction"
+    if any(status in {"waiting", "missing", "unknown", "pending-approval"} for status in statuses):
+        return "needs-evidence"
+    if statuses and statuses <= {"passed", "ready-offline", "ready-after-resource-check"}:
+        return "evidence-indexed-needs-impact-gate"
+    return "needs-evidence"
+
+
+def build_methodology_supporting_reviews(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    source_root: Path | None,
+    resource_snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    reviews: dict[str, Any] = {
+        "transaction_sidecar_review": build_transaction_sidecar_review(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+        ),
+        "transaction_corpus_checklist": build_transaction_corpus_checklist(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            quote_collection=load_optional_json(artifact_dir / "quote-collection.json"),
+            transaction_intent=load_optional_json(artifact_dir / "transaction-intent.json"),
+            burp_transaction_candidates=load_optional_json(artifact_dir / "burp-transaction-candidates.json"),
+            current_resource_snapshot=resource_snapshot,
+        ),
+    }
+    if source_root is None or is_blackbox_assessment(profile):
+        return reviews
+
+    operator_evidence = load_optional_json(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
+    rpc_method_policy, _rpc_method_policy_source = rpc_method_policy_for_hypothesis_matrix(
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
+    transaction_flow_review = build_transaction_flow_review(
+        source_root,
+        profile,
+        transaction_intent=load_optional_json(artifact_dir / "transaction-intent.json") or {},
+        rpc_method_policy=rpc_method_policy,
+        operator_evidence=operator_evidence,
+    )
+    deployment_review = build_deployment_resource_review(
+        source_root,
+        profile,
+        operator_evidence=operator_evidence,
+    )
+    operator_evidence_review = build_operator_evidence_review(
+        target=target,
+        artifact_dir=artifact_dir,
+        operator_evidence=operator_evidence,
+        deployment_review=deployment_review,
+        rpc_method_policy=rpc_method_policy,
+    )
+    reviews.update(
+        {
+            "transaction_flow_review": transaction_flow_review,
+            "deployment_review": deployment_review,
+            "operator_evidence_review": operator_evidence_review,
+            "credential_impact_checklist": build_credential_impact_checklist(
+                target=target,
+                profile=profile,
+                artifact_dir=artifact_dir,
+                transaction_flow_review=transaction_flow_review,
+                deployment_review=deployment_review,
+                current_resource_snapshot=resource_snapshot,
+            ),
+        }
+    )
+    return reviews
+
+
+def build_transaction_evidence_closure(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    item: dict[str, Any],
+    supporting_reviews: dict[str, Any],
+) -> dict[str, Any]:
+    sidecar_review = (
+        supporting_reviews.get("transaction_sidecar_review")
+        if isinstance(supporting_reviews.get("transaction_sidecar_review"), dict)
+        else {}
+    )
+    corpus_checklist = (
+        supporting_reviews.get("transaction_corpus_checklist")
+        if isinstance(supporting_reviews.get("transaction_corpus_checklist"), dict)
+        else {}
+    )
+    sidecar_checks = methodology_check_statuses(sidecar_review)
+    corpus_status = str(corpus_checklist.get("status") or "missing")
+    gate_ready = corpus_status == "decoded-intent-mismatch-review"
+    requirements = [
+        methodology_requirement(
+            "approved-transaction-payload-sidecar",
+            sidecar_checks.get("payload-sidecar-present", "waiting"),
+            sidecar_review.get("summary", {}),
+            "Add one approved quote response or extracted transaction payload sidecar.",
+        ),
+        methodology_requirement(
+            "transaction-payload-candidates",
+            sidecar_checks.get("payload-candidates-present", "waiting"),
+            sidecar_review.get("candidate_summaries", []),
+            "Fix payload extraction or sidecar shape until transaction candidates are present.",
+        ),
+        methodology_requirement(
+            "payload-contract-compatible",
+            sidecar_checks.get("payload-contract-compatible", "waiting"),
+            sidecar_review.get("payload_contract_review", {}),
+            "Use an SVM payload source matching the configured quote_response.expected_payload_type.",
+        ),
+        methodology_requirement(
+            "intent-policy-sidecar-valid",
+            sidecar_checks.get("intent-policy-sidecar-valid", "waiting"),
+            sidecar_review.get("intent_policy_sidecar", {}),
+            "Prepare a matching transaction-intent-policy.json with wallet, amount, mints, and allowed programs.",
+        ),
+        methodology_requirement(
+            "decoded-intent-reviewed",
+            "passed" if gate_ready else "waiting",
+            {"transaction_corpus_checklist_status": corpus_status},
+            "Run decode-transactions with the approved corpus and review signer/account/mint/amount/program mismatches.",
+        ),
+    ]
+    commands = []
+    if sidecar_review.get("status") == "ready-for-decode":
+        for command in sidecar_review.get("decode_commands", []) or []:
+            ref = validation_command_ref(str(command), source=f"{item.get('id')}:closure:decode")
+            if ref.get("classification") == "ready":
+                commands.append(ref)
+    for source, subcommand in [
+        ("transaction-sidecar", "transaction-sidecar-review --no-write --show-files --show-commands"),
+        (
+            "transaction-corpus",
+            "transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check",
+        ),
+        ("transaction-flow", "transaction-flow-review --no-write --top 8"),
+    ]:
+        ref = methodology_command_ref(
+            artifact_dir,
+            profile,
+            subcommand,
+            source=f"{item.get('id')}:closure:{source}",
+        )
+        if ref:
+            commands.append(ref)
+    return {
+        "status": methodology_closure_status(requirements, gate_ready=gate_ready),
+        "gate_ready": gate_ready,
+        "impact": item.get("impact"),
+        "artifact_statuses": {
+            "transaction_sidecar_review": sidecar_review.get("status") or "missing",
+            "transaction_corpus_checklist": corpus_status,
+        },
+        "requirements": requirements,
+        "missing_requirements": [
+            req.get("id")
+            for req in requirements
+            if req.get("status") not in {"passed", "ready-offline", "ready-after-resource-check"}
+        ],
+        "next_safe_commands": commands[:6],
+        "finding_gate_entry_condition": (
+            "Only enter finding-gate after decoded transaction evidence shows a signer, wallet, account, mint, amount, "
+            "or program mismatch with concrete user-funds impact."
+        ),
+    }
+
+
+def build_credential_evidence_closure(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    item: dict[str, Any],
+    supporting_reviews: dict[str, Any],
+) -> dict[str, Any]:
+    checklist = (
+        supporting_reviews.get("credential_impact_checklist")
+        if isinstance(supporting_reviews.get("credential_impact_checklist"), dict)
+        else {}
+    )
+    checks = methodology_check_statuses(checklist)
+    checklist_status = str(checklist.get("status") or "missing")
+    gate_ready = checklist_status == "provider-impact-ready-for-gate"
+    requirements = [
+        methodology_requirement(
+            "credentialed-upstream-route-without-bound-controls",
+            checks.get("route-credentialed-upstream-without-controls", "waiting"),
+            checklist.get("route_reviews", []),
+            "Keep route-bound auth/rate evidence explicit before treating provider usage as attacker-controlled.",
+        ),
+        methodology_requirement(
+            "provider-impact-evidence-complete",
+            checks.get("provider-impact-evidence-complete", "waiting"),
+            (checklist.get("summary") or {}).get("missing_provider_evidence", []),
+            "Collect redacted quota, billing, rate-limit, and usage-monitoring evidence from the provider/operator.",
+        ),
+        methodology_requirement(
+            "resource-safe-for-single-request",
+            checks.get("resource-safe-for-single-request", "waiting"),
+            checklist.get("resource_preflight", {}),
+            "Run only a final resource gate before any single approved request; do not use flooding or stress traffic.",
+        ),
+    ]
+    commands = []
+    for source, subcommand in [
+        (
+            "credential-impact",
+            "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check",
+        ),
+        ("operator-evidence", "operator-evidence-review --no-write --show-missing --show-template"),
+        ("deployment", "deployment-review --no-write --top 8"),
+        ("transaction-flow", "transaction-flow-review --no-write --top 8"),
+    ]:
+        ref = methodology_command_ref(
+            artifact_dir,
+            profile,
+            subcommand,
+            source=f"{item.get('id')}:closure:{source}",
+        )
+        if ref:
+            commands.append(ref)
+    return {
+        "status": methodology_closure_status(requirements, gate_ready=gate_ready),
+        "gate_ready": gate_ready,
+        "impact": item.get("impact"),
+        "artifact_statuses": {
+            "credential_impact_checklist": checklist_status,
+            "credential_proxy_review": (checklist.get("summary") or {}).get("credential_proxy_status") or "missing",
+            "provider_review": (checklist.get("summary") or {}).get("provider_review_status") or "missing",
+        },
+        "requirements": requirements,
+        "missing_requirements": [
+            req.get("id")
+            for req in requirements
+            if req.get("status") not in {"passed", "ready-offline", "ready-after-resource-check"}
+        ],
+        "next_safe_commands": commands[:6],
+        "finding_gate_entry_condition": (
+            "Only enter finding-gate after provider/operator evidence proves material quota, billing, account, "
+            "or availability impact from attacker-controlled unauthenticated use."
+        ),
+    }
+
+
+def build_resource_evidence_closure(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    item: dict[str, Any],
+    supporting_reviews: dict[str, Any],
+) -> dict[str, Any]:
+    deployment_review = (
+        supporting_reviews.get("deployment_review")
+        if isinstance(supporting_reviews.get("deployment_review"), dict)
+        else {}
+    )
+    operator_review = (
+        supporting_reviews.get("operator_evidence_review")
+        if isinstance(supporting_reviews.get("operator_evidence_review"), dict)
+        else {}
+    )
+    deployment_summary = deployment_review.get("summary", {}) if isinstance(deployment_review.get("summary"), dict) else {}
+    operator_summary = operator_review.get("summary", {}) if isinstance(operator_review.get("summary"), dict) else {}
+    missing_decisions = set(str(item) for item in operator_summary.get("missing_decisions", []) or [])
+    critical_missing = set(str(item) for item in deployment_summary.get("critical_missing", []) or [])
+    review_missing = not deployment_review or not operator_review
+
+    def decision_status(decision_id: str) -> str:
+        if review_missing:
+            return "waiting"
+        return "waiting" if decision_id in missing_decisions or decision_id in critical_missing else "passed"
+
+    requirements = [
+        methodology_requirement(
+            "external-rate-limit-store-config",
+            decision_status("external-rate-limit-store-config"),
+            {"critical_missing": sorted(critical_missing)},
+            "Confirm external rate-limit store configuration, health, and fallback behavior.",
+        ),
+        methodology_requirement(
+            "proxy-header-trust-model",
+            decision_status("proxy-header-trust-model"),
+            {"missing_decisions": sorted(missing_decisions)},
+            "Confirm whether trusted edge infrastructure overwrites x-forwarded-for/cf-connecting-ip/x-real-ip.",
+        ),
+        methodology_requirement(
+            "rpc-client-ip-header-trust-model",
+            decision_status("rpc-client-ip-header-trust-model"),
+            {"rpc_client_ip_trust": operator_summary.get("rpc_client_ip_trust_status") or "missing"},
+            "Confirm direct-to-app reachability and whether clients can control the rate-limit key material.",
+        ),
+        methodology_requirement(
+            "rate-limit-bounds",
+            decision_status("rate-limit-bounds"),
+            {"critical_missing": sorted(critical_missing)},
+            "Confirm key TTL, eviction bounds, burst/sustained windows, and connection cap behavior.",
+        ),
+        methodology_requirement(
+            "fallback-monitoring-alerts",
+            decision_status("fallback-monitoring-alerts"),
+            {"missing_decisions": sorted(missing_decisions)},
+            "Confirm monitoring/alerting for memory fallback or external store failures.",
+        ),
+        methodology_requirement(
+            "availability-impact-without-stress",
+            "waiting",
+            item.get("resource_abuse_review", {}),
+            "Prove concrete provider/app availability impact without flooding, rate testing, or DoS validation.",
+        ),
+    ]
+    commands = []
+    for source, subcommand in [
+        ("deployment", "deployment-review --no-write --top 8"),
+        ("operator-evidence", "operator-evidence-review --no-write --show-missing --show-template"),
+        ("validation-plan", "validation-plan --no-write --top 8 --show-commands --skip-current-resource-check"),
+    ]:
+        ref = methodology_command_ref(
+            artifact_dir,
+            profile,
+            subcommand,
+            source=f"{item.get('id')}:closure:{source}",
+        )
+        if ref:
+            commands.append(ref)
+    return {
+        "status": methodology_closure_status(requirements),
+        "gate_ready": False,
+        "impact": item.get("impact"),
+        "artifact_statuses": {
+            "deployment_review": deployment_review.get("status") or "missing",
+            "operator_evidence_review": operator_review.get("status") or "missing",
+            "rpc_client_ip_trust": operator_summary.get("rpc_client_ip_trust_status") or "missing",
+        },
+        "requirements": requirements,
+        "missing_requirements": [
+            req.get("id")
+            for req in requirements
+            if req.get("status") not in {"passed", "ready-offline", "ready-after-resource-check"}
+        ],
+        "next_safe_commands": commands[:6],
+        "finding_gate_entry_condition": (
+            "Only enter finding-gate after deployment/operator evidence proves attacker-controlled key growth or "
+            "connection sharding plus concrete availability impact, without rate/DoS testing."
+        ),
+    }
+
+
+def build_generic_evidence_closure(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    requirements = [
+        methodology_requirement(
+            f"required-evidence-{index}",
+            "waiting",
+            evidence,
+            "Collect concrete endpoint-specific impact evidence before reportability review.",
+        )
+        for index, evidence in enumerate(item.get("required_evidence", []) or [], start=1)
+    ]
+    ref = methodology_command_ref(
+        artifact_dir,
+        profile,
+        "validation-plan --no-write --top 8 --show-commands --skip-current-resource-check",
+        source=f"{item.get('id')}:closure:validation-plan",
+    )
+    return {
+        "status": methodology_closure_status(requirements),
+        "gate_ready": False,
+        "impact": item.get("impact"),
+        "artifact_statuses": {},
+        "requirements": requirements,
+        "missing_requirements": [req.get("id") for req in requirements],
+        "next_safe_commands": [ref] if ref else [],
+        "finding_gate_entry_condition": "Collect concrete impact evidence and refresh finding-gate/adjudication.",
+    }
+
+
+def build_evidence_closure_for_validation_item(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    item: dict[str, Any],
+    supporting_reviews: dict[str, Any],
+) -> dict[str, Any]:
+    impact = str(item.get("impact") or "")
+    hypothesis_type = str(item.get("hypothesis_type") or item.get("type") or "")
+    if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
+        return build_transaction_evidence_closure(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            item=item,
+            supporting_reviews=supporting_reviews,
+        )
+    if impact == "credentialed-upstream-cost-abuse" or hypothesis_type == "credential-proxy-review":
+        return build_credential_evidence_closure(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            item=item,
+            supporting_reviews=supporting_reviews,
+        )
+    if impact == "resource-exhaustion" or hypothesis_type == "resource-abuse-review":
+        return build_resource_evidence_closure(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            item=item,
+            supporting_reviews=supporting_reviews,
+        )
+    return build_generic_evidence_closure(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        item=item,
+    )
+
+
+def build_evidence_closure_summary(closures: list[dict[str, Any]]) -> dict[str, Any]:
+    status_counts: dict[str, int] = {}
+    missing_requirement_counts: dict[str, int] = {}
+    command_refs: list[dict[str, Any]] = []
+    for closure in closures:
+        increment_count(status_counts, str(closure.get("status") or "unknown"))
+        for requirement_id in closure.get("missing_requirements", []) or []:
+            increment_count(missing_requirement_counts, str(requirement_id))
+        command_refs.extend(closure.get("next_safe_commands", []) or [])
+    return {
+        "closures": len(closures),
+        "status_counts": dict(sorted(status_counts.items())),
+        "missing_requirement_counts": dict(sorted(missing_requirement_counts.items())),
+        "gate_ready_threads": sum(1 for closure in closures if closure.get("gate_ready")),
+        "command_safety": command_safety_summary(command_refs),
+    }
+
+
 def methodology_thread_rank(thread: dict[str, Any]) -> tuple[int, int, int, str]:
     impact_rank = {
         "transaction-integrity": 0,
@@ -9430,10 +9916,15 @@ def build_methodology_review(
     target: str,
     profile: dict[str, Any] | None,
     artifact_dir: Path,
+    source_root: Path | None = None,
     current_resource_snapshot: dict[str, Any] | None = None,
     limit: int = 8,
 ) -> dict[str, Any]:
-    resource_snapshot = current_resource_snapshot or build_default_resource_snapshot(max_processes=8)
+    resource_snapshot = (
+        current_resource_snapshot
+        if isinstance(current_resource_snapshot, dict)
+        else build_default_resource_snapshot(max_processes=8)
+    )
     resource_status = artifact_summary_status(resource_snapshot)
     harness_loop = build_harness_loop_run(
         target=target,
@@ -9448,6 +9939,13 @@ def build_methodology_review(
         artifact_dir=artifact_dir,
         limit=max(1, int(limit)),
         current_resource_snapshot=resource_snapshot,
+    )
+    supporting_reviews = build_methodology_supporting_reviews(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+        resource_snapshot=resource_snapshot,
     )
 
     stage_reviews = []
@@ -9480,6 +9978,12 @@ def build_methodology_review(
         if hypothesis_type == "verification-queue":
             continue
         command_ref = methodology_next_command_for_hypothesis(artifact_dir, profile, item)
+        evidence_closure = build_evidence_closure_for_validation_item(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            item=item,
+            supporting_reviews=supporting_reviews,
+        )
         high_value_threads.append(
             {
                 "id": item.get("id") or item.get("hypothesis_id"),
@@ -9495,9 +9999,17 @@ def build_methodology_review(
                 "next_offline_command": command_ref,
                 "required_evidence": item.get("required_evidence", []),
                 "forbidden": item.get("forbidden", []),
+                "evidence_closure": evidence_closure,
             }
         )
     high_value_threads.sort(key=methodology_thread_rank)
+    evidence_closure_summary = build_evidence_closure_summary(
+        [
+            thread.get("evidence_closure")
+            for thread in high_value_threads
+            if isinstance(thread.get("evidence_closure"), dict)
+        ]
+    )
     business_logic_map = build_business_logic_methodology_map(
         high_value_threads,
         limit=max(1, int(limit)),
@@ -9516,6 +10028,8 @@ def build_methodology_review(
         "ready_hypotheses": (hypothesis_matrix.get("summary", {}) or {}).get("ready_hypotheses", 0),
         "validation_items": (validation_plan.get("summary", {}) or {}).get("items", 0),
         "high_value_threads": len(high_value_threads),
+        "evidence_closure_status_counts": evidence_closure_summary.get("status_counts", {}),
+        "evidence_closure_gate_ready_threads": evidence_closure_summary.get("gate_ready_threads", 0),
     }
     status = "has-reportable-finding" if harness_loop.get("status") == "reportable-findings" else "needs-methodology-deepening"
     if resource_status not in {"healthy", "not-run"}:
@@ -9531,6 +10045,12 @@ def build_methodology_review(
         "research_sources": METHODOLOGY_RESEARCH_SOURCES,
         "stage_reviews": stage_reviews,
         "business_logic_map": business_logic_map,
+        "evidence_closure": evidence_closure_summary,
+        "supporting_review_statuses": {
+            key: value.get("status")
+            for key, value in supporting_reviews.items()
+            if isinstance(value, dict)
+        },
         "high_value_threads": high_value_threads[: max(1, int(limit))],
         "resource_preflight": validation_resource_preflight_summary(resource_snapshot),
         "artifact_refs": {
@@ -31396,6 +31916,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "methodology-review",
                     "--no-write",
                     "--show-commands",
+                    "--skip-current-resource-check",
                 ]
             )
             transaction_sidecar_review_return_code, transaction_sidecar_review_stdout = run_cli(
@@ -32296,6 +32817,8 @@ def build_no_write_selftest() -> dict[str, Any]:
             "passed": (
                 methodology_review_return_code == 0
                 and "Methodology review:" in methodology_review_stdout_text
+                and "resource=not-run" in methodology_review_stdout_text
+                and "Evidence closure:" in methodology_review_stdout_text
                 and "High-value threads:" in methodology_review_stdout
                 and "No files written (--no-write)." in methodology_review_stdout
                 and not any(
@@ -46410,12 +46933,15 @@ def run_methodology_review(args: argparse.Namespace) -> int:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         write_target_profile_artifact(artifact_dir, profile, target, source_root)
     current_resource_snapshot = None
-    if not getattr(args, "skip_current_resource_check", False):
+    if getattr(args, "skip_current_resource_check", False):
+        current_resource_snapshot = {"status": "not-run"}
+    else:
         current_resource_snapshot = build_default_resource_snapshot(max_processes=8)
     review = build_methodology_review(
         target=target,
         profile=profile,
         artifact_dir=artifact_dir,
+        source_root=source_root,
         current_resource_snapshot=current_resource_snapshot,
         limit=max(1, int(args.limit)),
     )
@@ -46474,16 +47000,40 @@ def run_methodology_review(args: argparse.Namespace) -> int:
                 f"- {row.get('priority')} {row.get('status')} "
                 f"path={row.get('path') or '-'} tests={','.join(test_ids[:4])}"
             )
+    evidence_closure = review.get("evidence_closure", {}) if isinstance(review.get("evidence_closure"), dict) else {}
+    if evidence_closure:
+        print(
+            "Evidence closure: "
+            f"closures={evidence_closure.get('closures', 0)} "
+            f"gate_ready={evidence_closure.get('gate_ready_threads', 0)} "
+            f"statuses={json.dumps(evidence_closure.get('status_counts', {}), sort_keys=True)}"
+        )
     print("High-value threads:")
     for thread in (review.get("high_value_threads", []) or [])[: max(0, int(args.limit))]:
+        closure = thread.get("evidence_closure") if isinstance(thread.get("evidence_closure"), dict) else {}
         print(
             f"- {thread.get('priority')} {thread.get('status')} {thread.get('type')} "
-            f"path={thread.get('path') or '-'} impact={thread.get('impact') or '-'}"
+            f"path={thread.get('path') or '-'} impact={thread.get('impact') or '-'} "
+            f"closure={closure.get('status') or '-'}"
         )
         print(f"  blocker={inline_summary_text(thread.get('current_blocker'), max_chars=260)}")
+        if closure:
+            missing = closure.get("missing_requirements", []) or []
+            print(
+                "  missing="
+                f"{','.join(str(item) for item in missing[:4]) if missing else 'none'}"
+            )
         command_ref = thread.get("next_offline_command") if isinstance(thread.get("next_offline_command"), dict) else None
         if args.show_commands and command_ref:
             print(f"    - {format_command_ref_label(command_ref)} {inline_summary_text(command_ref.get('command'), max_chars=420)}")
+        if args.show_commands and closure:
+            for ref in (closure.get("next_safe_commands", []) or [])[:2]:
+                if isinstance(ref, dict):
+                    print(
+                        "    - closure "
+                        f"{format_command_ref_label(ref)} "
+                        f"{inline_summary_text(ref.get('command'), max_chars=420)}"
+                    )
     if no_write:
         print("No files written (--no-write).")
     else:

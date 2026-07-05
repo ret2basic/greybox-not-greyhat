@@ -273,17 +273,26 @@ there is no reportable evidence yet.
 Use `methodology-review` to align the harness with business-logic testing
 methodology before broadening. It maps high-value threads to offline-safe
 business logic dimensions such as data validation, request forgery, integrity
-checks, workflow circumvention, and misuse/function-use limits:
+checks, workflow circumvention, and misuse/function-use limits. It also prints
+an evidence-closure view for each Medium/High/Critical candidate thread, showing
+which artifact or sidecar still blocks finding-gate review:
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
-  methodology-review --no-write --show-commands
+  methodology-review --no-write --show-commands --skip-current-resource-check
 ```
 
 The business-logic map is still a prioritization aid, not a finding. A
 Medium/High/Critical claim still requires endpoint-specific evidence proving a
 data validation failure, forged request impact, transaction/upstream integrity
-mismatch, workflow bypass, or quota/provider/resource misuse.
+mismatch, workflow bypass, or quota/provider/resource misuse. The closure view
+is conservative: transaction-integrity threads need an approved decoded corpus
+and intent-policy review, credentialed-upstream threads need redacted
+provider/operator impact evidence, and resource-exhaustion threads need
+deployment/proxy trust evidence plus non-stress availability impact evidence.
+With `--skip-current-resource-check`, `methodology-review` stays fully offline
+and reports resource status as `not-run` instead of reading current `/proc`
+resource state.
 
 When the loop is ready but no reportable evidence exists, use
 `hypothesis-matrix` to rank the next research questions from current local
