@@ -10324,6 +10324,11 @@ def build_rewrite_evidence_closure(
         profile=profile,
         artifact_dir=artifact_dir,
     )
+    approval_packet = (
+        response_review.get("single_request_approval_packet")
+        if isinstance(response_review.get("single_request_approval_packet"), dict)
+        else {}
+    )
     response_item = {}
     for candidate_item in response_review.get("items", []) or []:
         if not isinstance(candidate_item, dict):
@@ -10461,6 +10466,7 @@ def build_rewrite_evidence_closure(
             profile=profile,
             artifact_dir=artifact_dir,
         ),
+        "rewrite_response_approval_packet": approval_packet,
         "finding_gate_entry_condition": (
             "Only enter finding-gate after one approved read-only response proves concrete sensitive-data exposure, "
             "path confusion, authorization bypass, or equivalent impact. Static rewrite configuration is not enough."
@@ -11767,6 +11773,7 @@ def build_lead_dossier(
                     closure.get("transaction_corpus_approval_packet")
                     or closure.get("credential_impact_approval_packet")
                     or closure.get("resource_control_approval_packet")
+                    or closure.get("rewrite_response_approval_packet")
                     if closure
                     else None
                 ),
@@ -14848,7 +14855,14 @@ def rewrite_response_single_request_approval_packet(
         return None
 
     status = "ready-offline-approval" if recommended_path else "waiting-for-reviewed-read-only-path"
+    finding_gate_blockers = [
+        "No approved redacted response observation is present yet.",
+        "No concrete sensitive-data, path-confusion, authorization-bypass, tenant-data, or wallet/account-data impact indicator is present yet.",
+        "Finding-gate/adjudication must still accept the concrete impact before any Medium/High/Critical report.",
+    ]
     return {
+        "type": "rewrite-response-approval-packet",
+        "packet_type": "rewrite-response-approval-packet",
         "status": status,
         "recommended_request": {
             "method": str(recommended.get("method") or "GET") if recommended else None,
@@ -14916,11 +14930,8 @@ def rewrite_response_single_request_approval_packet(
                 ),
             },
         ],
-        "finding_gate_blockers": [
-            "No approved redacted response observation is present yet.",
-            "No concrete sensitive-data, path-confusion, authorization-bypass, tenant-data, or wallet/account-data impact indicator is present yet.",
-            "Finding-gate/adjudication must still accept the concrete impact before any Medium/High/Critical report.",
-        ],
+        "finding_gate_blocker_count": len(finding_gate_blockers),
+        "finding_gate_blockers": finding_gate_blockers,
         "safety": (
             "Offline approval packet only. It selects one reviewed candidate and prints the exact gated sequence; "
             "it sends no requests, invokes no Burp tools, reads no raw history, and does not approve active validation."
@@ -15571,6 +15582,23 @@ def validation_item_from_hypothesis(
     rewrite_review_context = validation_rewrite_review_context(rewrite_review_item)
     if rewrite_review_context and rewrite_review_context.get("read_only_path_candidates"):
         preconditions.append("Review rewrite_review.read_only_path_candidates and choose at most one no-write promotion preview.")
+    rewrite_response_approval_packet = None
+    if hypothesis.get("impact") == "fixed-upstream-proxy-confusion" or rewrite_review_context:
+        rewrite_response_review = load_optional_json(artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT)
+        if not isinstance(rewrite_response_review, dict) or not isinstance(
+            rewrite_response_review.get("single_request_approval_packet"),
+            dict,
+        ):
+            rewrite_response_review = build_rewrite_response_review(
+                target=target,
+                profile=profile,
+                artifact_dir=artifact_dir,
+            )
+        rewrite_response_approval_packet = (
+            rewrite_response_review.get("single_request_approval_packet")
+            if isinstance(rewrite_response_review.get("single_request_approval_packet"), dict)
+            else None
+        )
     transaction_approval_packet = None
     if hypothesis.get("type") == "transaction-flow-review" or hypothesis.get("impact") == "transaction-integrity":
         transaction_corpus_checklist = load_optional_json(artifact_dir / TRANSACTION_CORPUS_CHECKLIST_ARTIFACT)
@@ -15718,6 +15746,7 @@ def validation_item_from_hypothesis(
         "blocked_commands": blocked_commands,
         "command_replacements": command_replacements,
         "rewrite_review": rewrite_review_context,
+        "rewrite_response_approval_packet": rewrite_response_approval_packet,
         "transaction_flow_review": hypothesis.get("transaction_flow_review"),
         "transaction_corpus_approval_packet": transaction_approval_packet,
         "resource_abuse_review": hypothesis.get("resource_abuse_review"),
@@ -16363,6 +16392,7 @@ def build_iteration_decision_from_plan(
             ("transaction_corpus_approval_packet", "transaction-corpus"),
             ("credential_impact_approval_packet", "credential-impact"),
             ("resource_control_approval_packet", "resource-control"),
+            ("rewrite_response_approval_packet", "rewrite-response"),
         ]:
             packet = item.get(packet_key) if isinstance(item.get(packet_key), dict) else {}
             if not packet:
@@ -27402,6 +27432,26 @@ def format_approval_packet_inline(
             f"direction={recommended_quote.get('direction') or '-'} "
             f"payload={packet.get('payload_sidecar') or '-'} "
             f"policy={packet.get('intent_policy_sidecar') or '-'} "
+            f"blockers={blocker_count}"
+        )
+    recommended_request = (
+        packet.get("recommended_request")
+        if isinstance(packet.get("recommended_request"), dict)
+        else {}
+    )
+    if recommended_request:
+        sensitivity = (
+            recommended_request.get("sensitivity")
+            if isinstance(recommended_request.get("sensitivity"), dict)
+            else {}
+        )
+        kind_text = "type=rewrite-response " if include_kind else ""
+        return (
+            f"{status_text} "
+            f"{kind_text}"
+            f"recommended={recommended_request.get('method') or '-'} {recommended_request.get('path') or '-'} "
+            f"sensitivity={sensitivity.get('priority') or 'unknown'}:{sensitivity.get('score', 0)} "
+            f"sidecar={packet.get('sidecar_path') or '-'} "
             f"blockers={blocker_count}"
         )
     recommended_evidence = (
@@ -48667,6 +48717,27 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             ),
             None,
         )
+        rewrite_fixed_upstream_validation_item = next(
+            (
+                item
+                for item in rewrite_transaction_validation_plan.get("items", [])
+                if item.get("impact") == "fixed-upstream-proxy-confusion"
+            ),
+            None,
+        )
+        rewrite_iteration_decision_sample = build_iteration_decision_from_plan(
+            target="http://127.0.0.1:9998",
+            profile=rewrite_normalized,
+            artifact_dir=rewrite_transaction_matrix_dir,
+            validation_plan=rewrite_transaction_validation_plan,
+            artifact_health={
+                "generated_at": utc_now(),
+                "status": "healthy",
+                "summary": {"artifact_dirs": 1, "status_counts": {"healthy": 1}},
+            },
+            current_resource_snapshot={"generated_at": utc_now(), "status": "not-run"},
+            limit=8,
+        )
         rewrite_transaction_lead_dossier = build_lead_dossier(
             target="http://127.0.0.1:9998",
             profile=rewrite_normalized,
@@ -48784,6 +48855,32 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             rewrite_resource_validation_packet.get("recommended_evidence")
             if isinstance(rewrite_resource_validation_packet.get("recommended_evidence"), dict)
             else {}
+        )
+        rewrite_fixed_upstream_validation_packet = (
+            rewrite_fixed_upstream_validation_item.get("rewrite_response_approval_packet")
+            if isinstance(rewrite_fixed_upstream_validation_item, dict)
+            and isinstance(rewrite_fixed_upstream_validation_item.get("rewrite_response_approval_packet"), dict)
+            else {}
+        )
+        rewrite_fixed_upstream_validation_packet_request = (
+            rewrite_fixed_upstream_validation_packet.get("recommended_request")
+            if isinstance(rewrite_fixed_upstream_validation_packet.get("recommended_request"), dict)
+            else {}
+        )
+        rewrite_fixed_upstream_validation_packet_passed = (
+            rewrite_fixed_upstream_validation_item is not None
+            and rewrite_fixed_upstream_validation_item.get("status") == "ready-offline"
+            and rewrite_fixed_upstream_validation_packet.get("status") == "ready-offline-approval"
+            and rewrite_fixed_upstream_validation_packet.get("type") == "rewrite-response-approval-packet"
+            and rewrite_fixed_upstream_validation_packet_request.get("method") == "GET"
+            and is_safe_concrete_local_path(str(rewrite_fixed_upstream_validation_packet_request.get("path") or ""))
+            and rewrite_fixed_upstream_validation_packet.get("finding_gate_blocker_count", 0) >= 3
+            and any(
+                item.get("packet_type") == "rewrite-response"
+                and (item.get("packet") or {}).get("status") == "ready-offline-approval"
+                for item in rewrite_iteration_decision_sample.get("approval_packets", [])
+                if isinstance(item, dict)
+            )
         )
         rewrite_resource_evidence_gaps = build_evidence_gaps(
             rewrite_clusters,
@@ -50967,6 +51064,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and transaction_flow_hypothesis_passed
         and rewrite_transaction_lead_contract_passed
         and rewrite_fixed_upstream_lead_contract_passed
+        and rewrite_fixed_upstream_validation_packet_passed
         and rate_limit_resource_review_passed
         and transaction_method_exposure_passed
         and profile_custom_ws_discovery_passed
@@ -51442,6 +51540,15 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     if isinstance(contract, dict)
                 ],
                 "blocking_questions": sorted(set(rewrite_fixed_upstream_lead_blocking)),
+            },
+            "fixed_upstream_validation_packet": {
+                "status": "passed" if rewrite_fixed_upstream_validation_packet_passed else "failed",
+                "packet": rewrite_fixed_upstream_validation_packet,
+                "iteration_packet_types": [
+                    item.get("packet_type")
+                    for item in rewrite_iteration_decision_sample.get("approval_packets", [])
+                    if isinstance(item, dict)
+                ],
             },
             "guarded_fixed_upstream_hypothesis": {
                 "status": "passed" if guarded_fixed_hypothesis_passed else "failed",
@@ -57555,6 +57662,13 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                         f"query_refs={source_summary.get('query_forwarding_refs', 0)} "
                         f"credential_refs={source_summary.get('credential_forwarding_refs', 0)}"
                     )
+                rewrite_packet = (
+                    item.get("rewrite_response_approval_packet")
+                    if isinstance(item.get("rewrite_response_approval_packet"), dict)
+                    else {}
+                )
+                if rewrite_packet:
+                    print(f"  rewrite_response_approval_packet={format_approval_packet_inline(rewrite_packet)}")
                 read_only_candidates = rewrite_review.get("read_only_path_candidates", []) or []
                 blocked_candidates = rewrite_review.get("blocked_path_candidates", []) or []
                 if read_only_candidates:

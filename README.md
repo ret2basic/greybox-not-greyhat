@@ -486,6 +486,9 @@ steps, and remaining finding-gate blockers. The same command prints a redacted
 `rewrite-response-sidecar.jsonl` template for the case where a reviewer has one
 approved response shape but does not want to keep raw Burp history or a full
 response body in artifacts.
+`validation-plan`, `lead-dossier`, and `iteration-decision` carry the same
+rewrite-response approval packet so unattended loops can keep this as a
+one-request evidence closure instead of broad catch-all path enumeration.
 If `endpoint-clusters.json` or the target profile does not list a static
 `next.config.*` rewrite, `rewrite-review`, `hypothesis-matrix`, and
 `validation-plan` can still merge source-discovered rewrite-proxy clusters into
