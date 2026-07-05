@@ -10091,6 +10091,7 @@ def build_credential_evidence_closure(
         if isinstance(checklist.get("evidence_contract"), dict)
         else {}
     )
+    approval_packet = quote_credential_impact_approval_review_candidate(checklist)
     requirements = [
         methodology_requirement(
             "credentialed-upstream-route-without-bound-controls",
@@ -10149,6 +10150,7 @@ def build_credential_evidence_closure(
         ],
         "next_safe_commands": commands[:6],
         "evidence_contract": evidence_contract,
+        "credential_impact_approval_packet": approval_packet,
         "finding_gate_entry_condition": (
             "Only enter finding-gate after provider/operator evidence proves material quota, billing, account, "
             "or availability impact from attacker-controlled unauthenticated use."
@@ -11737,7 +11739,12 @@ def build_lead_dossier(
                 "required_evidence": thread.get("required_evidence", []),
                 "missing_requirements": closure.get("missing_requirements", []) if closure else [],
                 "artifact_statuses": closure.get("artifact_statuses", {}) if closure else {},
-                "approval_packet": closure.get("transaction_corpus_approval_packet") if closure else None,
+                "approval_packet": (
+                    closure.get("transaction_corpus_approval_packet")
+                    or closure.get("credential_impact_approval_packet")
+                    if closure
+                    else None
+                ),
                 "next_offline_command": next_command,
                 "next_safe_commands": closure.get("next_safe_commands", [])[:6] if closure else [],
                 "minimal_poc_plan": thread.get("minimal_poc_plan"),
@@ -15558,6 +15565,56 @@ def validation_item_from_hypothesis(
         transaction_approval_packet = quote_transaction_corpus_approval_review_candidate(
             transaction_corpus_checklist,
         )
+    credential_approval_packet = None
+    if hypothesis.get("type") == "credential-proxy-review" or hypothesis.get("impact") == "credentialed-upstream-cost-abuse":
+        credential_impact_checklist = load_optional_json(artifact_dir / CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT)
+        if not isinstance(credential_impact_checklist, dict) or not isinstance(
+            credential_impact_checklist.get("credential_impact_approval_packet"),
+            dict,
+        ):
+            operator_evidence = load_optional_json(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
+            transaction_flow_review = load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT)
+            deployment_review = load_optional_json(artifact_dir / DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT)
+            profile_doc = profile if isinstance(profile, dict) else {}
+            source_root_value = str(profile_doc.get("default_source_root") or DEFAULT_SOURCE_ROOT)
+            source_root = resolve_repo_path(source_root_value)
+            source_available = source_root.exists() and not is_blackbox_profile_like(profile_doc)
+            if source_available and (
+                not isinstance(transaction_flow_review, dict)
+                or not isinstance(transaction_flow_review.get("server_credential_proxy_review"), dict)
+            ):
+                rpc_method_policy, _rpc_method_policy_source = rpc_method_policy_for_hypothesis_matrix(
+                    profile=profile,
+                    artifact_dir=artifact_dir,
+                )
+                transaction_flow_review = build_transaction_flow_review(
+                    source_root,
+                    profile,
+                    transaction_intent=load_optional_json(artifact_dir / "transaction-intent.json") or {},
+                    rpc_method_policy=rpc_method_policy,
+                    operator_evidence=operator_evidence,
+                )
+            if source_available and (
+                not isinstance(deployment_review, dict)
+                or not isinstance(deployment_review.get("credential_provider_review"), dict)
+            ):
+                deployment_review = build_deployment_resource_review(
+                    source_root,
+                    profile,
+                    operator_evidence=operator_evidence,
+                )
+            if isinstance(transaction_flow_review, dict) or isinstance(deployment_review, dict):
+                credential_impact_checklist = build_credential_impact_checklist(
+                    target=target,
+                    profile=profile,
+                    artifact_dir=artifact_dir,
+                    transaction_flow_review=transaction_flow_review,
+                    deployment_review=deployment_review,
+                    current_resource_snapshot=current_resource_snapshot,
+                )
+        credential_approval_packet = quote_credential_impact_approval_review_candidate(
+            credential_impact_checklist,
+        )
 
     return {
         "id": f"VAL-{safe_hypothesis_id(hypothesis.get('id'))}",
@@ -15579,6 +15636,7 @@ def validation_item_from_hypothesis(
         "transaction_corpus_approval_packet": transaction_approval_packet,
         "resource_abuse_review": hypothesis.get("resource_abuse_review"),
         "credential_proxy_review": hypothesis.get("credential_proxy_review"),
+        "credential_impact_approval_packet": credential_approval_packet,
         "command_safety": command_summary,
         "blocked_command_safety": blocked_command_summary,
         "required_evidence": required_evidence_for_hypothesis(hypothesis),
@@ -16212,22 +16270,24 @@ def build_iteration_decision_from_plan(
     for item in validation_plan.get("items", []) or []:
         if not isinstance(item, dict):
             continue
-        packet = (
-            item.get("transaction_corpus_approval_packet")
-            if isinstance(item.get("transaction_corpus_approval_packet"), dict)
-            else {}
-        )
-        if not packet:
-            continue
-        approval_packets.append(
-            {
-                "validation_item_id": item.get("id"),
-                "validation_item_status": item.get("status"),
-                "validation_item_priority": item.get("priority"),
-                "validation_item_type": item.get("hypothesis_type"),
-                "packet": packet,
-            }
-        )
+        for packet_key, packet_type in [
+            ("transaction_corpus_approval_packet", "transaction-corpus"),
+            ("credential_impact_approval_packet", "credential-impact"),
+        ]:
+            packet = item.get(packet_key) if isinstance(item.get(packet_key), dict) else {}
+            if not packet:
+                continue
+            approval_packets.append(
+                {
+                    "validation_item_id": item.get("id"),
+                    "validation_item_status": item.get("status"),
+                    "validation_item_priority": item.get("priority"),
+                    "validation_item_type": item.get("hypothesis_type"),
+                    "packet_key": packet_key,
+                    "packet_type": packet_type,
+                    "packet": packet,
+                }
+            )
 
     actions: list[dict[str, Any]] = []
     if offline:
@@ -25070,6 +25130,212 @@ def credential_provider_review_from_artifacts(
     return provider_review if isinstance(provider_review, dict) else {}
 
 
+def credential_impact_approval_packet(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    summary: dict[str, Any],
+    evidence_contract: dict[str, Any],
+    operator_evidence_sidecar: dict[str, Any],
+    provider_evidence_requests: list[dict[str, Any]],
+    safe_validation_steps: list[dict[str, Any]],
+    resource_preflight: dict[str, Any],
+) -> dict[str, Any]:
+    assessment_policy = assessment_mode_policy(profile)
+    quote_path = probe_target_path(profile, "quote", "path", "/api/quote")
+    entrypoint = str(evidence_contract.get("entrypoint") or f"POST {quote_path}")
+    provider = str(evidence_contract.get("provider") or "M0")
+    sidecar_path = str(
+        operator_evidence_sidecar.get("path")
+        or repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
+    )
+    accepted_present_statuses = sorted(
+        operator_evidence_sidecar.get("accepted_present_statuses")
+        if isinstance(operator_evidence_sidecar.get("accepted_present_statuses"), list)
+        else OPERATOR_EVIDENCE_PRESENT_STATUSES
+    )
+
+    missing_decision_ids = ordered_unique_strings(
+        [
+            str(item)
+            for item in evidence_contract.get("missing_operator_decision_ids", []) or []
+            if str(item).strip()
+        ]
+    )
+    if not missing_decision_ids:
+        for request in provider_evidence_requests:
+            if not isinstance(request, dict):
+                continue
+            decision_id = str(request.get("id") or "").strip()
+            status = str(request.get("status") or "").strip().lower()
+            if decision_id and status not in OPERATOR_EVIDENCE_PRESENT_STATUSES:
+                missing_decision_ids.append(decision_id)
+    missing_decision_ids = ordered_unique_strings(missing_decision_ids)
+    route_count = int(summary.get("files_needing_cost_review") or 0)
+    provider_status = str(summary.get("provider_review_status") or "missing")
+    if route_count and provider_status in {"missing", "needs-provider-operator-evidence"} and not missing_decision_ids:
+        missing_decision_ids = sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS)
+
+    resource_status = str(resource_preflight.get("status") or "not-run")
+    budget = resource_preflight.get("resource_budget") if isinstance(resource_preflight.get("resource_budget"), dict) else {}
+    active_blocked = resource_status not in {"healthy", "not-run"} or budget.get("active_target_traffic") == "blocked"
+    provider_ready = bool(route_count) and provider_status == "provider-evidence-indexed" and not missing_decision_ids
+    if not route_count:
+        packet_status = "waiting-credential-route-context"
+    elif missing_decision_ids:
+        packet_status = (
+            "blocked-resource-waiting-provider-operator-evidence"
+            if active_blocked
+            else "waiting-provider-operator-evidence"
+        )
+    elif provider_ready and active_blocked:
+        packet_status = "ready-offline-gate-review-blocked-active-validation"
+    elif provider_ready:
+        packet_status = "ready-offline-gate-review"
+    else:
+        packet_status = "partial-provider-operator-evidence"
+
+    safe_step_by_id = {
+        str(step.get("id") or ""): step
+        for step in safe_validation_steps
+        if isinstance(step, dict)
+    }
+
+    def command(subcommand: str) -> str:
+        return validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile)
+
+    default_sequence = [
+        {
+            "id": "operator-template-preview",
+            "status": "ready",
+            "risk": "offline-local-template",
+            "command": command(
+                "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract"
+            ),
+        },
+        {
+            "id": "operator-evidence-review",
+            "status": "ready-after-sidecar-edit",
+            "risk": "offline-redacted-sidecar-review",
+            "command": command("operator-evidence-review --no-write --show-evidence --show-missing --show-closure-contract"),
+        },
+        {
+            "id": "credential-impact-review",
+            "status": "ready",
+            "risk": "offline-provider-impact-review",
+            "command": command(
+                "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check --show-evidence-contract"
+            ),
+        },
+        {
+            "id": "deployment-context",
+            "status": "ready",
+            "risk": "offline-local-deployment-review",
+            "command": command("deployment-review --no-write --top 8"),
+        },
+        {
+            "id": "resource-gate",
+            "status": "blocked-until-healthy-resource-snapshot" if active_blocked else "ready-before-active-validation",
+            "risk": "offline-local-resource-check",
+            "command": command("resource-snapshot --max-processes 8 --watch-port 3100 --no-write --strict"),
+        },
+        {
+            "id": "single-request-validation",
+            "status": "blocked-until-provider-evidence-and-resource-gate"
+            if active_blocked or not provider_ready
+            else "pending-manual-approval",
+            "risk": "single-approved-target-request",
+            "action": (
+                f"If provider/operator evidence proves material impact, confirm reachability with at most one approved {entrypoint} request."
+            ),
+        },
+        {
+            "id": "finding-gate-preview",
+            "status": "ready-after-provider-impact-evidence" if provider_ready else "waiting-provider-operator-evidence",
+            "risk": "offline-manual-gate-preview",
+            "command": command("gate --no-write --show-items"),
+        },
+    ]
+    for row in default_sequence:
+        safe_step = safe_step_by_id.get(str(row.get("id") or ""))
+        if safe_step and safe_step.get("status"):
+            row["checklist_step_status"] = safe_step.get("status")
+        if safe_step and safe_step.get("action") and not row.get("action"):
+            row["action"] = safe_step.get("action")
+
+    blocker_by_decision = {
+        "credentialed-upstream-quota-policy": "No provider/operator quota policy evidence is present.",
+        "credentialed-upstream-rate-limit-policy": "No provider/operator rate-limit policy evidence is present.",
+        "credentialed-upstream-billing-impact": "No provider/operator billing or credit impact evidence is present.",
+        "credentialed-upstream-usage-monitoring": "No provider/operator usage monitoring evidence is present.",
+    }
+    blockers = [
+        blocker_by_decision.get(decision_id, f"No provider/operator evidence is present for {decision_id}.")
+        for decision_id in missing_decision_ids
+    ]
+    if active_blocked:
+        blockers.append(
+            "Current resource gate is not healthy; single-request reachability validation remains blocked."
+        )
+    if not provider_ready:
+        blockers.append(
+            "No approved single request or equivalent reachability evidence is present."
+        )
+        blockers.append(
+            "Finding-gate has not accepted concrete quota, billing, account, or availability impact."
+        )
+    elif provider_ready:
+        blockers.append(
+            "Finding-gate/adjudication still must accept concrete provider cost, quota, or availability impact before reporting."
+        )
+
+    finding_gate_blockers = ordered_unique_strings(blockers)
+    return {
+        "status": packet_status,
+        "packet_type": "credential-impact-approval-packet",
+        "assessment": {
+            "mode": assessment_policy.get("mode"),
+            "optimization_goal": assessment_policy.get("optimization_goal"),
+            "credential_lead_bias": (
+                "coverage-first: close credentialed-upstream provider-impact evidence for every dangerous source-derived route."
+                if assessment_policy.get("mode") == "greybox"
+                else "bounty-first: collect only the provider/operator evidence needed for one valid high-impact report."
+            ),
+        },
+        "recommended_evidence": {
+            "entrypoint": entrypoint,
+            "provider": provider,
+            "missing_decision_ids": missing_decision_ids,
+            "route_count": route_count,
+            "provider_review_status": provider_status,
+        },
+        "operator_evidence_sidecar": sidecar_path,
+        "accepted_present_statuses": accepted_present_statuses,
+        "redacted_sidecar_required_fields": [
+            "one evidence_items[] row per missing provider/operator decision id",
+            "status must stay pending/needs-review until reviewed evidence justifies an accepted_present_statuses value",
+            "summary must be short, non-placeholder, and redacted",
+            "source_ref should identify a reviewed provider doc, operator note, ticket, dashboard excerpt, or equivalent source without raw secrets",
+            "no provider API keys, bearer tokens, cookies, billing account IDs, raw dashboards, private keys, seed phrases, wallet signatures, or raw Burp history",
+        ],
+        "offline_commands": [
+            command("operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-closure-contract"),
+            command(
+                "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check --show-evidence-contract"
+            ),
+            command("deployment-review --no-write --top 8"),
+            command("transaction-flow-review --no-write --top 8"),
+        ],
+        "approval_sequence": default_sequence,
+        "finding_gate_blockers": finding_gate_blockers,
+        "finding_gate_blocker_count": len(finding_gate_blockers),
+        "safety": (
+            "Offline credential-impact approval packet only. It describes provider/operator evidence and a gated single-request path; "
+            "it sends no target or provider requests, invokes no Burp tools, exposes no secrets, signs no wallets, and submits no transactions."
+        ),
+    }
+
+
 def build_credential_impact_checklist(
     *,
     target: str,
@@ -25204,6 +25470,39 @@ def build_credential_impact_checklist(
         provider=str(provider_review.get("provider") or "M0"),
         missing_decisions=evidence_requests,
     )
+    operator_evidence_sidecar = {
+        "path": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+        "template": sidecar_template,
+        "accepted_present_statuses": sorted(OPERATOR_EVIDENCE_PRESENT_STATUSES),
+        "redaction_gate": "Do not include provider API key values, bearer tokens, cookies, wallet secrets, or raw account identifiers.",
+    }
+    summary = {
+        "credential_proxy_status": credential_proxy.get("status") or "missing",
+        "provider_review_status": provider_review.get("status") or "missing",
+        "files_needing_cost_review": len(files_needing_review),
+        "missing_provider_evidence": missing_provider_evidence,
+        "provider_public_docs_status": provider_public_docs_review.get("status"),
+        "provider_public_docs": provider_public_docs_summary.get("documents", 0),
+        "resource_status": resource_status,
+        "resource_budget_mode": budget.get("mode") or "unknown",
+    }
+    approval_packet = credential_impact_approval_packet(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        summary=summary,
+        evidence_contract=evidence_contract,
+        operator_evidence_sidecar=operator_evidence_sidecar,
+        provider_evidence_requests=evidence_requests,
+        safe_validation_steps=safe_validation_steps,
+        resource_preflight=resource_preflight,
+    )
+    recommended_evidence = (
+        approval_packet.get("recommended_evidence")
+        if isinstance(approval_packet.get("recommended_evidence"), dict)
+        else {}
+    )
+    summary["approval_packet_status"] = approval_packet.get("status")
+    summary["approval_packet_missing_decisions"] = recommended_evidence.get("missing_decision_ids", [])
 
     return {
         "generated_at": utc_now(),
@@ -25211,27 +25510,14 @@ def build_credential_impact_checklist(
         "target": target,
         "profile": profile_summary(profile),
         "artifact_dir": repo_relative_or_absolute(artifact_dir),
-        "summary": {
-            "credential_proxy_status": credential_proxy.get("status") or "missing",
-            "provider_review_status": provider_review.get("status") or "missing",
-            "files_needing_cost_review": len(files_needing_review),
-            "missing_provider_evidence": missing_provider_evidence,
-            "provider_public_docs_status": provider_public_docs_review.get("status"),
-            "provider_public_docs": provider_public_docs_summary.get("documents", 0),
-            "resource_status": resource_status,
-            "resource_budget_mode": budget.get("mode") or "unknown",
-        },
+        "summary": summary,
         "resource_preflight": resource_preflight,
         "route_reviews": route_reviews,
         "provider_public_docs_review": provider_public_docs_review,
         "provider_evidence_requests": evidence_requests,
         "evidence_contract": evidence_contract,
-        "operator_evidence_sidecar": {
-            "path": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
-            "template": sidecar_template,
-            "accepted_present_statuses": sorted(OPERATOR_EVIDENCE_PRESENT_STATUSES),
-            "redaction_gate": "Do not include provider API key values, bearer tokens, cookies, wallet secrets, or raw account identifiers.",
-        },
+        "operator_evidence_sidecar": operator_evidence_sidecar,
+        "credential_impact_approval_packet": approval_packet,
         "safe_validation_steps": safe_validation_steps,
         "followup_commands": followup_commands,
         "acceptance_checks": [
@@ -26630,6 +26916,105 @@ def quote_transaction_corpus_approval_review_candidate(
         "next_step": transaction_corpus_checklist.get("next_step"),
         "safety": approval_packet.get("safety"),
     }
+
+
+def quote_credential_impact_approval_review_candidate(
+    credential_impact_checklist: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(credential_impact_checklist, dict):
+        return None
+    approval_packet = (
+        credential_impact_checklist.get("credential_impact_approval_packet")
+        if isinstance(credential_impact_checklist.get("credential_impact_approval_packet"), dict)
+        else {}
+    )
+    if not approval_packet:
+        return None
+    approval_sequence = []
+    for step in approval_packet.get("approval_sequence", []) or []:
+        if not isinstance(step, dict):
+            continue
+        approval_sequence.append(
+            {
+                "id": step.get("id"),
+                "status": step.get("status"),
+                "risk": step.get("risk"),
+                "has_command": bool(step.get("command")),
+                "has_action": bool(step.get("action")),
+            }
+        )
+    blockers = [
+        str(item)
+        for item in approval_packet.get("finding_gate_blockers", []) or []
+        if str(item).strip()
+    ]
+    recommended_evidence = (
+        approval_packet.get("recommended_evidence")
+        if isinstance(approval_packet.get("recommended_evidence"), dict)
+        else {}
+    )
+    return {
+        "id": "review_credential_impact_approval_packet",
+        "type": "credential-impact-approval-packet",
+        "status": approval_packet.get("status"),
+        "checklist_status": credential_impact_checklist.get("status"),
+        "assessment": approval_packet.get("assessment", {}),
+        "recommended_evidence": recommended_evidence,
+        "operator_evidence_sidecar": approval_packet.get("operator_evidence_sidecar"),
+        "accepted_present_statuses": approval_packet.get("accepted_present_statuses", []),
+        "approval_sequence": approval_sequence,
+        "finding_gate_blockers": blockers[:8],
+        "finding_gate_blocker_count": len(blockers),
+        "next_step": credential_impact_checklist.get("next_step"),
+        "safety": approval_packet.get("safety"),
+    }
+
+
+def format_approval_packet_inline(
+    packet: dict[str, Any],
+    *,
+    status_key: bool = False,
+    include_kind: bool = True,
+) -> str:
+    status = str(packet.get("status") or "unknown")
+    status_text = f"status={status}" if status_key else status
+    blocker_count = packet.get("finding_gate_blocker_count")
+    if not isinstance(blocker_count, int):
+        blockers = packet.get("finding_gate_blockers") if isinstance(packet.get("finding_gate_blockers"), list) else []
+        blocker_count = len(blockers)
+    recommended_quote = (
+        packet.get("recommended_quote")
+        if isinstance(packet.get("recommended_quote"), dict)
+        else {}
+    )
+    if recommended_quote:
+        return (
+            f"{status_text} "
+            f"recommended={recommended_quote.get('method') or '-'} {recommended_quote.get('path') or '-'} "
+            f"direction={recommended_quote.get('direction') or '-'} "
+            f"payload={packet.get('payload_sidecar') or '-'} "
+            f"policy={packet.get('intent_policy_sidecar') or '-'} "
+            f"blockers={blocker_count}"
+        )
+    recommended_evidence = (
+        packet.get("recommended_evidence")
+        if isinstance(packet.get("recommended_evidence"), dict)
+        else {}
+    )
+    if recommended_evidence:
+        missing = recommended_evidence.get("missing_decision_ids", [])
+        missing_count = len(missing) if isinstance(missing, list) else 0
+        kind_text = "type=credential-impact " if include_kind else ""
+        return (
+            f"{status_text} "
+            f"{kind_text}"
+            f"entrypoint={recommended_evidence.get('entrypoint') or '-'} "
+            f"provider={recommended_evidence.get('provider') or '-'} "
+            f"sidecar={packet.get('operator_evidence_sidecar') or '-'} "
+            f"decisions={missing_count} "
+            f"blockers={blocker_count}"
+        )
+    return f"{status_text} blockers={blocker_count}"
 
 
 def build_evidence_gaps(
@@ -30858,6 +31243,11 @@ def build_command_safety_selftest() -> dict[str, Any]:
     provider_ready_commands = "\n".join(
         str(command_text) for command_text in provider_ready_checklist.get("followup_commands", []) or []
     )
+    provider_ready_approval_packet = (
+        provider_ready_checklist.get("credential_impact_approval_packet")
+        if isinstance(provider_ready_checklist.get("credential_impact_approval_packet"), dict)
+        else {}
+    )
     assertions.append(
         {
             "id": "credential-impact-ready-emits-gate-followups",
@@ -30866,11 +31256,14 @@ def build_command_safety_selftest() -> dict[str, Any]:
                 and "gate --no-write --show-items" in provider_ready_commands
                 and "adjudicate --no-write" in provider_ready_commands
                 and "evidence-chain --no-write" in provider_ready_commands
+                and provider_ready_approval_packet.get("status") == "ready-offline-gate-review"
+                and provider_ready_approval_packet.get("packet_type") == "credential-impact-approval-packet"
             ),
             "expected": "ready provider-impact evidence exposes offline gate/adjudicate/evidence-chain follow-up commands",
             "actual": {
                 "status": provider_ready_checklist.get("status"),
                 "followup_commands": provider_ready_checklist.get("followup_commands", []),
+                "approval_packet": provider_ready_approval_packet,
             },
         }
     )
@@ -38462,6 +38855,9 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Credential impact checklist:" in credential_impact_checklist_stdout_text
                 and "Credential proxy:" in credential_impact_checklist_stdout_text
                 and "Provider missing:" in credential_impact_checklist_stdout_text
+                and "Approval packet: status=" in credential_impact_checklist_stdout_text
+                and "type=credential-impact" in credential_impact_checklist_stdout_text
+                and "sidecar=" in credential_impact_checklist_stdout_text
                 and "Evidence contract: credentialed-upstream-cost-abuse-evidence-contract" in credential_impact_checklist_stdout_text
                 and "Provider/operator evidence shows account-level quota" in credential_impact_checklist_stdout_text
                 and "operator-evidence-review --no-write --show-missing --show-template" in credential_impact_checklist_stdout_text
@@ -46311,6 +46707,20 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                         "status": "ready-offline",
                         "priority": "medium",
                         "hypothesis_type": "resource-abuse-review",
+                        "credential_impact_approval_packet": {
+                            "status": "waiting-provider-operator-evidence",
+                            "type": "credential-impact-approval-packet",
+                            "recommended_evidence": {
+                                "entrypoint": "POST /api/quote",
+                                "provider": "M0",
+                                "missing_decision_ids": [
+                                    "credentialed-upstream-quota-policy",
+                                    "credentialed-upstream-billing-impact",
+                                ],
+                            },
+                            "operator_evidence_sidecar": ".greybox/focused/operator-evidence.json",
+                            "finding_gate_blocker_count": 4,
+                        },
                         "allowed_now": [
                             focused_iteration_ref("harness-loop --no-write --skip-current-resource-check"),
                             focused_iteration_ref("hypothesis-matrix --no-write --show-next"),
@@ -47218,17 +47628,21 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and "top-secret" not in blackbox_iteration_command_text_sample
         and "AbC1234567890Token" not in blackbox_iteration_command_text_sample
         and focused_iteration_decision_sample.get("summary", {}).get("offline_command_preview_limit") == 2
-        and focused_iteration_decision_sample.get("summary", {}).get("approval_packets") == 1
-        and (focused_iteration_decision_sample.get("approval_packets", [{}])[0].get("packet") or {}).get("status")
-        == "ready-offline-approval"
-        and (
-            (focused_iteration_decision_sample.get("approval_packets", [{}])[0].get("packet") or {}).get(
-                "recommended_quote",
-                {},
-            )
-            or {}
-        ).get("direction")
-        == "buy"
+        and focused_iteration_decision_sample.get("summary", {}).get("approval_packets") == 2
+        and any(
+            item.get("packet_type") == "transaction-corpus"
+            and (item.get("packet") or {}).get("status") == "ready-offline-approval"
+            and (((item.get("packet") or {}).get("recommended_quote") or {}).get("direction") == "buy")
+            for item in focused_iteration_decision_sample.get("approval_packets", [])
+            if isinstance(item, dict)
+        )
+        and any(
+            item.get("packet_type") == "credential-impact"
+            and (item.get("packet") or {}).get("status") == "waiting-provider-operator-evidence"
+            and (((item.get("packet") or {}).get("recommended_evidence") or {}).get("provider") == "M0")
+            for item in focused_iteration_decision_sample.get("approval_packets", [])
+            if isinstance(item, dict)
+        )
         and focused_iteration_preview_commands[:2]
         == [
             focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
@@ -47925,6 +48339,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         rewrite_transaction_validation_packet_quote = (
             rewrite_transaction_validation_packet.get("recommended_quote")
             if isinstance(rewrite_transaction_validation_packet.get("recommended_quote"), dict)
+            else {}
+        )
+        rewrite_credential_validation_packet = (
+            rewrite_credential_proxy_validation_item.get("credential_impact_approval_packet")
+            if isinstance(rewrite_credential_proxy_validation_item, dict)
+            and isinstance(rewrite_credential_proxy_validation_item.get("credential_impact_approval_packet"), dict)
+            else {}
+        )
+        rewrite_credential_validation_packet_evidence = (
+            rewrite_credential_validation_packet.get("recommended_evidence")
+            if isinstance(rewrite_credential_validation_packet.get("recommended_evidence"), dict)
             else {}
         )
         rewrite_resource_evidence_gaps = build_evidence_gaps(
@@ -48867,6 +49292,15 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 )
                 or []
             )
+            and rewrite_credential_validation_packet.get("status") == "waiting-provider-operator-evidence"
+            and rewrite_credential_validation_packet.get("type") == "credential-impact-approval-packet"
+            and rewrite_credential_validation_packet_evidence.get("entrypoint") == "POST /api/quote"
+            and rewrite_credential_validation_packet_evidence.get("provider") == "M0"
+            and "credentialed-upstream-billing-impact"
+            in (rewrite_credential_validation_packet_evidence.get("missing_decision_ids") or [])
+            and rewrite_credential_validation_packet.get("operator_evidence_sidecar")
+            == repo_relative_or_absolute(rewrite_transaction_matrix_dir / OPERATOR_EVIDENCE_ARTIFACT)
+            and rewrite_credential_validation_packet.get("finding_gate_blocker_count", 0) >= 4
             and any(
                 "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check"
                 in str(ref.get("command") or "")
@@ -54749,20 +55183,7 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
             else {}
         )
         if approval_packet:
-            recommended_quote = (
-                approval_packet.get("recommended_quote")
-                if isinstance(approval_packet.get("recommended_quote"), dict)
-                else {}
-            )
-            print(
-                "  approval_packet="
-                f"{approval_packet.get('status') or 'unknown'} "
-                f"recommended={recommended_quote.get('method') or '-'} {recommended_quote.get('path') or '-'} "
-                f"direction={recommended_quote.get('direction') or '-'} "
-                f"payload={approval_packet.get('payload_sidecar') or '-'} "
-                f"policy={approval_packet.get('intent_policy_sidecar') or '-'} "
-                f"blockers={approval_packet.get('finding_gate_blocker_count', 0)}"
-            )
+            print(f"  approval_packet={format_approval_packet_inline(approval_packet)}")
         if args.show_evidence:
             for evidence in (lead.get("required_evidence", []) or [])[:3]:
                 print(f"    evidence={inline_summary_text(evidence, max_chars=260)}")
@@ -55894,6 +56315,13 @@ def run_credential_impact_checklist(args: argparse.Namespace) -> int:
             f"tiers={json.dumps(provider_docs_summary.get('evidence_tier_counts', {}), sort_keys=True)} "
             f"impact_gate={provider_docs_summary.get('impact_gate') or 'unknown'}"
         )
+    approval_packet = (
+        checklist.get("credential_impact_approval_packet")
+        if isinstance(checklist.get("credential_impact_approval_packet"), dict)
+        else {}
+    )
+    if approval_packet:
+        print(f"Approval packet: {format_approval_packet_inline(approval_packet, status_key=True)}")
     if args.show_evidence_contract:
         evidence_contract = (
             checklist.get("evidence_contract")
@@ -56610,20 +57038,7 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                     else {}
                 )
                 if transaction_packet:
-                    recommended_quote = (
-                        transaction_packet.get("recommended_quote")
-                        if isinstance(transaction_packet.get("recommended_quote"), dict)
-                        else {}
-                    )
-                    print(
-                        "  transaction_approval_packet="
-                        f"{transaction_packet.get('status') or 'unknown'} "
-                        f"recommended={recommended_quote.get('method') or '-'} {recommended_quote.get('path') or '-'} "
-                        f"direction={recommended_quote.get('direction') or '-'} "
-                        f"payload={transaction_packet.get('payload_sidecar') or '-'} "
-                        f"policy={transaction_packet.get('intent_policy_sidecar') or '-'} "
-                        f"blockers={transaction_packet.get('finding_gate_blocker_count', 0)}"
-                    )
+                    print(f"  transaction_approval_packet={format_approval_packet_inline(transaction_packet)}")
                 resource_review = (
                     item.get("resource_abuse_review")
                     if isinstance(item.get("resource_abuse_review"), dict)
@@ -56659,6 +57074,13 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                     provider_missing = credential_review.get("deployment_provider_missing", []) or []
                     if provider_missing:
                         print(f"  provider_missing={','.join(str(item) for item in provider_missing[:5])}")
+                credential_packet = (
+                    item.get("credential_impact_approval_packet")
+                    if isinstance(item.get("credential_impact_approval_packet"), dict)
+                    else {}
+                )
+                if credential_packet:
+                    print(f"  credential_approval_packet={format_approval_packet_inline(credential_packet)}")
                 rewrite_review = item.get("rewrite_review") if isinstance(item.get("rewrite_review"), dict) else {}
                 source_guard = (
                     rewrite_review.get("source_guard_review")
@@ -56826,20 +57248,11 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
     ]
     for item in approval_packets[: max(0, int(args.top))]:
         packet = item.get("packet") if isinstance(item.get("packet"), dict) else {}
-        recommended_quote = (
-            packet.get("recommended_quote")
-            if isinstance(packet.get("recommended_quote"), dict)
-            else {}
-        )
         print(
             "Approval packet: "
             f"item={item.get('validation_item_id') or '-'} "
-            f"status={packet.get('status') or 'unknown'} "
-            f"recommended={recommended_quote.get('method') or '-'} {recommended_quote.get('path') or '-'} "
-            f"direction={recommended_quote.get('direction') or '-'} "
-            f"payload={packet.get('payload_sidecar') or '-'} "
-            f"policy={packet.get('intent_policy_sidecar') or '-'} "
-            f"blockers={packet.get('finding_gate_blocker_count', 0)}"
+            f"type={item.get('packet_type') or '-'} "
+            f"{format_approval_packet_inline(packet, status_key=True, include_kind=False)}"
         )
 
     top_count = max(0, int(args.top))

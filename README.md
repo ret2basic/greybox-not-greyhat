@@ -373,6 +373,15 @@ finding claim. Use
 to print the credentialed-upstream evidence contract, including reportability
 gates, missing provider/operator decisions, safe evidence sources, and forbidden
 validation steps without sending target or provider traffic.
+It also emits `credential_impact_approval_packet`, a compact offline packet for
+the provider-impact path. The packet names the recommended credentialed
+entrypoint, provider, redacted `operator-evidence.json` sidecar, accepted
+present statuses, missing quota/rate-limit/billing/monitoring decisions,
+resource-gated approval sequence, and current finding-gate blockers. In
+`greybox` mode this helps close credentialed-upstream coverage for every
+dangerous source-derived route; in `blackbox` mode it keeps the work focused on
+the smallest provider/operator evidence package that can support one valid
+high-impact bounty report.
 Profiles can attach `quote_provider.public_docs` entries for official provider
 documentation. InferForge indexes those references as public context for API-key
 authentication and executable transaction-payload behavior, but it does not
