@@ -149,6 +149,7 @@ COMMAND_SAFETY_SELFTEST_ARTIFACT = "command-safety-selftest.json"
 ARTIFACT_HEALTH_SELFTEST_ARTIFACT = "artifact-health-selftest.json"
 MANIFEST_REFRESH_SELFTEST_ARTIFACT = "manifest-refresh-selftest.json"
 NO_WRITE_SELFTEST_ARTIFACT = "no-write-selftest.json"
+REWRITE_RESPONSE_REVIEW_SELFTEST_ARTIFACT = "rewrite-response-review-selftest.json"
 BURP_SYNC_FAILURE_SELFTEST_ARTIFACT = "burp-sync-failure-selftest.json"
 RAW_BURP_HISTORY_ARTIFACTS = {
     "burp-mcp-history-latest.txt",
@@ -244,6 +245,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     ARTIFACT_HEALTH_SELFTEST_ARTIFACT,
     MANIFEST_REFRESH_SELFTEST_ARTIFACT,
     NO_WRITE_SELFTEST_ARTIFACT,
+    REWRITE_RESPONSE_REVIEW_SELFTEST_ARTIFACT,
     BURP_SYNC_FAILURE_SELFTEST_ARTIFACT,
     "transaction-intent-policy.json",
 ]
@@ -304,6 +306,7 @@ INDEX_ARTIFACT_ORDER = [
     ARTIFACT_HEALTH_SELFTEST_ARTIFACT,
     MANIFEST_REFRESH_SELFTEST_ARTIFACT,
     NO_WRITE_SELFTEST_ARTIFACT,
+    REWRITE_RESPONSE_REVIEW_SELFTEST_ARTIFACT,
     BURP_SYNC_FAILURE_SELFTEST_ARTIFACT,
     TARGET_PROFILE_ARTIFACT,
     STRATEGY_REGISTRY_ARTIFACT,
@@ -32311,6 +32314,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("self-test-artifact-health", "run_artifact_health_selftest"),
         refresh_expectation("self-test-manifest-refresh", "run_manifest_refresh_selftest"),
         refresh_expectation("self-test-no-write", "run_no_write_selftest"),
+        refresh_expectation("self-test-rewrite-response-review", "run_rewrite_response_review_selftest"),
         refresh_expectation("self-test-burp-sync-failures", "run_burp_sync_failure_selftest"),
         refresh_expectation("self-test-transactions", "run_transaction_decoder_selftest"),
         refresh_expectation("collect-quote", "run_collect_quote", min_refreshes=2, min_prints=2),
@@ -34127,6 +34131,241 @@ def build_no_write_selftest() -> dict[str, Any]:
         },
         "assertions": assertions,
         "safety": "Synthetic no-write self-test. It monkeypatches capability checks, writes only temporary local input files, and sends no requests.",
+    }
+
+
+def build_rewrite_response_review_selftest() -> dict[str, Any]:
+    target = "http://127.0.0.1:9997"
+    approved_path = "/api/no-write/vault/balance"
+    unapproved_path = "/api/no-write/admin/export"
+
+    with tempfile.TemporaryDirectory(prefix="inferforge-rewrite-response-review-selftest-") as temp_dir:
+        root = Path(temp_dir)
+        source_root = root / "source"
+        artifact_dir = root / "artifacts"
+        (source_root / "src").mkdir(parents=True)
+        (source_root / "src" / "store.ts").write_text(
+            "\n".join(
+                [
+                    "const api = { get: (path: string) => path };",
+                    "export const loadVaultBalance = () => api.get('/vault/balance');",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (source_root / "next.config.ts").write_text(
+            "\n".join(
+                [
+                    "export default {",
+                    "  async rewrites() {",
+                    "    return [{ source: '/api/no-write/:path*', destination: 'https://upstream.example/:path*' }];",
+                    "  },",
+                    "};",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        profile = {
+            "schema_version": 1,
+            "name": "rewrite-response-review-selftest",
+            "display_name": "Rewrite Response Review Self-Test",
+            "default_target": target,
+            "default_source_root": str(source_root),
+            "strategy_sets": ["fixed-upstream-proxy"],
+            "clusters": [
+                {
+                    "id": "no-write-rewrite",
+                    "method": "GET",
+                    "methods": ["GET"],
+                    "path": "/api/no-write/{path*}",
+                    "paths": ["/api/no-write/{path*}"],
+                    "kind": "rewrite-proxy",
+                    "priority": "high",
+                    "strategy_set": "fixed-upstream-proxy",
+                    "source_refs": ["next.config.ts"],
+                    "discovery": {
+                        "rewrites": [
+                            {
+                                "source": "/api/no-write/:path*",
+                                "source_pattern": "/api/no-write/{path*}",
+                                "destination_resolved": "https://upstream.example/:path*",
+                                "destination_template": "https://upstream.example/:path*",
+                                "phase": "array",
+                            }
+                        ],
+                        "fixed_upstreams": ["https://upstream.example"],
+                    },
+                }
+            ],
+        }
+        append_jsonl(
+            artifact_dir / "burp-history-observations.jsonl",
+            [
+                {
+                    "method": "GET",
+                    "path": approved_path,
+                    "status": 200,
+                    "content_type": "application/json",
+                    "response_sample": json.dumps(
+                        {
+                            "vault": {
+                                "balance": "123.45",
+                                "wallet": "wallet-1",
+                                "owner": "owner-1",
+                            },
+                            "debug": "token=should-not-appear",
+                        },
+                        separators=(",", ":"),
+                    ),
+                },
+                {
+                    "method": "GET",
+                    "path": unapproved_path,
+                    "status": 200,
+                    "content_type": "application/json",
+                    "response_sample": json.dumps(
+                        {
+                            "admin": {
+                                "token_present": True,
+                                "export": True,
+                            }
+                        },
+                        separators=(",", ":"),
+                    ),
+                },
+            ],
+        )
+
+        rewrite_review = build_rewrite_review_run(target=target, profile=profile, artifact_dir=artifact_dir)
+        review = build_rewrite_response_review(target=target, profile=profile, artifact_dir=artifact_dir)
+        response_item = (review.get("items") or [{}])[0] if review.get("items") else {}
+        observations = [item for item in response_item.get("observations", []) or [] if isinstance(item, dict)]
+        approved_observations = [item for item in observations if item.get("approved_path")]
+        unapproved_observations = [item for item in observations if not item.get("approved_path")]
+        candidate_observations = [item for item in observations if item.get("candidate_impact")]
+        candidate_markers = [
+            marker
+            for observation in candidate_observations
+            for marker in observation.get("sensitive_field_markers", []) or []
+            if isinstance(marker, dict)
+        ]
+        rewrite_item = (rewrite_review.get("items") or [{}])[0] if rewrite_review.get("items") else {}
+        closure = build_rewrite_evidence_closure(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            item={
+                "id": "HYP-rewrite-response-review-selftest",
+                "type": "cluster-strategy",
+                "cluster_id": rewrite_item.get("cluster_id"),
+                "path": rewrite_item.get("path"),
+                "impact": "fixed-upstream-proxy-confusion",
+                "rewrite_review": rewrite_item,
+            },
+        )
+        review_text = json.dumps(review, sort_keys=True)
+        closure_text = json.dumps(closure, sort_keys=True)
+
+    assertions = [
+        {
+            "id": "rewrite-review-derives-one-approved-read-only-path",
+            "passed": (
+                rewrite_review.get("status") == "has-review-items"
+                and response_item.get("approved_path_candidates") == [approved_path]
+                and (rewrite_review.get("summary") or {}).get("read_only_path_candidates") == 1
+            ),
+            "expected": "synthetic catch-all rewrite derives exactly one approved read-only local path from client source",
+            "actual": {
+                "rewrite_status": rewrite_review.get("status"),
+                "approved_path_candidates": response_item.get("approved_path_candidates"),
+                "rewrite_summary": rewrite_review.get("summary"),
+            },
+        },
+        {
+            "id": "approved-sensitive-response-enters-candidate-impact-review",
+            "passed": (
+                review.get("status") == "candidate-impact-review"
+                and response_item.get("status") == "candidate-impact-review"
+                and (review.get("summary") or {}).get("observed_approved_responses") == 1
+                and (review.get("summary") or {}).get("candidate_impact_observations") == 1
+                and response_item.get("observed_approved_response_count") == 1
+                and response_item.get("candidate_impact_observation_count") == 1
+            ),
+            "expected": "one approved 2xx JSON response with sensitive field names is indexed as candidate impact evidence",
+            "actual": {
+                "status": review.get("status"),
+                "summary": review.get("summary"),
+                "item": response_item,
+            },
+        },
+        {
+            "id": "unapproved-sensitive-response-does-not-count-as-candidate-impact",
+            "passed": (
+                response_item.get("unapproved_observation_count") == 1
+                and len(unapproved_observations) == 1
+                and all(not item.get("candidate_impact") for item in unapproved_observations)
+                and [item.get("path") for item in candidate_observations] == [approved_path]
+            ),
+            "expected": "sensitive-looking observations under the same catch-all route require exact approved_path matching",
+            "actual": {
+                "unapproved_observations": unapproved_observations,
+                "candidate_observations": candidate_observations,
+            },
+        },
+        {
+            "id": "candidate-impact-keeps-field-markers-not-values",
+            "passed": (
+                any(marker.get("field_path") == "$.vault.balance" for marker in candidate_markers)
+                and any(marker.get("field_path") == "$.vault.wallet" for marker in candidate_markers)
+                and "should-not-appear" not in review_text
+                and "token=[redacted]" in review_text
+            ),
+            "expected": "response review keeps field-path markers and redacts secret-like sample values",
+            "actual": {
+                "candidate_markers": candidate_markers,
+                "review_text_contains_sentinel": "should-not-appear" in review_text,
+            },
+        },
+        {
+            "id": "candidate-impact-opens-manual-finding-gate-only",
+            "passed": (
+                closure.get("gate_ready") is True
+                and closure.get("status") == "ready-for-finding-gate-review"
+                and "manual finding-gate review" in str(review.get("reportability_gate") or "")
+                and "Only enter finding-gate" in str(closure.get("finding_gate_entry_condition") or "")
+                and "reportable" not in str(closure.get("status") or "")
+                and "should-not-appear" not in closure_text
+            ),
+            "expected": "candidate impact prepares a manual gate review without marking the issue reportable",
+            "actual": {
+                "closure": closure,
+                "reportability_gate": review.get("reportability_gate"),
+            },
+        },
+    ]
+    failed = [item for item in assertions if not item["passed"]]
+    return {
+        "generated_at": utc_now(),
+        "status": "failed" if failed else "passed",
+        "target": target,
+        "summary": {
+            "assertions": len(assertions),
+            "failed": len(failed),
+            "review_status": review.get("status"),
+            "closure_status": closure.get("status"),
+            "gate_ready": closure.get("gate_ready"),
+        },
+        "cases": {
+            "rewrite_review": rewrite_review,
+            "rewrite_response_review": review,
+            "rewrite_evidence_closure": closure,
+        },
+        "assertions": assertions,
+        "safety": (
+            "Synthetic rewrite response review self-test. It writes temporary local source and normalized observation "
+            "files only; it does not invoke Burp, send requests, probe services, sign wallets, or submit transactions."
+        ),
     }
 
 
@@ -45967,6 +46206,37 @@ def run_no_write_selftest(args: argparse.Namespace) -> int:
     return 0 if result["status"] == "passed" else 1
 
 
+def run_rewrite_response_review_selftest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result = build_rewrite_response_review_selftest()
+    result["current_profile_context"] = profile_summary(profile)
+    output_path = artifact_dir / REWRITE_RESPONSE_REVIEW_SELFTEST_ARTIFACT
+    write_json(output_path, sanitize_artifact_samples(result))
+    print(f"Rewrite response review self-test: {result['status']}")
+    print(
+        "Cases: "
+        f"assertions={result['summary']['assertions']}, "
+        f"failed={result['summary']['failed']}, "
+        f"review={result['summary']['review_status']}, "
+        f"closure={result['summary']['closure_status']}, "
+        f"gate_ready={result['summary']['gate_ready']}"
+    )
+    failed = [item for item in result.get("assertions", []) if not item.get("passed")]
+    if failed:
+        print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="self-test-rewrite-response-review",
+            output_paths=[output_path],
+        )
+    )
+    return 0 if result["status"] == "passed" else 1
+
+
 def run_burp_sync_failure_selftest(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, _source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -46211,6 +46481,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             ("self-test-artifact-health", "self-test-artifact-health"),
             ("self-test-manifest-refresh", "self-test-manifest-refresh"),
             ("self-test-no-write", "self-test-no-write"),
+            ("self-test-rewrite-response-review", "self-test-rewrite-response-review"),
             ("self-test-burp-sync-failures", "self-test-burp-sync-failures"),
             ("self-test-transactions", "self-test-transactions"),
         ]:
@@ -52026,6 +52297,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a synthetic self-test for --no-write command behavior",
     )
     no_write_selftest.set_defaults(func=run_no_write_selftest)
+
+    rewrite_response_review_selftest = sub.add_parser(
+        "self-test-rewrite-response-review",
+        help="Run a synthetic self-test for rewrite response review gating",
+    )
+    rewrite_response_review_selftest.set_defaults(func=run_rewrite_response_review_selftest)
 
     burp_sync_failure_selftest = sub.add_parser(
         "self-test-burp-sync-failures",

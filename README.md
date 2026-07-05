@@ -961,6 +961,7 @@ python3 scripts/inferforge.py self-test-review-blockers
 python3 scripts/inferforge.py self-test-artifact-health
 python3 scripts/inferforge.py self-test-manifest-refresh
 python3 scripts/inferforge.py self-test-no-write
+python3 scripts/inferforge.py self-test-rewrite-response-review
 python3 scripts/inferforge.py self-test-burp-sync-failures
 python3 scripts/inferforge.py review-blockers
 python3 scripts/inferforge.py collect-quote --direction buy --wallet EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR --amount-in 1000000
