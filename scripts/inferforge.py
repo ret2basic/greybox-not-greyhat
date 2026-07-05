@@ -173,6 +173,7 @@ BOUNTY_LANE_PRIORITIES_ARTIFACT = "bounty-lane-priorities.json"
 BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT = "bounty-evidence-authorization.json"
 BOUNTY_EVIDENCE_INTAKE_ARTIFACT = "bounty-evidence-intake.json"
 BOUNTY_ACTION_QUEUE_ARTIFACT = "bounty-action-queue.json"
+BOUNTY_PREP_SYNC_ARTIFACT = "bounty-prep-sync.json"
 BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT = "bounty-evidence-request.md"
 BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT = "bounty-evidence-templates.json"
 BOUNTY_TEMPLATE_SAFETY_ARTIFACT = "bounty-template-safety.json"
@@ -300,6 +301,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT,
     BOUNTY_EVIDENCE_INTAKE_ARTIFACT,
     BOUNTY_ACTION_QUEUE_ARTIFACT,
+    BOUNTY_PREP_SYNC_ARTIFACT,
     BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT,
     BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT,
     BOUNTY_TEMPLATE_SAFETY_ARTIFACT,
@@ -26141,6 +26143,292 @@ def build_bounty_action_queue(
         "safety": (
             "Offline action queue only. It reads local JSON artifacts, sends no requests, calls no Burp tool, starts no browser, "
             "creates no evidence sidecars, signs no wallet, submits no transaction, and changes no infrastructure."
+        ),
+    }
+
+
+BOUNTY_PREP_COMPATIBLE_PREP_LANES: dict[str, set[str]] = {
+    "transaction-integrity": {
+        "approved-transaction-payload",
+        "transaction-intent-policy",
+        "decoded-transaction-review",
+        "finding-gate-review",
+    },
+    "sensitive-response-impact": {
+        "single-approved-response",
+        "read-only-path-selection",
+        "impact-classification",
+        "finding-gate-review",
+    },
+    "credentialed-provider-impact": {
+        "provider-operator-evidence",
+        "finding-gate-review",
+    },
+    "resource-control": {
+        "deployment-resource-evidence",
+        "resource-gate",
+        "finding-gate-review",
+    },
+    "websocket-header-trust": {
+        "deployment-resource-evidence",
+        "provider-operator-evidence",
+        "finding-gate-review",
+    },
+    "build-secret-exposure": {
+        "build-provenance",
+        "build-secret-exposure",
+        "finding-gate-review",
+    },
+}
+
+
+def bounty_prep_top_action(action_queue: dict[str, Any] | None) -> dict[str, Any]:
+    actions = (
+        action_queue.get("actions", [])
+        if isinstance(action_queue, dict) and isinstance(action_queue.get("actions"), list)
+        else []
+    )
+    for action in actions:
+        if isinstance(action, dict) and action.get("kind") != "park-until-official-evidence":
+            return action
+    return next((action for action in actions if isinstance(action, dict)), {})
+
+
+def bounty_prep_package_top_unblocker(
+    prep_package: dict[str, Any] | None,
+    prep_status: dict[str, Any] | None,
+) -> dict[str, Any]:
+    for doc in [prep_status, prep_package]:
+        if not isinstance(doc, dict):
+            continue
+        top = doc.get("top_unblocker")
+        if isinstance(top, dict) and top:
+            return top
+    return {}
+
+
+def bounty_prep_required_artifact_names(
+    prep_package: dict[str, Any] | None,
+    prep_status: dict[str, Any] | None,
+) -> list[str]:
+    names: list[str] = []
+    if isinstance(prep_status, dict):
+        for row in prep_status.get("required_evidence_artifacts", []) or []:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or Path(str(row.get("artifact") or "")).name).strip()
+            if name:
+                names.append(name)
+    if isinstance(prep_package, dict):
+        for ref in normalize_string_list(prep_package.get("required_artifacts")):
+            name = bounty_validation_evidence_label(ref)
+            if name:
+                names.append(name)
+    return ordered_unique_strings(names)
+
+
+def bounty_prep_evidence_name(value: Any) -> str:
+    text = bounty_validation_evidence_label(value)
+    if not text:
+        return ""
+    return Path(text).name if text.endswith((".json", ".jsonl", ".txt", ".md", ".log")) else text
+
+
+def bounty_prep_check(check_id: str, status: str, expected: Any, actual: Any, next_step: str) -> dict[str, Any]:
+    return {
+        "id": check_id,
+        "status": status,
+        "passed": status == "passed",
+        "expected": expected,
+        "actual": actual,
+        "next_step": next_step,
+    }
+
+
+def build_bounty_prep_sync(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    bounty_action_queue: dict[str, Any] | None,
+    evidence_prep_package: dict[str, Any] | None,
+    evidence_prep_status: dict[str, Any] | None,
+    bounty_template_safety: dict[str, Any] | None,
+) -> dict[str, Any]:
+    queue = bounty_action_queue if isinstance(bounty_action_queue, dict) else {}
+    prep_package = evidence_prep_package if isinstance(evidence_prep_package, dict) else {}
+    prep_status = evidence_prep_status if isinstance(evidence_prep_status, dict) else {}
+    template_safety = bounty_template_safety if isinstance(bounty_template_safety, dict) else {}
+    queue_summary = queue.get("summary") if isinstance(queue.get("summary"), dict) else {}
+    top_action = bounty_prep_top_action(queue)
+    top_lane = str(top_action.get("lane") or queue_summary.get("top_lane") or "").strip()
+    top_kind = str(top_action.get("kind") or queue_summary.get("top_kind") or "").strip()
+    top_evidence = ordered_unique_strings(
+        [bounty_prep_evidence_name(item) for item in normalize_string_list(top_action.get("requested_evidence"))]
+    )
+    top_unblocker = bounty_prep_package_top_unblocker(prep_package, prep_status)
+    prep_lane = str(top_unblocker.get("lane") or "").strip()
+    prep_required_names = bounty_prep_required_artifact_names(prep_package, prep_status)
+    compatible_lanes = BOUNTY_PREP_COMPATIBLE_PREP_LANES.get(top_lane, set())
+    lane_aligned = bool(top_lane and prep_lane and (prep_lane == top_lane or prep_lane in compatible_lanes))
+    evidence_covered = all(item in prep_required_names for item in top_evidence) if top_evidence else False
+    template_status = str(template_safety.get("status") or "missing").strip()
+
+    checks = [
+        bounty_prep_check(
+            "bounty-action-queue-present",
+            "passed" if queue else "missing",
+            "bounty-action-queue is available and has a top workflow action",
+            {
+                "status": queue.get("status"),
+                "top_lane": top_lane or None,
+                "top_kind": top_kind or None,
+                "top_action": top_action.get("id"),
+            },
+            "Run bounty-action-queue before evidence preparation sync.",
+        ),
+        bounty_prep_check(
+            "evidence-prep-package-present",
+            "passed" if prep_package else "missing",
+            f"{EVIDENCE_PREP_PACKAGE_ARTIFACT} is available",
+            {
+                "status": prep_package.get("status"),
+                "top_unblocker": prep_package.get("top_unblocker") if prep_package else None,
+            },
+            "Run iteration-decision --write-evidence-prep-package before using evidence-prep-status.",
+        ),
+        bounty_prep_check(
+            "evidence-prep-status-present",
+            "passed" if prep_status else "missing",
+            f"{EVIDENCE_PREP_STATUS_ARTIFACT} or a freshly built prep status is available",
+            {
+                "status": prep_status.get("status"),
+                "top_unblocker": prep_status.get("top_unblocker") if prep_status else None,
+            },
+            "Run evidence-prep-status to refresh local evidence readiness.",
+        ),
+        bounty_prep_check(
+            "top-lane-aligned",
+            "passed" if lane_aligned else "blocked",
+            {
+                "bounty_lane": top_lane,
+                "compatible_prep_lanes": sorted(compatible_lanes),
+            },
+            {"prep_lane": prep_lane, "prep_top_unblocker": top_unblocker},
+            (
+                "Treat bounty-action-queue as source of truth for bounty-first work; refresh or replace stale prep guidance "
+                "before asking for official evidence."
+            ),
+        ),
+        bounty_prep_check(
+            "top-required-evidence-covered",
+            "passed" if evidence_covered else "blocked",
+            top_evidence,
+            prep_required_names,
+            "Refresh the evidence-prep package so it names the current top bounty lane's required official evidence.",
+        ),
+        bounty_prep_check(
+            "template-safety-not-blocked",
+            "passed" if template_status in {"template-safety-passed", "no-templates-to-review"} else "blocked",
+            "template safety is passed or neutral",
+            {"status": template_status},
+            "Fix bounty template safety blockers before sharing or filling evidence templates.",
+        ),
+    ]
+    missing = [check for check in checks if check.get("status") == "missing"]
+    blocked = [check for check in checks if check.get("status") == "blocked"]
+    if missing:
+        status = "missing-prep-sync-inputs"
+    elif blocked:
+        status = "blocked-prep-sync-mismatch"
+    elif top_kind in {"collect-approved-evidence", "fix-evidence-intake", "park-until-official-evidence"}:
+        status = "prep-sync-aligned-waiting-evidence"
+    elif top_kind == "validate-ready-evidence":
+        status = "prep-sync-aligned-ready-for-validation"
+    else:
+        status = "prep-sync-aligned"
+
+    commands = ordered_unique_strings(
+        [
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "bounty-action-queue --no-write --show-actions --show-blockers --show-commands --top 8",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "bounty-evidence-request --no-write --top 3",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "bounty-evidence-templates --no-write --show-templates --top 6",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "bounty-template-safety --no-write --strict --show-templates --show-files --top 8",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "evidence-prep-status --no-write --show-details --strict",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "adjudicate --no-write",
+                profile=profile,
+            ),
+        ]
+    )
+    first_blocker = (blocked or missing)[0] if (blocked or missing) else None
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-prep-sync-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "checks": len(checks),
+            "passed": sum(1 for check in checks if check.get("status") == "passed"),
+            "blocked": len(blocked),
+            "missing": len(missing),
+            "top_lane": top_lane or None,
+            "top_kind": top_kind or None,
+            "prep_lane": prep_lane or None,
+            "lane_aligned": lane_aligned,
+            "top_required_evidence_covered": evidence_covered,
+            "top_requested_evidence": top_evidence,
+            "prep_required_evidence": prep_required_names,
+            "bounty_action_queue_status": artifact_summary_status(queue),
+            "evidence_prep_package_status": artifact_summary_status(prep_package),
+            "evidence_prep_status": artifact_summary_status(prep_status),
+            "bounty_template_safety_status": artifact_summary_status(template_safety),
+        },
+        "top_bounty_action": top_action,
+        "prep_top_unblocker": top_unblocker,
+        "checks": checks,
+        "first_blocker": first_blocker,
+        "commands": commands,
+        "source_of_truth": (
+            "For bounty-first iteration, bounty-action-queue is the active source of truth. Evidence-prep packages are helpers "
+            "and must not redirect collection away from the current highest-value actionable lane."
+        ),
+        "reportability_rule": (
+            "Prep sync is workflow hygiene only. It is not evidence, not lane validation, not finding-gate acceptance, "
+            "and not adjudication."
+        ),
+        "next_step": (
+            first_blocker.get("next_step")
+            if isinstance(first_blocker, dict)
+            else top_action.get("next_step")
+            or "Continue with the current bounty action queue."
+        ),
+        "safety": (
+            "Offline synchronization check only. It reads local artifacts, sends no requests, calls no Burp tool, starts no browser, "
+            "creates no official evidence sidecars, signs no wallet, submits no transaction, and changes no infrastructure."
         ),
     }
 
@@ -53576,6 +53864,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("bounty-evidence-authorization", "run_bounty_evidence_authorization"),
         refresh_expectation("bounty-evidence-intake", "run_bounty_evidence_intake"),
         refresh_expectation("bounty-action-queue", "run_bounty_action_queue"),
+        refresh_expectation("bounty-prep-sync", "run_bounty_prep_sync"),
         refresh_expectation("bounty-evidence-request", "run_bounty_evidence_request"),
         refresh_expectation("bounty-evidence-templates", "run_bounty_evidence_templates"),
         refresh_expectation("bounty-template-safety", "run_bounty_template_safety"),
@@ -79026,6 +79315,111 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_bounty_prep_sync(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    queue = build_or_load_bounty_action_queue_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+        max_file_bytes=int(args.max_file_bytes),
+    )
+    package_path = resolve_repo_path(args.package) if args.package else artifact_dir / EVIDENCE_PREP_PACKAGE_ARTIFACT
+    prep_package = load_optional_json(package_path)
+    prep_status = build_evidence_prep_status(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        package_doc=prep_package if isinstance(prep_package, dict) else None,
+        package_path=package_path,
+    )
+    templates = build_bounty_evidence_templates(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_action_queue=queue,
+        top=max(1, int(args.top)),
+    )
+    template_safety = build_bounty_template_safety(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_evidence_templates=templates,
+        max_file_bytes=int(args.max_file_bytes),
+    )
+    sync = build_bounty_prep_sync(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_action_queue=queue,
+        evidence_prep_package=prep_package,
+        evidence_prep_status=prep_status,
+        bounty_template_safety=template_safety,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / BOUNTY_PREP_SYNC_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(sync))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-prep-sync",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = sync.get("summary", {}) if isinstance(sync.get("summary"), dict) else {}
+    print(f"Bounty prep sync: {sync.get('status')}")
+    print(
+        "Sync: "
+        f"checks={summary.get('checks', 0)} "
+        f"passed={summary.get('passed', 0)} "
+        f"blocked={summary.get('blocked', 0)} "
+        f"missing={summary.get('missing', 0)} "
+        f"top={summary.get('top_lane') or '-'} "
+        f"prep={summary.get('prep_lane') or '-'} "
+        f"aligned={summary.get('lane_aligned')}"
+    )
+    evidence = ", ".join(normalize_string_list(summary.get("top_requested_evidence"))[:6])
+    prep_evidence = ", ".join(normalize_string_list(summary.get("prep_required_evidence"))[:8])
+    if evidence:
+        print(f"Top requested evidence: {inline_summary_text(evidence, max_chars=320)}")
+    if prep_evidence:
+        print(f"Prep required evidence: {inline_summary_text(prep_evidence, max_chars=420)}")
+    display_limit = max(0, int(args.top))
+    if getattr(args, "show_checks", False):
+        print("Checks:")
+        for check in (sync.get("checks", []) or [])[:display_limit]:
+            if not isinstance(check, dict):
+                continue
+            print(f"- {check.get('status')} {check.get('id')}: {inline_summary_text(check.get('next_step'), max_chars=360)}")
+            if getattr(args, "show_details", False):
+                print(f"  expected={inline_summary_text(check.get('expected'), max_chars=300)}")
+                print(f"  actual={inline_summary_text(check.get('actual'), max_chars=300)}")
+    if getattr(args, "show_commands", False):
+        print("Commands:")
+        for command_text in normalize_string_list(sync.get("commands"))[:display_limit]:
+            print(f"- {inline_summary_text(command_text, max_chars=460)}")
+    print(f"Rule: {inline_summary_text(sync.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(sync.get('next_step'), max_chars=420)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and sync.get("status") != "prep-sync-aligned-ready-for-validation":
+        return 1
+    return 0
+
+
 def build_or_load_bounty_action_queue_for_run(
     *,
     target: str,
@@ -82915,6 +83309,65 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero when evidence intake redaction or format blockers must be fixed first.",
     )
     bounty_action_queue.set_defaults(func=run_bounty_action_queue)
+
+    bounty_prep_sync = sub.add_parser(
+        "bounty-prep-sync",
+        help="Check that evidence-prep guidance is aligned with the current top bounty action",
+    )
+    bounty_prep_sync.add_argument(
+        "--package",
+        help=(
+            f"Evidence prep package to compare. Defaults to --artifact-dir/{EVIDENCE_PREP_PACKAGE_ARTIFACT}."
+        ),
+    )
+    bounty_prep_sync.add_argument(
+        "--output",
+        help=(
+            f"Where to write {BOUNTY_PREP_SYNC_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{BOUNTY_PREP_SYNC_ARTIFACT}."
+        ),
+    )
+    bounty_prep_sync.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of sync checks or commands to print.",
+    )
+    bounty_prep_sync.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=262144,
+        help="Maximum bytes to read from local evidence files during sync checks. Defaults to 262144.",
+    )
+    bounty_prep_sync.add_argument(
+        "--show-checks",
+        action="store_true",
+        help="Print each prep sync check and next step.",
+    )
+    bounty_prep_sync.add_argument(
+        "--show-details",
+        action="store_true",
+        help="Print bounded expected/actual details for each shown sync check.",
+    )
+    bounty_prep_sync.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print local follow-up commands for the aligned bounty evidence path.",
+    )
+    bounty_prep_sync.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print bounty prep sync only; do not write {BOUNTY_PREP_SYNC_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    bounty_prep_sync.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless prep guidance is aligned and ready for evidence validation.",
+    )
+    bounty_prep_sync.set_defaults(func=run_bounty_prep_sync)
 
     bounty_evidence_request = sub.add_parser(
         "bounty-evidence-request",
