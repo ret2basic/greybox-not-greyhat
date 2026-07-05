@@ -132,6 +132,7 @@ VALIDATION_PLAN_ARTIFACT = "validation-plan.json"
 ITERATION_DECISION_ARTIFACT = "iteration-decision.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
+REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
 DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT = "deployment-resource-review.json"
 TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
 TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
@@ -224,6 +225,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     ITERATION_DECISION_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
+    REWRITE_RESPONSE_REVIEW_ARTIFACT,
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
@@ -321,6 +323,7 @@ INDEX_ARTIFACT_ORDER = [
     WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT,
     DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
+    REWRITE_RESPONSE_REVIEW_ARTIFACT,
     TRANSACTION_FLOW_REVIEW_ARTIFACT,
     TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
     TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
@@ -8790,6 +8793,7 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
         "evidence-gaps --no-write",
         "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check",
         "rewrite-validation-checklist --no-write --show-candidates --show-commands",
+        "rewrite-response-review --no-write --show-observations",
         "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check",
         "operator-evidence-review --no-write --show-missing --show-template",
         "transaction-sidecar-review --no-write --show-files --show-commands",
@@ -9345,7 +9349,7 @@ def methodology_next_command_for_hypothesis(
     elif impact == "resource-exhaustion" or hypothesis_type == "resource-abuse-review":
         subcommand = "deployment-review --no-write --top 8"
     elif impact == "fixed-upstream-proxy-confusion":
-        subcommand = "rewrite-validation-checklist --no-write --show-candidates --show-commands"
+        subcommand = "rewrite-response-review --no-write --show-observations"
     else:
         subcommand = "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check"
     ref = validation_command_ref(
@@ -9775,6 +9779,23 @@ def build_rewrite_evidence_closure(
         if isinstance(rewrite_review.get("source_guard_review"), dict)
         else {}
     )
+    response_review = build_rewrite_response_review(
+        target=str((profile or {}).get("default_target") or DEFAULT_TARGET),
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
+    response_item = {}
+    for candidate_item in response_review.get("items", []) or []:
+        if not isinstance(candidate_item, dict):
+            continue
+        if (
+            candidate_item.get("cluster_id") == item.get("cluster_id")
+            or candidate_item.get("path") == item.get("path")
+        ):
+            response_item = candidate_item
+            break
+    approved_response_count = int(response_item.get("observed_approved_response_count") or 0)
+    candidate_impact_count = int(response_item.get("candidate_impact_observation_count") or 0)
     rewrite_indexed = bool(rewrite_review)
     requirements = [
         methodology_requirement(
@@ -9803,14 +9824,14 @@ def build_rewrite_evidence_closure(
         ),
         methodology_requirement(
             "single-approved-response-observed",
-            "waiting",
-            {"rewrite_review_id": rewrite_review.get("rewrite_review_id"), "path": item.get("path")},
+            "passed" if approved_response_count else "waiting",
+            response_item or {"rewrite_review_id": rewrite_review.get("rewrite_review_id"), "path": item.get("path")},
             "After resource and scope gates, observe one approved read-only path; do not enumerate catch-all paths.",
         ),
         methodology_requirement(
             "concrete-sensitive-data-or-path-confusion-impact",
-            "waiting",
-            item.get("required_evidence", []),
+            "ready-offline" if candidate_impact_count else "waiting",
+            response_item.get("observations", []) if response_item else item.get("required_evidence", []),
             "Escalate only if that one response proves unauthorized data exposure, upstream path confusion, or equivalent concrete impact.",
         ),
     ]
@@ -9818,6 +9839,7 @@ def build_rewrite_evidence_closure(
     for source, subcommand in [
         ("rewrite-review", "rewrite-review --no-write --show-next"),
         ("rewrite-validation-checklist", "rewrite-validation-checklist --no-write --show-candidates --show-commands"),
+        ("rewrite-response-review", "rewrite-response-review --no-write --show-observations"),
         ("validation-plan", "validation-plan --no-write --top 8 --show-commands --skip-current-resource-check"),
     ]:
         ref = methodology_command_ref(
@@ -9829,8 +9851,8 @@ def build_rewrite_evidence_closure(
         if ref:
             commands.append(ref)
     return {
-        "status": methodology_closure_status(requirements),
-        "gate_ready": False,
+        "status": methodology_closure_status(requirements, gate_ready=bool(candidate_impact_count)),
+        "gate_ready": bool(candidate_impact_count),
         "impact": item.get("impact"),
         "artifact_statuses": {
             "rewrite_review": rewrite_review.get("source_guard_review", {}).get("status")
@@ -9838,6 +9860,9 @@ def build_rewrite_evidence_closure(
             else "indexed" if rewrite_indexed else "missing",
             "read_only_path_candidates": len(read_only_candidates),
             "blocked_path_candidates": len(blocked_candidates),
+            "rewrite_response_review": response_review.get("status"),
+            "observed_approved_responses": approved_response_count,
+            "candidate_impact_observations": candidate_impact_count,
         },
         "requirements": requirements,
         "missing_requirements": [
@@ -12800,6 +12825,267 @@ def build_rewrite_validation_checklist(
     }
 
 
+REWRITE_RESPONSE_SENSITIVE_FIELD_KEYWORDS = {
+    "account",
+    "address",
+    "admin",
+    "amount",
+    "apy",
+    "auth",
+    "balance",
+    "billing",
+    "capital",
+    "email",
+    "export",
+    "fee",
+    "history",
+    "internal",
+    "invoice",
+    "mint",
+    "nav",
+    "owner",
+    "portfolio",
+    "private",
+    "secret",
+    "token",
+    "treasury",
+    "user",
+    "vault",
+    "wallet",
+}
+
+
+def json_field_paths(value: Any, *, prefix: str = "$", limit: int = 80) -> list[str]:
+    paths: list[str] = []
+
+    def walk(node: Any, current: str) -> None:
+        if len(paths) >= limit:
+            return
+        if isinstance(node, dict):
+            for key, child in node.items():
+                child_path = f"{current}.{key}"
+                paths.append(child_path)
+                walk(child, child_path)
+                if len(paths) >= limit:
+                    return
+        elif isinstance(node, list):
+            paths.append(f"{current}[]")
+            for child in node[:5]:
+                walk(child, f"{current}[]")
+                if len(paths) >= limit:
+                    return
+
+    walk(value, prefix)
+    return paths[:limit]
+
+
+def response_sample_json_field_paths(sample: str, *, limit: int = 80) -> list[str]:
+    text = str(sample or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    return json_field_paths(parsed, limit=limit)
+
+
+def rewrite_response_sensitive_field_markers(sample: str) -> list[dict[str, Any]]:
+    markers = []
+    for field_path in response_sample_json_field_paths(sample):
+        lowered = field_path.lower()
+        keywords = sorted(
+            keyword
+            for keyword in REWRITE_RESPONSE_SENSITIVE_FIELD_KEYWORDS
+            if re.search(rf"(^|[^a-z0-9]){re.escape(keyword)}([^a-z0-9]|$)", lowered)
+        )
+        if keywords:
+            markers.append(
+                {
+                    "field_path": field_path,
+                    "matched_keywords": keywords,
+                }
+            )
+    return markers[:20]
+
+
+def rewrite_response_review_observation(
+    row: dict[str, Any],
+    *,
+    index: int,
+    approved_paths: set[str],
+) -> dict[str, Any]:
+    path = str(row.get("path") or "")
+    method = str(row.get("method") or "").upper()
+    sample = str(row.get("response_sample") or row.get("body_sample") or "")
+    status = row.get("status")
+    status_int = status if isinstance(status, int) else None
+    successful = status_int is not None and 200 <= status_int < 300
+    sensitivity = rewrite_path_candidate_sensitivity(path)
+    field_markers = rewrite_response_sensitive_field_markers(sample)
+    secret_pattern_seen = contains_unredacted_secret_text(sample)
+    json_fields = response_sample_json_field_paths(sample, limit=20)
+    approved_path = path in approved_paths
+    impact_indicators = []
+    if successful:
+        impact_indicators.append("successful-response")
+    if field_markers:
+        impact_indicators.append("sensitive-json-field-names")
+    if secret_pattern_seen:
+        impact_indicators.append("secret-like-response-sample")
+    if sensitivity.get("priority") == "high" and sample.strip():
+        impact_indicators.append("high-sensitivity-path-nonempty-response")
+    candidate_impact = bool(successful and approved_path and (field_markers or secret_pattern_seen))
+    if candidate_impact:
+        review_status = "candidate-impact-evidence"
+    elif successful and approved_path:
+        review_status = "approved-response-observed"
+    elif approved_path:
+        review_status = "approved-response-non-success"
+    else:
+        review_status = "unapproved-or-unmatched-observation"
+    return {
+        "id": f"REWRITE-RESP-{index:03d}",
+        "status": review_status,
+        "method": method,
+        "path": path,
+        "approved_path": approved_path,
+        "response": {
+            "status": status,
+            "content_type": row.get("content_type"),
+            "sample_present": bool(sample.strip()),
+            "response_sample": redact_text(sample, max_chars=500),
+        },
+        "path_sensitivity": sensitivity,
+        "json_field_paths": json_fields,
+        "sensitive_field_markers": field_markers,
+        "impact_indicators": impact_indicators,
+        "candidate_impact": candidate_impact,
+        "evidence_ref": {
+            "artifact": "burp-history-observations.jsonl",
+            "line": index,
+        },
+        "safety": "Existing normalized observation only. No raw Burp history is read and no request is sent.",
+    }
+
+
+def build_rewrite_response_review(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    endpoint_clusters, endpoint_clusters_source = endpoint_clusters_for_hypothesis_matrix(
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
+    rewrite_review = build_rewrite_review_run(target=target, profile=profile, artifact_dir=artifact_dir)
+    burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
+    items = []
+    for rewrite_item in rewrite_review.get("items", []) or []:
+        if not isinstance(rewrite_item, dict):
+            continue
+        cluster_id = str(rewrite_item.get("cluster_id") or "")
+        approved_paths = {
+            str(candidate.get("local_path") or "")
+            for candidate in rewrite_item.get("read_only_path_candidates", []) or []
+            if isinstance(candidate, dict) and candidate.get("local_path")
+        }
+        observations = []
+        for index, row in enumerate(burp_history, start=1):
+            if not isinstance(row, dict):
+                continue
+            row_method = str(row.get("method") or "")
+            row_path = str(row.get("path") or "")
+            row_clusters = classify_endpoint(row_method, row_path, endpoint_clusters)
+            if cluster_id not in row_clusters and row_path not in approved_paths:
+                continue
+            observations.append(
+                rewrite_response_review_observation(
+                    row,
+                    index=index,
+                    approved_paths=approved_paths,
+                )
+            )
+        approved_observations = [row for row in observations if row.get("approved_path")]
+        candidate_impact_observations = [row for row in observations if row.get("candidate_impact")]
+        if candidate_impact_observations:
+            item_status = "candidate-impact-review"
+        elif approved_observations:
+            item_status = "approved-response-observed"
+        elif observations:
+            item_status = "observed-unapproved-only"
+        else:
+            item_status = "missing-approved-response"
+        items.append(
+            {
+                "id": f"REWRITE-RESPONSE-{safe_probe_id(rewrite_item.get('id') or rewrite_item.get('path'))}",
+                "status": item_status,
+                "priority": rewrite_item.get("priority"),
+                "rewrite_review_id": rewrite_item.get("id"),
+                "cluster_id": cluster_id,
+                "path": rewrite_item.get("path"),
+                "approved_path_candidates": sorted(approved_paths),
+                "observed_approved_response_count": len(approved_observations),
+                "candidate_impact_observation_count": len(candidate_impact_observations),
+                "unapproved_observation_count": len(observations) - len(approved_observations),
+                "observations": observations[:10],
+                "next_step": (
+                    "Open finding-gate only after manual review confirms authorization bypass, sensitive data exposure, path confusion, or equivalent concrete impact."
+                    if candidate_impact_observations
+                    else "Observe exactly one approved read-only path after scope and resource gates; do not enumerate catch-all paths."
+                    if not approved_observations
+                    else "Review the approved response for concrete impact; static route shape and a 2xx alone are not enough."
+                ),
+            }
+        )
+    status_counts: dict[str, int] = {}
+    approved_count = 0
+    candidate_impact_count = 0
+    for item in items:
+        increment_count(status_counts, str(item.get("status") or "unknown"))
+        approved_count += int(item.get("observed_approved_response_count") or 0)
+        candidate_impact_count += int(item.get("candidate_impact_observation_count") or 0)
+    if candidate_impact_count:
+        status = "candidate-impact-review"
+    elif approved_count:
+        status = "approved-response-observed"
+    elif burp_history:
+        status = "no-approved-rewrite-response"
+    else:
+        status = "no-burp-observations"
+    return {
+        "generated_at": utc_now(),
+        "status": status,
+        "target": target,
+        "profile": profile_summary(profile),
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "summary": {
+            "items": len(items),
+            "status_counts": dict(sorted(status_counts.items())),
+            "burp_observations": len(burp_history),
+            "observed_approved_responses": approved_count,
+            "candidate_impact_observations": candidate_impact_count,
+            "endpoint_clusters_source": endpoint_clusters_source,
+            "rewrite_review": rewrite_review.get("status"),
+        },
+        "items": items,
+        "artifact_refs": {
+            "burp_history": "burp-history-observations.jsonl",
+            "rewrite_review": REWRITE_REVIEW_ARTIFACT,
+            "rewrite_validation_checklist": REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
+        },
+        "reportability_gate": (
+            "Response review indexes candidate evidence only. A reportable finding still requires manual finding-gate review "
+            "that ties one approved response to unauthorized sensitive data exposure, upstream path confusion, authorization bypass, or equivalent impact."
+        ),
+        "safety": (
+            "Offline response review only. It reads normalized redacted observations and does not query Burp, read raw history, "
+            "send requests, enumerate paths, sign wallets, or submit transactions."
+        ),
+    }
+
+
 def validation_allowed_commands(
     *,
     artifact_dir: Path,
@@ -12826,6 +13112,7 @@ def validation_allowed_commands(
     ]
     if rewrite_review_item:
         allowed_now_commands.insert(3, command("rewrite-validation-checklist --no-write --show-candidates --show-commands"))
+        allowed_now_commands.insert(4, command("rewrite-response-review --no-write --show-observations"))
     if hypothesis.get("type") == "resource-abuse-review" or hypothesis.get("impact") == "resource-exhaustion":
         allowed_now_commands.insert(3, command("operator-evidence-review --no-write --show-missing --show-template"))
         allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
@@ -31985,6 +32272,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("hypothesis-matrix", "run_hypothesis_matrix"),
         refresh_expectation("rewrite-review", "run_rewrite_review"),
         refresh_expectation("rewrite-validation-checklist", "run_rewrite_validation_checklist"),
+        refresh_expectation("rewrite-response-review", "run_rewrite_response_review"),
         refresh_expectation("deployment-review", "run_deployment_review"),
         refresh_expectation("operator-evidence-review", "run_operator_evidence_review"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
@@ -32238,6 +32526,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         credential_impact_checklist_output_dir = root / "credential-impact-checklist-output"
         operator_evidence_review_output_dir = root / "operator-evidence-review-output"
         websocket_candidate_review_output_dir = root / "websocket-candidate-review-output"
+        rewrite_response_review_output_dir = root / "rewrite-response-review-output"
         decode_transactions_output_dir = root / "decode-transactions-output"
         promote_output_dir = root / "promote-output"
         invalid_promote_output_dir = root / "invalid-promote-output"
@@ -32484,6 +32773,21 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--no-write",
                 ]
             )
+            rewrite_response_review_return_code, rewrite_response_review_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(rewrite_response_review_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "rewrite-response-review",
+                    "--no-write",
+                    "--show-observations",
+                ]
+            )
             decode_transactions_return_code, decode_transactions_stdout = run_cli(
                 [
                     "--profile",
@@ -32676,6 +32980,16 @@ def build_no_write_selftest() -> dict[str, Any]:
             "websocket_candidate_review_manifest": (
                 websocket_candidate_review_output_dir / MANIFEST_NAME
             ).exists(),
+            "rewrite_response_review_dir": rewrite_response_review_output_dir.exists(),
+            "rewrite_response_review_target_profile_json": (
+                rewrite_response_review_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "rewrite_response_review_json": (
+                rewrite_response_review_output_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT
+            ).exists(),
+            "rewrite_response_review_manifest": (
+                rewrite_response_review_output_dir / MANIFEST_NAME
+            ).exists(),
             "decode_transactions_dir": decode_transactions_output_dir.exists(),
             "decode_transactions_target_profile_json": (
                 decode_transactions_output_dir / TARGET_PROFILE_ARTIFACT
@@ -32722,6 +33036,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     credential_impact_checklist_stdout_text = "\n".join(credential_impact_checklist_stdout)
     operator_evidence_review_stdout_text = "\n".join(operator_evidence_review_stdout)
     websocket_candidate_review_stdout_text = "\n".join(websocket_candidate_review_stdout)
+    rewrite_response_review_stdout_text = "\n".join(rewrite_response_review_stdout)
     decode_transactions_stdout_text = "\n".join(decode_transactions_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
     invalid_promote_stdout_text = "\n".join(invalid_promote_stdout)
@@ -33433,6 +33748,32 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": websocket_candidate_review_return_code,
                 "stdout": websocket_candidate_review_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "rewrite-response-review-no-write-skips-artifacts",
+            "passed": (
+                rewrite_response_review_return_code == 0
+                and "Rewrite response review:" in rewrite_response_review_stdout_text
+                and "Responses:" in rewrite_response_review_stdout_text
+                and "Gate:" in rewrite_response_review_stdout_text
+                and "No files written (--no-write)." in rewrite_response_review_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "rewrite_response_review_dir",
+                        "rewrite_response_review_target_profile_json",
+                        "rewrite_response_review_json",
+                        "rewrite_response_review_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in rewrite_response_review_stdout)
+            ),
+            "expected": "rewrite-response-review --no-write prints response evidence status without writing artifacts or manifests",
+            "actual": {
+                "return_code": rewrite_response_review_return_code,
+                "stdout": rewrite_response_review_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -48005,6 +48346,76 @@ def run_rewrite_validation_checklist(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_rewrite_response_review(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    review = build_rewrite_response_review(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT
+    )
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(review))
+
+    summary = review.get("summary", {}) or {}
+    print(f"Rewrite response review: {review['status']}")
+    print(
+        "Responses: "
+        f"items={summary.get('items', 0)} "
+        f"burp_observations={summary.get('burp_observations', 0)} "
+        f"approved={summary.get('observed_approved_responses', 0)} "
+        f"candidate_impact={summary.get('candidate_impact_observations', 0)} "
+        f"statuses={json.dumps(summary.get('status_counts', {}), sort_keys=True)}"
+    )
+    for item in (review.get("items", []) or [])[: max(0, int(args.top))]:
+        print(
+            f"- {item.get('priority')} {item.get('status')} "
+            f"path={item.get('path') or '-'} approved={item.get('observed_approved_response_count', 0)} "
+            f"candidate_impact={item.get('candidate_impact_observation_count', 0)}"
+        )
+        if args.show_observations:
+            for observation in (item.get("observations", []) or [])[:3]:
+                print(
+                    "  observation="
+                    f"{observation.get('method')} {observation.get('path')} "
+                    f"status={((observation.get('response') or {}).get('status'))} "
+                    f"approved={observation.get('approved_path')} "
+                    f"indicators={','.join(observation.get('impact_indicators', []) or []) or '-'}"
+                )
+                markers = observation.get("sensitive_field_markers", []) or []
+                for marker in markers[:3]:
+                    print(
+                        "    field="
+                        f"{marker.get('field_path')} "
+                        f"keywords={','.join(marker.get('matched_keywords', []) or [])}"
+                    )
+    print(f"Gate: {inline_summary_text(review.get('reportability_gate'), max_chars=280)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="rewrite-response-review",
+                output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+            )
+        )
+    if args.strict and review["status"] != "candidate-impact-review":
+        return 1
+    return 0
+
+
 def run_deployment_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -51094,6 +51505,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless at least one rewrite path is ready for a no-write promotion preview.",
     )
     rewrite_validation_checklist.set_defaults(func=run_rewrite_validation_checklist)
+
+    rewrite_response_review = sub.add_parser(
+        "rewrite-response-review",
+        help="Review one approved rewrite response from normalized observations without sending requests",
+    )
+    rewrite_response_review.add_argument(
+        "--output",
+        help=(
+            f"Where to write {REWRITE_RESPONSE_REVIEW_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{REWRITE_RESPONSE_REVIEW_ARTIFACT}."
+        ),
+    )
+    rewrite_response_review.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of rewrite response review items to print.",
+    )
+    rewrite_response_review.add_argument(
+        "--show-observations",
+        action="store_true",
+        help="Print compact approved-response and candidate-impact observation details.",
+    )
+    rewrite_response_review.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print rewrite response review only; do not write {REWRITE_RESPONSE_REVIEW_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    rewrite_response_review.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless an approved rewrite response has candidate impact indicators.",
+    )
+    rewrite_response_review.set_defaults(func=run_rewrite_response_review)
 
     deployment_review = sub.add_parser(
         "deployment-review",
