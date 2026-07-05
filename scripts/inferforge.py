@@ -37451,9 +37451,10 @@ def oracle_plan_action_score(action: dict[str, Any], *, assessment_mode: str) ->
     coverage_score = int(action.get("coverage_pressure") or 0)
     bounty_score = int(action.get("bounty_pressure") or 0)
     validity_score = int(action.get("validity_pressure") or 0)
+    evidence_score = int(action.get("evidence_closure_pressure") or 0)
     if assessment_mode == "blackbox":
         return bounty_score + validity_score
-    return coverage_score + validity_score
+    return coverage_score + evidence_score
 
 
 def oracle_plan_action_from_work_item(
@@ -37471,7 +37472,8 @@ def oracle_plan_action_from_work_item(
     priority_score = oracle_plan_priority_score(work_item.get("priority"))
     payoff_score = ORACLE_PLAN_TYPE_PAYOFF.get(oracle_type, 10)
     dependency_score = oracle_plan_dependency_score(dependency_kind)
-    validity_pressure = payoff_score + dependency_score + (15 if contract_ready else 0) - min(missing_artifacts, 10)
+    evidence_closure_pressure = dependency_score + (15 if contract_ready else 0) - min(missing_artifacts, 10)
+    validity_pressure = payoff_score + evidence_closure_pressure
     bounty_pressure = payoff_score + priority_score + (10 if active_traffic_required else 0) - (20 if operator_dependency else 0)
     coverage_pressure = priority_score + missing_artifacts + (10 if operator_dependency else 0)
     action = {
@@ -37501,6 +37503,7 @@ def oracle_plan_action_from_work_item(
         "coverage_pressure": coverage_pressure,
         "bounty_pressure": bounty_pressure,
         "validity_pressure": validity_pressure,
+        "evidence_closure_pressure": evidence_closure_pressure,
         "score": 0,
         "recommendation": "review-offline-first",
         "reason": (
@@ -59452,7 +59455,8 @@ def run_oracle_plan(args: argparse.Namespace) -> int:
                 "  pressure="
                 f"coverage:{action.get('coverage_pressure', 0)} "
                 f"bounty:{action.get('bounty_pressure', 0)} "
-                f"validity:{action.get('validity_pressure', 0)}"
+                f"validity:{action.get('validity_pressure', 0)} "
+                f"evidence:{action.get('evidence_closure_pressure', 0)}"
             )
             if action.get("reason"):
                 print(f"  reason={inline_summary_text(action.get('reason'), max_chars=260)}")
