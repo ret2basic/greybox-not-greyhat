@@ -1345,6 +1345,10 @@ Add `--current-resource-check` before considering active target traffic; when
 local memory or swap pressure makes the resource gate unhealthy, active queue
 items such as bounded `audit` reruns are marked `blocked-resource` while
 offline index/gate commands remain available.
+For WebSocket header-forwarding leads, run
+`websocket-candidate-review --no-write --show-evidence-contract` to print the
+required sensitive-header filters, auth-context status, reportability gates, and
+forbidden validation steps without opening sockets or importing Burp history.
 Manual-review or external-blocker items that have no generated command template
 also print compact follow-up details, including reason, prerequisites, review
 candidates, evidence refs, and safety notes, so commandless review work is
@@ -1359,13 +1363,16 @@ Each queue item also contains `command_safety` metadata. Commands are classified
 as `ready`, `manual-template` when they still contain `REPLACE_WITH_*`,
 `review-gated` when they depend on an approved/manual-review step, or
 `unsafe-template` when shell-sensitive placeholder syntax such as `<...>` or
-control operators are present. The CLI and reproduction steps print command
-safety totals for runnable, manual-input, external-blocked, unsafe, and
-placeholder counts so unattended runs can tell whether commands are ready to
-execute. `verification-queue` returns a non-zero status if unsafe command
-templates are generated. Human-review and external-configuration states are
-encoded in the JSON artifacts; use `review-blockers --strict` when those states
-should fail a CI job.
+control operators are present. Commands that reference protected control-plane
+ports are also classified as `unsafe-template`; these ports must not appear in
+watch-port, readiness, health-check, resource-check, probe, or reclaim command
+templates. The CLI and reproduction steps print command safety totals for
+runnable, manual-input, external-blocked, unsafe, and placeholder counts so
+unattended runs can tell whether commands are ready to execute.
+`verification-queue` returns a non-zero status if unsafe command templates are
+generated. Human-review and external-configuration states are encoded in the
+JSON artifacts; use `review-blockers --strict` when those states should fail a
+CI job.
 
 `review-blockers` writes `.greybox/review-blockers.json` plus
 `.greybox/review-blockers.md`, a read-only summary of the human-review,

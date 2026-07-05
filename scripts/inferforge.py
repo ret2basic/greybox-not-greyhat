@@ -7807,6 +7807,59 @@ def websocket_cookie_name_sensitivity(name: str) -> str:
     return "unknown"
 
 
+def websocket_header_forwarding_evidence_contract(
+    *,
+    missing_sensitive_header_filters: list[str],
+    auth_context_status: str,
+    auth_context_summary: dict[str, Any] | None = None,
+    leads: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    lead_files = ordered_unique_strings(
+        [lead.get("file") for lead in leads or [] if isinstance(lead, dict) and lead.get("file")]
+    )
+    context_headers = ordered_unique_strings(
+        [
+            header
+            for lead in leads or []
+            if isinstance(lead, dict)
+            for header in (lead.get("context_headers_seen", []) or [])
+        ]
+    )
+    return {
+        "id": "websocket-header-forwarding-evidence-contract",
+        "entrypoint": "WS /api/rpc/solana/{cluster}",
+        "missing_sensitive_header_filters": ordered_unique_strings(missing_sensitive_header_filters),
+        "required_header_filters": sorted(WEBSOCKET_HEADER_FORWARDING_REQUIRED_FILTERS),
+        "context_headers_seen": context_headers,
+        "auth_context_status": auth_context_status,
+        "auth_context_summary": auth_context_summary or {},
+        "source_files": lead_files,
+        "reportable_only_if": [
+            "Application-origin WebSocket requests carry sensitive cookies, session tokens, Authorization material, or equivalent user/account credentials.",
+            "The upstream WebSocket provider receives, logs, trusts, or bills based on forwarded client headers.",
+            "Browser and non-browser constraints are understood for the exact forwarded header needed to demonstrate impact.",
+            "Concrete disclosure, authorization confusion, trust-boundary confusion, quota/account attribution, or equivalent impact is evidenced.",
+        ],
+        "not_reportable_when": [
+            "Only non-sensitive preference cookies or visual theme cookies exist on the WebSocket origin.",
+            "Sensitive client headers are explicitly stripped before constructing the upstream WebSocket.",
+            "The upstream provider ignores or never receives the forwarded client headers.",
+            "The only evidence is static header forwarding without auth/header context or upstream trust/disclosure impact.",
+        ],
+        "safe_evidence_sources": [
+            "Redacted source review showing exactly which request headers are forwarded or filtered.",
+            "Redacted cookie/auth context showing only names, categories, and sensitivity, never values.",
+            "Provider/operator documentation or statements showing whether upstream logs or trusts forwarded headers.",
+            "One approved minimal handshake/header observation only after resource and scope gates are healthy.",
+        ],
+        "forbidden_validation": [
+            "No WebSocket subscription frames, wallet payloads, trading messages, or resource-pressure tests.",
+            "No raw cookies, bearer tokens, API keys, private keys, seed phrases, or full Burp history artifacts.",
+            "No browser automation or Burp history import while the resource gate blocks active target traffic.",
+        ],
+    }
+
+
 def build_websocket_auth_context_review(
     source_root: Path,
     *,
@@ -8151,6 +8204,17 @@ def build_websocket_header_forwarding_review(
             }
             files.append(file_review)
             if file_status in {"needs-header-trust-review", "header-forwarding-pattern-needs-review"}:
+                lead_contract = websocket_header_forwarding_evidence_contract(
+                    missing_sensitive_header_filters=missing_sensitive_filters,
+                    auth_context_status=auth_context_status,
+                    auth_context_summary=auth_context_summary,
+                    leads=[
+                        {
+                            "file": rel,
+                            "context_headers_seen": context_headers,
+                        }
+                    ],
+                )
                 leads.append(
                     {
                         "id": f"websocket-header-forwarding:{safe_probe_id(rel)}",
@@ -8180,6 +8244,7 @@ def build_websocket_header_forwarding_review(
                             "Source-level forwarding of request headers to an upstream WebSocket is not reportable by itself. "
                             "Escalate only with authentication/header-context and upstream trust or disclosure evidence."
                         ),
+                        "evidence_contract": lead_contract,
                     }
                 )
         if scanned >= max_files:
@@ -8205,6 +8270,12 @@ def build_websocket_header_forwarding_review(
             if file_review.get("status") in {"needs-header-trust-review", "header-forwarding-pattern-needs-review"}
         }
     )
+    evidence_contract = websocket_header_forwarding_evidence_contract(
+        missing_sensitive_header_filters=all_missing_filters,
+        auth_context_status=auth_context_status,
+        auth_context_summary=auth_context_summary,
+        leads=leads,
+    )
     return {
         "generated_at": utc_now(),
         "status": status,
@@ -8228,6 +8299,7 @@ def build_websocket_header_forwarding_review(
         "skipped": skipped,
         "leads": leads,
         "auth_context": auth_context,
+        "evidence_contract": evidence_contract,
         "reportability_gate": (
             "This source review only identifies WebSocket header-forwarding patterns and is not reportable by itself. "
             "It does not prove a vulnerability without auth/header context, browser/client constraints, and upstream "
@@ -11313,6 +11385,7 @@ def hypothesis_from_queue_item(
             )
         ),
         "required_evidence": item.get("required_evidence", []),
+        "evidence_contract": item.get("evidence_contract") if isinstance(item.get("evidence_contract"), dict) else {},
         "evidence_refs": ["verification-queue.json", "reproduction-steps.md"],
         "safety": "Queue-derived hypothesis. It is a next-step candidate, not vulnerability evidence.",
     }
@@ -28915,9 +28988,41 @@ def external_probe_flags_in_command(command: str) -> list[str]:
     return [flag for flag in EXTERNAL_PROBE_COMMAND_FLAGS if flag in token_set]
 
 
-def classify_verification_command(command: str, *, source: str, item_status: str | None = None) -> dict[str, Any]:
+def protected_control_plane_ports_in_command(
+    command: str,
+    protected_ports: Iterable[int] | None = None,
+) -> list[int]:
+    ports = {
+        int(port)
+        for port in (PROTECTED_CONTROL_PLANE_PORTS if protected_ports is None else protected_ports)
+    }
+    matches = []
+    for port in sorted(ports):
+        port_text = str(port)
+        patterns = [
+            rf"(?:^|\s)--(?:watch-port|port)(?:=|\s+){re.escape(port_text)}(?:\s|$)",
+            rf"(?:^|\s)-p(?:=|\s+){re.escape(port_text)}(?:\s|$)",
+            rf"\b(?:port|listen|addr|address)[=:]{re.escape(port_text)}\b",
+            rf":{re.escape(port_text)}\b",
+        ]
+        if any(re.search(pattern, command) for pattern in patterns):
+            matches.append(port)
+    return matches
+
+
+def classify_verification_command(
+    command: str,
+    *,
+    source: str,
+    item_status: str | None = None,
+    protected_ports: Iterable[int] | None = None,
+) -> dict[str, Any]:
     normalized = normalize_manual_placeholder_command(str(command))
     external_probe_flags = external_probe_flags_in_command(normalized)
+    protected_control_ports = protected_control_plane_ports_in_command(
+        normalized,
+        protected_ports=protected_ports,
+    )
     known_placeholders = [
         PLACEHOLDER_REAL_WALLET,
         PLACEHOLDER_APPROVED_POOL_ADDRESS,
@@ -28945,6 +29050,8 @@ def classify_verification_command(command: str, *, source: str, item_status: str
         issues.append("shell-angle-placeholder-or-redirection")
     if unsafe_shell_operators:
         issues.append("shell-control-operator")
+    if protected_control_ports:
+        issues.append("protected-control-plane-port")
 
     if issues:
         classification = "unsafe-template"
@@ -28977,6 +29084,7 @@ def classify_verification_command(command: str, *, source: str, item_status: str
         "external_probe_flags": external_probe_flags,
         "placeholders": placeholders,
         "issues": issues,
+        "protected_control_plane_port_refs": len(protected_control_ports),
     }
 
 
@@ -29035,6 +29143,7 @@ def verification_queue_exit_code(verification_queue: dict[str, Any]) -> int:
 
 
 def build_command_safety_selftest() -> dict[str, Any]:
+    synthetic_control_plane_port = 65432
     cases = [
         {
             "id": "ready-command",
@@ -29114,6 +29223,17 @@ def build_command_safety_selftest() -> dict[str, Any]:
             "expected_classification": "unsafe-template",
             "expected_issues": ["shell-control-operator"],
         },
+        {
+            "id": "protected-control-plane-port-unsafe",
+            "command": f"python3 scripts/inferforge.py resource-snapshot --watch-port {synthetic_control_plane_port} --no-write",
+            "item_status": "ready",
+            "protected_ports": [synthetic_control_plane_port],
+            "expected_classification": "unsafe-template",
+            "expected_issues": ["protected-control-plane-port"],
+            "expected_protected_control_plane_port_refs": 1,
+            "expected_runnable": False,
+            "expected_requires_manual_input": True,
+        },
     ]
 
     results = []
@@ -29123,6 +29243,7 @@ def build_command_safety_selftest() -> dict[str, Any]:
             str(case["command"]),
             source=f"command-safety-selftest:{case['id']}",
             item_status=str(case.get("item_status") or ""),
+            protected_ports=case.get("protected_ports"),
         )
         results.append({**case, "result": result})
         assertions.append(
@@ -29163,6 +29284,16 @@ def build_command_safety_selftest() -> dict[str, Any]:
                     "passed": issue in (result.get("issues", []) or []),
                     "expected": issue,
                     "actual": result.get("issues", []),
+                }
+            )
+        if "expected_protected_control_plane_port_refs" in case:
+            assertions.append(
+                {
+                    "id": f"{case['id']}:protected-control-plane-port-refs",
+                    "passed": result.get("protected_control_plane_port_refs")
+                    == case.get("expected_protected_control_plane_port_refs"),
+                    "expected": case.get("expected_protected_control_plane_port_refs"),
+                    "actual": result.get("protected_control_plane_port_refs"),
                 }
             )
         if "expected_external_probe_flags" in case:
@@ -30070,7 +30201,7 @@ def build_verification_queue(
                 "toward an upstream socket without enough evidence to classify impact. "
                 f"Auth context: {websocket_auth_context_status}."
             ),
-            commands=[cmd("websocket-candidate-review --no-write")],
+            commands=[cmd("websocket-candidate-review --no-write --show-evidence-contract")],
             evidence_refs=[WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT],
             prerequisites=[
                 "Confirm whether the application sets cookies, session tokens, or Authorization material on the WebSocket origin.",
@@ -30091,6 +30222,7 @@ def build_verification_queue(
                 ),
                 "reportability_gate": websocket_source_review.get("reportability_gate")
                 or "WebSocket header forwarding is not reportable without auth/header context and upstream trust evidence.",
+                "evidence_contract": websocket_source_review.get("evidence_contract", {}),
                 "required_evidence": [
                     (
                         "Authentication context showing whether cookies, sessions, or Authorization material exist "
@@ -45038,12 +45170,33 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
     websocket_bad_summary = websocket_header_forwarding_bad_review.get("summary") or {}
     websocket_bad_auth_summary = websocket_bad_summary.get("auth_context_summary") or {}
     websocket_bad_leads = websocket_header_forwarding_bad_review.get("leads", []) or []
+    websocket_bad_contract = (
+        websocket_header_forwarding_bad_review.get("evidence_contract")
+        if isinstance(websocket_header_forwarding_bad_review.get("evidence_contract"), dict)
+        else {}
+    )
+    websocket_bad_lead_contract = (
+        websocket_bad_leads[0].get("evidence_contract", {})
+        if websocket_bad_leads and isinstance(websocket_bad_leads[0], dict)
+        else {}
+    )
     websocket_theme_summary = websocket_header_forwarding_theme_review.get("summary") or {}
     websocket_theme_auth_summary = websocket_theme_summary.get("auth_context_summary") or {}
     websocket_theme_leads = websocket_header_forwarding_theme_review.get("leads", []) or []
     websocket_server_auth_summary = websocket_header_forwarding_server_auth_review.get("summary") or {}
     websocket_server_auth_context_summary = websocket_server_auth_summary.get("auth_context_summary") or {}
     websocket_server_auth_leads = websocket_header_forwarding_server_auth_review.get("leads", []) or []
+    websocket_queue_contract = (
+        websocket_queue_item.get("evidence_contract")
+        if isinstance(websocket_queue_item.get("evidence_contract"), dict)
+        else {}
+    )
+    websocket_matrix_contract = (
+        websocket_matrix_hypothesis.get("evidence_contract")
+        if isinstance(websocket_matrix_hypothesis.get("evidence_contract"), dict)
+        else {}
+    )
+    websocket_queue_commands_text = "\n".join(websocket_queue_item.get("commands", []) or [])
     websocket_low_queue_hypothesis = hypothesis_from_queue_item(
         {
             "id": "REVIEW-websocket-low-context",
@@ -45074,6 +45227,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and websocket_bad_leads
         and websocket_bad_leads[0].get("priority") == "medium"
         and websocket_bad_leads[0].get("auth_context_status") == "sensitive-app-auth-context"
+        and websocket_bad_contract.get("id") == "websocket-header-forwarding-evidence-contract"
+        and set(websocket_bad_contract.get("missing_sensitive_header_filters", [])) == {"authorization", "cookie"}
+        and websocket_bad_contract.get("auth_context_status") == "sensitive-app-auth-context"
+        and any(
+            "No WebSocket subscription frames" in str(item)
+            for item in websocket_bad_contract.get("forbidden_validation", []) or []
+        )
+        and websocket_bad_lead_contract.get("id") == "websocket-header-forwarding-evidence-contract"
         and websocket_header_forwarding_filtered_review.get("status") == "header-forwarding-filtered"
         and (websocket_header_forwarding_filtered_review.get("summary") or {}).get("lead_count") == 0
         and websocket_header_forwarding_theme_review.get("status") == "needs-header-trust-review"
@@ -45099,16 +45260,20 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and websocket_queue_item.get("offline_only") is True
         and websocket_queue_item.get("impact") == "websocket-header-forwarding"
         and websocket_queue_item.get("websocket_auth_context_status") == "sensitive-app-auth-context"
-        and "websocket-candidate-review --no-write" in "\n".join(websocket_queue_item.get("commands", []) or [])
+        and "websocket-candidate-review --no-write" in websocket_queue_commands_text
+        and "--show-evidence-contract" in websocket_queue_commands_text
+        and websocket_queue_contract.get("id") == "websocket-header-forwarding-evidence-contract"
         and websocket_matrix_hypothesis.get("status") == "ready-for-offline-review"
         and websocket_matrix_hypothesis.get("offline_only") is True
         and websocket_matrix_hypothesis.get("impact") == "websocket-header-forwarding"
+        and websocket_matrix_contract.get("id") == "websocket-header-forwarding-evidence-contract"
         and websocket_low_queue_hypothesis.get("priority") == "low"
         and procedural_queue_hypothesis.get("priority") == "info"
         and procedural_queue_hypothesis.get("queue_role") == "procedural-refresh"
         and procedural_queue_hypothesis.get("impact") == "process-readiness"
         and websocket_validation_item.get("status") == "ready-offline"
         and "websocket-candidate-review --no-write" in websocket_validation_allowed_now
+        and "--show-evidence-contract" in websocket_validation_allowed_now
     )
     blackbox_asset_profile_paths = {
         cluster.get("path")
@@ -48440,6 +48605,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "bad_review": {
                 "status": websocket_header_forwarding_bad_review.get("status"),
                 "summary": websocket_header_forwarding_bad_review.get("summary", {}),
+                "evidence_contract": websocket_bad_contract,
                 "leads": websocket_header_forwarding_bad_review.get("leads", []),
             },
             "filtered_review": {
@@ -48450,6 +48616,14 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "candidate_review": {
                 "status": websocket_header_forwarding_candidate_review.get("status"),
                 "summary": websocket_header_forwarding_candidate_review.get("summary", {}),
+            },
+            "contract_flow": {
+                "source_contract": websocket_bad_contract.get("id"),
+                "lead_contract": websocket_bad_lead_contract.get("id"),
+                "queue_contract": websocket_queue_contract.get("id"),
+                "matrix_contract": websocket_matrix_contract.get("id"),
+                "queue_commands": websocket_queue_item.get("commands", []),
+                "validation_allowed_now": websocket_validation_allowed_now,
             },
             "queue_item": websocket_queue_item,
             "matrix_hypothesis": websocket_matrix_hypothesis,
@@ -52267,6 +52441,24 @@ def run_websocket_candidate_review(args: argparse.Namespace) -> int:
         f"missing_filters={','.join(source_summary.get('missing_sensitive_header_filters', []) or []) or '(none)'} "
         f"auth_context={source_summary.get('auth_context_status', 'not-run')}"
     )
+    if args.show_evidence_contract:
+        contract = (
+            source_review.get("evidence_contract")
+            if isinstance(source_review.get("evidence_contract"), dict)
+            else {}
+        )
+        if contract:
+            print(
+                "Evidence contract: "
+                f"{contract.get('id')} "
+                f"entrypoint={contract.get('entrypoint') or '-'} "
+                f"missing_filters={','.join(contract.get('missing_sensitive_header_filters', []) or []) or 'none'} "
+                f"auth_context={contract.get('auth_context_status') or 'unknown'}"
+            )
+            for gate in (contract.get("reportable_only_if", []) or [])[:2]:
+                print(f"  gate={inline_summary_text(gate, max_chars=260)}")
+            for stop in (contract.get("forbidden_validation", []) or [])[:2]:
+                print(f"  stop={inline_summary_text(stop, max_chars=260)}")
     if args.no_write:
         print("No files written (--no-write).")
     else:
@@ -56404,6 +56596,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-write",
         action="store_true",
         help="Print review summary only; do not write websocket-candidate-review.json or refresh manifests.",
+    )
+    websocket_candidate_review.add_argument(
+        "--show-evidence-contract",
+        action="store_true",
+        help="Print the WebSocket header-forwarding evidence contract for source-review leads.",
     )
     websocket_candidate_review.add_argument(
         "--allow-resource-warning",
