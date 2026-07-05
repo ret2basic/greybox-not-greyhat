@@ -38545,6 +38545,47 @@ def build_oracle_plan_from_review_blockers(
     }
 
 
+def oracle_plan_operator_sidecar_templates_doc(
+    oracle_plan: dict[str, Any],
+    *,
+    limit: int,
+) -> dict[str, Any]:
+    actions = [
+        action
+        for action in oracle_plan.get("actions", []) or []
+        if isinstance(action, dict)
+    ][: max(0, int(limit))]
+    templates = []
+    for action in actions:
+        template = (
+            action.get("operator_evidence_minimal_sidecar_template")
+            if isinstance(action.get("operator_evidence_minimal_sidecar_template"), dict)
+            else {}
+        )
+        items = [
+            item
+            for item in template.get("evidence_items", []) or []
+            if isinstance(item, dict)
+        ]
+        if not items:
+            continue
+        row = json_clone(template)
+        row["oracle_action_id"] = action.get("id")
+        row["oracle_type"] = action.get("oracle_type")
+        row["evidence_contract_kind"] = action.get("evidence_contract_kind")
+        row["recommendation"] = action.get("recommendation")
+        templates.append(row)
+    return {
+        "schema": "inferforge-oracle-operator-sidecar-templates-v1",
+        "status": "templates-present" if templates else "no-operator-sidecar-templates",
+        "template_count": len(templates),
+        "templates": templates,
+        "safety": (
+            "Template preview only. It is not evidence, sends no traffic, and must not contain secrets or raw target/provider data."
+        ),
+    }
+
+
 def finding_gate_preview_blocker_strings(preview: dict[str, Any]) -> list[str]:
     blockers: list[Any] = []
     for check in preview.get("checks", []) or []:
@@ -39889,6 +39930,22 @@ def build_review_blockers_selftest() -> dict[str, Any]:
         },
         {"type": "provider-impact"},
     )
+    operator_template_preview_doc = oracle_plan_operator_sidecar_templates_doc(
+        {
+            "actions": [
+                {
+                    "id": "ORACLE-operator-template-selftest",
+                    "oracle_type": "provider-impact",
+                    "evidence_contract_kind": operator_contract.get("kind"),
+                    "recommendation": "park-until-operator-evidence",
+                    "operator_evidence_minimal_sidecar_template": operator_contract.get(
+                        "operator_evidence_minimal_sidecar_template"
+                    ),
+                }
+            ]
+        },
+        limit=1,
+    )
     credential_candidate_required_fields = quote_credential_impact_approval_review_candidate(
         {
             "status": "needs-provider-impact-evidence",
@@ -40257,6 +40314,30 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             ),
             "expected": "operator evidence contracts expose missing decision IDs and template rows when no sidecar field contract is present",
             "actual": operator_decision_fallback_contract,
+        },
+        {
+            "id": "oracle-plan-operator-sidecar-template-json-doc",
+            "passed": (
+                operator_template_preview_doc.get("status") == "templates-present"
+                and operator_template_preview_doc.get("template_count") == 1
+                and (
+                    (operator_template_preview_doc.get("templates") or [{}])[0].get("oracle_action_id")
+                    == "ORACLE-operator-template-selftest"
+                )
+                and (
+                    (operator_template_preview_doc.get("templates") or [{}])[0].get("evidence_contract_kind")
+                    == "provider-operator-cost-impact"
+                )
+                and (
+                    (
+                        (operator_template_preview_doc.get("templates") or [{}])[0].get("evidence_items")
+                        or [{}]
+                    )[0].get("id")
+                    == "credentialed-upstream-billing-impact"
+                )
+            ),
+            "expected": "oracle-plan sidecar template JSON preview preserves displayed action metadata and template items",
+            "actual": operator_template_preview_doc,
         },
         {
             "id": "operator-approval-review-candidates-preserve-required-fields",
@@ -60897,6 +60978,16 @@ def run_oracle_plan(args: argparse.Namespace) -> int:
                     print(f"  operator_template_item=... +{len(template_items) - 3} more")
             if action.get("reason"):
                 print(f"  reason={inline_summary_text(action.get('reason'), max_chars=260)}")
+    if getattr(args, "show_sidecar_template_json", False):
+        template_doc = oracle_plan_operator_sidecar_templates_doc(
+            oracle_plan,
+            limit=display_limit,
+        )
+        if template_doc.get("templates"):
+            print("Operator sidecar template JSON:")
+            print(json.dumps(sanitize_artifact_samples(template_doc), indent=2, sort_keys=False))
+        else:
+            print("Operator sidecar template JSON: none")
     remaining = len(oracle_plan.get("actions", []) or []) - display_limit
     if remaining > 0:
         if no_write:
@@ -67250,6 +67341,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-details",
         action="store_true",
         help="Print next-step, traffic policy, and pressure details for each action.",
+    )
+    oracle_plan.add_argument(
+        "--show-sidecar-template-json",
+        action="store_true",
+        help="Print per-oracle operator-evidence sidecar template JSON for displayed actions.",
     )
     oracle_plan.add_argument(
         "--no-write",
