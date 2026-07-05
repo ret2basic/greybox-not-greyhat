@@ -11313,6 +11313,62 @@ def cluster_needs_client_http_path_candidates(cluster: dict[str, Any]) -> bool:
     )
 
 
+def rewrite_path_candidate_sensitivity(path: str) -> dict[str, Any]:
+    lowered = str(path or "").lower()
+    keyword_weights = {
+        "admin": 5,
+        "internal": 5,
+        "secret": 5,
+        "token": 5,
+        "auth": 4,
+        "private": 4,
+        "vault": 4,
+        "wallet": 4,
+        "balance": 4,
+        "capital": 4,
+        "portfolio": 4,
+        "account": 4,
+        "billing": 4,
+        "invoice": 4,
+        "withdraw": 4,
+        "deposit": 4,
+        "dry-powder": 4,
+        "metrics": 3,
+        "project": 2,
+        "points": 1,
+        "leaderboard": 1,
+    }
+    matches = [
+        {"keyword": keyword, "weight": weight}
+        for keyword, weight in keyword_weights.items()
+        if keyword in lowered
+    ]
+    score = sum(int(match["weight"]) for match in matches)
+    priority = "high" if score >= 4 else "medium" if score >= 2 else "low"
+    return {
+        "priority": priority,
+        "score": score,
+        "matched_keywords": [match["keyword"] for match in matches],
+        "review_note": (
+            "Path keywords suggest potential sensitive business, account, wallet, or financial data. "
+            "Treat this only as a prioritization hint; one approved response is still required for impact."
+            if score >= 4
+            else "Path keywords suggest possible business-state data; review scope and sensitivity before any request."
+            if score >= 2
+            else "No high-sensitivity path keywords matched; still confirm scope and read-only behavior before any request."
+        ),
+    }
+
+
+def rewrite_candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, str, str]:
+    sensitivity = candidate.get("sensitivity") if isinstance(candidate.get("sensitivity"), dict) else {}
+    return (
+        -int(sensitivity.get("score") or 0),
+        str(candidate.get("method") or ""),
+        str(candidate.get("local_path") or candidate.get("client_path") or ""),
+    )
+
+
 def rewrite_path_candidates_for_cluster(
     cluster: dict[str, Any],
     client_candidates: list[dict[str, Any]],
@@ -11342,6 +11398,7 @@ def rewrite_path_candidates_for_cluster(
             "source_ref": candidate.get("source_ref"),
             "receiver": candidate.get("receiver"),
         }
+        row["sensitivity"] = rewrite_path_candidate_sensitivity(local_path)
         if any(token in api_path for token in ["${", "{", "}"]):
             row["status"] = "blocked-dynamic-template"
             row["reason"] = "Dynamic client API path is not a concrete approved rewrite validation path."
@@ -11353,11 +11410,17 @@ def rewrite_path_candidates_for_cluster(
                 "Confirm requesting this path will not disclose personal data, secrets, account state, or privileged records unless that is the intended impact check.",
                 "Promote exactly one concrete local_path into a Burp observation plan before sending traffic.",
             ]
+            if row["sensitivity"].get("priority") in {"medium", "high"}:
+                row["approval_required"].append(
+                    "Review path sensitivity keywords and confirm the single approved request is justified by scope and impact hypothesis."
+                )
             read_only.append(row)
         else:
             row["status"] = "blocked-non-read-only"
             row["reason"] = "Non-GET/HEAD client API path is not eligible for unattended rewrite validation."
             blocked.append(row)
+    read_only.sort(key=rewrite_candidate_sort_key)
+    blocked.sort(key=rewrite_candidate_sort_key)
     return {"read_only": read_only[:20], "blocked": blocked[:20]}
 
 
@@ -12669,12 +12732,27 @@ def build_rewrite_validation_checklist(
     priority_counts: dict[str, int] = {}
     read_only_count = 0
     blocked_count = 0
+    high_sensitivity_count = 0
     promotion_commands: list[str] = []
     for item in items:
         increment_count(status_counts, str(item.get("status") or "unknown"))
         increment_count(priority_counts, str(item.get("priority") or "info"))
-        read_only_count += len(item.get("read_only_path_candidates", []) or [])
+        read_only_candidates = item.get("read_only_path_candidates", []) or []
+        read_only_count += len(read_only_candidates)
         blocked_count += len(item.get("blocked_path_candidates", []) or [])
+        high_sensitivity_count += sum(
+            1
+            for candidate in read_only_candidates
+            if isinstance(candidate, dict)
+            and (
+                (
+                    candidate.get("sensitivity")
+                    if isinstance(candidate.get("sensitivity"), dict)
+                    else {}
+                ).get("priority")
+                == "high"
+            )
+        )
         promotion_commands.extend(
             str(command)
             for command in item.get("promotion_preview_commands", []) or []
@@ -12698,6 +12776,7 @@ def build_rewrite_validation_checklist(
             "priority_counts": dict(sorted(priority_counts.items())),
             "read_only_path_candidates": read_only_count,
             "blocked_path_candidates": blocked_count,
+            "high_sensitivity_read_only_candidates": high_sensitivity_count,
             "promotion_preview_commands": len(promotion_commands),
             "rewrite_review": rewrite_review.get("status"),
         },
@@ -47804,16 +47883,20 @@ def run_rewrite_review(args: argparse.Namespace) -> int:
                 read_only_candidates = item.get("read_only_path_candidates", []) or []
                 blocked_candidates = item.get("blocked_path_candidates", []) or []
                 for candidate in read_only_candidates[:3]:
+                    sensitivity = candidate.get("sensitivity") if isinstance(candidate.get("sensitivity"), dict) else {}
                     print(
                         "  candidate="
                         f"{candidate.get('method')} {candidate.get('local_path')} "
-                        f"source={candidate.get('source_ref')}"
+                        f"source={candidate.get('source_ref')} "
+                        f"sensitivity={sensitivity.get('priority') or 'unknown'}:{sensitivity.get('score', 0)}"
                     )
                 for candidate in blocked_candidates[:3]:
+                    sensitivity = candidate.get("sensitivity") if isinstance(candidate.get("sensitivity"), dict) else {}
                     print(
                         "  blocked_candidate="
                         f"{candidate.get('method')} {candidate.get('local_path')} "
-                        f"reason={inline_summary_text(candidate.get('reason'), max_chars=120)}"
+                        f"reason={inline_summary_text(candidate.get('reason'), max_chars=120)} "
+                        f"sensitivity={sensitivity.get('priority') or 'unknown'}:{sensitivity.get('score', 0)}"
                     )
 
     if no_write:
@@ -47856,6 +47939,7 @@ def run_rewrite_validation_checklist(args: argparse.Namespace) -> int:
         "Rewrite paths: "
         f"items={summary.get('items', 0)} "
         f"read_only_candidates={summary.get('read_only_path_candidates', 0)} "
+        f"high_sensitivity={summary.get('high_sensitivity_read_only_candidates', 0)} "
         f"blocked_candidates={summary.get('blocked_path_candidates', 0)} "
         f"promotion_previews={summary.get('promotion_preview_commands', 0)} "
         f"statuses={json.dumps(summary.get('status_counts', {}), sort_keys=True)}"
@@ -47867,16 +47951,20 @@ def run_rewrite_validation_checklist(args: argparse.Namespace) -> int:
         )
         if args.show_candidates:
             for candidate in (item.get("read_only_path_candidates", []) or [])[:3]:
+                sensitivity = candidate.get("sensitivity") if isinstance(candidate.get("sensitivity"), dict) else {}
                 print(
                     "  candidate="
                     f"{candidate.get('method')} {candidate.get('local_path')} "
-                    f"source={candidate.get('source_ref')}"
+                    f"source={candidate.get('source_ref')} "
+                    f"sensitivity={sensitivity.get('priority') or 'unknown'}:{sensitivity.get('score', 0)}"
                 )
             for candidate in (item.get("blocked_path_candidates", []) or [])[:3]:
+                sensitivity = candidate.get("sensitivity") if isinstance(candidate.get("sensitivity"), dict) else {}
                 print(
                     "  blocked_candidate="
                     f"{candidate.get('method')} {candidate.get('local_path')} "
-                    f"status={candidate.get('status')}"
+                    f"status={candidate.get('status')} "
+                    f"sensitivity={sensitivity.get('priority') or 'unknown'}:{sensitivity.get('score', 0)}"
                 )
         if args.show_commands:
             for command_text in (item.get("promotion_preview_commands", []) or [])[:3]:
