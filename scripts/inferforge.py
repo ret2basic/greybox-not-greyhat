@@ -167,6 +167,7 @@ BOUNTY_FRONTIER_ARTIFACT = "bounty-frontier.json"
 BOUNTY_VALIDATION_GATES_ARTIFACT = "bounty-validation-gates.json"
 BOUNTY_INVALIDITY_REVIEW_ARTIFACT = "bounty-invalidity-review.json"
 BOUNTY_READINESS_ROLLUP_ARTIFACT = "bounty-readiness-rollup.json"
+BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT = "bounty-evidence-workorders.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -284,6 +285,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     BOUNTY_VALIDATION_GATES_ARTIFACT,
     BOUNTY_INVALIDITY_REVIEW_ARTIFACT,
     BOUNTY_READINESS_ROLLUP_ARTIFACT,
+    BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -24099,6 +24101,362 @@ def build_bounty_readiness_rollup(
     }
 
 
+BOUNTY_REPORTABILITY_SOURCE_REFS = [
+    {
+        "id": "pkqs91-codex-web3-bounty-thread",
+        "url": "https://x.com/pkqs91/status/2070157806104457395",
+        "status": "x-login-gated-empty-fetch",
+        "takeaway": "Keep finder and triager separated; treat leads as allegations until official evidence closes them.",
+    },
+    {
+        "id": "hackerone-quality-reports",
+        "url": "https://docs.hackerone.com/en/articles/8475116-quality-reports",
+        "status": "reviewed",
+        "takeaway": "Quality reports need concise title, reproducible steps, impact, and supporting material.",
+    },
+    {
+        "id": "bugcrowd-reporting-a-bug",
+        "url": "https://docs.bugcrowd.com/researchers/reporting-managing-submissions/reporting-a-bug/",
+        "status": "reviewed",
+        "takeaway": "Reports should identify where the bug is, who it affects, how to reproduce it, impacted parameters, and PoC evidence.",
+    },
+    {
+        "id": "immunefi-rules",
+        "url": "https://immunefi.com/rules/",
+        "status": "reviewed",
+        "takeaway": "Avoid low-quality, incomplete, traffic-heavy, severity-misrepresented, or AI-generated reports without impact proof.",
+    },
+    {
+        "id": "invalid-report-reasons-llm-study",
+        "url": "https://arxiv.org/html/2511.18608v1",
+        "status": "reviewed",
+        "takeaway": "LLM-assisted triage tends to over-accept invalid reports; explicit invalidity taxonomy and RAG-style checks reduce bias.",
+    },
+]
+
+BOUNTY_WORKORDER_GLOBAL_ACCEPTANCE_CHECKS = [
+    "The affected asset and exact entrypoint are in scope for the authorized assessment.",
+    "The proof can be reproduced from the provided steps without hidden assumptions.",
+    "The evidence demonstrates concrete security impact, not only a code smell or static pattern.",
+    "The PoC or offline verifier is safe, bounded, and does not require destructive actions, stress traffic, wallet signing, or transaction submission.",
+    "The artifact contains enough redacted proof for an independent reviewer to validate the claim.",
+    "The finding-gate and adjudication commands accept the evidence before any report text is prepared.",
+]
+
+BOUNTY_WORKORDER_GLOBAL_FORBIDDEN_FIELDS = [
+    "raw secret values",
+    "provider API keys",
+    "bearer tokens",
+    "cookies",
+    "private keys",
+    "seed phrases",
+    "wallet signatures",
+    "signed transactions",
+    "full raw response bodies",
+    "raw Burp history",
+    "billing account identifiers",
+    "unredacted CI/build logs",
+]
+
+
+def bounty_evidence_workorder_lane_spec(
+    lane: str,
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if lane == "transaction-integrity":
+        return {
+            "evidence_goal": "Prove a concrete mismatch between approved user quote intent and decoded transaction effects.",
+            "human_action": "Provide one approved quote transaction payload and one matching explicit intent policy.",
+            "official_artifacts": [
+                repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl"),
+                repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json"),
+            ],
+            "must_capture": [
+                "approved POST /api/quote request metadata: method, path, direction, wallet, raw amountIn",
+                "exact approved quote response transaction payload or extracted base64 transaction payload",
+                "matching transaction-intent-policy.json fields for direction, wallet, amountIn, expected mints, and allowed programs or manual program review",
+                "offline decode result showing signer, wallet, mint, amount, or program-boundary mismatch",
+                "review note explaining why the mismatch has user-funds or transaction-integrity impact",
+            ],
+            "reject_if": [
+                "payload is synthetic, placeholder, draft, stale, signed, or taken from raw unreviewed history",
+                "intent policy does not match the approved request",
+                "decode mismatch is explained by decimals, routing, blockhash refresh, address lookup coverage, or approved program behavior",
+            ],
+            "template_commands": [
+                validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "transaction-sidecar-review --no-write --show-files --show-candidates --show-commands --show-payload-template-json --show-evidence-contract",
+                    profile=profile,
+                ),
+                validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "transaction-corpus-checklist --no-write --show-commands --show-steps --show-policy-template-json --skip-current-resource-check",
+                    profile=profile,
+                ),
+            ],
+            "after_evidence_commands": [
+                validation_command_for_artifact_dir(artifact_dir, "transaction-evidence-readiness --no-write --show-checks --show-next --show-commands --top 8", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "decode-transactions --no-write", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+            ],
+        }
+    if lane == "build-secret-exposure":
+        return {
+            "evidence_goal": "Prove a real non-placeholder build secret was retained or disclosed in a build artifact, cache, log, registry object, or attestation.",
+            "human_action": "Provide redacted build provenance tied to the exact Dockerfile build step.",
+            "official_artifacts": [
+                "redacted build provenance: image history/config, cache/log excerpt, registry artifact, or builder attestation"
+            ],
+            "must_capture": [
+                "source file and line for the build-secret static signal",
+                "redacted proof that a real non-placeholder secret was supplied to that build step",
+                "redacted image history/config, layer/cache metadata, CI/build log excerpt, registry artifact, or builder attestation",
+                "proof that the retained/disclosed material has plausible package-registry, deployment, account, or service impact",
+                "review note confirming raw secret values were removed before writing artifacts",
+            ],
+            "reject_if": [
+                "only Dockerfile source or placeholder values are available",
+                "builder stage, logs, remote cache, registry objects, and pushed images are proven unavailable or not retained",
+                "evidence contains raw secret values or unredacted logs",
+            ],
+            "template_commands": [
+                validation_command_for_artifact_dir(artifact_dir, "secret-exposure-review --no-write --show-findings", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "build-provenance-readiness --no-write --show-signals --show-checks --show-next --show-commands --top 8", profile=profile),
+            ],
+            "after_evidence_commands": [
+                validation_command_for_artifact_dir(artifact_dir, "build-provenance-readiness --no-write --show-signals --show-checks --show-next --show-commands --top 8", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "bounty-validation-gates --no-write --show-gates", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+            ],
+        }
+    if lane == "sensitive-response-impact":
+        return {
+            "evidence_goal": "Prove one approved read-only response exposes concrete sensitive data, authorization, tenant, wallet/account, or path-confusion impact.",
+            "human_action": "Provide exactly one approved redacted rewrite-response-sidecar.jsonl row.",
+            "official_artifacts": [repo_relative_or_absolute(artifact_dir / REWRITE_RESPONSE_SIDECAR_ARTIFACT)],
+            "must_capture": [
+                "one reviewed in-scope read-only request method and path",
+                "status code and content type",
+                "impact indicators and redacted sensitive field markers or JSON field paths",
+                "short redacted impact summary",
+                "reviewer, ticket, screenshot, or source reference proving the response was approved for evidence use",
+            ],
+            "reject_if": [
+                "raw body, cookies, tokens, private keys, full response body, or raw Burp history are embedded",
+                "more than one approved row is present",
+                "status/path exists without concrete sensitive-data, auth, tenant, wallet/account, or path-confusion impact",
+            ],
+            "template_commands": [
+                validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "rewrite-response-review --no-write --show-observations --show-sidecar-validation --show-sidecar-template-json",
+                    profile=profile,
+                )
+            ],
+            "after_evidence_commands": [
+                validation_command_for_artifact_dir(artifact_dir, "response-evidence-readiness --no-write --show-checks --show-next --show-package --show-commands --top 8", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "bounty-validation-gates --no-write --show-gates", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+            ],
+        }
+    if lane == "resource-control":
+        goal = "Prove attacker-influenced resource identity, routing, or control produces non-stress operator-visible impact."
+    elif lane == "websocket-header-trust":
+        goal = "Prove a sensitive browser-controlled WebSocket header reaches an upstream trust, logging, billing, auth, or quota boundary."
+    else:
+        goal = "Prove credentialed provider impact such as quota, billing, rate-limit, monitoring, account, or upstream abuse impact."
+    return {
+        "evidence_goal": goal,
+        "human_action": "Provide redacted operator-evidence.json rows for every required operator/provider decision.",
+        "official_artifacts": [repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)],
+        "must_capture": [
+            "decision id matching the operator-evidence-review missing decision",
+            "accepted present status: confirmed, evidence-present, operator-confirmed, provider-confirmed, or present",
+            "short redacted evidence summary for the provider, deployment, resource, or WebSocket trust boundary",
+            "source_ref to reviewed ticket, dashboard, screenshot, billing page, deployment note, or provider document",
+            "non-stress impact note showing quota, billing, rate-limit, account, routing, logging, auth, or resource-control consequence",
+        ],
+        "reject_if": [
+            "evidence is pending, placeholder, source-only, or provider-doc-only without operator confirmation",
+            "proof requires quota depletion, load generation, acting as another user, or privileged traffic",
+            "raw provider keys, bearer tokens, cookies, billing account identifiers, dashboards, or secrets are embedded",
+        ],
+        "template_commands": [
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-sidecar-validation --show-closure-contract",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check --show-evidence-contract",
+                profile=profile,
+            ),
+        ],
+        "after_evidence_commands": [
+            validation_command_for_artifact_dir(artifact_dir, "operator-impact-readiness --no-write --show-checks --show-next --show-gates --show-contracts --show-commands --top 8", profile=profile),
+            validation_command_for_artifact_dir(artifact_dir, "bounty-validation-gates --no-write --show-gates", profile=profile),
+            validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+            validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+        ],
+    }
+
+
+def bounty_evidence_workorder_for_rollup_row(
+    row: dict[str, Any],
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    rank: int,
+) -> dict[str, Any]:
+    lane = str(row.get("lane") or "unknown")
+    lane_spec = bounty_evidence_workorder_lane_spec(lane, artifact_dir=artifact_dir, profile=profile)
+    required_evidence = ordered_unique_strings(
+        [
+            *normalize_string_list(row.get("required_official_evidence")),
+            *normalize_string_list(lane_spec.get("official_artifacts")),
+        ]
+    )
+    required_labels = ordered_unique_strings(
+        [
+            *normalize_string_list(row.get("required_official_evidence_labels")),
+            *[bounty_validation_evidence_label(value) for value in normalize_string_list(required_evidence)],
+        ]
+    )
+    template_commands = normalize_string_list(lane_spec.get("template_commands"))
+    after_evidence_commands = ordered_unique_strings(
+        [
+            *normalize_string_list(lane_spec.get("after_evidence_commands")),
+            *normalize_string_list(row.get("validation_commands")),
+            validation_command_for_artifact_dir(artifact_dir, "bounty-readiness-rollup --no-write --show-lanes --show-next --show-commands --top 8", profile=profile),
+        ]
+    )
+    official_evidence_missing = int(row.get("official_evidence_missing_count") or 0) > 0
+    invalid_now = bool(row.get("invalid_if_reported_now"))
+    return {
+        "id": f"WORKORDER-{safe_probe_id(str(row.get('gate_id') or row.get('lane') or rank))}",
+        "rank": rank,
+        "gate_id": row.get("gate_id"),
+        "frontier_id": row.get("frontier_id"),
+        "claim_id": row.get("claim_id"),
+        "entrypoint": row.get("entrypoint"),
+        "lane": lane,
+        "expected_severity": row.get("expected_severity"),
+        "gate_status": row.get("gate_status"),
+        "readiness_status": row.get("readiness_status"),
+        "first_blocker": {
+            "id": row.get("first_blocker_id"),
+            "status": row.get("first_blocker_status"),
+            "next_step": row.get("first_blocker_next_step"),
+        },
+        "official_evidence_required": bool(required_evidence),
+        "official_evidence_missing": official_evidence_missing,
+        "evidence_distance": int(row.get("evidence_distance") or 0),
+        "operator_input_required": bool(invalid_now and required_evidence),
+        "agent_can_continue_without_official_evidence": False,
+        "evidence_goal": lane_spec.get("evidence_goal"),
+        "first_human_action": lane_spec.get("human_action") or row.get("next_step"),
+        "required_official_evidence": required_evidence,
+        "required_official_evidence_labels": required_labels,
+        "must_capture": normalize_string_list(lane_spec.get("must_capture")),
+        "must_not_capture": BOUNTY_WORKORDER_GLOBAL_FORBIDDEN_FIELDS,
+        "acceptance_checklist": BOUNTY_WORKORDER_GLOBAL_ACCEPTANCE_CHECKS,
+        "lane_reject_if": normalize_string_list(lane_spec.get("reject_if")),
+        "invalidity_category": row.get("invalidity_category"),
+        "invalidity_categories": normalize_string_list(row.get("invalidity_categories")),
+        "minimum_fix": row.get("minimum_fix"),
+        "invalid_if_reported_now": invalid_now,
+        "template_preview_commands": template_commands,
+        "after_evidence_validation_commands": after_evidence_commands[:10],
+        "recommended_preview_command": template_commands[0] if template_commands else row.get("recommended_command"),
+        "reportability_boundary": row.get("reportability_boundary"),
+    }
+
+
+def build_bounty_evidence_workorders(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    bounty_readiness_rollup: dict[str, Any] | None,
+) -> dict[str, Any]:
+    rows = (
+        bounty_readiness_rollup.get("lane_rollups", [])
+        if isinstance(bounty_readiness_rollup, dict) and isinstance(bounty_readiness_rollup.get("lane_rollups"), list)
+        else []
+    )
+    workorders = [
+        bounty_evidence_workorder_for_rollup_row(
+            row,
+            artifact_dir=artifact_dir,
+            profile=profile,
+            rank=index,
+        )
+        for index, row in enumerate(rows, start=1)
+        if isinstance(row, dict)
+    ]
+    shortest = sorted(
+        workorders,
+        key=lambda item: (
+            0 if item.get("operator_input_required") else 1,
+            int(item.get("evidence_distance") or 99),
+            BOUNTY_FRONTIER_SEVERITY_RANK.get(str(item.get("expected_severity") or "info"), 9),
+            str(item.get("lane") or ""),
+            str(item.get("id") or ""),
+        ),
+    )
+    operator_required = sum(1 for item in workorders if item.get("operator_input_required"))
+    invalid_now = sum(1 for item in workorders if item.get("invalid_if_reported_now"))
+    if not workorders:
+        status = "no-bounty-evidence-workorders"
+    elif operator_required:
+        status = "waiting-official-evidence"
+    elif invalid_now:
+        status = "waiting-validation"
+    else:
+        status = "ready-for-finding-gate-review"
+    top = workorders[0] if workorders else {}
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-evidence-workorders-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "methodology_sources": BOUNTY_REPORTABILITY_SOURCE_REFS,
+        "summary": {
+            "workorders": len(workorders),
+            "operator_input_required": operator_required,
+            "invalid_if_reported_now": invalid_now,
+            "top_workorder": top.get("id"),
+            "top_lane": top.get("lane"),
+            "top_first_blocker": (top.get("first_blocker") or {}).get("id") if isinstance(top.get("first_blocker"), dict) else None,
+            "bounty_readiness_rollup_status": artifact_summary_status(bounty_readiness_rollup),
+        },
+        "workorders": workorders,
+        "shortest_operator_workorders": shortest[:8],
+        "reportability_rule": (
+            "A workorder is not evidence. It is a bounded request for official evidence. Do not submit a bounty report until "
+            "the workorder evidence exists, the lane readiness command passes, finding-gate accepts the claim, and adjudication agrees."
+        ),
+        "next_step": (
+            top.get("first_human_action")
+            or top.get("recommended_preview_command")
+            or "Refresh bounty-readiness-rollup first."
+        ),
+        "safety": (
+            "Offline evidence workorder synthesis only. It reads local JSON artifacts, sends no target traffic, calls no Burp tool, "
+            "starts no browser, creates no official sidecars, signs no wallet, and submits no transaction."
+        ),
+    }
+
+
 def build_provenance_invalidity_row(invalidity_review: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(invalidity_review, dict):
         return {}
@@ -25420,6 +25778,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     BOUNTY_VALIDATION_GATES_ARTIFACT: "bounty-validation-gates",
     BOUNTY_INVALIDITY_REVIEW_ARTIFACT: "bounty-invalidity-review",
     BOUNTY_READINESS_ROLLUP_ARTIFACT: "bounty-readiness-rollup",
+    BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT: "bounty-evidence-workorders",
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
     TRANSACTION_EVIDENCE_READINESS_ARTIFACT: "transaction-evidence-readiness",
     OPERATOR_IMPACT_READINESS_ARTIFACT: "operator-impact-readiness",
@@ -25469,6 +25828,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "bounty-validation-gates",
     "bounty-invalidity-review",
     "bounty-readiness-rollup",
+    "bounty-evidence-workorders",
     "transaction-intent-boundary",
     "transaction-evidence-readiness",
     "operator-impact-readiness",
@@ -25503,6 +25863,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "bounty-validation-gates": "bounty-validation-gates --no-write",
     "bounty-invalidity-review": "bounty-invalidity-review --no-write",
     "bounty-readiness-rollup": "bounty-readiness-rollup --no-write",
+    "bounty-evidence-workorders": "bounty-evidence-workorders --no-write",
     "transaction-intent-boundary": "transaction-intent-boundary --no-write",
     "transaction-evidence-readiness": "transaction-evidence-readiness --no-write",
     "operator-impact-readiness": "operator-impact-readiness --no-write",
@@ -50584,6 +50945,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("bounty-validation-gates", "run_bounty_validation_gates"),
         refresh_expectation("bounty-invalidity-review", "run_bounty_invalidity_review"),
         refresh_expectation("bounty-readiness-rollup", "run_bounty_readiness_rollup"),
+        refresh_expectation("bounty-evidence-workorders", "run_bounty_evidence_workorders"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-intent-boundary", "run_transaction_intent_boundary"),
         refresh_expectation("transaction-evidence-readiness", "run_transaction_evidence_readiness"),
@@ -75165,6 +75527,163 @@ def run_bounty_readiness_rollup(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_or_load_bounty_readiness_rollup_for_run(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    source_root: Path,
+) -> dict[str, Any]:
+    rollup = load_optional_json(artifact_dir / BOUNTY_READINESS_ROLLUP_ARTIFACT)
+    if isinstance(rollup, dict):
+        return rollup
+    gates = build_or_load_bounty_validation_gates_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    adjudication = load_optional_json(artifact_dir / "adjudication.json")
+    invalidity_review = load_optional_json(artifact_dir / BOUNTY_INVALIDITY_REVIEW_ARTIFACT)
+    if not isinstance(invalidity_review, dict):
+        invalidity_review = build_bounty_invalidity_review(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            bounty_validation_gates=gates,
+            adjudication=adjudication,
+        )
+    readiness_artifacts = {
+        artifact_name: load_optional_json(artifact_dir / artifact_name)
+        for artifact_name in sorted(set(BOUNTY_READINESS_ARTIFACT_BY_LANE.values()))
+    }
+    return build_bounty_readiness_rollup(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_validation_gates=gates,
+        bounty_invalidity_review=invalidity_review,
+        adjudication=adjudication,
+        readiness_artifacts=readiness_artifacts,
+    )
+
+
+def run_bounty_evidence_workorders(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    rollup = build_or_load_bounty_readiness_rollup_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    workorders = build_bounty_evidence_workorders(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_readiness_rollup=rollup,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(workorders))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-evidence-workorders",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = workorders.get("summary", {}) if isinstance(workorders.get("summary"), dict) else {}
+    print(f"Bounty evidence workorders: {workorders.get('status')}")
+    print(
+        "Workorders: "
+        f"total={summary.get('workorders', 0)} "
+        f"operator_required={summary.get('operator_input_required', 0)} "
+        f"invalid_now={summary.get('invalid_if_reported_now', 0)} "
+        f"top={summary.get('top_workorder') or '-'} "
+        f"lane={summary.get('top_lane') or '-'}"
+    )
+    print(
+        "Inputs: "
+        f"rollup={summary.get('bounty_readiness_rollup_status') or '-'} "
+        f"top_blocker={summary.get('top_first_blocker') or '-'}"
+    )
+    display_limit = max(0, int(args.top))
+    if getattr(args, "show_workorders", False):
+        print("Workorders:")
+        for item in (workorders.get("workorders", []) or [])[:display_limit]:
+            if not isinstance(item, dict):
+                continue
+            blocker = item.get("first_blocker") if isinstance(item.get("first_blocker"), dict) else {}
+            print(
+                f"- {item.get('id')}: {item.get('expected_severity')} lane={item.get('lane')} "
+                f"operator_required={item.get('operator_input_required')} "
+                f"distance={item.get('evidence_distance')} blocker={blocker.get('id') or '-'}"
+            )
+            print(f"  goal={inline_summary_text(item.get('evidence_goal'), max_chars=260)}")
+            evidence = ", ".join(normalize_string_list(item.get("required_official_evidence_labels"))[:4])
+            if evidence:
+                print(f"  needs={inline_summary_text(evidence, max_chars=300)}")
+            if getattr(args, "show_checklist", False):
+                for capture in normalize_string_list(item.get("must_capture"))[:3]:
+                    print(f"  capture={inline_summary_text(capture, max_chars=260)}")
+                for reject in normalize_string_list(item.get("lane_reject_if"))[:2]:
+                    print(f"  reject_if={inline_summary_text(reject, max_chars=260)}")
+            if getattr(args, "show_commands", False):
+                commands = normalize_string_list(item.get("template_preview_commands"))
+                if commands:
+                    print(f"  preview={inline_summary_text(commands[0], max_chars=420)}")
+                after = normalize_string_list(item.get("after_evidence_validation_commands"))
+                if after:
+                    print(f"  after={inline_summary_text(after[0], max_chars=420)}")
+        remaining = len(workorders.get("workorders", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more workorder(s); rerun without --no-write to write the full artifact")
+            else:
+                print(f"- {remaining} more workorder(s) in {output_path}")
+    if getattr(args, "show_sources", False):
+        print("Sources:")
+        for source in (workorders.get("methodology_sources", []) or [])[:display_limit]:
+            if not isinstance(source, dict):
+                continue
+            print(
+                f"- {source.get('id')}: status={source.get('status')} "
+                f"url={source.get('url')}"
+            )
+            print(f"  takeaway={inline_summary_text(source.get('takeaway'), max_chars=260)}")
+    if getattr(args, "show_commands", False) and not getattr(args, "show_workorders", False):
+        print("Commands:")
+        seen: set[str] = set()
+        for item in (workorders.get("workorders", []) or [])[:display_limit]:
+            if not isinstance(item, dict):
+                continue
+            for command_text in normalize_string_list(item.get("template_preview_commands"))[:1]:
+                if command_text in seen:
+                    continue
+                seen.add(command_text)
+                print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    print(f"Rule: {inline_summary_text(workorders.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(workorders.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and workorders.get("status") != "ready-for-finding-gate-review":
+        return 1
+    return 0
+
+
 def run_rpc_proxy_parity_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -78368,6 +78887,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless a lane is ready for validation or final reportability review.",
     )
     bounty_readiness_rollup.set_defaults(func=run_bounty_readiness_rollup)
+
+    bounty_evidence_workorders = sub.add_parser(
+        "bounty-evidence-workorders",
+        help="Turn bounty readiness blockers into bounded official-evidence workorders without collecting evidence",
+    )
+    bounty_evidence_workorders.add_argument(
+        "--output",
+        help=(
+            f"Where to write {BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT}."
+        ),
+    )
+    bounty_evidence_workorders.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of workorders, commands, or sources to print.",
+    )
+    bounty_evidence_workorders.add_argument(
+        "--show-workorders",
+        action="store_true",
+        help="Print ranked official-evidence workorders.",
+    )
+    bounty_evidence_workorders.add_argument(
+        "--show-checklist",
+        action="store_true",
+        help="Print must-capture and reject-if checklist details for each shown workorder.",
+    )
+    bounty_evidence_workorders.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print safe offline template and after-evidence validation commands.",
+    )
+    bounty_evidence_workorders.add_argument(
+        "--show-sources",
+        action="store_true",
+        help="Print methodology source references used by the workorder rules.",
+    )
+    bounty_evidence_workorders.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print bounty evidence workorders only; do not write {BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    bounty_evidence_workorders.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless no workorders need official evidence and finding-gate review can proceed.",
+    )
+    bounty_evidence_workorders.set_defaults(func=run_bounty_evidence_workorders)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
