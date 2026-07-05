@@ -10419,7 +10419,7 @@ def credential_impact_evidence_closure_plan(
         "safety": (
             "Offline closure plan only. It emits redacted sidecar requirements, provider-impact review steps, "
             "resource gates, and finding-gate blockers; it sends no target/provider traffic, invokes no Burp tools, "
-            "exposes no secrets, signs no wallets, and submits no transactions."
+            "exposes no provider API keys or other secrets, signs no wallets, and submits no transactions."
         ),
     }
 
@@ -12561,6 +12561,7 @@ def assessment_objective_satisfaction_summary(
     else:
         status = "needs-dangerous-surface-coverage-closure"
         next_step = "Close or explicitly accept every remaining dangerous-surface evidence gap before declaring greybox coverage complete."
+    unblocker_rollup = objective_unblocker_rollup(open_items)
 
     return {
         "status": status,
@@ -12576,7 +12577,163 @@ def assessment_objective_satisfaction_summary(
         "top_satisfied_id": assessment_item_identity(satisfied_items[0]) if satisfied_items else None,
         "top_open_id": assessment_item_identity(open_items[0]) if open_items else None,
         "objective_blocker_counts": dict(sorted(blocker_counts.items())),
+        "unblocker_lane_counts": unblocker_rollup.get("lane_counts", {}),
+        "unblocker_actionability_counts": unblocker_rollup.get("actionability_counts", {}),
+        "top_unblocker": unblocker_rollup.get("top_unblocker"),
+        "unblockers": unblocker_rollup.get("items", []),
         "next_step": next_step,
+    }
+
+
+def objective_unblocker_lane(
+    *,
+    impact: str,
+    active_step: str,
+    missing_requirements: list[str],
+    approval_packet_types: list[str],
+    closure_plan_id: str,
+) -> str:
+    packet_type_set = {str(packet_type).strip().lower() for packet_type in approval_packet_types}
+    if not active_step and "rewrite-response" in packet_type_set:
+        return "single-approved-response"
+    tokens = " ".join(
+        [
+            impact,
+            active_step,
+            closure_plan_id,
+            *missing_requirements,
+            *approval_packet_types,
+        ]
+    ).lower()
+    if any(token in tokens for token in ["approved-payload-sidecar", "transaction-payload", "transaction-corpus"]):
+        return "approved-transaction-payload"
+    if any(token in tokens for token in ["intent-policy-sidecar", "intent-policy-sidecar-valid"]):
+        return "transaction-intent-policy"
+    if any(token in tokens for token in ["decoded-intent-review", "decoded-intent-reviewed"]):
+        return "decoded-transaction-review"
+    if any(
+        token in tokens
+        for token in [
+            "provider-impact",
+            "credentialed-upstream",
+            "credential-impact",
+            "quota-policy",
+            "billing-impact",
+            "usage-monitoring",
+            "rate-limit-policy",
+        ]
+    ):
+        return "provider-operator-evidence"
+    if any(
+        token in tokens
+        for token in [
+            "deployment-context",
+            "resource-control",
+            "external-rate-limit-store",
+            "proxy-header-trust",
+            "rpc-client-ip-header",
+            "rate-limit-bounds",
+            "resource-bound",
+        ]
+    ):
+        return "deployment-resource-evidence"
+    if any(token in tokens for token in ["operator-evidence-sidecar", "operator-evidence"]):
+        if "resource" in tokens or impact == "resource-exhaustion":
+            return "deployment-resource-evidence"
+        return "provider-operator-evidence"
+    if any(token in tokens for token in ["read-only-path-selection", "approved-read-only-path"]):
+        return "read-only-path-selection"
+    if any(token in tokens for token in ["response-evidence-sidecar", "single-approved-response"]):
+        return "single-approved-response"
+    if any(token in tokens for token in ["impact-classification", "concrete-sensitive-data", "path-confusion-impact"]):
+        return "impact-classification"
+    if any(token in tokens for token in ["single-request-resource-gate", "resource-safe-for-single-request"]):
+        return "resource-gate"
+    if any(token in tokens for token in ["finding-gate-entry", "finding-gate-impact"]):
+        return "finding-gate-review"
+    if any(token in tokens for token in ["source-context", "rewrite-review-indexed", "resource-signal-context"]):
+        return "offline-source-context"
+    return "unclassified-evidence"
+
+
+def objective_unblocker_actionability(lane: str, step_status: str) -> str:
+    if step_status == "blocked-resource" or lane == "resource-gate":
+        return "wait-for-healthy-resource-gate"
+    if lane in {"provider-operator-evidence", "deployment-resource-evidence"}:
+        return "needs-operator-or-deployment-evidence"
+    if lane in {"approved-transaction-payload", "single-approved-response"}:
+        return "needs-approved-single-observation"
+    if lane in {"transaction-intent-policy", "decoded-transaction-review", "impact-classification"}:
+        return "offline-review-after-sidecar"
+    if lane in {"read-only-path-selection", "offline-source-context", "finding-gate-review"}:
+        return "offline-review"
+    return "needs-evidence-triage"
+
+
+def assessment_item_objective_unblocker(item: dict[str, Any]) -> dict[str, Any]:
+    closure_plan = item.get("closure_plan") if isinstance(item.get("closure_plan"), dict) else {}
+    active_step = str(closure_plan.get("active_step") or "").strip()
+    active_step_row: dict[str, Any] = {}
+    for step in closure_plan.get("steps", []) or []:
+        if isinstance(step, dict) and str(step.get("id") or "") == active_step:
+            active_step_row = step
+            break
+    missing_requirements = normalize_string_list(item.get("missing_requirements"))
+    approval_packet_types = normalize_string_list(item.get("approval_packet_types"))
+    if not approval_packet_types:
+        approval_packet = item.get("approval_packet") if isinstance(item.get("approval_packet"), dict) else {}
+        packet_type = str(approval_packet.get("packet_type") or approval_packet.get("type") or "").strip()
+        if packet_type:
+            approval_packet_types.append(packet_type)
+    impact = str(item.get("impact") or "")
+    lane = objective_unblocker_lane(
+        impact=impact,
+        active_step=active_step,
+        missing_requirements=missing_requirements,
+        approval_packet_types=approval_packet_types,
+        closure_plan_id=str(closure_plan.get("id") or ""),
+    )
+    step_status = str(
+        active_step_row.get("status")
+        or item.get("closure_status")
+        or item.get("validation_item_status")
+        or "unknown"
+    )
+    assessment = item.get("assessment_rank") if isinstance(item.get("assessment_rank"), dict) else {}
+    alignment = (
+        assessment.get("objective_alignment")
+        if isinstance(assessment.get("objective_alignment"), dict)
+        else {}
+    )
+    return {
+        "item_id": assessment_item_identity(item),
+        "priority": item.get("priority") or item.get("validation_item_priority"),
+        "impact": impact or None,
+        "path": item.get("path"),
+        "lane": lane,
+        "actionability": objective_unblocker_actionability(lane, step_status),
+        "active_step": active_step or None,
+        "step_status": step_status,
+        "artifact": active_step_row.get("artifact"),
+        "next_step": active_step_row.get("next_step") or alignment.get("objective_blocker"),
+        "missing_requirements": missing_requirements[:6],
+        "approval_packet_types": approval_packet_types,
+        "objective_blocker": alignment.get("objective_blocker"),
+    }
+
+
+def objective_unblocker_rollup(open_items: list[dict[str, Any]]) -> dict[str, Any]:
+    unblockers = [assessment_item_objective_unblocker(item) for item in open_items if isinstance(item, dict)]
+    lane_counts: dict[str, int] = {}
+    actionability_counts: dict[str, int] = {}
+    for unblocker in unblockers:
+        increment_count(lane_counts, str(unblocker.get("lane") or "unknown"))
+        increment_count(actionability_counts, str(unblocker.get("actionability") or "unknown"))
+    return {
+        "items": unblockers[:8],
+        "top_unblocker": unblockers[0] if unblockers else None,
+        "lane_counts": dict(sorted(lane_counts.items())),
+        "actionability_counts": dict(sorted(actionability_counts.items())),
     }
 
 
@@ -42127,6 +42284,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and blackbox_objective_satisfaction_sample.get("status") == "objective-satisfied"
                 and blackbox_objective_satisfaction_sample.get("completion_unit")
                 == "one-valid-medium-high-critical-report"
+                and blackbox_objective_satisfaction_sample.get("top_unblocker", {}).get("lane")
+                == "approved-transaction-payload"
             ),
             "expected": "greybox optimizes coverage while blackbox optimizes one valid high-bounty finding, including strict checklist gates",
             "actual": {
@@ -42193,9 +42352,13 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and greybox_objective_satisfaction_sample.get("satisfied_items") == 1
                 and greybox_objective_satisfaction_sample.get("open_items") == 2
                 and greybox_objective_satisfaction_sample.get("top_open_id") == "coverage-resource-exhaustion"
+                and greybox_objective_satisfaction_sample.get("top_unblocker", {}).get("lane")
+                == "deployment-resource-evidence"
                 and blackbox_objective_satisfaction_sample.get("satisfied_items") == 1
                 and blackbox_objective_satisfaction_sample.get("top_satisfied_id") == "gate-ready-sensitive-data"
                 and blackbox_objective_satisfaction_sample.get("open_items") == 2
+                and blackbox_objective_satisfaction_sample.get("top_unblocker", {}).get("lane")
+                == "approved-transaction-payload"
                 and (
                     blackbox_ranked_sample[0].get("assessment_rank", {}).get("bounty_pressure", {}).get("score", 0)
                     >= blackbox_ranked_sample[0].get("assessment_rank", {}).get("coverage_pressure", {}).get("score", 0)
@@ -42597,6 +42760,7 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Bounty harness:" in methodology_review_stdout_text
                 and "selection=greybox-coverage-first" in methodology_review_stdout_text
                 and "objective=" in methodology_review_stdout_text
+                and "lane=" in methodology_review_stdout_text
                 and "- bounty system-context-threat-model:" in methodology_review_stdout_text
                 and "High-value threads:" in methodology_review_stdout
                 and "poc_plan=" in methodology_review_stdout_text
@@ -42627,6 +42791,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Lead dossier:" in lead_dossier_stdout_text
                 and "Leads:" in lead_dossier_stdout_text
                 and "Objective satisfaction:" in lead_dossier_stdout_text
+                and "lane=" in lead_dossier_stdout_text
+                and "action=" in lead_dossier_stdout_text
                 and "strict_validation=blocked-before-finding-gate" in lead_dossier_stdout_text
                 and "question=waiting concrete-impact-evidence" in lead_dossier_stdout_text
                 and "No files written (--no-write)." in lead_dossier_stdout
@@ -59928,11 +60094,22 @@ def run_methodology_review(args: argparse.Namespace) -> int:
             if isinstance(bounty_alignment.get("summary"), dict)
             else {}
         )
+        bounty_objective = (
+            bounty_alignment.get("objective_satisfaction")
+            if isinstance(bounty_alignment.get("objective_satisfaction"), dict)
+            else {}
+        )
+        bounty_top_unblocker = (
+            bounty_objective.get("top_unblocker")
+            if isinstance(bounty_objective.get("top_unblocker"), dict)
+            else {}
+        )
         print(
             "Bounty harness: "
             f"{bounty_alignment.get('status')} "
             f"selection={bounty_summary.get('lead_selection_strategy') or '-'} "
             f"objective={bounty_summary.get('objective_status') or '-'} "
+            f"lane={bounty_top_unblocker.get('lane') or '-'} "
             f"top={bounty_summary.get('top_candidate_id') or '-'} "
             f"gate_ready={bounty_summary.get('gate_ready_threads', 0)} "
             f"resource={bounty_summary.get('resource_status') or '-'} "
@@ -60065,13 +60242,20 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
         else {}
     )
     if objective_satisfaction:
+        top_unblocker = (
+            objective_satisfaction.get("top_unblocker")
+            if isinstance(objective_satisfaction.get("top_unblocker"), dict)
+            else {}
+        )
         print(
             "Objective satisfaction: "
             f"status={objective_satisfaction.get('status') or '-'} "
             f"unit={objective_satisfaction.get('completion_unit') or '-'} "
             f"satisfied={objective_satisfaction.get('satisfied_items', 0)} "
             f"open={objective_satisfaction.get('open_items', 0)} "
-            f"top_open={objective_satisfaction.get('top_open_id') or '-'}"
+            f"top_open={objective_satisfaction.get('top_open_id') or '-'} "
+            f"lane={top_unblocker.get('lane') or '-'} "
+            f"action={top_unblocker.get('actionability') or '-'}"
         )
     if assessment_policy:
         objective_model = (
@@ -62272,13 +62456,20 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
         else {}
     )
     if objective_satisfaction:
+        top_unblocker = (
+            objective_satisfaction.get("top_unblocker")
+            if isinstance(objective_satisfaction.get("top_unblocker"), dict)
+            else {}
+        )
         print(
             "Objective: "
             f"status={objective_satisfaction.get('status') or '-'} "
             f"unit={objective_satisfaction.get('completion_unit') or '-'} "
             f"satisfied={objective_satisfaction.get('satisfied_items', 0)} "
             f"open={objective_satisfaction.get('open_items', 0)} "
-            f"top_open={objective_satisfaction.get('top_open_id') or '-'}"
+            f"top_open={objective_satisfaction.get('top_open_id') or '-'} "
+            f"lane={top_unblocker.get('lane') or '-'} "
+            f"action={top_unblocker.get('actionability') or '-'}"
         )
     if resource_preflight and resource_preflight.get("status") != "not-run":
         warnings = resource_preflight.get("warnings", []) or []

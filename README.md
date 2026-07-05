@@ -359,7 +359,11 @@ also emits `objective_satisfaction`, a run-level rollup of the same model. In
 greybox mode it stays open until every ranked dangerous surface is covered or
 closed; in blackbox mode it becomes satisfied as soon as one gate-ready
 Medium/High/Critical report path exists, while weaker broad-coverage leads can
-remain parked.
+remain parked. The rollup includes `top_unblocker`,
+`unblocker_lane_counts`, and `unblocker_actionability_counts` so the next loop
+can distinguish approved payload capture, provider/operator evidence,
+deployment resource evidence, read-only response observation, resource gates,
+and finding-gate review.
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
@@ -638,7 +642,8 @@ decision fields as `lead-dossier`. Blackbox focus rows also carry
 dominant bounty candidate; approval packets also carry the matching assessment
 scorecard for the validation item that produced them. The iteration summary also
 includes `objective_satisfaction`, so unattended runs can tell whether the
-active mode still needs coverage closure or a valid Medium+ bounty report path.
+active mode still needs coverage closure or a valid Medium+ bounty report path,
+and which evidence lane is currently blocking it.
 
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:
