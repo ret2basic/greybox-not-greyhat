@@ -1417,6 +1417,13 @@ For WebSocket header-forwarding leads, run
 `websocket-candidate-review --no-write --show-evidence-contract` to print the
 required sensitive-header filters, auth-context status, reportability gates, and
 forbidden validation steps without opening sockets or importing Burp history.
+When source review finds an unresolved forwarding lead, the same review now
+prints and carries a WebSocket header-forwarding approval packet through
+`verification-queue`, `validation-plan`, and `iteration-decision`. That packet
+requires sensitive client-header context, upstream receipt/trust/logging or
+billing evidence, browser/client header-control review, and concrete impact
+before any finding-gate escalation; it still forbids WebSocket frames,
+subscriptions, wallet payloads, raw secrets, and resource-pressure tests.
 Manual-review or external-blocker items that have no generated command template
 also print compact follow-up details, including reason, prerequisites, review
 candidates, evidence refs, and safety notes, so commandless review work is

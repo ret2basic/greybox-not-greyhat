@@ -7994,6 +7994,116 @@ def websocket_header_forwarding_evidence_contract(
     }
 
 
+def websocket_header_forwarding_approval_packet(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    source_review: dict[str, Any],
+) -> dict[str, Any]:
+    leads = [lead for lead in source_review.get("leads", []) or [] if isinstance(lead, dict)]
+    source_summary = (
+        source_review.get("summary")
+        if isinstance(source_review.get("summary"), dict)
+        else {}
+    )
+    missing_filters = ordered_unique_strings(
+        source_summary.get("missing_sensitive_header_filters", []) or []
+    )
+    auth_context_status = str(source_summary.get("auth_context_status") or "unknown")
+    source_files = ordered_unique_strings(
+        [lead.get("file") for lead in leads if lead.get("file")]
+    )
+    missing_decisions = [
+        "sensitive-client-header-context",
+        "upstream-header-receipt-logging-policy",
+        "upstream-header-trust-or-billing-policy",
+        "browser-client-header-control-model",
+        "concrete-header-forwarding-impact",
+    ]
+    if missing_filters:
+        missing_decisions.insert(0, "sensitive-header-filter-policy")
+    if auth_context_status in {"non-sensitive-cookie-only", "no-app-auth-context-evidence", "unknown"}:
+        missing_decisions.insert(0, "sensitive-app-auth-material-presence")
+    if not leads:
+        status = "not-applicable-no-source-leads"
+    elif auth_context_status == "sensitive-app-auth-context":
+        status = "waiting-upstream-header-trust-evidence"
+    else:
+        status = "waiting-auth-upstream-header-evidence"
+    finding_gate_blockers = [
+        "No proof that sensitive client-controlled cookies, session tokens, Authorization material, or equivalent auth headers are present on the WebSocket origin.",
+        "No provider/operator evidence that the upstream WebSocket receives, logs, trusts, bills, or authorizes based on forwarded client headers.",
+        "No browser/client constraint analysis for the exact forwarded header needed to demonstrate impact.",
+        "No concrete disclosure, trust-boundary confusion, quota/account attribution, or authorization impact is present yet.",
+    ]
+    return {
+        "type": "websocket-header-forwarding-approval-packet",
+        "packet_type": "websocket-header-forwarding-approval-packet",
+        "status": status,
+        "assessment": {
+            "mode": assessment_mode(profile),
+            "optimization_goal": assessment_mode_policy(profile).get("optimization_goal"),
+            "strategy_note": (
+                "coverage-first: keep the WebSocket header-forwarding trust boundary closed by evidence."
+                if not is_blackbox_assessment(profile)
+                else "bounty-first: continue only if auth/header context plus upstream trust evidence can support a valid high-impact report."
+            ),
+        },
+        "recommended_evidence": {
+            "entrypoint": "WS /api/rpc/solana/{cluster}",
+            "provider": "websocket-upstream/operator",
+            "source_files": source_files,
+            "missing_sensitive_header_filters": missing_filters,
+            "auth_context_status": auth_context_status,
+            "missing_decision_ids": ordered_unique_strings(missing_decisions),
+        },
+        "operator_evidence_sidecar": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+        "offline_commands": [
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "websocket-candidate-review --no-write --show-evidence-contract",
+                profile=profile,
+            ),
+        ],
+        "approval_sequence": [
+            {
+                "id": "source-review",
+                "status": "ready",
+                "command": validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "websocket-candidate-review --no-write --show-evidence-contract",
+                    profile=profile,
+                ),
+            },
+            {
+                "id": "auth-context-review",
+                "status": "passed" if auth_context_status == "sensitive-app-auth-context" else "waiting",
+                "decision_ids": ["sensitive-app-auth-material-presence", "sensitive-client-header-context"],
+            },
+            {
+                "id": "upstream-operator-evidence",
+                "status": "waiting",
+                "sidecar": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+                "decision_ids": [
+                    "upstream-header-receipt-logging-policy",
+                    "upstream-header-trust-or-billing-policy",
+                ],
+            },
+            {
+                "id": "active-handshake-or-observation",
+                "status": "blocked-until-healthy-resource-gate-and-explicit-approval",
+                "note": "At most one approved handshake/header observation; no WebSocket frames or subscriptions.",
+            },
+        ],
+        "finding_gate_blocker_count": len(finding_gate_blockers),
+        "finding_gate_blockers": finding_gate_blockers,
+        "safety": (
+            "Offline approval packet only. It does not open WebSocket connections, send frames, read raw Burp history, "
+            "collect secrets, or approve active target traffic."
+        ),
+    }
+
+
 def build_websocket_auth_context_review(
     source_root: Path,
     *,
@@ -8451,6 +8561,8 @@ def build_websocket_candidate_review(
     target: str,
     asset_candidates_doc: dict[str, Any] | None,
     scope_policy: dict[str, Any] | None,
+    profile: dict[str, Any] | None = None,
+    artifact_dir: Path | None = None,
     source_root: Path | None = None,
     websocket_source_review: dict[str, Any] | None = None,
     baseline_results: list[dict[str, Any]] | None = None,
@@ -8476,6 +8588,16 @@ def build_websocket_candidate_review(
             "leads": [],
             "safety": "No source root was provided to websocket-candidate-review.",
         }
+    source_review = json_clone(source_review)
+    source_approval_packet = websocket_header_forwarding_approval_packet(
+        artifact_dir=artifact_dir or DEFAULT_ARTIFACT_DIR,
+        profile=profile,
+        source_review=source_review,
+    )
+    if source_approval_packet.get("status") != "not-applicable-no-source-leads":
+        source_review["websocket_header_forwarding_approval_packet"] = source_approval_packet
+        if isinstance(source_review.get("summary"), dict):
+            source_review["summary"]["approval_packet_status"] = source_approval_packet.get("status")
     scope_decisions = scope_policy_decision_map(scope_policy)
     baseline_by_id = {
         str(item.get("candidate_id") or ""): item
@@ -8571,9 +8693,15 @@ def build_websocket_candidate_review(
                 "auth_context_summary",
                 {},
             ),
+            "websocket_header_approval_packet_status": source_approval_packet.get("status"),
         },
         "candidates": candidates,
         "source_review": source_review,
+        "websocket_header_forwarding_approval_packet": (
+            source_approval_packet
+            if source_approval_packet.get("status") != "not-applicable-no-source-leads"
+            else None
+        ),
         "safety": (
             "WebSocket candidate review only. Handshake baselines, when requested, perform one HTTP Upgrade "
             "attempt per in-scope candidate and send no WebSocket frames, subscriptions, wallet payloads, or trade messages."
@@ -10483,6 +10611,12 @@ def build_generic_evidence_closure(
     requirements = build_semantic_generic_evidence_requirements(item)
     command_specs = [("validation-plan", "validation-plan --no-write --top 8 --show-commands --skip-current-resource-check")]
     impact = str(item.get("impact") or "")
+    websocket_header_packet = (
+        item.get("websocket_header_forwarding_approval_packet")
+        if impact == "websocket-header-forwarding"
+        and isinstance(item.get("websocket_header_forwarding_approval_packet"), dict)
+        else None
+    )
     if impact == "rpc-proxy-abuse":
         command_specs.append(("deployment-review", "deployment-review --no-write --top 8"))
     if impact == "unauthorized-state-change":
@@ -10513,6 +10647,7 @@ def build_generic_evidence_closure(
             profile=profile,
             artifact_dir=artifact_dir,
         ),
+        "websocket_header_forwarding_approval_packet": websocket_header_packet,
         "finding_gate_entry_condition": "Collect concrete impact evidence and refresh finding-gate/adjudication.",
     }
 
@@ -10610,6 +10745,13 @@ def minimal_poc_manual_inputs_for_thread(item: dict[str, Any]) -> list[str]:
             "The exact RPC method, origin, or rate-control boundary that should reject or constrain the request.",
             "One approved redacted observation or offline RPC policy/source artifact for the exact RPC proxy path.",
             "Concrete non-DoS impact evidence: user funds, sensitive data, availability budget, upstream quota, or equivalent operator impact.",
+        ]
+    if impact == "websocket-header-forwarding":
+        return [
+            "Redacted source evidence for exactly which WebSocket client headers are forwarded or filtered.",
+            "Auth/header context showing whether sensitive cookies, session tokens, Authorization material, or equivalent user/account credentials exist on the WebSocket origin.",
+            "Provider/operator evidence showing whether the upstream WebSocket receives, logs, trusts, bills, or authorizes based on forwarded headers.",
+            "A finding-gate decision showing concrete disclosure, trust-boundary, quota/account attribution, or authorization impact without WebSocket frames or subscriptions.",
         ]
     if impact == "unauthorized-state-change":
         return [
@@ -11774,6 +11916,7 @@ def build_lead_dossier(
                     or closure.get("credential_impact_approval_packet")
                     or closure.get("resource_control_approval_packet")
                     or closure.get("rewrite_response_approval_packet")
+                    or closure.get("websocket_header_forwarding_approval_packet")
                     if closure
                     else None
                 ),
@@ -12155,6 +12298,11 @@ def hypothesis_from_queue_item(
         ),
         "required_evidence": item.get("required_evidence", []),
         "evidence_contract": item.get("evidence_contract") if isinstance(item.get("evidence_contract"), dict) else {},
+        "websocket_header_forwarding_approval_packet": (
+            item.get("websocket_header_forwarding_approval_packet")
+            if isinstance(item.get("websocket_header_forwarding_approval_packet"), dict)
+            else {}
+        ),
         "evidence_refs": ["verification-queue.json", "reproduction-steps.md"],
         "safety": "Queue-derived hypothesis. It is a next-step candidate, not vulnerability evidence.",
     }
@@ -15582,6 +15730,36 @@ def validation_item_from_hypothesis(
     rewrite_review_context = validation_rewrite_review_context(rewrite_review_item)
     if rewrite_review_context and rewrite_review_context.get("read_only_path_candidates"):
         preconditions.append("Review rewrite_review.read_only_path_candidates and choose at most one no-write promotion preview.")
+    websocket_header_approval_packet = None
+    if hypothesis.get("impact") == "websocket-header-forwarding":
+        websocket_header_approval_packet = (
+            hypothesis.get("websocket_header_forwarding_approval_packet")
+            if isinstance(hypothesis.get("websocket_header_forwarding_approval_packet"), dict)
+            else None
+        )
+        if not websocket_header_approval_packet:
+            websocket_candidate_review = load_optional_json(artifact_dir / WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT)
+            if isinstance(websocket_candidate_review, dict):
+                websocket_source_review = (
+                    websocket_candidate_review.get("source_review")
+                    if isinstance(websocket_candidate_review.get("source_review"), dict)
+                    else {}
+                )
+                websocket_header_approval_packet = (
+                    websocket_candidate_review.get("websocket_header_forwarding_approval_packet")
+                    if isinstance(websocket_candidate_review.get("websocket_header_forwarding_approval_packet"), dict)
+                    else websocket_source_review.get("websocket_header_forwarding_approval_packet")
+                    if isinstance(websocket_source_review.get("websocket_header_forwarding_approval_packet"), dict)
+                    else None
+                )
+                if not websocket_header_approval_packet and websocket_source_review:
+                    websocket_header_approval_packet = websocket_header_forwarding_approval_packet(
+                        artifact_dir=artifact_dir,
+                        profile=profile,
+                        source_review=websocket_source_review,
+                    )
+                    if websocket_header_approval_packet.get("status") == "not-applicable-no-source-leads":
+                        websocket_header_approval_packet = None
     rewrite_response_approval_packet = None
     if hypothesis.get("impact") == "fixed-upstream-proxy-confusion" or rewrite_review_context:
         rewrite_response_review = load_optional_json(artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT)
@@ -15753,6 +15931,7 @@ def validation_item_from_hypothesis(
         "credential_proxy_review": hypothesis.get("credential_proxy_review"),
         "credential_impact_approval_packet": credential_approval_packet,
         "resource_control_approval_packet": resource_approval_packet,
+        "websocket_header_forwarding_approval_packet": websocket_header_approval_packet,
         "command_safety": command_summary,
         "blocked_command_safety": blocked_command_summary,
         "required_evidence": required_evidence_for_hypothesis(hypothesis),
@@ -16393,6 +16572,7 @@ def build_iteration_decision_from_plan(
             ("credential_impact_approval_packet", "credential-impact"),
             ("resource_control_approval_packet", "resource-control"),
             ("rewrite_response_approval_packet", "rewrite-response"),
+            ("websocket_header_forwarding_approval_packet", "websocket-header-forwarding"),
         ]:
             packet = item.get(packet_key) if isinstance(item.get(packet_key), dict) else {}
             if not packet:
@@ -27465,6 +27645,8 @@ def format_approval_packet_inline(
         raw_kind = str(packet.get("packet_type") or packet.get("type") or "")
         if "resource-control" in raw_kind:
             kind_label = "resource-control"
+        elif "websocket" in raw_kind:
+            kind_label = "websocket-header-forwarding"
         elif "credential" in raw_kind:
             kind_label = "credential-impact"
         else:
@@ -32407,6 +32589,20 @@ def build_verification_queue(
             if isinstance(websocket_auth_context.get("summary"), dict)
             else {}
         )
+        websocket_approval_packet = (
+            websocket_source_review.get("websocket_header_forwarding_approval_packet")
+            if isinstance(websocket_source_review.get("websocket_header_forwarding_approval_packet"), dict)
+            else websocket_candidate_review_doc.get("websocket_header_forwarding_approval_packet")
+            if isinstance(websocket_candidate_review_doc, dict)
+            and isinstance(websocket_candidate_review_doc.get("websocket_header_forwarding_approval_packet"), dict)
+            else {}
+        )
+        if not websocket_approval_packet:
+            websocket_approval_packet = websocket_header_forwarding_approval_packet(
+                artifact_dir=artifact_dir or DEFAULT_ARTIFACT_DIR,
+                profile=None,
+                source_review=websocket_source_review,
+            )
         websocket_queue_priority = lead_priority_from_values(
             "low",
             *[lead.get("priority") for lead in websocket_header_forwarding_leads],
@@ -32456,6 +32652,7 @@ def build_verification_queue(
                 "websocket_source_review_summary": websocket_source_summary,
                 "websocket_auth_context_status": websocket_auth_context_status,
                 "websocket_auth_context_summary": websocket_auth_context_summary,
+                "websocket_header_forwarding_approval_packet": websocket_approval_packet,
                 "websocket_auth_context_evidence": {
                     "sensitive": websocket_auth_context.get("sensitive_context_evidence", [])[:6],
                     "unknown": websocket_auth_context.get("unknown_context_evidence", [])[:6],
@@ -47544,6 +47741,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
     websocket_header_forwarding_queue: dict[str, Any] = {}
     websocket_header_forwarding_matrix: dict[str, Any] = {}
     websocket_header_forwarding_validation: dict[str, Any] = {}
+    websocket_header_forwarding_iteration_decision: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(prefix="inferforge-ws-header-forwarding-selftest-") as ws_header_temp_dir:
         ws_header_root = Path(ws_header_temp_dir)
         bad_root = ws_header_root / "bad"
@@ -47672,6 +47870,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             target="https://ws-header-forwarding.test",
             asset_candidates_doc={"candidates": []},
             scope_policy={"policy": {"allowed_hosts": ["ws-header-forwarding.test"]}},
+            artifact_dir=ws_header_artifact_dir,
             source_root=bad_root,
         )
         write_json(ws_header_artifact_dir / WEBSOCKET_CANDIDATE_REVIEW_ARTIFACT, websocket_header_forwarding_candidate_review)
@@ -47695,6 +47894,19 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             target=target,
             profile=test_profile,
             artifact_dir=ws_header_artifact_dir,
+            limit=40,
+        )
+        websocket_header_forwarding_iteration_decision = build_iteration_decision_from_plan(
+            target=target,
+            profile=test_profile,
+            artifact_dir=ws_header_artifact_dir,
+            validation_plan=websocket_header_forwarding_validation,
+            artifact_health={
+                "generated_at": utc_now(),
+                "status": "healthy",
+                "summary": {"artifact_dirs": 1, "status_counts": {"healthy": 1}},
+            },
+            current_resource_snapshot={"generated_at": utc_now(), "status": "not-run"},
             limit=40,
         )
     websocket_queue_item = next(
@@ -47750,6 +47962,21 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         if isinstance(websocket_queue_item.get("evidence_contract"), dict)
         else {}
     )
+    websocket_candidate_packet = (
+        websocket_header_forwarding_candidate_review.get("websocket_header_forwarding_approval_packet")
+        if isinstance(websocket_header_forwarding_candidate_review.get("websocket_header_forwarding_approval_packet"), dict)
+        else {}
+    )
+    websocket_queue_packet = (
+        websocket_queue_item.get("websocket_header_forwarding_approval_packet")
+        if isinstance(websocket_queue_item.get("websocket_header_forwarding_approval_packet"), dict)
+        else {}
+    )
+    websocket_validation_packet = (
+        websocket_validation_item.get("websocket_header_forwarding_approval_packet")
+        if isinstance(websocket_validation_item.get("websocket_header_forwarding_approval_packet"), dict)
+        else {}
+    )
     websocket_matrix_contract = (
         websocket_matrix_hypothesis.get("evidence_contract")
         if isinstance(websocket_matrix_hypothesis.get("evidence_contract"), dict)
@@ -47793,6 +48020,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "No WebSocket subscription frames" in str(item)
             for item in websocket_bad_contract.get("forbidden_validation", []) or []
         )
+        and websocket_candidate_packet.get("status") == "waiting-upstream-header-trust-evidence"
+        and websocket_candidate_packet.get("type") == "websocket-header-forwarding-approval-packet"
+        and (websocket_candidate_packet.get("recommended_evidence") or {}).get("entrypoint")
+        == "WS /api/rpc/solana/{cluster}"
+        and "sensitive-header-filter-policy"
+        in ((websocket_candidate_packet.get("recommended_evidence") or {}).get("missing_decision_ids") or [])
         and websocket_bad_lead_contract.get("id") == "websocket-header-forwarding-evidence-contract"
         and websocket_header_forwarding_filtered_review.get("status") == "header-forwarding-filtered"
         and (websocket_header_forwarding_filtered_review.get("summary") or {}).get("lead_count") == 0
@@ -47819,6 +48052,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and websocket_queue_item.get("offline_only") is True
         and websocket_queue_item.get("impact") == "websocket-header-forwarding"
         and websocket_queue_item.get("websocket_auth_context_status") == "sensitive-app-auth-context"
+        and websocket_queue_packet.get("status") == "waiting-upstream-header-trust-evidence"
         and "websocket-candidate-review --no-write" in websocket_queue_commands_text
         and "--show-evidence-contract" in websocket_queue_commands_text
         and websocket_queue_contract.get("id") == "websocket-header-forwarding-evidence-contract"
@@ -47831,6 +48065,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and procedural_queue_hypothesis.get("queue_role") == "procedural-refresh"
         and procedural_queue_hypothesis.get("impact") == "process-readiness"
         and websocket_validation_item.get("status") == "ready-offline"
+        and websocket_validation_packet.get("status") == "waiting-upstream-header-trust-evidence"
+        and any(
+            item.get("packet_type") == "websocket-header-forwarding"
+            and (item.get("packet") or {}).get("status") == "waiting-upstream-header-trust-evidence"
+            for item in websocket_header_forwarding_iteration_decision.get("approval_packets", [])
+            if isinstance(item, dict)
+        )
         and "websocket-candidate-review --no-write" in websocket_validation_allowed_now
         and "--show-evidence-contract" in websocket_validation_allowed_now
     )
@@ -51431,6 +51672,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             "candidate_review": {
                 "status": websocket_header_forwarding_candidate_review.get("status"),
                 "summary": websocket_header_forwarding_candidate_review.get("summary", {}),
+                "approval_packet": websocket_candidate_packet,
             },
             "contract_flow": {
                 "source_contract": websocket_bad_contract.get("id"),
@@ -51439,6 +51681,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "matrix_contract": websocket_matrix_contract.get("id"),
                 "queue_commands": websocket_queue_item.get("commands", []),
                 "validation_allowed_now": websocket_validation_allowed_now,
+                "queue_packet": websocket_queue_packet,
+                "validation_packet": websocket_validation_packet,
+                "iteration_packet_types": [
+                    item.get("packet_type")
+                    for item in websocket_header_forwarding_iteration_decision.get("approval_packets", [])
+                    if isinstance(item, dict)
+                ],
             },
             "queue_item": websocket_queue_item,
             "matrix_hypothesis": websocket_matrix_hypothesis,
@@ -55230,6 +55479,8 @@ def run_websocket_candidate_review(args: argparse.Namespace) -> int:
     scope_policy = load_optional_json(artifact_dir / SCOPE_POLICY_ARTIFACT)
     review = build_websocket_candidate_review(
         target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
         asset_candidates_doc=asset_candidates_doc,
         scope_policy=scope_policy,
         source_root=source_root,
@@ -55327,6 +55578,8 @@ def run_websocket_candidate_review(args: argparse.Namespace) -> int:
             return 2
         review = build_websocket_candidate_review(
             target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
             asset_candidates_doc=asset_candidates_doc,
             scope_policy=scope_policy,
             source_root=source_root,
@@ -55368,6 +55621,15 @@ def run_websocket_candidate_review(args: argparse.Namespace) -> int:
         f"missing_filters={','.join(source_summary.get('missing_sensitive_header_filters', []) or []) or '(none)'} "
         f"auth_context={source_summary.get('auth_context_status', 'not-run')}"
     )
+    websocket_packet = (
+        source_review.get("websocket_header_forwarding_approval_packet")
+        if isinstance(source_review.get("websocket_header_forwarding_approval_packet"), dict)
+        else review.get("websocket_header_forwarding_approval_packet")
+        if isinstance(review.get("websocket_header_forwarding_approval_packet"), dict)
+        else {}
+    )
+    if websocket_packet:
+        print(f"Approval packet: {format_approval_packet_inline(websocket_packet, status_key=True)}")
     if args.show_evidence_contract:
         contract = (
             source_review.get("evidence_contract")
@@ -57644,6 +57906,13 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                 )
                 if credential_packet:
                     print(f"  credential_approval_packet={format_approval_packet_inline(credential_packet)}")
+                websocket_packet = (
+                    item.get("websocket_header_forwarding_approval_packet")
+                    if isinstance(item.get("websocket_header_forwarding_approval_packet"), dict)
+                    else {}
+                )
+                if websocket_packet:
+                    print(f"  websocket_approval_packet={format_approval_packet_inline(websocket_packet)}")
                 rewrite_review = item.get("rewrite_review") if isinstance(item.get("rewrite_review"), dict) else {}
                 source_guard = (
                     rewrite_review.get("source_guard_review")
