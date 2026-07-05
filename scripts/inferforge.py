@@ -11739,6 +11739,10 @@ def rewrite_path_candidates_for_cluster(
 
 def rewrite_source_review_token_categories() -> dict[str, list[str]]:
     return {
+        "next_config_rewrites": ["async rewrites()", "rewrites()"],
+        "rewrite_sources": ["source:"],
+        "rewrite_destinations": ["destination:"],
+        "rewrite_env_defaults": ["process.env.", "?? 'https://", '?? "https://'],
         "method_handlers": ["export async function GET", "export async function HEAD", "export async function POST"],
         "route_param_reads": ["context.params", "params", "address"],
         "positive_param_guards": [
@@ -11834,7 +11838,29 @@ def build_rewrite_source_guard_review(
     query_forwarding = matches["query_forwarding"]
     credential_forwarding = matches["credential_forwarding"]
     param_interpolation = matches["attacker_param_interpolation"]
+    config_rewrites = matches["next_config_rewrites"]
+    rewrite_sources = matches["rewrite_sources"]
+    rewrite_destinations = matches["rewrite_destinations"]
+    rewrite_env_defaults = matches["rewrite_env_defaults"]
     decisions = [
+        decision(
+            "next-config-rewrite",
+            "evidence-present" if config_rewrites or rewrite_sources or rewrite_destinations else "not-seen",
+            [*config_rewrites, *rewrite_sources[:4], *rewrite_destinations[:4]],
+            "Is this proxy boundary implemented as a Next.js config rewrite rather than an application route handler?",
+        ),
+        decision(
+            "rewrite-destination",
+            "evidence-present" if rewrite_destinations else "missing-evidence",
+            rewrite_destinations,
+            "Which destination expression does the rewrite use, and is the upstream host fixed by configuration?",
+        ),
+        decision(
+            "rewrite-upstream-env-default",
+            "evidence-present" if rewrite_env_defaults else "not-seen",
+            rewrite_env_defaults,
+            "Does the rewrite use an environment-controlled upstream with a checked-in default?",
+        ),
         decision(
             "fixed-upstream-host",
             "evidence-present" if fixed_fetches else "missing-evidence",
@@ -11884,6 +11910,8 @@ def build_rewrite_source_guard_review(
 
     if fixed_fetches and guards and not query_forwarding and not credential_forwarding:
         status = "source-guard-indexed"
+    elif config_rewrites or rewrite_sources or rewrite_destinations:
+        status = "config-rewrite-indexed"
     elif fixed_fetches or guards:
         status = "needs-source-review"
     elif skipped and not files:
@@ -11897,6 +11925,10 @@ def build_rewrite_source_guard_review(
             "files": len(files),
             "skipped": len(skipped),
             "decision_status_counts": dict(sorted(decision_status_counts.items())),
+            "next_config_rewrite_refs": len(config_rewrites),
+            "rewrite_source_refs": len(rewrite_sources),
+            "rewrite_destination_refs": len(rewrite_destinations),
+            "rewrite_env_default_refs": len(rewrite_env_defaults),
             "fixed_upstream_fetch_refs": len(fixed_fetches),
             "positive_guard_refs": len(guards),
             "query_forwarding_refs": len(query_forwarding),
@@ -11912,7 +11944,7 @@ def build_rewrite_source_guard_review(
         "matches": {category: refs[:12] for category, refs in matches.items()},
         "decisions": decisions,
         "required_evidence": [
-            "Source evidence for the fixed upstream host and route parameter guard.",
+            "Source evidence for the rewrite/proxy boundary, fixed upstream host, and route parameter guard.",
             "Evidence that query strings and credentials are not forwarded unless explicitly intended.",
             "One approved read-only concrete path and response comparison before any reportability claim.",
         ],
@@ -12000,11 +12032,21 @@ def rewrite_review_item_for_cluster(
         risk_factors.append("client-non-read-only-path-blocked")
     if any(candidate.get("status") == "blocked-dynamic-template" for candidate in blocked_candidates):
         risk_factors.append("client-dynamic-path-blocked")
+    source_guard_summary = source_guard_review.get("summary") or {}
+    if source_guard_summary.get("next_config_rewrite_refs", 0):
+        risk_factors.append("config-rewrite-indexed")
+    if source_guard_summary.get("rewrite_destination_refs", 0):
+        risk_factors.append("config-rewrite-destination-indexed")
+    if (
+        source_guard_summary.get("next_config_rewrite_refs", 0)
+        and not source_guard_summary.get("positive_guard_refs", 0)
+    ):
+        risk_factors.append("no-positive-source-guard")
     if source_guard_review.get("status") == "source-guard-indexed":
         risk_factors.append("source-positive-guard-indexed")
-    if (source_guard_review.get("summary") or {}).get("query_forwarding_refs", 0):
+    if source_guard_summary.get("query_forwarding_refs", 0):
         risk_factors.append("query-forwarding-review")
-    if (source_guard_review.get("summary") or {}).get("credential_forwarding_refs", 0):
+    if source_guard_summary.get("credential_forwarding_refs", 0):
         risk_factors.append("credential-forwarding-review")
 
     if status == "needs-source-review" and source_guard_review.get("status") == "source-guard-indexed":
@@ -45277,6 +45319,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             and rewrite_review_proxy_item.get("catch_all") is True
             and rewrite_checklist_proxy_item is not None
             and rewrite_checklist_proxy_item.get("status") == "ready-for-single-path-promotion-preview"
+            and rewrite_checklist_proxy_item.get("source_guard_status") == "config-rewrite-indexed"
+            and rewrite_checklist_proxy_item.get("source_guard_summary", {}).get("next_config_rewrite_refs", 0) >= 1
+            and rewrite_checklist_proxy_item.get("source_guard_summary", {}).get("rewrite_source_refs", 0) >= 1
+            and rewrite_checklist_proxy_item.get("source_guard_summary", {}).get("rewrite_destination_refs", 0) >= 1
             and rewrite_checklist_proxy_item.get("source_guard_summary", {}).get("fixed_upstream_fetch_refs") == 0
             and rewrite_checklist_recommended.get("local_path") == "/api/proxy/users/42"
             and isinstance(rewrite_checklist_recommended_sensitivity.get("matched_keywords"), list)
@@ -45286,6 +45332,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 for reason in rewrite_checklist_proxy_item.get("candidate_selection_rationale", [])
             )
             and "fixed-upstream" in rewrite_review_proxy_item.get("risk_factors", [])
+            and "config-rewrite-indexed" in rewrite_review_proxy_item.get("risk_factors", [])
+            and "config-rewrite-destination-indexed" in rewrite_review_proxy_item.get("risk_factors", [])
             and "client-read-only-path-candidate" in rewrite_review_proxy_item.get("risk_factors", [])
             and "client-non-read-only-path-blocked" in rewrite_review_proxy_item.get("risk_factors", [])
             and "https://api.example.test" in rewrite_review_proxy_item.get("fixed_upstreams", [])
@@ -50982,6 +51030,8 @@ def run_rewrite_review(args: argparse.Namespace) -> int:
                     print(
                         "  source_guard_review="
                         f"{source_guard.get('status')} "
+                        f"config_rewrites={source_summary.get('next_config_rewrite_refs', 0)} "
+                        f"destinations={source_summary.get('rewrite_destination_refs', 0)} "
                         f"fixed_fetches={source_summary.get('fixed_upstream_fetch_refs', 0)} "
                         f"guards={source_summary.get('positive_guard_refs', 0)} "
                         f"query_refs={source_summary.get('query_forwarding_refs', 0)} "
@@ -51073,6 +51123,8 @@ def run_rewrite_validation_checklist(args: argparse.Namespace) -> int:
                 print(
                     "  source_guard="
                     f"{item.get('source_guard_status')} "
+                    f"config={source_guard_summary.get('next_config_rewrite_refs', 0)} "
+                    f"destinations={source_guard_summary.get('rewrite_destination_refs', 0)} "
                     f"fixed={source_guard_summary.get('fixed_upstream_fetch_refs', 0)} "
                     f"guards={source_guard_summary.get('positive_guard_refs', 0)} "
                     f"query={source_guard_summary.get('query_forwarding_refs', 0)} "
@@ -52370,6 +52422,8 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                     print(
                         "  rewrite_source_guard="
                         f"{source_guard.get('status')} "
+                        f"config_rewrites={source_summary.get('next_config_rewrite_refs', 0)} "
+                        f"destinations={source_summary.get('rewrite_destination_refs', 0)} "
                         f"fixed_fetches={source_summary.get('fixed_upstream_fetch_refs', 0)} "
                         f"guards={source_summary.get('positive_guard_refs', 0)} "
                         f"query_refs={source_summary.get('query_forwarding_refs', 0)} "
