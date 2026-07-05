@@ -260,9 +260,9 @@ issue validation, and PoC/reporting stages, then prints the safest next steps:
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
-  harness-loop --no-write
+  harness-loop --no-write --skip-current-resource-check
 python3 scripts/inferforge.py --artifact-dir .greybox/target-set \
-  harness-loop --discover-child-runs --no-write
+  harness-loop --discover-child-runs --no-write --skip-current-resource-check
 ```
 
 `harness-loop` is also read-only. It is intended for low-memory unattended runs:
@@ -515,10 +515,13 @@ internal current-resource preflight before memory-sensitive work. The internal
 gate is intentionally conservative (`MemAvailable` below 2048 MiB or used swap
 above 1024 MiB is a warning). When an active command hits that gate, it writes a
 resource-gate artifact and exits before active probes, Burp history reads, quote
-or Orca baseline requests, black-box page/script fetches, WebSocket handshake
-baselines, DNS/HTTPS takeover baselines, Node transaction decoding, or the full
-regression step schedule. Use `--allow-resource-warning` only after reviewing
-local pressure and narrowing the command with limits or skip flags.
+collection, Orca baseline requests, black-box page/script fetches, WebSocket
+handshake baselines, DNS/HTTPS takeover baselines, Node transaction decoding,
+browser automation, or the full regression step schedule. For pure no-write
+planning previews, prefer commands that include `--skip-current-resource-check`;
+run an explicit `resource-snapshot --watch-port 3100 --strict` only immediately
+before approved active target work. Use `--allow-resource-warning` only after
+reviewing local pressure and narrowing the command with limits or skip flags.
 
 Review program scope, authentication context, and endpoint criticality before
 any active probes:
@@ -902,7 +905,7 @@ python3 scripts/inferforge.py regression-suite --include-external --ws-resource-
 python3 scripts/inferforge.py adjudicate
 python3 scripts/inferforge.py audit --no-ws
 python3 scripts/inferforge.py audit --ws-resource-probes
-python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-commands
+python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check
 python3 scripts/inferforge.py decode-transactions
 python3 scripts/inferforge.py self-test-transactions
 python3 scripts/inferforge.py self-test-profile-routing
@@ -946,7 +949,7 @@ When the resource gate is degraded or critical, it keeps capture steps marked as
 blocked and only prints sidecar formats plus decode commands:
 
 ```bash
-python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-commands --show-steps
+python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-commands --show-steps --skip-current-resource-check
 ```
 
 ```bash

@@ -8692,18 +8692,18 @@ HARNESS_STAGE_OFFLINE_FOLLOWUPS = {
     "finding-identification": [
         "response-deltas --no-write",
         "transaction-sidecar-review --no-write --show-files --show-commands",
-        "transaction-corpus-checklist --no-write --show-commands",
+        "transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check",
         "transaction-flow-review --no-write --top 8",
         "hypothesis-matrix --no-write --show-next",
     ],
     "issue-validation": [
-        "methodology-review --no-write --limit 8",
+        "methodology-review --no-write --limit 8 --skip-current-resource-check",
         "evidence-gaps --no-write",
-        "validation-plan --no-write --limit 8 --show-commands",
-        "credential-impact-checklist --no-write --show-commands --show-evidence",
+        "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check",
+        "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check",
         "operator-evidence-review --no-write --show-missing --show-template",
         "transaction-sidecar-review --no-write --show-files --show-commands",
-        "transaction-corpus-checklist --no-write --show-commands",
+        "transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check",
         "deployment-review --no-write --top 8",
         "transaction-flow-review --no-write --top 8",
     ],
@@ -9249,15 +9249,15 @@ def methodology_next_command_for_hypothesis(
     impact = str(item.get("impact") or "")
     hypothesis_type = str(item.get("type") or item.get("hypothesis_type") or "")
     if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
-        subcommand = "transaction-corpus-checklist --no-write --show-commands"
+        subcommand = "transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check"
     elif impact == "credentialed-upstream-cost-abuse" or hypothesis_type == "credential-proxy-review":
-        subcommand = "credential-impact-checklist --no-write --show-commands --show-evidence"
+        subcommand = "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check"
     elif impact == "resource-exhaustion" or hypothesis_type == "resource-abuse-review":
         subcommand = "deployment-review --no-write --top 8"
     elif impact == "fixed-upstream-proxy-confusion":
         subcommand = "rewrite-review --no-write --show-next"
     else:
-        subcommand = "validation-plan --no-write --limit 8 --show-commands"
+        subcommand = "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check"
     ref = validation_command_ref(
         validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile),
         source=f"methodology-review:hypothesis:{item.get('id') or hypothesis_type or impact}",
@@ -11654,7 +11654,7 @@ def validation_allowed_commands(
         return validation_command_for_artifact_dir(artifact_dir, subcommand, profile=profile)
 
     allowed_now_commands = [
-        command("harness-loop --no-write"),
+        command("harness-loop --no-write --skip-current-resource-check"),
         command("hypothesis-matrix --no-write --show-next"),
         command("rewrite-review --no-write --show-next"),
         command("source-peek-requests --no-write --top 8"),
@@ -11671,13 +11671,16 @@ def validation_allowed_commands(
         allowed_now_commands.insert(3, command("deployment-review --no-write --top 8"))
     if hypothesis.get("type") == "transaction-flow-review" or hypothesis.get("impact") == "transaction-integrity":
         allowed_now_commands.insert(3, command("transaction-flow-review --no-write --top 8"))
-        allowed_now_commands.insert(3, command("transaction-corpus-checklist --no-write --show-commands"))
+        allowed_now_commands.insert(
+            3,
+            command("transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check"),
+        )
         allowed_now_commands.insert(3, command("transaction-sidecar-review --no-write --show-files --show-commands"))
     if hypothesis.get("type") == "credential-proxy-review" or hypothesis.get("impact") == "credentialed-upstream-cost-abuse":
         for subcommand in reversed(
             [
                 "operator-evidence-review --no-write --show-missing --show-template",
-                "credential-impact-checklist --no-write --show-commands --show-evidence",
+                "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check",
                 "deployment-review --no-write --top 8",
                 "transaction-flow-review --no-write --top 8",
             ]
@@ -26612,6 +26615,7 @@ def verification_queue_command_preview_lines(item: dict[str, Any], *, limit: int
         if "--include-external" in command_text or "--ws-resource-probes" in command_text:
             lines.append(
                 "    offline_alternative=Run validation-plan --no-write --limit 8 --show-commands "
+                "--skip-current-resource-check "
                 "for constrained replacements before any active audit."
             )
             lines.append(
@@ -26620,6 +26624,7 @@ def verification_queue_command_preview_lines(item: dict[str, Any], *, limit: int
         if "collect-quote" in command_text:
             lines.append(
                 "    offline_alternative=Run transaction-corpus-checklist --no-write --show-commands --show-steps "
+                "--skip-current-resource-check "
                 "until one approved quote corpus can be captured safely."
             )
     return lines
@@ -26679,6 +26684,7 @@ def verification_queue_followup_preview_lines(item: dict[str, Any], *, limit: in
         if "--include-external" in command_text or "--ws-resource-probes" in command_text:
             lines.append(
                 "    offline_alternative=Run validation-plan --no-write --limit 8 --show-commands "
+                "--skip-current-resource-check "
                 "for constrained replacements before any active audit."
             )
             lines.append(
@@ -26687,6 +26693,7 @@ def verification_queue_followup_preview_lines(item: dict[str, Any], *, limit: in
         if "collect-quote" in command_text:
             lines.append(
                 "    offline_alternative=Run transaction-corpus-checklist --no-write --show-commands --show-steps "
+                "--skip-current-resource-check "
                 "until one approved quote corpus can be captured safely."
             )
 
@@ -38118,7 +38125,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                         "priority": "medium",
                         "hypothesis_type": "resource-abuse-review",
                         "allowed_now": [
-                            focused_iteration_ref("harness-loop --no-write"),
+                            focused_iteration_ref("harness-loop --no-write --skip-current-resource-check"),
                             focused_iteration_ref("hypothesis-matrix --no-write --show-next"),
                             focused_iteration_ref("deployment-review --no-write --top 8"),
                             focused_iteration_ref("operator-evidence-review --no-write --show-missing --show-template"),
@@ -38130,7 +38137,9 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                         "priority": "high",
                         "hypothesis_type": "transaction-flow-review",
                         "allowed_now": [
-                            focused_iteration_ref("transaction-corpus-checklist --no-write --show-commands"),
+                            focused_iteration_ref(
+                                "transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check"
+                            ),
                             focused_iteration_ref("transaction-sidecar-review --no-write --show-files --show-commands"),
                         ],
                     },
@@ -40150,6 +40159,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 for ref in rewrite_transaction_validation_item.get("allowed_now", []) or []
                 if isinstance(ref, dict)
             )
+            and any(
+                "transaction-corpus-checklist --no-write --show-commands --skip-current-resource-check"
+                in str(ref.get("command") or "")
+                for ref in rewrite_transaction_validation_item.get("allowed_now", []) or []
+                if isinstance(ref, dict)
+            )
             and rewrite_credential_proxy_validation_item is not None
             and rewrite_credential_proxy_validation_item.get("status") == "ready-offline"
             and rewrite_credential_proxy_validation_item.get("impact") == "credentialed-upstream-cost-abuse"
@@ -40180,6 +40195,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                     [],
                 )
                 or []
+            )
+            and any(
+                "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check"
+                in str(ref.get("command") or "")
+                for ref in rewrite_credential_proxy_validation_item.get("allowed_now", []) or []
+                if isinstance(ref, dict)
             )
         )
         rate_limit_resource_review = rewrite_transaction_policy.get("rate_limit_resource_review", {})
