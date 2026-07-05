@@ -19548,6 +19548,15 @@ def transaction_corpus_policy_templates(profile: dict[str, Any] | None, artifact
         if not direction:
             continue
         allowed_programs = normalize_string_list(row.get("allowedPrograms"))
+        prepare_parts = [
+            "prepare-transaction-intent-policy",
+            "--direction",
+            direction,
+            "--wallet",
+            PLACEHOLDER_REAL_WALLET,
+            "--amount-in",
+            "REPLACE_WITH_RAW_AMOUNT",
+        ]
         decode_parts = [
             "decode-transactions",
             "--input",
@@ -19560,6 +19569,7 @@ def transaction_corpus_policy_templates(profile: dict[str, Any] | None, artifact
             "REPLACE_WITH_RAW_AMOUNT",
         ]
         for program_id in allowed_programs:
+            prepare_parts.extend(["--intent-allowed-program", program_id])
             decode_parts.extend(["--intent-allowed-program", program_id])
         templates.append(
             {
@@ -19571,6 +19581,11 @@ def transaction_corpus_policy_templates(profile: dict[str, Any] | None, artifact
                 "programAllowlistStatus": "configured" if allowed_programs else "manual-review-required",
                 "missing_runtime_fields": row.get("missing_runtime_fields", []),
                 "intent_policy_sidecar_template": row.get("sidecar_template", {}),
+                "prepare_policy_command": validation_command_for_artifact_dir(
+                    artifact_dir,
+                    " ".join(shlex.quote(str(part)) for part in prepare_parts),
+                    profile=profile,
+                ),
                 "decode_command": validation_command_for_artifact_dir(
                     artifact_dir,
                     " ".join(shlex.quote(str(part)) for part in decode_parts),
@@ -19969,6 +19984,7 @@ def build_transaction_corpus_checklist(
             "status": row.get("status"),
             "path": intent_policy_sidecar_path,
             "policy": row.get("intent_policy_sidecar_template", {}),
+            "prepare_command": row.get("prepare_policy_command"),
             "notes": [
                 "Copy exactly one policy object to transaction-intent-policy.json for the approved quote direction.",
                 "Replace wallet and amountIn placeholders with the real approved quote request values before decoding.",
@@ -41157,6 +41173,17 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         if isinstance(template, dict) and isinstance(template.get("policy"), dict)
         for key in template.get("policy", {})
     }
+    transaction_policy_prepare_commands = "\n".join(
+        str(template.get("prepare_command") or "")
+        for template in transaction_policy_sidecar_templates
+        if isinstance(template, dict)
+    )
+    transaction_prepare_policy_sample = build_transaction_intent_policy_sidecar(
+        test_profile,
+        direction="buy",
+        wallet="EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR",
+        amount_in="1000000",
+    )
     transaction_corpus_gate_checklist_passed = (
         transaction_corpus_gate_checklist.get("status") == "decoded-intent-mismatch-review"
         and transaction_corpus_gate_checklist.get("summary", {}).get("ready_for_finding_gate") is True
@@ -41165,6 +41192,11 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and {"direction", "wallet", "amountIn", "sourceMint", "destinationMint"}.issubset(
             transaction_policy_template_fields
         )
+        and "prepare-transaction-intent-policy --direction buy" in transaction_policy_prepare_commands
+        and "prepare-transaction-intent-policy --direction sell" in transaction_policy_prepare_commands
+        and transaction_prepare_policy_sample.get("direction") == "buy"
+        and transaction_prepare_policy_sample.get("amountIn") == "1000000"
+        and transaction_prepare_policy_sample.get("wallet") == "EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR"
         and " gate --no-write" in transaction_corpus_gate_commands
         and " adjudicate --no-write" in transaction_corpus_gate_commands
         and " evidence-chain --no-write" in transaction_corpus_gate_commands
@@ -41723,6 +41755,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         "transaction_corpus_gate_checklist": {
             "status": "passed" if transaction_corpus_gate_checklist_passed else "failed",
             "checklist_status": transaction_corpus_gate_checklist.get("status"),
+            "prepare_policy_commands": transaction_policy_prepare_commands.splitlines(),
+            "prepare_policy_sample": transaction_prepare_policy_sample,
             "post_decode_commands": transaction_corpus_gate_checklist.get("post_decode_commands", []),
         },
         "route_method_export_list": {
@@ -46717,6 +46751,8 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
             f"allowed_programs={len(row.get('allowedPrograms', []) or [])} "
             f"program_policy={row.get('programAllowlistStatus') or 'unknown'}"
         )
+        if args.show_commands and row.get("prepare_policy_command"):
+            print(f"  prepare={inline_summary_text(row.get('prepare_policy_command'), max_chars=420)}")
         if args.show_commands and row.get("decode_command"):
             print(f"  decode={inline_summary_text(row.get('decode_command'), max_chars=420)}")
     post_decode_commands = checklist.get("post_decode_commands", []) or []
@@ -47240,6 +47276,41 @@ def build_quote_collection_body(
     )
 
 
+def build_transaction_intent_policy_sidecar(
+    profile: dict[str, Any] | None,
+    *,
+    direction: str,
+    wallet: str,
+    amount_in: str,
+    allowed_programs: list[str] | None = None,
+) -> dict[str, Any]:
+    expected_mints = expected_mints_for_direction(direction, profile)
+    if expected_mints is None:
+        raise ValueError(
+            "quote_intent.directions must define sourceMint and destinationMint "
+            f"for direction `{direction}` before preparing an intent policy."
+        )
+    source_mint, destination_mint = expected_mints
+    policy: dict[str, Any] = {
+        "direction": direction,
+        "wallet": wallet,
+        "amountIn": amount_in,
+        "sourceMint": source_mint,
+        "destinationMint": destination_mint,
+    }
+    if allowed_programs:
+        policy["allowedPrograms"] = allowed_programs
+    else:
+        profile_allowed_programs = quote_allowed_programs(profile, direction)
+        if profile_allowed_programs:
+            policy["allowedPrograms"] = profile_allowed_programs
+
+    normalized = normalize_transaction_intent_policy(policy, profile)
+    if not normalized.get("valid"):
+        raise ValueError("; ".join(str(issue) for issue in normalized.get("issues", []) or []))
+    return policy
+
+
 def quote_provider_diagnostic_matches(diagnostic: dict[str, Any], status: Any, body_sample: str) -> bool:
     statuses_raw = (
         diagnostic.get("statuses")
@@ -47331,6 +47402,62 @@ def diagnose_quote_collection_response(
     }
 
 
+def run_prepare_transaction_intent_policy(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    output_path = Path(args.output).resolve() if args.output else artifact_dir / "transaction-intent-policy.json"
+    try:
+        policy = build_transaction_intent_policy_sidecar(
+            profile,
+            direction=args.direction,
+            wallet=args.wallet,
+            amount_in=args.amount_in,
+            allowed_programs=args.intent_allowed_program or None,
+        )
+    except ValueError as error:
+        print(f"Transaction intent policy error: {error}")
+        return 2
+
+    allowed_programs = policy.get("allowedPrograms", []) if isinstance(policy.get("allowedPrograms"), list) else []
+    program_status = "configured" if allowed_programs else "manual-review-required"
+    print("Transaction intent policy: preview" if no_write else "Transaction intent policy: prepared")
+    print(f"Path: {output_path}")
+    print(
+        "Intent: "
+        f"direction={policy.get('direction')} "
+        f"wallet={policy.get('wallet')} "
+        f"amountIn={policy.get('amountIn')}"
+    )
+    print(
+        "Mints: "
+        f"source={policy.get('sourceMint')} "
+        f"destination={policy.get('destinationMint')}"
+    )
+    print(f"Program allowlist: {program_status} count={len(allowed_programs)}")
+    if no_write:
+        print("Policy JSON:")
+        print(json.dumps(policy, indent=2, sort_keys=True))
+        print("No files written (--no-write).")
+        return 0
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_target_profile_artifact(artifact_dir, profile, target, source_root)
+    write_json(output_path, policy)
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="prepare-transaction-intent-policy",
+            output_paths=[
+                *target_profile_artifact_paths(artifact_dir),
+                output_path,
+            ],
+        )
+    )
+    return 0
+
+
 def run_collect_quote(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -47416,23 +47543,15 @@ def run_collect_quote(args: argparse.Namespace) -> int:
             )
         )
         return 2
-    expected_mints = expected_mints_for_direction(args.direction, profile)
-    if expected_mints is None:
-        raise RuntimeError("quote collection body was built without direction mints")
-    source_mint, destination_mint = expected_mints
-    policy = {
-        "direction": args.direction,
-        "wallet": args.wallet,
-        "amountIn": args.amount_in,
-        "sourceMint": source_mint,
-        "destinationMint": destination_mint,
-    }
-    if args.intent_allowed_program:
-        policy["allowedPrograms"] = args.intent_allowed_program
-    else:
-        profile_allowed_programs = quote_allowed_programs(profile, args.direction)
-        if profile_allowed_programs:
-            policy["allowedPrograms"] = profile_allowed_programs
+    policy = build_transaction_intent_policy_sidecar(
+        profile,
+        direction=args.direction,
+        wallet=args.wallet,
+        amount_in=args.amount_in,
+        allowed_programs=args.intent_allowed_program or None,
+    )
+    source_mint = str(policy["sourceMint"])
+    destination_mint = str(policy["destinationMint"])
     write_json(artifact_dir / "transaction-intent-policy.json", policy)
 
     try:
@@ -49111,6 +49230,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless a remote transaction signing flow needs intent-corpus review.",
     )
     transaction_flow_review.set_defaults(func=run_transaction_flow_review)
+
+    prepare_intent_policy = sub.add_parser(
+        "prepare-transaction-intent-policy",
+        help="Write or preview a transaction-intent-policy.json sidecar without sending target traffic",
+    )
+    prepare_intent_policy.add_argument("--direction", choices=["buy", "sell"], required=True, help="Approved quote direction")
+    prepare_intent_policy.add_argument("--wallet", required=True, help="Approved executing wallet/sender")
+    prepare_intent_policy.add_argument("--amount-in", required=True, help="Approved raw positive integer amountIn")
+    prepare_intent_policy.add_argument(
+        "--intent-allowed-program",
+        action="append",
+        help="Allowed compiled instruction program ID. Repeat only after manual allowlist review.",
+    )
+    prepare_intent_policy.add_argument(
+        "--output",
+        help="Where to write the sidecar. Defaults to --artifact-dir/transaction-intent-policy.json.",
+    )
+    prepare_intent_policy.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Print the derived policy only; do not write transaction-intent-policy.json or refreshed manifests.",
+    )
+    prepare_intent_policy.set_defaults(func=run_prepare_transaction_intent_policy)
 
     transaction_sidecar_review = sub.add_parser(
         "transaction-sidecar-review",

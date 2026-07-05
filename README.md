@@ -972,6 +972,16 @@ python3 scripts/inferforge.py decode-transactions \
   --intent-allowed-program 11111111111111111111111111111111
 ```
 
+To write the matching sidecar without sending target traffic, prepare it from
+the active profile first:
+
+```bash
+python3 scripts/inferforge.py prepare-transaction-intent-policy \
+  --direction buy \
+  --wallet EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR \
+  --amount-in 1000000
+```
+
 Or through `.greybox/transaction-intent-policy.json`:
 
 ```json
