@@ -19456,6 +19456,40 @@ def build_iteration_assessment_focus(
     return focus_rows
 
 
+def oracle_plan_cli_subcommand(*, limit: int, check_dirs: list[Path] | None = None) -> str:
+    display_limit = max(1, min(12, int(limit or 1)))
+    parts = ["oracle-plan", "--no-write", "--top", str(display_limit), "--show-details"]
+    for check_dir in check_dirs or []:
+        parts.extend(["--check-dir", repo_relative_or_absolute(check_dir)])
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def oracle_plan_command_refs_for_iteration(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    oracle_plan: dict[str, Any] | None,
+    check_dirs: list[Path] | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not isinstance(oracle_plan, dict) or not oracle_plan.get("actions"):
+        return []
+    subcommand = oracle_plan_cli_subcommand(limit=limit, check_dirs=check_dirs)
+    command = validation_command_for_artifact_dir(
+        artifact_dir,
+        subcommand,
+        profile=profile,
+    )
+    ref = validation_command_ref(
+        command,
+        source="iteration-decision:oracle-plan",
+        item_status="ready",
+    )
+    if ref.get("classification") != "ready":
+        return []
+    return [ref]
+
+
 OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     TARGET_PROFILE_ARTIFACT: "profile",
     STRATEGY_REGISTRY_ARTIFACT: "profile",
@@ -19624,6 +19658,8 @@ def build_iteration_decision_from_plan(
     artifact_health: dict[str, Any],
     current_resource_snapshot: dict[str, Any] | None,
     limit: int,
+    oracle_plan: dict[str, Any] | None = None,
+    oracle_plan_command_check_dirs: list[Path] | None = None,
 ) -> dict[str, Any]:
     assessment_policy = assessment_mode_policy(profile)
     lead_selection_strategy = lead_dossier_ranking_strategy(assessment_policy)
@@ -19711,15 +19747,29 @@ def build_iteration_decision_from_plan(
         for ref in objective_package_commands
         if str(ref.get("command") or "").strip()
     }
+    oracle_plan_commands = oracle_plan_command_refs_for_iteration(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        oracle_plan=oracle_plan,
+        check_dirs=oracle_plan_command_check_dirs,
+        limit=limit,
+    )
+    oracle_plan_command_keys = {
+        str(ref.get("command") or "").strip()
+        for ref in oracle_plan_commands
+        if str(ref.get("command") or "").strip()
+    }
     offline_after_objective_package = [
         ref
         for ref in offline
         if str(ref.get("command") or "").strip() not in objective_package_command_keys
+        and str(ref.get("command") or "").strip() not in oracle_plan_command_keys
     ]
     allowed_command_summary = command_safety_summary(
         [
             *artifact_repair,
             *objective_package_commands,
+            *oracle_plan_commands,
             *offline_after_objective_package,
             *resource_checks,
             *active_after_gate,
@@ -19733,6 +19783,17 @@ def build_iteration_decision_from_plan(
                 kind="offline",
                 reason="Run the no-write evidence-package commands for the current objective blocker first.",
                 commands=objective_package_commands,
+                limit=offline_preview_limit,
+            )
+        )
+    if oracle_plan_commands:
+        actions.append(
+            iteration_action(
+                action_id="oracle-evidence-plan",
+                status="ready",
+                kind="offline",
+                reason="Rank the validation-oracle blockers and shortest evidence contracts before broad offline planning.",
+                commands=oracle_plan_commands,
                 limit=offline_preview_limit,
             )
         )
@@ -19817,7 +19878,7 @@ def build_iteration_decision_from_plan(
             )
         )
 
-    if objective_package_commands or offline_after_objective_package or artifact_repair:
+    if objective_package_commands or oracle_plan_commands or offline_after_objective_package or artifact_repair:
         status = "ready-offline"
     elif artifact_health_blocks_active:
         status = "blocked-artifact-health"
@@ -19831,6 +19892,18 @@ def build_iteration_decision_from_plan(
         status = "parked"
     else:
         status = "no-validation-items"
+
+    oracle_plan_summary = oracle_plan.get("summary", {}) if isinstance(oracle_plan, dict) else {}
+    oracle_plan_actions = oracle_plan.get("actions", []) if isinstance(oracle_plan, dict) else []
+    if not isinstance(oracle_plan_summary, dict):
+        oracle_plan_summary = {}
+    if not isinstance(oracle_plan_actions, list):
+        oracle_plan_actions = []
+    top_oracle_action = oracle_plan_actions[0] if oracle_plan_actions and isinstance(oracle_plan_actions[0], dict) else {}
+    try:
+        oracle_plan_action_count = int(oracle_plan_summary.get("actions"))
+    except (TypeError, ValueError):
+        oracle_plan_action_count = len(oracle_plan_actions)
 
     return {
         "generated_at": utc_now(),
@@ -19866,6 +19939,11 @@ def build_iteration_decision_from_plan(
             "resource_blocked_active_commands": len(active_after_gate) if resource_blocks_active else 0,
             "approval_packets": len(approval_packets),
             "objective_package_commands": len(objective_package_commands),
+            "oracle_plan_status": (oracle_plan or {}).get("status") if isinstance(oracle_plan, dict) else None,
+            "oracle_plan_actions": oracle_plan_action_count,
+            "top_oracle": oracle_plan_summary.get("top_oracle_type"),
+            "top_oracle_contract": top_oracle_action.get("evidence_contract_kind"),
+            "top_oracle_first_missing": top_oracle_action.get("first_missing_artifact"),
             "blocked_commands": len(blocked),
             "command_safety": allowed_command_summary,
             "blocked_command_safety": blocked_command_summary,
@@ -19938,6 +20016,13 @@ def build_iteration_decision(
             current_resource_snapshot=current_resource_snapshot,
         )
         artifact_health = build_artifact_health(check_dirs)
+        review_blockers = build_review_blockers_rollup(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            check_dirs=check_dirs,
+            artifact_health=artifact_health,
+        )
     else:
         validation_plan = build_validation_plan_run(
             target=target,
@@ -19947,6 +20032,27 @@ def build_iteration_decision(
             current_resource_snapshot=current_resource_snapshot,
         )
         artifact_health = build_artifact_health([artifact_dir])
+        review_blockers = build_review_blockers(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            discovery_coverage=load_optional_json(artifact_dir / DISCOVERY_COVERAGE_ARTIFACT),
+            burp_observation_coverage=load_optional_json(artifact_dir / "burp-observation-coverage.json"),
+            verification_queue=load_optional_json(artifact_dir / "verification-queue.json"),
+            source_peek_requests=load_optional_json(artifact_dir / "source-peek-requests.json"),
+            environment_readiness=load_optional_json(artifact_dir / "environment-readiness.json"),
+            artifact_health=artifact_health,
+            finding_gate=current_finding_gate_for_artifact_dir(
+                target=target,
+                profile=profile,
+                artifact_dir=artifact_dir,
+            ),
+        )
+    oracle_plan = build_oracle_plan_from_review_blockers(
+        review_blockers,
+        artifact_dir=artifact_dir,
+        profile=profile,
+    )
     return build_iteration_decision_from_plan(
         target=target,
         profile=profile,
@@ -19955,6 +20061,8 @@ def build_iteration_decision(
         artifact_health=artifact_health,
         current_resource_snapshot=current_resource_snapshot,
         limit=limit,
+        oracle_plan=oracle_plan,
+        oracle_plan_command_check_dirs=check_dirs,
     )
 
 
@@ -52576,6 +52684,40 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 item_status="ready",
             )
 
+        focused_iteration_oracle_plan_sample = build_oracle_plan_from_review_blockers(
+            {
+                "generated_at": utc_now(),
+                "status": "needs-human-review",
+                "assessment_policy": assessment_mode_policy(blackbox_normalized_profile),
+                "summary": {"groups": 1},
+                "oracle_summary": {
+                    "type_counts": {"transaction-intent": 1},
+                    "dependency_counts": {"approved-sidecar-or-single-observation": 1},
+                    "artifact_status_counts": {"missing-artifacts": 1},
+                    "work_items": [
+                        {
+                            "group_id": "finding-gate-blocker:post-api-quote:transaction-corpus",
+                            "oracle_type": "transaction-intent",
+                            "oracle_status": "waiting-evidence",
+                            "priority": "high",
+                            "category": "finding-gate-blocker",
+                            "cluster_id": "quote",
+                            "title": "Blocked quote transaction-intent gate",
+                            "dependency_kind": "approved-sidecar-or-single-observation",
+                            "missing_artifact_count": 2,
+                            "first_missing_artifact": "transaction-intent-policy.json",
+                            "evidence_contract_kind": "approved-quote-transaction-corpus",
+                            "evidence_contract_status": "has-contract",
+                            "first_required_field": "approved=true for one reviewed quote payload sidecar",
+                            "required_field_count": 6,
+                            "next_step": "Collect one approved quote payload sidecar, then decode offline against intent policy.",
+                        }
+                    ],
+                },
+            },
+            artifact_dir=harness_loop_run_dir,
+            profile=blackbox_normalized_profile,
+        )
         focused_iteration_decision_sample = build_iteration_decision_from_plan(
             target="https://blackbox.test",
             profile=blackbox_normalized_profile,
@@ -52651,6 +52793,7 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 "watched_ports": {"3100": {"listening": False}},
             },
             limit=8,
+            oracle_plan=focused_iteration_oracle_plan_sample,
         )
         focused_iteration_preview_commands = [
             str(ref.get("command") or "")
@@ -52663,6 +52806,13 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             str(ref.get("command") or "")
             for action in focused_iteration_decision_sample.get("actions", [])
             if action.get("id") == "objective-evidence-package"
+            for ref in action.get("commands", []) or []
+            if isinstance(ref, dict)
+        ]
+        focused_iteration_oracle_preview_commands = [
+            str(ref.get("command") or "")
+            for action in focused_iteration_decision_sample.get("actions", [])
+            if action.get("id") == "oracle-evidence-plan"
             for ref in action.get("commands", []) or []
             if isinstance(ref, dict)
         ]
@@ -53812,6 +53962,12 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and "AbC1234567890Token" not in blackbox_iteration_command_text_sample
         and focused_iteration_decision_sample.get("summary", {}).get("offline_command_preview_limit") == 2
         and focused_iteration_decision_sample.get("summary", {}).get("approval_packets") == 2
+        and focused_iteration_decision_sample.get("summary", {}).get("oracle_plan_actions") == 1
+        and focused_iteration_decision_sample.get("summary", {}).get("top_oracle") == "transaction-intent"
+        and focused_iteration_decision_sample.get("summary", {}).get("top_oracle_contract")
+        == "approved-quote-transaction-corpus"
+        and focused_iteration_decision_sample.get("summary", {}).get("top_oracle_first_missing")
+        == "transaction-intent-policy.json"
         and any(
             item.get("packet_type") == "transaction-corpus"
             and (item.get("packet") or {}).get("status") == "ready-offline-approval"
@@ -53831,13 +53987,25 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
             focused_iteration_command(TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND),
         ]
+        and focused_iteration_oracle_preview_commands
+        == [
+            focused_iteration_command(oracle_plan_cli_subcommand(limit=8)),
+        ]
         and not any(
             command in focused_iteration_preview_commands
             for command in focused_iteration_objective_preview_commands
         )
         and not any(
+            command in [*focused_iteration_preview_commands, *focused_iteration_objective_preview_commands]
+            for command in focused_iteration_oracle_preview_commands
+        )
+        and not any(
             any(token in {"harness-loop", "hypothesis-matrix"} for token in validation_command_tokens(command))
-            for command in [*focused_iteration_objective_preview_commands[:2], *focused_iteration_preview_commands[:2]]
+            for command in [
+                *focused_iteration_objective_preview_commands[:2],
+                *focused_iteration_oracle_preview_commands[:1],
+                *focused_iteration_preview_commands[:2],
+            ]
         )
         and artifact_repair_iteration_decision_sample.get("status") == "ready-offline"
         and artifact_repair_iteration_decision_sample.get("summary", {}).get("artifact_repair_commands") == 2
@@ -56948,14 +57116,28 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                             TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND
                         ),
                     ]
+                    and focused_iteration_oracle_preview_commands
+                    == [
+                        focused_iteration_command(oracle_plan_cli_subcommand(limit=8)),
+                    ]
+                    and focused_iteration_decision_sample.get("summary", {}).get("oracle_plan_actions") == 1
+                    and focused_iteration_decision_sample.get("summary", {}).get("top_oracle") == "transaction-intent"
                     and not any(
                         command in focused_iteration_preview_commands
                         for command in focused_iteration_objective_preview_commands
                     )
                     and not any(
+                        command in [
+                            *focused_iteration_preview_commands,
+                            *focused_iteration_objective_preview_commands,
+                        ]
+                        for command in focused_iteration_oracle_preview_commands
+                    )
+                    and not any(
                         any(token in {"harness-loop", "hypothesis-matrix"} for token in validation_command_tokens(command))
                         for command in [
                             *focused_iteration_objective_preview_commands[:2],
+                            *focused_iteration_oracle_preview_commands[:1],
                             *focused_iteration_preview_commands[:2],
                         ]
                     )
@@ -56966,10 +57148,22 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
                 ),
                 "preview_commands": focused_iteration_preview_commands,
                 "objective_preview_commands": focused_iteration_objective_preview_commands,
+                "oracle_preview_commands": focused_iteration_oracle_preview_commands,
                 "expected_commands": [
                     focused_iteration_command(TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND),
                     focused_iteration_command(TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND),
                 ],
+                "expected_oracle_commands": [
+                    focused_iteration_command(oracle_plan_cli_subcommand(limit=8)),
+                ],
+                "oracle_summary": {
+                    "actions": focused_iteration_decision_sample.get("summary", {}).get("oracle_plan_actions"),
+                    "top": focused_iteration_decision_sample.get("summary", {}).get("top_oracle"),
+                    "contract": focused_iteration_decision_sample.get("summary", {}).get("top_oracle_contract"),
+                    "first_missing": focused_iteration_decision_sample.get("summary", {}).get(
+                        "top_oracle_first_missing"
+                    ),
+                },
             },
         },
         "any_method_match_reasons": {
@@ -64056,6 +64250,15 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
         f"objective_package={summary.get('objective_package_commands', 0)} "
         f"blocked={summary.get('blocked_commands', 0)}"
     )
+    if summary.get("oracle_plan_status") or summary.get("oracle_plan_actions"):
+        print(
+            "Oracle plan: "
+            f"status={summary.get('oracle_plan_status') or '-'} "
+            f"actions={summary.get('oracle_plan_actions', 0)} "
+            f"top={summary.get('top_oracle') or '-'} "
+            f"contract={summary.get('top_oracle_contract') or '-'} "
+            f"first_missing={summary.get('top_oracle_first_missing') or '-'}"
+        )
     if command_safety:
         print(f"Command safety: {format_command_safety_summary(command_safety)}")
     if blocked_command_safety and blocked_command_safety.get("commands"):
