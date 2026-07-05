@@ -330,10 +330,13 @@ of broad coverage gaps. Each lead carries an `assessment_rank` scorecard with
 `coverage_pressure`, `bounty_pressure`, `validity_pressure`, a composite score,
 and a pursue/park decision. In greybox mode, missing dangerous-surface evidence
 raises coverage pressure; in blackbox mode, gate-ready validity and expected
-payoff dominate. Each lead also prints a strict validation checklist status for
-scope, attacker control, concrete impact, minimal evidence, safe reproduction,
-counter-evidence, and severity/report path; the lead stays blocked before
-finding gate until all seven questions are satisfied:
+payoff dominate. Blackbox lead sets also include `relative_focus`: when one
+dominant bounty candidate is strong enough, weaker broad-coverage leads are
+parked behind it until that candidate stalls or closes. Each lead also prints a
+strict validation checklist status for scope, attacker control, concrete impact,
+minimal evidence, safe reproduction, counter-evidence, and severity/report path;
+the lead stays blocked before finding gate until all seven questions are
+satisfied:
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
@@ -590,8 +593,10 @@ coverage-first until dangerous source-derived surfaces are closed, while
 stronger valid high-impact report path exists. The artifact includes
 `iteration_focus`, a ranked validation-item scorecard using the same
 `coverage_pressure`, `bounty_pressure`, `validity_pressure`, and pursue/park
-decision fields as `lead-dossier`; approval packets also carry the matching
-assessment scorecard for the validation item that produced them.
+decision fields as `lead-dossier`. Blackbox focus rows also carry
+`relative_focus` so an unattended loop can park broad coverage work behind the
+dominant bounty candidate; approval packets also carry the matching assessment
+scorecard for the validation item that produced them.
 
 For in-scope WebSocket candidates extracted from static assets, keep validation
 to handshake-only unless a separate message-level plan has been reviewed:

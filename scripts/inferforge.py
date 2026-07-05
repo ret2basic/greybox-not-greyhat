@@ -11080,6 +11080,9 @@ LEAD_DOSSIER_BLACKBOX_PAYOFF_SCORE = {
     "resource-exhaustion": 18,
 }
 
+BLACKBOX_DOMINANT_FOCUS_MIN_SCORE = 65
+BLACKBOX_DOMINANT_FOCUS_DECISIONS = {"pursue-now", "pursue-minimal-evidence"}
+
 
 def lead_dossier_ranking_strategy(assessment_policy: dict[str, Any]) -> str:
     if str(assessment_policy.get("mode") or "") == "blackbox":
@@ -11122,6 +11125,21 @@ def lead_dossier_blocking_question_count(lead: dict[str, Any]) -> int:
 
 def lead_dossier_closure_blocked(lead: dict[str, Any]) -> bool:
     return str(lead.get("closure_status") or "").startswith("blocked")
+
+
+def assessment_item_identity(item: dict[str, Any]) -> str:
+    return str(
+        item.get("id")
+        or item.get("validation_item_id")
+        or item.get("path")
+        or item.get("impact")
+        or "assessment-item"
+    )
+
+
+def assessment_relative_focus_parked(item: dict[str, Any]) -> bool:
+    relative_focus = item.get("relative_focus") if isinstance(item.get("relative_focus"), dict) else {}
+    return str(relative_focus.get("role") or "").startswith("parked")
 
 
 def lead_dossier_assessment_scorecard(
@@ -11245,6 +11263,87 @@ def lead_dossier_assessment_scorecard(
     }
 
 
+def apply_assessment_relative_focus_policy(
+    items: list[dict[str, Any]],
+    assessment_policy: dict[str, Any],
+) -> None:
+    strategy = lead_dossier_ranking_strategy(assessment_policy)
+    if not items:
+        return
+    if strategy != "blackbox-bounty-first":
+        for item in items:
+            item["relative_focus"] = {
+                "strategy": strategy,
+                "role": "coverage-work-item",
+                "recommendation": "keep-open-until-coverage-or-evidence-closure",
+                "reason": (
+                    "Greybox mode is coverage-first; do not park dangerous surfaces only because another "
+                    "finding candidate exists."
+                ),
+            }
+        return
+
+    top = items[0]
+    top_assessment = top.get("assessment_rank") if isinstance(top.get("assessment_rank"), dict) else {}
+    try:
+        top_score = int(top_assessment.get("composite_score") or 0)
+    except (TypeError, ValueError):
+        top_score = 0
+    top_decision = str(top_assessment.get("decision") or "")
+    top_id = assessment_item_identity(top)
+    dominant = top_score >= BLACKBOX_DOMINANT_FOCUS_MIN_SCORE and top_decision in BLACKBOX_DOMINANT_FOCUS_DECISIONS
+
+    for index, item in enumerate(items):
+        assessment = item.get("assessment_rank") if isinstance(item.get("assessment_rank"), dict) else {}
+        try:
+            item_score = int(assessment.get("composite_score") or 0)
+        except (TypeError, ValueError):
+            item_score = 0
+        item_decision = str(assessment.get("decision") or "")
+        if index == 0:
+            item["relative_focus"] = {
+                "strategy": strategy,
+                "role": "dominant-bounty-focus" if dominant else "top-bounty-candidate",
+                "dominant_focus_id": top_id,
+                "dominant_focus_score": top_score,
+                "recommendation": "pursue-first" if dominant else "keep-ranking-until-validity-improves",
+                "reason": (
+                    "Blackbox mode optimizes for the strongest valid bounty finding before broad coverage."
+                ),
+            }
+            continue
+        if not dominant:
+            item["relative_focus"] = {
+                "strategy": strategy,
+                "role": "secondary-bounty-candidate",
+                "dominant_focus_id": top_id,
+                "dominant_focus_score": top_score,
+                "recommendation": "keep-as-secondary",
+                "reason": "No dominant bounty focus is strong enough to park other candidates yet.",
+            }
+            continue
+        if item_decision in BLACKBOX_DOMINANT_FOCUS_DECISIONS and item_score >= top_score:
+            item["relative_focus"] = {
+                "strategy": strategy,
+                "role": "co-dominant-bounty-focus",
+                "dominant_focus_id": top_id,
+                "dominant_focus_score": top_score,
+                "recommendation": "compare-payoff-before-parking",
+                "reason": "This candidate is at least as strong as the current top bounty focus.",
+            }
+            continue
+        item["relative_focus"] = {
+            "strategy": strategy,
+            "role": "parked-behind-dominant-bounty-focus",
+            "dominant_focus_id": top_id,
+            "dominant_focus_score": top_score,
+            "recommendation": "park-until-dominant-focus-stalls-or-closes",
+            "reason": (
+                "Blackbox mode does not need full coverage while a stronger valid high-impact bounty path is available."
+            ),
+        }
+
+
 def lead_dossier_assessment_rank_key(
     lead: dict[str, Any],
     *,
@@ -11292,6 +11391,7 @@ def apply_lead_dossier_assessment_ranking(
     ranked_leads = [lead for _key, _original_index, lead in ranked]
     for rank, lead in enumerate(ranked_leads, start=1):
         lead["rank"] = rank
+    apply_assessment_relative_focus_policy(ranked_leads, assessment_policy)
     return strategy, ranked_leads
 
 
@@ -12494,11 +12594,14 @@ def build_lead_dossier(
     priority_counts: dict[str, int] = {}
     status_counts: dict[str, int] = {}
     gate_ready = 0
+    relative_parked = 0
     for lead in leads:
         increment_count(priority_counts, str(lead.get("priority") or "info"))
         increment_count(status_counts, str(lead.get("closure_status") or "unknown"))
         if lead.get("gate_ready"):
             gate_ready += 1
+        if assessment_relative_focus_parked(lead):
+            relative_parked += 1
     status = "ready-for-finding-gate-review" if gate_ready else "needs-evidence"
     if not leads:
         status = "no-high-value-leads"
@@ -12513,6 +12616,7 @@ def build_lead_dossier(
             "selection_pool_leads": len(ranked_candidates),
             "lead_selection_strategy": ranking_strategy,
             "gate_ready_leads": gate_ready,
+            "relative_parked_leads": relative_parked,
             "priority_counts": dict(sorted(priority_counts.items())),
             "closure_status_counts": dict(sorted(status_counts.items())),
             "methodology_status": methodology.get("status"),
@@ -17097,6 +17201,7 @@ def build_iteration_assessment_focus(
     focus_rows = [row for _key, _original_index, row in ranked]
     for rank, row in enumerate(focus_rows, start=1):
         row["rank"] = rank
+    apply_assessment_relative_focus_policy(focus_rows, assessment_policy)
     return focus_rows
 
 
@@ -17476,9 +17581,20 @@ def build_iteration_decision_from_plan(
                 1
                 for item in iteration_focus
                 if str((item.get("assessment_rank") or {}).get("parking_recommendation") or "").startswith("park")
+                or assessment_relative_focus_parked(item)
+            ),
+            "focus_relative_parked": sum(
+                1
+                for item in iteration_focus
+                if assessment_relative_focus_parked(item)
             ),
             "top_focus_decision": (
                 (iteration_focus[0].get("assessment_rank") or {}).get("decision")
+                if iteration_focus
+                else None
+            ),
+            "top_focus_role": (
+                (iteration_focus[0].get("relative_focus") or {}).get("role")
                 if iteration_focus
                 else None
             ),
@@ -39865,6 +39981,10 @@ def build_no_write_selftest() -> dict[str, Any]:
                 == "pursue-now"
                 and blackbox_ranked_sample[0].get("assessment_rank", {}).get("parking_recommendation")
                 == "do-not-park"
+                and blackbox_ranked_sample[0].get("relative_focus", {}).get("role")
+                == "dominant-bounty-focus"
+                and blackbox_ranked_sample[1].get("relative_focus", {}).get("role")
+                == "parked-behind-dominant-bounty-focus"
                 and (
                     blackbox_ranked_sample[0].get("assessment_rank", {}).get("bounty_pressure", {}).get("score", 0)
                     >= blackbox_ranked_sample[0].get("assessment_rank", {}).get("coverage_pressure", {}).get("score", 0)
@@ -39878,6 +39998,10 @@ def build_no_write_selftest() -> dict[str, Any]:
                 "blackbox_strategy": blackbox_ranking_strategy,
                 "blackbox_order": [lead.get("id") for lead in blackbox_ranked_sample],
                 "blackbox_top_scorecard": blackbox_ranked_sample[0].get("assessment_rank", {}),
+                "blackbox_relative_roles": [
+                    lead.get("relative_focus", {}).get("role")
+                    for lead in blackbox_ranked_sample
+                ],
             },
         },
         {
@@ -49202,6 +49326,8 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_iteration_decision_sample.get("summary", {}).get("lead_selection_strategy")
         == "blackbox-bounty-first"
         and blackbox_iteration_decision_sample.get("summary", {}).get("focus_items", 0) > 0
+        and blackbox_iteration_decision_sample.get("summary", {}).get("top_focus_role")
+        in {"dominant-bounty-focus", "top-bounty-candidate"}
         and blackbox_iteration_top_focus_scorecard.get("strategy") == "blackbox-bounty-first"
         and blackbox_iteration_top_focus_scorecard.get("bounty_pressure", {}).get("score") is not None
         and all(isinstance(scorecard, dict) for scorecard in blackbox_iteration_packet_scorecards)
@@ -56946,11 +57072,17 @@ def run_lead_dossier(args: argparse.Namespace) -> int:
                 if isinstance(assessment_rank.get("validity_pressure"), dict)
                 else {}
             )
+            relative_focus = (
+                lead.get("relative_focus")
+                if isinstance(lead.get("relative_focus"), dict)
+                else {}
+            )
             print(
                 "  assessment="
                 f"score={assessment_rank.get('composite_score')} "
                 f"decision={assessment_rank.get('decision')} "
                 f"park={assessment_rank.get('parking_recommendation')} "
+                f"relative={relative_focus.get('role') or '-'} "
                 f"coverage={coverage_pressure.get('score')} "
                 f"bounty={bounty_pressure.get('score')} "
                 f"validity={validity_pressure.get('score')}"
@@ -59098,11 +59230,17 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
             if isinstance(focus_assessment.get("validity_pressure"), dict)
             else {}
         )
+        relative_focus = (
+            top_focus.get("relative_focus")
+            if isinstance(top_focus.get("relative_focus"), dict)
+            else {}
+        )
         print(
             "Top focus: "
             f"item={top_focus.get('validation_item_id') or '-'} "
             f"decision={focus_assessment.get('decision') or '-'} "
             f"park={focus_assessment.get('parking_recommendation') or '-'} "
+            f"relative={relative_focus.get('role') or '-'} "
             f"score={focus_assessment.get('composite_score')} "
             f"coverage={coverage_pressure.get('score')} "
             f"bounty={bounty_pressure.get('score')} "
