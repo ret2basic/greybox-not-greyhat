@@ -907,6 +907,7 @@ python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-com
 
 ```bash
 python3 scripts/inferforge.py decode-transactions --input .greybox/transaction-payloads.jsonl
+python3 scripts/inferforge.py decode-transactions --no-write --input .greybox/transaction-payloads.jsonl
 python3 scripts/inferforge.py decode-transactions --input ./approved-payloads.jsonl --max-input-bytes 1048576
 ```
 

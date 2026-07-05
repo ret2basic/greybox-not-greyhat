@@ -28537,6 +28537,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         report_output_dir = root / "report-output"
         methodology_review_output_dir = root / "methodology-review-output"
         transaction_corpus_checklist_output_dir = root / "transaction-corpus-checklist-output"
+        decode_transactions_output_dir = root / "decode-transactions-output"
         promote_output_dir = root / "promote-output"
         invalid_promote_output_dir = root / "invalid-promote-output"
         import_history_output_dir = root / "import-history-output"
@@ -28718,6 +28719,20 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--skip-current-resource-check",
                 ]
             )
+            decode_transactions_return_code, decode_transactions_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(decode_transactions_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "decode-transactions",
+                    "--no-write",
+                ]
+            )
             promote_return_code, promote_stdout = run_cli(
                 [
                     "--profile",
@@ -28856,6 +28871,15 @@ def build_no_write_selftest() -> dict[str, Any]:
             "transaction_corpus_checklist_manifest": (
                 transaction_corpus_checklist_output_dir / MANIFEST_NAME
             ).exists(),
+            "decode_transactions_dir": decode_transactions_output_dir.exists(),
+            "decode_transactions_target_profile_json": (
+                decode_transactions_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "decode_transactions_candidates_json": (
+                decode_transactions_output_dir / "burp-transaction-candidates.json"
+            ).exists(),
+            "decode_transactions_intent_json": (decode_transactions_output_dir / "transaction-intent.json").exists(),
+            "decode_transactions_manifest": (decode_transactions_output_dir / MANIFEST_NAME).exists(),
             "promote_dir": promote_output_dir.exists(),
             "promote_reviewed_profile": (promote_output_dir / "reviewed-profile.json").exists(),
             "promote_validation": (promote_output_dir / "reviewed-profile-validation.json").exists(),
@@ -28889,6 +28913,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     report_stdout_text = "\n".join(report_stdout)
     methodology_review_stdout_text = "\n".join(methodology_review_stdout)
     transaction_corpus_checklist_stdout_text = "\n".join(transaction_corpus_checklist_stdout)
+    decode_transactions_stdout_text = "\n".join(decode_transactions_stdout)
     promote_stdout_text = "\n".join(promote_stdout)
     invalid_promote_stdout_text = "\n".join(invalid_promote_stdout)
     import_history_limit_stdout_text = "\n".join(import_history_limit_stdout)
@@ -29475,6 +29500,32 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": transaction_corpus_checklist_return_code,
                 "stdout": transaction_corpus_checklist_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "decode-transactions-no-write-skips-artifacts",
+            "passed": (
+                decode_transactions_return_code == 0
+                and "Transaction decode: preview" in decode_transactions_stdout
+                and "Intent gate:" in decode_transactions_stdout_text
+                and "No files written (--no-write)." in decode_transactions_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "decode_transactions_dir",
+                        "decode_transactions_target_profile_json",
+                        "decode_transactions_candidates_json",
+                        "decode_transactions_intent_json",
+                        "decode_transactions_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in decode_transactions_stdout)
+            ),
+            "expected": "decode-transactions --no-write previews intent checks without writing artifacts or manifests",
+            "actual": {
+                "return_code": decode_transactions_return_code,
+                "stdout": decode_transactions_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -42726,9 +42777,11 @@ def run_iteration_decision(args: argparse.Namespace) -> int:
 
 def run_decode_transactions(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    write_target_profile_artifact(artifact_dir, profile, target, source_root)
-    ensure_burp_transaction_candidates_artifact(artifact_dir)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+        ensure_burp_transaction_candidates_artifact(artifact_dir)
     results = load_jsonl(artifact_dir / "probe-results.jsonl")
     extra_inputs = [Path(item).resolve() for item in args.input or []]
     transaction_intent = build_transaction_intent(
@@ -42746,8 +42799,11 @@ def run_decode_transactions(args: argparse.Namespace) -> int:
         max_input_bytes=args.max_input_bytes,
     )
     output_path = artifact_dir / "transaction-intent.json"
-    write_json(output_path, transaction_intent)
-    print(f"Wrote {output_path}")
+    if not no_write:
+        write_json(output_path, transaction_intent)
+        print(f"Wrote {output_path}")
+    else:
+        print("Transaction decode: preview")
     print(
         "Transactions: "
         f"{transaction_intent['candidates_seen']} candidates, "
@@ -42760,18 +42816,21 @@ def run_decode_transactions(args: argparse.Namespace) -> int:
         f"severity={reportability_review.get('candidate_severity') or 'none'} "
         f"ready_for_finding_gate={reportability_review.get('ready_for_finding_gate')}"
     )
-    print_refreshed_manifests(
-        refresh_current_artifact_manifest(
-            artifact_dir=artifact_dir,
-            target=target,
-            command="decode-transactions",
-            output_paths=[
-                *target_profile_artifact_paths(artifact_dir),
-                artifact_dir / "burp-transaction-candidates.json",
-                output_path,
-            ],
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print_refreshed_manifests(
+            refresh_current_artifact_manifest(
+                artifact_dir=artifact_dir,
+                target=target,
+                command="decode-transactions",
+                output_paths=[
+                    *target_profile_artifact_paths(artifact_dir),
+                    artifact_dir / "burp-transaction-candidates.json",
+                    output_path,
+                ],
+            )
         )
-    )
     return 0
 
 
@@ -44804,6 +44863,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     add_intent_policy_args(decode)
+    decode.add_argument(
+        "--no-write",
+        action="store_true",
+        help="Preview decoded transaction intent and gate results without writing transaction-intent artifacts or manifests.",
+    )
     decode.set_defaults(func=run_decode_transactions)
 
     selftest = sub.add_parser(
