@@ -174,6 +174,7 @@ BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT = "bounty-evidence-authorization.json"
 BOUNTY_EVIDENCE_INTAKE_ARTIFACT = "bounty-evidence-intake.json"
 BOUNTY_ACTION_QUEUE_ARTIFACT = "bounty-action-queue.json"
 BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT = "bounty-evidence-request.md"
+BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT = "bounty-evidence-templates.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -298,6 +299,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     BOUNTY_EVIDENCE_INTAKE_ARTIFACT,
     BOUNTY_ACTION_QUEUE_ARTIFACT,
     BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT,
+    BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -26333,6 +26335,287 @@ def build_bounty_evidence_request_brief(
     }
 
 
+def bounty_template_target_path(name: str, *, artifact_dir: Path) -> str:
+    return repo_relative_or_absolute(artifact_dir / name)
+
+
+def bounty_template_transaction_payload(action: dict[str, Any], *, artifact_dir: Path, profile: dict[str, Any] | None) -> dict[str, Any]:
+    content = {
+        "draft_only": True,
+        "approved": False,
+        "approval_required": "Replace placeholders with exactly one approved in-scope POST /api/quote response or extracted unsigned transaction payload.",
+        "request": {
+            "method": "POST",
+            "path": "/api/quote",
+            "direction": "REPLACE_WITH_APPROVED_DIRECTION",
+            "wallet_or_test_wallet_marker": "REPLACE_WITH_APPROVED_PUBLIC_WALLET_OR_MARKER",
+            "raw_amount_in": "REPLACE_WITH_APPROVED_RAW_AMOUNT_IN",
+            "approval_reference": "REPLACE_WITH_REVIEWER_TICKET_OR_OPERATOR_APPROVAL",
+        },
+        "payloads": [
+            {
+                "data": {
+                    "type": quote_response_expected_payload_type(profile) or "svm",
+                    "transaction": "REPLACE_WITH_APPROVED_BASE64_UNSIGNED_TRANSACTION",
+                }
+            }
+        ],
+        "redaction_notes": "Do not include cookies, bearer tokens, wallet signatures, signed transactions, raw Burp history, or unrelated quote responses.",
+    }
+    return {
+        "id": f"TEMPLATE-{safe_probe_id(str(action.get('id') or 'transaction-payload'))}-payloads",
+        "lane": "transaction-integrity",
+        "template_kind": "jsonl-row",
+        "target_evidence_path": bounty_template_target_path("transaction-payloads.jsonl", artifact_dir=artifact_dir),
+        "draft_content": content,
+        "instructions": [
+            "Write one JSONL row only after replacing placeholders with approved redacted evidence.",
+            "Keep approved=false while this remains a template.",
+            "Run bounty-evidence-intake before transaction-sidecar-review.",
+        ],
+    }
+
+
+def bounty_template_transaction_policy(action: dict[str, Any], *, artifact_dir: Path) -> dict[str, Any]:
+    content = {
+        "draft_only": True,
+        "approved": False,
+        "approval_required": "Replace placeholders with the same approved quote request used for transaction-payloads.jsonl.",
+        "direction": "REPLACE_WITH_APPROVED_DIRECTION",
+        "wallet": PLACEHOLDER_REAL_WALLET,
+        "amountIn": "REPLACE_WITH_APPROVED_RAW_AMOUNT_IN",
+        "sourceMint": "REPLACE_WITH_APPROVED_SOURCE_MINT",
+        "destinationMint": "REPLACE_WITH_APPROVED_DESTINATION_MINT",
+        "recipient": "REPLACE_WITH_APPROVED_RECIPIENT_OR_WALLET",
+        "allowedPrograms": [],
+        "manual_program_review_required": True,
+        "approval_reference": "REPLACE_WITH_REVIEWER_TICKET_OR_OPERATOR_APPROVAL",
+        "redaction_notes": "Use only public wallet/account identifiers required to verify intent; do not include signatures or private keys.",
+    }
+    return {
+        "id": f"TEMPLATE-{safe_probe_id(str(action.get('id') or 'transaction-policy'))}-intent-policy",
+        "lane": "transaction-integrity",
+        "template_kind": "json",
+        "target_evidence_path": bounty_template_target_path("transaction-intent-policy.json", artifact_dir=artifact_dir),
+        "draft_content": content,
+        "instructions": [
+            "Use the same approved request as the transaction payload.",
+            "Keep manual_program_review_required=true unless allowed programs have been reviewed.",
+            "Run transaction-sidecar-review and decode-transactions only after payload and policy match.",
+        ],
+    }
+
+
+def bounty_template_rewrite_response(action: dict[str, Any], *, artifact_dir: Path) -> dict[str, Any]:
+    path = "/api/infrafi/vault/solana/dry-powder"
+    entrypoint = str(action.get("entrypoint") or "")
+    if " " in entrypoint:
+        _method, candidate = entrypoint.split(" ", 1)
+        if candidate.startswith("/"):
+            path = candidate.strip()
+    content = {
+        "draft_only": True,
+        "approved": False,
+        "approval_required": "Set approved=true only after one in-scope read-only response is reviewed and redacted.",
+        "method": "GET",
+        "path": path,
+        "status": 200,
+        "content_type": "application/json",
+        "impact_indicators": ["REPLACE_WITH_ACCEPTED_IMPACT_INDICATOR"],
+        "json_field_paths": ["$.REPLACE_WITH_REDACTED_FIELD_NAME"],
+        "sensitive_field_markers": [
+            {
+                "field_path": "$.REPLACE_WITH_REDACTED_FIELD_NAME",
+                "matched_keywords": ["REPLACE_WITH_SENSITIVE_KEYWORD"],
+            }
+        ],
+        "impact_summary": "REPLACE_WITH_SHORT_REDACTED_IMPACT_SUMMARY",
+        "reviewer": "REPLACE_WITH_REVIEWER_OR_TICKET",
+        "redaction_notes": "Do not include raw response bodies, cookies, bearer tokens, private account data, or raw Burp history.",
+    }
+    return {
+        "id": f"TEMPLATE-{safe_probe_id(str(action.get('id') or 'rewrite-response'))}-response-sidecar",
+        "lane": "sensitive-response-impact",
+        "template_kind": "jsonl-row",
+        "target_evidence_path": bounty_template_target_path(REWRITE_RESPONSE_SIDECAR_ARTIFACT, artifact_dir=artifact_dir),
+        "draft_content": content,
+        "instructions": [
+            "Use exactly one approved read-only response row.",
+            "Keep only field paths, impact indicators, status/content type, and redacted impact summary.",
+            "Run rewrite-response-review and bounty-evidence-intake before finding-gate.",
+        ],
+    }
+
+
+def bounty_template_build_provenance(action: dict[str, Any]) -> dict[str, Any]:
+    content = {
+        "draft_only": True,
+        "approved": False,
+        "approval_required": "Use only operator-approved redacted build provenance tied to the exact Dockerfile build step.",
+        "evidence_kind": "REPLACE_WITH_IMAGE_HISTORY_CONFIG_CACHE_LOG_REGISTRY_ARTIFACT_OR_ATTESTATION",
+        "source_file": "infrafi-web/Dockerfile",
+        "source_line": "REPLACE_WITH_SOURCE_LINE",
+        "build_step": "REPLACE_WITH_BUILD_STEP_OR_LAYER_REFERENCE",
+        "redacted_secret_supply_summary": "REPLACE_WITH_REDACTED_PROOF_REAL_NON_PLACEHOLDER_SECRET_WAS_SUPPLIED",
+        "redacted_retention_or_disclosure_summary": "REPLACE_WITH_REDACTED_PROOF_OF_RETENTION_OR_DISCLOSURE",
+        "impact_summary": "REPLACE_WITH_PACKAGE_REGISTRY_DEPLOYMENT_ACCOUNT_OR_SERVICE_IMPACT_SUMMARY",
+        "approval_reference": "REPLACE_WITH_OPERATOR_REVIEW_TICKET_OR_ATTESTATION",
+        "redaction_notes": "Do not include raw secret values, full .npmrc contents, unredacted CI logs, or provider credentials.",
+    }
+    return {
+        "id": f"TEMPLATE-{safe_probe_id(str(action.get('id') or 'build-provenance'))}-provenance",
+        "lane": "build-secret-exposure",
+        "template_kind": "operator-summary",
+        "target_evidence_path": "redacted build provenance supplied outside official sidecar files",
+        "draft_content": content,
+        "instructions": [
+            "This is a handoff template, not an InferForge official sidecar path.",
+            "Attach or summarize redacted provenance only after operator approval.",
+            "Run build-provenance-readiness after the approved provenance summary exists.",
+        ],
+    }
+
+
+def bounty_template_operator_evidence(action: dict[str, Any], *, artifact_dir: Path) -> dict[str, Any]:
+    content = {
+        "draft_only": True,
+        "schema": "inferforge-operator-evidence-v1",
+        "evidence_items": [
+            {
+                "decision_id": f"REPLACE_WITH_DECISION_ID_FOR_{safe_probe_id(str(action.get('lane') or 'lane')).upper()}",
+                "status": "pending",
+                "impact_class": "REPLACE_WITH_PROVIDER_QUOTA_BILLING_MONITORING_ACCOUNT_RESOURCE_OR_TRUST_IMPACT",
+                "summary": "REPLACE_WITH_REDACTED_OPERATOR_OR_PROVIDER_EVIDENCE_SUMMARY",
+                "source": "REPLACE_WITH_OPERATOR_TICKET_DASHBOARD_ATTESTATION_OR_PROVIDER_REFERENCE",
+                "approval_reference": "REPLACE_WITH_OPERATOR_APPROVAL",
+                "redaction_notes": "Do not include provider API keys, cookies, bearer tokens, billing account identifiers, or raw dashboards.",
+            }
+        ],
+    }
+    return {
+        "id": f"TEMPLATE-{safe_probe_id(str(action.get('id') or 'operator-evidence'))}-operator-evidence",
+        "lane": action.get("lane"),
+        "template_kind": "json",
+        "target_evidence_path": bounty_template_target_path(OPERATOR_EVIDENCE_ARTIFACT, artifact_dir=artifact_dir),
+        "draft_content": content,
+        "instructions": [
+            "Pending rows are not evidence; only reviewed present/confirmed rows can unblock validation.",
+            "Use one row per required operator/provider decision id.",
+            "Run operator-evidence-review and bounty-evidence-intake before finding-gate.",
+        ],
+    }
+
+
+def bounty_evidence_templates_for_action(
+    action: dict[str, Any],
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    lane = str(action.get("lane") or "")
+    if lane == "transaction-integrity":
+        return [
+            bounty_template_transaction_payload(action, artifact_dir=artifact_dir, profile=profile),
+            bounty_template_transaction_policy(action, artifact_dir=artifact_dir),
+        ]
+    if lane == "build-secret-exposure":
+        return [bounty_template_build_provenance(action)]
+    if lane == "sensitive-response-impact":
+        return [bounty_template_rewrite_response(action, artifact_dir=artifact_dir)]
+    if lane in {"credentialed-provider-impact", "resource-control", "websocket-header-trust"}:
+        return [bounty_template_operator_evidence(action, artifact_dir=artifact_dir)]
+    return []
+
+
+def build_bounty_evidence_templates(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    bounty_action_queue: dict[str, Any] | None,
+    top: int,
+) -> dict[str, Any]:
+    actions = (
+        bounty_action_queue.get("actions", [])
+        if isinstance(bounty_action_queue, dict) and isinstance(bounty_action_queue.get("actions"), list)
+        else []
+    )
+    active_actions = [
+        row
+        for row in actions
+        if isinstance(row, dict)
+        and str(row.get("kind") or "") in {"collect-approved-evidence", "fix-evidence-intake", "validate-ready-evidence"}
+    ][:top]
+    templates = []
+    for action in active_actions:
+        for template in bounty_evidence_templates_for_action(action, artifact_dir=artifact_dir, profile=profile):
+            template["action_id"] = action.get("id")
+            template["expected_severity"] = action.get("expected_severity")
+            template["reportability_boundary"] = (
+                "Template-only. This is not evidence, not lane validation, not a finding, and not a bounty report."
+            )
+            template["after_filling_commands"] = ordered_unique_strings(
+                [
+                    validation_command_for_artifact_dir(
+                        artifact_dir,
+                        "bounty-evidence-intake --no-write --show-requests --show-files --show-risks --top 8",
+                        profile=profile,
+                    ),
+                    str(action.get("safe_offline_command") or ""),
+                    validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+                ]
+            )
+            templates.append(template)
+    target_paths = ordered_unique_strings(
+        [
+            str(template.get("target_evidence_path") or "")
+            for template in templates
+            if template.get("target_evidence_path")
+        ]
+    )
+    lane_counts: dict[str, int] = {}
+    kind_counts: dict[str, int] = {}
+    for template in templates:
+        increment_count(lane_counts, str(template.get("lane") or "unknown"))
+        increment_count(kind_counts, str(template.get("template_kind") or "unknown"))
+    status = "bounty-evidence-templates-ready" if templates else "no-bounty-evidence-templates"
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-evidence-templates-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "templates": len(templates),
+            "actions": len(active_actions),
+            "target_evidence_paths": len(target_paths),
+            "lane_counts": dict(sorted(lane_counts.items())),
+            "template_kind_counts": dict(sorted(kind_counts.items())),
+            "bounty_action_queue_status": artifact_summary_status(bounty_action_queue),
+        },
+        "templates": templates,
+        "target_evidence_paths": target_paths,
+        "write_policy": (
+            f"This command writes only {BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT}. It never writes transaction-payloads.jsonl, "
+            "transaction-intent-policy.json, rewrite-response-sidecar.jsonl, operator-evidence.json, or raw build provenance."
+        ),
+        "reportability_rule": (
+            "Templates are not evidence. Replace placeholders only with approved redacted evidence, run intake/readiness, "
+            "then require finding-gate and adjudication before any Medium+ claim."
+        ),
+        "next_step": (
+            "Use the first template to request approved redacted evidence for the top action."
+            if templates
+            else "Build bounty-action-queue first."
+        ),
+        "safety": (
+            "Offline template rendering only. It reads local JSON artifacts, sends no requests, calls no Burp tool, starts no browser, "
+            "creates no official evidence sidecars, signs no wallet, submits no transaction, and changes no infrastructure."
+        ),
+    }
+
+
 def build_provenance_invalidity_row(invalidity_review: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(invalidity_review, dict):
         return {}
@@ -27661,6 +27944,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     BOUNTY_EVIDENCE_INTAKE_ARTIFACT: "bounty-evidence-intake",
     BOUNTY_ACTION_QUEUE_ARTIFACT: "bounty-action-queue",
     BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT: "bounty-evidence-request",
+    BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT: "bounty-evidence-templates",
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
     TRANSACTION_EVIDENCE_READINESS_ARTIFACT: "transaction-evidence-readiness",
     OPERATOR_IMPACT_READINESS_ARTIFACT: "operator-impact-readiness",
@@ -27717,6 +28001,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "bounty-evidence-intake",
     "bounty-action-queue",
     "bounty-evidence-request",
+    "bounty-evidence-templates",
     "transaction-intent-boundary",
     "transaction-evidence-readiness",
     "operator-impact-readiness",
@@ -27758,6 +28043,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "bounty-evidence-intake": "bounty-evidence-intake --no-write",
     "bounty-action-queue": "bounty-action-queue --no-write",
     "bounty-evidence-request": "bounty-evidence-request --no-write",
+    "bounty-evidence-templates": "bounty-evidence-templates --no-write",
     "transaction-intent-boundary": "transaction-intent-boundary --no-write",
     "transaction-evidence-readiness": "transaction-evidence-readiness --no-write",
     "operator-impact-readiness": "operator-impact-readiness --no-write",
@@ -52846,6 +53132,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("bounty-evidence-intake", "run_bounty_evidence_intake"),
         refresh_expectation("bounty-action-queue", "run_bounty_action_queue"),
         refresh_expectation("bounty-evidence-request", "run_bounty_evidence_request"),
+        refresh_expectation("bounty-evidence-templates", "run_bounty_evidence_templates"),
         refresh_expectation("transaction-flow-review", "run_transaction_flow_review"),
         refresh_expectation("transaction-intent-boundary", "run_transaction_intent_boundary"),
         refresh_expectation("transaction-evidence-readiness", "run_transaction_evidence_readiness"),
@@ -78409,6 +78696,93 @@ def run_bounty_evidence_request(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_bounty_evidence_templates(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    queue = build_or_load_bounty_action_queue_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+        max_file_bytes=int(args.max_file_bytes),
+    )
+    templates = build_bounty_evidence_templates(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_action_queue=queue,
+        top=int(args.top),
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(templates))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="bounty-evidence-templates",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = templates.get("summary", {}) if isinstance(templates.get("summary"), dict) else {}
+    print(f"Bounty evidence templates: {templates.get('status')}")
+    print(
+        "Templates: "
+        f"count={summary.get('templates', 0)} "
+        f"actions={summary.get('actions', 0)} "
+        f"targets={summary.get('target_evidence_paths', 0)} "
+        f"queue={summary.get('bounty_action_queue_status') or '-'}"
+    )
+    print(f"Kinds: {json.dumps(summary.get('template_kind_counts', {}), sort_keys=True)}")
+    display_limit = max(0, int(args.top))
+    if getattr(args, "show_templates", False):
+        print("Templates:")
+        for row in (templates.get("templates", []) or [])[:display_limit]:
+            if not isinstance(row, dict):
+                continue
+            print(
+                f"- {row.get('id')}: lane={row.get('lane')} kind={row.get('template_kind')} "
+                f"target={row.get('target_evidence_path')}"
+            )
+            for instruction in normalize_string_list(row.get("instructions"))[:3]:
+                print(f"  instruction={inline_summary_text(instruction, max_chars=260)}")
+            commands = normalize_string_list(row.get("after_filling_commands"))
+            if commands:
+                print(f"  validate={inline_summary_text(commands[0], max_chars=420)}")
+            if getattr(args, "show_content", False):
+                preview = json.dumps(row.get("draft_content"), indent=2, sort_keys=False)
+                print("  draft_content=")
+                for line in preview.splitlines()[: max(1, int(args.content_lines))]:
+                    print(f"    {line}")
+                if len(preview.splitlines()) > int(args.content_lines):
+                    print(f"    ... +{len(preview.splitlines()) - int(args.content_lines)} more line(s)")
+        remaining = len(templates.get("templates", []) or []) - display_limit
+        if remaining > 0:
+            if no_write:
+                print(f"- {remaining} more template(s); rerun without --no-write to write the full workbook")
+            else:
+                print(f"- {remaining} more template(s) in {output_path}")
+    print(f"Write policy: {inline_summary_text(templates.get('write_policy'), max_chars=420)}")
+    print(f"Rule: {inline_summary_text(templates.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(templates.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and summary.get("templates", 0) <= 0:
+        return 1
+    return 0
+
+
 def run_rpc_proxy_parity_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -81988,6 +82362,60 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless the brief contains at least one human or agent action.",
     )
     bounty_evidence_request.set_defaults(func=run_bounty_evidence_request)
+
+    bounty_evidence_templates = sub.add_parser(
+        "bounty-evidence-templates",
+        help="Render draft-only JSON templates for current prioritized bounty evidence requests",
+    )
+    bounty_evidence_templates.add_argument(
+        "--output",
+        help=(
+            f"Where to write {BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT}."
+        ),
+    )
+    bounty_evidence_templates.add_argument(
+        "--top",
+        type=positive_int,
+        default=5,
+        help="Number of queued actions or templates to include.",
+    )
+    bounty_evidence_templates.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=262144,
+        help="Maximum bytes to read if evidence intake or action queue must be built. Defaults to 262144.",
+    )
+    bounty_evidence_templates.add_argument(
+        "--content-lines",
+        type=positive_int,
+        default=18,
+        help="Maximum draft_content preview lines to print per template with --show-content.",
+    )
+    bounty_evidence_templates.add_argument(
+        "--show-templates",
+        action="store_true",
+        help="Print template IDs, lanes, target evidence paths, and validation commands.",
+    )
+    bounty_evidence_templates.add_argument(
+        "--show-content",
+        action="store_true",
+        help="Print bounded draft_content previews. These contain placeholders only.",
+    )
+    bounty_evidence_templates.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print bounty evidence templates only; do not write {BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    bounty_evidence_templates.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless at least one draft-only evidence template can be rendered.",
+    )
+    bounty_evidence_templates.set_defaults(func=run_bounty_evidence_templates)
 
     transaction_flow_review = sub.add_parser(
         "transaction-flow-review",
