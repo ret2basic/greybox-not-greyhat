@@ -24822,6 +24822,83 @@ def normalize_quote_transaction_evidence_gap_artifact(evidence_gaps: dict[str, A
     return normalized
 
 
+def evidence_gap_followup_commands(
+    gap_id: str,
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> list[str]:
+    if gap_id == "GAP-quote-transaction-corpus":
+        return [
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND,
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND,
+                profile=profile,
+            ),
+        ]
+    if gap_id == "GAP-rpc-resource-control-deployment-review":
+        return [
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "operator-evidence-review --no-write --show-missing --show-template --show-closure-contract",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "deployment-review --no-write --top 8",
+                profile=profile,
+            ),
+        ]
+    if gap_id in {
+        "GAP-rpc-transaction-method-deployment-decision",
+        "GAP-rpc-high-impact-policy-decision",
+        "GAP-rpc-high-impact-allowed-methods",
+        "GAP-quote-business-policy-probes",
+    }:
+        return [
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check",
+                profile=profile,
+            )
+        ]
+    if gap_id.endswith("-burp-observation"):
+        return [
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "burp-observation-coverage --no-write",
+                profile=profile,
+            )
+        ]
+    if gap_id.startswith("GAP-server-action-"):
+        return [
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "source-peek-requests --no-write --top 8",
+                profile=profile,
+            ),
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "source-peek --no-write --top 8",
+                profile=profile,
+            ),
+        ]
+    if gap_id == "GAP-orca-real-address-cache-baseline":
+        return [
+            validation_command_for_artifact_dir(
+                artifact_dir,
+                "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check",
+                profile=profile,
+            )
+        ]
+    return []
+
+
 def compact_source_refs(values: list[Any]) -> list[str]:
     refs = []
     seen: set[str] = set()
@@ -34032,6 +34109,8 @@ def build_no_write_selftest() -> dict[str, Any]:
                     str(root),
                     "evidence-gaps",
                     "--no-write",
+                    "--show-gaps",
+                    "--show-commands",
                 ]
             )
             burp_observation_coverage_return_code, burp_observation_coverage_stdout = run_cli(
@@ -34990,8 +35069,13 @@ def build_no_write_selftest() -> dict[str, Any]:
             "passed": (
                 evidence_gaps_return_code == 0
                 and "Evidence gaps:" in evidence_gaps_stdout_text
+                and "priorities=" in evidence_gaps_stdout_text
                 and "Burp observation coverage:" in evidence_gaps_stdout_text
+                and "status_counts=" in evidence_gaps_stdout_text
                 and "Blackbox coverage:" in evidence_gaps_stdout_text
+                and "required_failures=" in evidence_gaps_stdout_text
+                and "Evidence gap details:" in evidence_gaps_stdout_text
+                and "followup=[" in evidence_gaps_stdout_text
                 and "No files written (--no-write)." in evidence_gaps_stdout
                 and not any(
                     output_paths[key]
@@ -47686,9 +47770,63 @@ def run_evidence_gaps(args: argparse.Namespace) -> int:
     source_peek_requests_path = artifact_dir / "source-peek-requests.json"
     if not no_write:
         write_json(source_peek_requests_path, source_peek_requests)
-    print(f"Evidence gaps: {len(evidence_gaps.get('gaps', []) or [])}")
-    print(f"Burp observation coverage: {burp_observation_coverage['status']}")
-    print(f"Blackbox coverage: {blackbox_coverage['status']}")
+    evidence_summary = evidence_gaps.get("summary", {}) if isinstance(evidence_gaps.get("summary"), dict) else {}
+    burp_summary = (
+        burp_observation_coverage.get("summary", {})
+        if isinstance(burp_observation_coverage.get("summary"), dict)
+        else {}
+    )
+    blackbox_summary = (
+        blackbox_coverage.get("summary", {}) if isinstance(blackbox_coverage.get("summary"), dict) else {}
+    )
+    print(
+        "Evidence gaps: "
+        f"{len(evidence_gaps.get('gaps', []) or [])} "
+        f"priorities={json.dumps(evidence_summary.get('gap_priority_counts', {}), sort_keys=True)} "
+        f"clusters={json.dumps(evidence_summary.get('gap_cluster_counts', {}), sort_keys=True)}"
+    )
+    print(
+        "Burp observation coverage: "
+        f"{burp_observation_coverage['status']} "
+        f"status_counts={json.dumps(burp_summary.get('status_counts', {}), sort_keys=True)}"
+    )
+    print(
+        "Blackbox coverage: "
+        f"{blackbox_coverage['status']} "
+        f"failed_clusters={blackbox_summary.get('failed_clusters', 0)} "
+        f"open_items={blackbox_summary.get('covered_with_open_items', 0)} "
+        f"required_failures={','.join(blackbox_summary.get('required_failures', [])[:6]) or 'none'}"
+    )
+    if blackbox_summary.get("warnings"):
+        print(f"Blackbox warnings: {','.join(blackbox_summary.get('warnings', [])[:6])}")
+    if args.show_gaps:
+        print("Evidence gap details:")
+        gaps = [gap for gap in evidence_gaps.get("gaps", []) or [] if isinstance(gap, dict)]
+        for gap in gaps[: max(0, int(args.top))]:
+            gap_id = str(gap.get("id") or "")
+            print(
+                f"- {gap.get('priority') or 'unknown'} {gap_id} "
+                f"cluster={gap.get('cluster_id') or 'unknown'} "
+                f"title={inline_summary_text(gap.get('title'), max_chars=180)}"
+            )
+            if gap.get("reason"):
+                print(f"  reason={inline_summary_text(gap.get('reason'), max_chars=240)}")
+            if gap.get("safe_next_step"):
+                print(f"  next={inline_summary_text(gap.get('safe_next_step'), max_chars=260)}")
+            if gap.get("safety_gate"):
+                print(f"  safety={inline_summary_text(gap.get('safety_gate'), max_chars=220)}")
+            if args.show_commands:
+                commands = evidence_gap_followup_commands(gap_id, artifact_dir=artifact_dir, profile=profile)
+                for command in commands:
+                    ref = validation_command_ref(command, source=f"evidence-gaps:{gap_id}")
+                    print(
+                        f"  followup=[{ref.get('classification') or 'unknown'}] "
+                        f"{inline_summary_text(ref.get('command') or command, max_chars=420)}"
+                    )
+                if not commands:
+                    print("  followup=none-mapped")
+        if len(gaps) > max(0, int(args.top)):
+            print(f"- ... +{len(gaps) - max(0, int(args.top))} more gap(s)")
     if no_write:
         print("No files written (--no-write).")
     else:
@@ -47772,47 +47910,6 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
     )
     if args.show_gaps:
         print("Evidence gaps:")
-
-        def gap_followup_commands(gap_id: str) -> list[str]:
-            if gap_id == "GAP-quote-transaction-corpus":
-                return [
-                    validation_command_for_artifact_dir(
-                        artifact_dir,
-                        TRANSACTION_SIDECAR_EVIDENCE_CONTRACT_SUBCOMMAND,
-                        profile=profile,
-                    ),
-                    validation_command_for_artifact_dir(
-                        artifact_dir,
-                        TRANSACTION_CORPUS_EVIDENCE_CONTRACT_SUBCOMMAND,
-                        profile=profile,
-                    ),
-                ]
-            if gap_id == "GAP-rpc-resource-control-deployment-review":
-                return [
-                    validation_command_for_artifact_dir(
-                        artifact_dir,
-                        "operator-evidence-review --no-write --show-missing --show-template --show-closure-contract",
-                        profile=profile,
-                    )
-                ]
-            if gap_id.endswith("-burp-observation"):
-                return [
-                    validation_command_for_artifact_dir(
-                        artifact_dir,
-                        "burp-observation-coverage --no-write",
-                        profile=profile,
-                    )
-                ]
-            if gap_id == "GAP-quote-business-policy-probes":
-                return [
-                    validation_command_for_artifact_dir(
-                        artifact_dir,
-                        "validation-plan --no-write --limit 8 --show-commands --skip-current-resource-check",
-                        profile=profile,
-                    )
-                ]
-            return []
-
         gap_rows = []
         seen_gap_ids: set[str] = set()
         for cluster in evidence_chain.get("clusters", []) or []:
@@ -47833,7 +47930,11 @@ def run_evidence_chain(args: argparse.Namespace) -> int:
             )
             if gap.get("safe_next_step"):
                 print(f"  next={inline_summary_text(gap.get('safe_next_step'), max_chars=240)}")
-            for followup in gap_followup_commands(str(gap.get("id") or "")):
+            for followup in evidence_gap_followup_commands(
+                str(gap.get("id") or ""),
+                artifact_dir=artifact_dir,
+                profile=profile,
+            ):
                 print(f"  followup={inline_summary_text(followup, max_chars=420)}")
         if len(gap_rows) > max(0, int(args.top)):
             print(f"- ... +{len(gap_rows) - max(0, int(args.top))} more gap(s)")
@@ -53697,6 +53798,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict",
         action="store_true",
         help="Return non-zero if any evidence gaps remain.",
+    )
+    evidence_gaps.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of evidence gaps to print when --show-gaps is used.",
+    )
+    evidence_gaps.add_argument(
+        "--show-gaps",
+        action="store_true",
+        help="Print compact evidence-gap details and safe next steps.",
+    )
+    evidence_gaps.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print safe no-write follow-up commands for known evidence-gap types.",
     )
     evidence_gaps.add_argument(
         "--no-write",
