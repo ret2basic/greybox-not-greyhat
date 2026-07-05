@@ -421,6 +421,8 @@ existing `burp-history-observations.jsonl` rows for that rewrite. It separates
 “one approved response observed” from “candidate sensitive-field or path
 confusion impact evidence”, redacts response samples, and still requires a
 manual finding-gate decision before anything is treated as reportable.
+If candidate impact is present, `gate --no-write` imports it as a redacted
+manual-review gate item; it does not mark the issue reportable by itself.
 For source-backed fixed-upstream API routes, it also scans the referenced route
 source for fixed upstream fetches, positive route-parameter guards, query
 forwarding, credential/header forwarding, upstream status forwarding, and cache

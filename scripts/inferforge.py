@@ -34264,8 +34264,34 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                 "rewrite_review": rewrite_item,
             },
         )
+        finding_gate = build_finding_gate([], [], {}, review)
+        rewrite_gate_item = next(
+            (
+                item
+                for item in finding_gate.get("gates", []) or []
+                if item.get("classification") == "candidate-fixed-upstream-proxy-confusion-impact"
+            ),
+            None,
+        )
         review_text = json.dumps(review, sort_keys=True)
         closure_text = json.dumps(closure, sort_keys=True)
+        finding_gate_text = json.dumps(finding_gate, sort_keys=True)
+        write_json(artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT, review)
+        gate_stdout_buffer = io.StringIO()
+        gate_args = build_parser().parse_args(
+            [
+                "--artifact-dir",
+                str(artifact_dir),
+                "--target",
+                target,
+                "gate",
+                "--no-write",
+            ]
+        )
+        with contextlib.redirect_stdout(gate_stdout_buffer):
+            gate_return_code = gate_args.func(gate_args)
+        gate_stdout = gate_stdout_buffer.getvalue().splitlines()
+        gate_output_path_exists = (artifact_dir / "finding-gate.json").exists()
 
     assertions = [
         {
@@ -34343,6 +34369,41 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
                 "reportability_gate": review.get("reportability_gate"),
             },
         },
+        {
+            "id": "finding-gate-ingests-rewrite-candidate-impact-as-manual-review",
+            "passed": (
+                rewrite_gate_item is not None
+                and rewrite_gate_item.get("gate_status") == "manual-review"
+                and rewrite_gate_item.get("classification") == "candidate-fixed-upstream-proxy-confusion-impact"
+                and rewrite_gate_item.get("severity") == "high"
+                and any(
+                    check.get("id") == "manual-impact-review" and check.get("passed") is False
+                    for check in rewrite_gate_item.get("checks", []) or []
+                )
+                and "response_sample" not in finding_gate_text
+                and "should-not-appear" not in finding_gate_text
+            ),
+            "expected": "finding-gate imports rewrite candidate impact as a redacted manual-review candidate",
+            "actual": {
+                "gate_item": rewrite_gate_item,
+                "finding_gate_contains_sentinel": "should-not-appear" in finding_gate_text,
+            },
+        },
+        {
+            "id": "gate-no-write-loads-rewrite-response-review-artifact",
+            "passed": (
+                gate_return_code == 0
+                and "Gated 1 item(s)" in gate_stdout
+                and "No files written (--no-write)." in gate_stdout
+                and not gate_output_path_exists
+            ),
+            "expected": "gate --no-write imports rewrite-response-review candidate gates without writing finding-gate.json",
+            "actual": {
+                "return_code": gate_return_code,
+                "stdout": gate_stdout,
+                "finding_gate_exists": gate_output_path_exists,
+            },
+        },
     ]
     failed = [item for item in assertions if not item["passed"]]
     return {
@@ -34355,11 +34416,14 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             "review_status": review.get("status"),
             "closure_status": closure.get("status"),
             "gate_ready": closure.get("gate_ready"),
+            "finding_gate_items": len(finding_gate.get("gates", []) or []),
+            "gate_no_write_return_code": gate_return_code,
         },
         "cases": {
             "rewrite_review": rewrite_review,
             "rewrite_response_review": review,
             "rewrite_evidence_closure": closure,
+            "finding_gate": finding_gate,
         },
         "assertions": assertions,
         "safety": (
@@ -37141,10 +37205,86 @@ def transaction_intent_finding_gate_item(transaction_intent: dict[str, Any] | No
     }
 
 
+def rewrite_response_review_gate_observation_summary(observation: dict[str, Any]) -> dict[str, Any]:
+    response = observation.get("response") if isinstance(observation.get("response"), dict) else {}
+    return {
+        "id": observation.get("id"),
+        "method": observation.get("method"),
+        "path": observation.get("path"),
+        "approved_path": bool(observation.get("approved_path")),
+        "response_status": response.get("status"),
+        "content_type": response.get("content_type"),
+        "impact_indicators": observation.get("impact_indicators", []) or [],
+        "sensitive_field_markers": observation.get("sensitive_field_markers", []) or [],
+        "evidence_ref": observation.get("evidence_ref"),
+    }
+
+
+def rewrite_response_review_finding_gate_items(
+    rewrite_response_review: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not isinstance(rewrite_response_review, dict):
+        return []
+    gate_items = []
+    for item in rewrite_response_review.get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        candidate_impact_count = int(item.get("candidate_impact_observation_count") or 0)
+        if candidate_impact_count <= 0:
+            continue
+        observations = [
+            observation
+            for observation in item.get("observations", []) or []
+            if isinstance(observation, dict) and observation.get("candidate_impact")
+        ]
+        priority = str(item.get("priority") or "needs-triage")
+        gate_items.append(
+            {
+                "suspicion_id": f"REWRITE-RESP-{safe_probe_id(item.get('cluster_id') or item.get('path') or item.get('id'))}",
+                "entrypoint": f"GET {item.get('path') or '-'}",
+                "classification": "candidate-fixed-upstream-proxy-confusion-impact",
+                "gate_status": "manual-review",
+                "severity": priority if priority in {"critical", "high", "medium", "low"} else "needs-triage",
+                "title": "Approved rewrite response requires finding-gate review",
+                "source_artifact": REWRITE_RESPONSE_REVIEW_ARTIFACT,
+                "checks": [
+                    {
+                        "id": "approved-rewrite-response",
+                        "passed": int(item.get("observed_approved_response_count") or 0) > 0,
+                        "evidence": {
+                            "artifact": REWRITE_RESPONSE_REVIEW_ARTIFACT,
+                            "rewrite_review_id": item.get("rewrite_review_id"),
+                            "approved_path_candidates": item.get("approved_path_candidates", []),
+                        },
+                    },
+                    {
+                        "id": "candidate-impact-indicators",
+                        "passed": candidate_impact_count > 0,
+                        "evidence": [
+                            rewrite_response_review_gate_observation_summary(observation)
+                            for observation in observations[:5]
+                        ],
+                    },
+                    {
+                        "id": "manual-impact-review",
+                        "passed": False,
+                        "evidence": rewrite_response_review.get("reportability_gate"),
+                        "note": (
+                            "Manual review must tie the approved response to unauthorized sensitive data exposure, "
+                            "upstream path confusion, authorization bypass, or equivalent concrete impact."
+                        ),
+                    },
+                ],
+            }
+        )
+    return gate_items
+
+
 def build_finding_gate(
     suspicions: list[dict[str, Any]],
     burp_history: list[dict[str, Any]],
     transaction_intent: dict[str, Any] | None = None,
+    rewrite_response_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     gates = []
     burp_paths = {row.get("path") for row in burp_history}
@@ -37206,6 +37346,7 @@ def build_finding_gate(
     tx_gate = transaction_intent_finding_gate_item(transaction_intent)
     if tx_gate:
         gates.append(tx_gate)
+    gates.extend(rewrite_response_review_finding_gate_items(rewrite_response_review))
 
     return {
         "generated_at": utc_now(),
@@ -37213,6 +37354,7 @@ def build_finding_gate(
             "valid-finding requires black-box reproduction, source context when needed, explicit attacker model, impact, and counter-evidence review.",
             "hardening-note may pass with controlled probe reproduction plus source context, but must not be reported as an exploitable vulnerability.",
             "decoded transaction intent mismatches enter finding-gate as manual-review candidates and are not reportable until impact is proven.",
+            "rewrite response candidate impacts enter finding-gate as manual-review candidates and are not reportable until concrete unauthorized impact is proven.",
         ],
         "gates": gates,
     }
@@ -38721,7 +38863,8 @@ def run_audit(args: argparse.Namespace) -> int:
     quote_collection = json.loads(read_text(quote_collection_path)) if quote_collection_path.exists() else None
     suspicions = build_suspicions(results, clusters)
     write_json(artifact_dir / "suspicions.json", {"generated_at": utc_now(), "suspicions": suspicions})
-    finding_gate = build_finding_gate(suspicions, burp_history, transaction_intent)
+    rewrite_response_review = load_optional_json(artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT) or {}
+    finding_gate = build_finding_gate(suspicions, burp_history, transaction_intent, rewrite_response_review)
     write_json(artifact_dir / "finding-gate.json", finding_gate)
     findings = build_findings(suspicions, finding_gate)
     hardening_notes = build_hardening_notes(suspicions, finding_gate)
@@ -45165,10 +45308,11 @@ def run_gate(args: argparse.Namespace) -> int:
     no_write = bool(args.no_write)
     burp_history = load_jsonl(artifact_dir / "burp-history-observations.jsonl")
     transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {}
+    rewrite_response_review = load_optional_json(artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT) or {}
     suspicions_path = artifact_dir / "suspicions.json"
     suspicions_doc = json.loads(read_text(suspicions_path)) if suspicions_path.exists() else {}
     suspicions = suspicions_doc.get("suspicions", [])
-    gate = build_finding_gate(suspicions, burp_history, transaction_intent)
+    gate = build_finding_gate(suspicions, burp_history, transaction_intent, rewrite_response_review)
     output_path = artifact_dir / "finding-gate.json"
     print(f"Gated {len(gate['gates'])} item(s)")
     if not suspicions_path.exists():
@@ -45767,10 +45911,12 @@ def run_report(args: argparse.Namespace) -> int:
         burp_history,
     )
     loaded_transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json")
+    loaded_rewrite_response_review = load_optional_json(artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT)
     finding_gate = load_optional_json(artifact_dir / "finding-gate.json") or build_finding_gate(
         suspicions,
         burp_history,
         loaded_transaction_intent or {},
+        loaded_rewrite_response_review or {},
     )
     hardening_notes_doc = load_optional_json(artifact_dir / "hardening-notes.json") or {}
     hardening_notes = hardening_notes_doc.get("hardening_notes")
@@ -47418,7 +47564,8 @@ def run_adjudicate(args: argparse.Namespace) -> int:
     wrote_finding_gate = False
     if finding_gate is None:
         transaction_intent = load_optional_json(artifact_dir / "transaction-intent.json") or {}
-        finding_gate = build_finding_gate(suspicions, burp_history, transaction_intent)
+        rewrite_response_review = load_optional_json(artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT) or {}
+        finding_gate = build_finding_gate(suspicions, burp_history, transaction_intent, rewrite_response_review)
         if not no_write:
             write_json(artifact_dir / "finding-gate.json", finding_gate)
             wrote_finding_gate = True
