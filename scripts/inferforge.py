@@ -176,6 +176,7 @@ BOUNTY_ACTION_QUEUE_ARTIFACT = "bounty-action-queue.json"
 BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT = "bounty-evidence-request.md"
 BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT = "bounty-evidence-templates.json"
 BOUNTY_TEMPLATE_SAFETY_ARTIFACT = "bounty-template-safety.json"
+BOUNTY_TEMPLATE_SAFETY_SELFTEST_ARTIFACT = "bounty-template-safety-selftest.json"
 REWRITE_REVIEW_ARTIFACT = "rewrite-review.json"
 REWRITE_VALIDATION_CHECKLIST_ARTIFACT = "rewrite-validation-checklist.json"
 REWRITE_RESPONSE_REVIEW_ARTIFACT = "rewrite-response-review.json"
@@ -302,6 +303,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     BOUNTY_EVIDENCE_REQUEST_BRIEF_ARTIFACT,
     BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT,
     BOUNTY_TEMPLATE_SAFETY_ARTIFACT,
+    BOUNTY_TEMPLATE_SAFETY_SELFTEST_ARTIFACT,
     REWRITE_REVIEW_ARTIFACT,
     REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
     REWRITE_RESPONSE_REVIEW_ARTIFACT,
@@ -26818,6 +26820,239 @@ def build_bounty_template_safety(
         "safety": (
             "Offline template safety review only. It reads local templates and bounded local evidence paths, sends no requests, "
             "calls no Burp tool, starts no browser, creates no evidence sidecars, signs no wallet, submits no transaction, "
+            "and changes no infrastructure."
+        ),
+    }
+
+
+def build_bounty_template_safety_selftest() -> dict[str, Any]:
+    target = "http://127.0.0.1:9997"
+    max_file_bytes = 262144
+
+    def template_doc(templates: list[dict[str, Any]], *, status: str = "bounty-evidence-templates-ready") -> dict[str, Any]:
+        return {
+            "generated_at": utc_now(),
+            "schema": "inferforge-bounty-evidence-templates-v1",
+            "status": status,
+            "target": target,
+            "summary": {"templates": len(templates)},
+            "templates": templates,
+            "reportability_rule": "Synthetic templates only. These are not evidence and cannot promote findings.",
+        }
+
+    def template(
+        template_id: str,
+        *,
+        target_evidence_path: str,
+        draft_content: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "id": template_id,
+            "lane": "transaction-integrity",
+            "template_kind": "jsonl-row",
+            "target_evidence_path": target_evidence_path,
+            "draft_content": draft_content,
+            "reportability_boundary": "Synthetic template-only fixture. Not evidence.",
+        }
+
+    with tempfile.TemporaryDirectory(prefix="inferforge-bounty-template-safety-selftest-") as temp_dir:
+        root = Path(temp_dir)
+        safe_dir = root / "safe"
+        polluted_dir = root / "polluted"
+        approved_dir = root / "approved"
+        empty_dir = root / "empty"
+        for path in [safe_dir, polluted_dir, approved_dir, empty_dir]:
+            path.mkdir(parents=True, exist_ok=True)
+
+        safe_template = template(
+            "selftest-safe-template",
+            target_evidence_path="transaction-payloads.jsonl",
+            draft_content={
+                "draft_only": True,
+                "approved": False,
+                "payloads": [
+                    {
+                        "data": {
+                            "type": "svm",
+                            "transaction": "REPLACE_WITH_APPROVED_BASE64_UNSIGNED_TRANSACTION",
+                        }
+                    }
+                ],
+            },
+        )
+        safe_case = build_bounty_template_safety(
+            target=target,
+            profile=None,
+            artifact_dir=safe_dir,
+            bounty_evidence_templates=template_doc([safe_template]),
+            max_file_bytes=max_file_bytes,
+        )
+
+        (polluted_dir / "transaction-payloads.jsonl").write_text(
+            json.dumps(
+                {
+                    "draft_only": True,
+                    "approved": False,
+                    "payloads": [
+                        {
+                            "data": {
+                                "transaction": "REPLACE_WITH_APPROVED_BASE64_UNSIGNED_TRANSACTION",
+                            }
+                        }
+                    ],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        polluted_template = template(
+            "selftest-polluted-sidecar-template",
+            target_evidence_path="transaction-payloads.jsonl",
+            draft_content={
+                "draft_only": True,
+                "approved": False,
+                "payloads": [
+                    {
+                        "data": {
+                            "type": "svm",
+                            "transaction": "REPLACE_WITH_APPROVED_BASE64_UNSIGNED_TRANSACTION",
+                        }
+                    }
+                ],
+            },
+        )
+        polluted_case = build_bounty_template_safety(
+            target=target,
+            profile=None,
+            artifact_dir=polluted_dir,
+            bounty_evidence_templates=template_doc([polluted_template]),
+            max_file_bytes=max_file_bytes,
+        )
+
+        approved_template = template(
+            "selftest-approved-true-template",
+            target_evidence_path="operator-evidence.json",
+            draft_content={
+                "draft_only": True,
+                "approved": True,
+                "approval_reference": "REPLACE_WITH_OPERATOR_APPROVAL",
+            },
+        )
+        approved_case = build_bounty_template_safety(
+            target=target,
+            profile=None,
+            artifact_dir=approved_dir,
+            bounty_evidence_templates=template_doc([approved_template]),
+            max_file_bytes=max_file_bytes,
+        )
+
+        empty_case = build_bounty_template_safety(
+            target=target,
+            profile=None,
+            artifact_dir=empty_dir,
+            bounty_evidence_templates=template_doc([], status="no-bounty-evidence-templates"),
+            max_file_bytes=max_file_bytes,
+        )
+
+    def issue_counts(case: dict[str, Any]) -> dict[str, Any]:
+        summary = case.get("summary") if isinstance(case.get("summary"), dict) else {}
+        return summary.get("issue_counts") if isinstance(summary.get("issue_counts"), dict) else {}
+
+    safe_summary = safe_case.get("summary") if isinstance(safe_case.get("summary"), dict) else {}
+    polluted_summary = polluted_case.get("summary") if isinstance(polluted_case.get("summary"), dict) else {}
+    approved_summary = approved_case.get("summary") if isinstance(approved_case.get("summary"), dict) else {}
+
+    assertions = [
+        {
+            "id": "safe-draft-template-passes",
+            "passed": (
+                safe_case.get("status") == "template-safety-passed"
+                and safe_summary.get("templates") == 1
+                and safe_summary.get("passed") == 1
+                and safe_summary.get("blocked") == 0
+            ),
+            "expected": "a draft_only approved=false template with placeholders and no copied official sidecar passes",
+            "actual": {
+                "status": safe_case.get("status"),
+                "summary": safe_summary,
+            },
+        },
+        {
+            "id": "official-sidecar-template-marker-blocks",
+            "passed": (
+                polluted_case.get("status") == "blocked-template-safety"
+                and polluted_summary.get("blocked") == 1
+                and issue_counts(polluted_case).get("official-evidence-path-contains-template-marker") == 1
+            ),
+            "expected": "template markers copied into an official evidence sidecar block template safety",
+            "actual": {
+                "status": polluted_case.get("status"),
+                "summary": polluted_summary,
+            },
+        },
+        {
+            "id": "approved-true-template-blocks",
+            "passed": (
+                approved_case.get("status") == "blocked-template-safety"
+                and approved_summary.get("blocked") == 1
+                and issue_counts(approved_case).get("template-contains-approved-true") == 1
+            ),
+            "expected": "draft templates must not set approved=true",
+            "actual": {
+                "status": approved_case.get("status"),
+                "summary": approved_summary,
+            },
+        },
+        {
+            "id": "missing-official-evidence-is-not-finding-evidence",
+            "passed": (
+                safe_case.get("status") == "template-safety-passed"
+                and "not evidence" in str(safe_case.get("reportability_rule") or "").lower()
+                and "finding" not in safe_case
+                and "findings" not in safe_case
+            ),
+            "expected": "a missing official sidecar can pass negative-control template safety but cannot become a finding",
+            "actual": {
+                "status": safe_case.get("status"),
+                "reportability_rule": safe_case.get("reportability_rule"),
+                "keys": sorted(str(key) for key in safe_case.keys()),
+            },
+        },
+        {
+            "id": "empty-template-package-stays-neutral",
+            "passed": empty_case.get("status") == "no-templates-to-review",
+            "expected": "an empty template package is neutral and does not fabricate evidence",
+            "actual": {"status": empty_case.get("status")},
+        },
+    ]
+    failed = [item for item in assertions if not item.get("passed")]
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-bounty-template-safety-selftest-v1",
+        "status": "failed" if failed else "passed",
+        "target": target,
+        "summary": {
+            "cases": 4,
+            "assertions": len(assertions),
+            "failed": len(failed),
+            "case_statuses": {
+                "safe": safe_case.get("status"),
+                "polluted_sidecar": polluted_case.get("status"),
+                "approved_true": approved_case.get("status"),
+                "empty": empty_case.get("status"),
+            },
+        },
+        "cases": {
+            "safe": safe_case,
+            "polluted_sidecar": polluted_case,
+            "approved_true": approved_case,
+            "empty": empty_case,
+        },
+        "assertions": assertions,
+        "safety": (
+            "Synthetic local fixture only. It writes temporary files under tempfile, sends no requests, calls no Burp tool, "
+            "starts no browser, creates no workspace evidence sidecars, signs no wallet, submits no transaction, "
             "and changes no infrastructure."
         ),
     }
@@ -53399,6 +53634,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("self-test-rewrite-response-review", "run_rewrite_response_review_selftest"),
         refresh_expectation("self-test-burp-sync-failures", "run_burp_sync_failure_selftest"),
         refresh_expectation("self-test-transactions", "run_transaction_decoder_selftest"),
+        refresh_expectation("self-test-bounty-template-safety", "run_bounty_template_safety_selftest"),
         refresh_expectation("collect-quote", "run_collect_quote", min_refreshes=2, min_prints=2),
         refresh_expectation("collect-orca-baseline", "run_collect_orca_baseline", min_refreshes=2, min_prints=2),
     ]
@@ -72026,6 +72262,7 @@ def run_regression_suite(args: argparse.Namespace) -> int:
             ("self-test-rewrite-response-review", "self-test-rewrite-response-review"),
             ("self-test-burp-sync-failures", "self-test-burp-sync-failures"),
             ("self-test-transactions", "self-test-transactions"),
+            ("self-test-bounty-template-safety", "self-test-bounty-template-safety"),
         ]:
             command = inferforge_cli_command(
                 args,
@@ -79111,6 +79348,37 @@ def run_bounty_template_safety(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_bounty_template_safety_selftest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result = build_bounty_template_safety_selftest()
+    result["current_profile_context"] = profile_summary(profile)
+    output_path = artifact_dir / BOUNTY_TEMPLATE_SAFETY_SELFTEST_ARTIFACT
+    write_json(output_path, sanitize_artifact_samples(result))
+    summary = result.get("summary", {}) if isinstance(result.get("summary"), dict) else {}
+    print(f"Bounty template safety self-test: {result['status']}")
+    print(
+        "Cases: "
+        f"cases={summary.get('cases', 0)} "
+        f"assertions={summary.get('assertions', 0)} "
+        f"failed={summary.get('failed', 0)} "
+        f"statuses={json.dumps(summary.get('case_statuses', {}), sort_keys=True)}"
+    )
+    failed = [item for item in result.get("assertions", []) if not item.get("passed")]
+    if failed:
+        print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="self-test-bounty-template-safety",
+            output_paths=[output_path],
+        )
+    )
+    return 0 if result["status"] == "passed" else 1
+
+
 def run_rpc_proxy_parity_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -83623,6 +83891,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a synthetic self-test for redacted burp-sync failure artifacts",
     )
     burp_sync_failure_selftest.set_defaults(func=run_burp_sync_failure_selftest)
+
+    bounty_template_safety_selftest = sub.add_parser(
+        "self-test-bounty-template-safety",
+        help="Run a synthetic self-test for bounty template safety negative controls",
+    )
+    bounty_template_safety_selftest.set_defaults(func=run_bounty_template_safety_selftest)
 
     collect_quote = sub.add_parser(
         "collect-quote",
