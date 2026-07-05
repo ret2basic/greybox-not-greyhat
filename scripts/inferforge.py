@@ -24628,6 +24628,25 @@ def verification_queue_command_preview_lines(item: dict[str, Any], *, limit: int
         lines.append(f"    - {format_command_ref_label(ref)} {command}")
     if len(command_refs) > limit:
         lines.append(f"    - ... +{len(command_refs) - limit} more commands")
+    if str(item.get("status") or "") == "blocked-external":
+        command_text = "\n".join(
+            str(ref.get("command") or "")
+            for ref in command_refs
+            if isinstance(ref, dict)
+        )
+        if "--include-external" in command_text or "--ws-resource-probes" in command_text:
+            lines.append(
+                "    offline_alternative=Run validation-plan --no-write --limit 8 --show-commands "
+                "for constrained replacements before any active audit."
+            )
+            lines.append(
+                "    resource_gate=Do not run replacement audit traffic until resource-snapshot --strict is healthy."
+            )
+        if "collect-quote" in command_text:
+            lines.append(
+                "    offline_alternative=Run transaction-corpus-checklist --no-write --show-commands --show-steps "
+                "until one approved quote corpus can be captured safely."
+            )
     return lines
 
 
@@ -24675,6 +24694,26 @@ def verification_queue_followup_preview_lines(item: dict[str, Any], *, limit: in
     if evidence_refs:
         suffix = "" if len(evidence_refs) <= 6 else f",+{len(evidence_refs) - 6}"
         lines.append(f"    evidence_refs={','.join(evidence_refs[:6])}{suffix}")
+
+    if status == "blocked-external":
+        command_text = "\n".join(
+            str(ref.get("command") or "")
+            for ref in (item.get("command_safety", {}) or {}).get("commands", []) or []
+            if isinstance(ref, dict)
+        )
+        if "--include-external" in command_text or "--ws-resource-probes" in command_text:
+            lines.append(
+                "    offline_alternative=Run validation-plan --no-write --limit 8 --show-commands "
+                "for constrained replacements before any active audit."
+            )
+            lines.append(
+                "    resource_gate=Do not run replacement audit traffic until resource-snapshot --strict is healthy."
+            )
+        if "collect-quote" in command_text:
+            lines.append(
+                "    offline_alternative=Run transaction-corpus-checklist --no-write --show-commands --show-steps "
+                "until one approved quote corpus can be captured safely."
+            )
 
     safety = inline_summary_text(item.get("safety") or "", max_chars=260)
     if safety:
