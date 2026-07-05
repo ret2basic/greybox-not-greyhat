@@ -10041,17 +10041,28 @@ def rpc_method_policy_for_hypothesis_matrix(
     artifact_dir: Path,
 ) -> tuple[dict[str, Any], str]:
     artifact = load_optional_json(artifact_dir / "rpc-method-policy.json")
-    if artifact:
+    if isinstance(artifact, dict):
+        rate_review = (
+            artifact.get("rate_limit_resource_review")
+            if isinstance(artifact.get("rate_limit_resource_review"), dict)
+            else {}
+        )
+        if isinstance(rate_review.get("client_ip_trust_review"), dict):
+            return artifact, "artifact"
+    elif artifact:
         return artifact, "artifact"
     profile_doc = profile if isinstance(profile, dict) else {}
     if not profile_doc:
         profile_doc = load_optional_json(artifact_dir / TARGET_PROFILE_ARTIFACT) or {}
     if not profile_doc:
-        return {}, "missing"
+        return artifact or {}, "stale-artifact-schema" if artifact else "missing"
     source_root = resolve_repo_path(profile_doc.get("default_source_root") or DEFAULT_SOURCE_ROOT)
     if not is_blackbox_profile_like(profile_doc) and not source_root.exists():
-        return {}, "source-unavailable"
-    return build_rpc_method_policy(source_root, [], profile=profile_doc), "profile-fallback"
+        return artifact or {}, "stale-artifact-source-unavailable" if artifact else "source-unavailable"
+    return (
+        build_rpc_method_policy(source_root, [], profile=profile_doc),
+        "profile-fallback-stale-artifact-schema" if artifact else "profile-fallback",
+    )
 
 
 def hypothesis_from_rpc_method_policy(
@@ -10362,6 +10373,11 @@ def hypothesis_from_rpc_rate_limit_resource_policy(
     )
     if review.get("status") != "needs-deployment-review":
         return None
+    client_ip_trust_review = (
+        review.get("client_ip_trust_review")
+        if isinstance(review.get("client_ip_trust_review"), dict)
+        else {}
+    )
     source_refs = [
         f"{ref.get('file')}:{ref.get('line')}"
         for signal in review.get("signals", []) or []
@@ -10390,7 +10406,12 @@ def hypothesis_from_rpc_rate_limit_resource_policy(
         "reportability_gate": review.get("reportability_gate"),
         "next_step": review.get("next_step"),
         "evidence_refs": compact_source_refs(["rpc-method-policy.json", *source_refs]),
-        "resource_abuse_review": review,
+        "resource_abuse_review": {
+            **review,
+            "client_ip_trust_status": client_ip_trust_review.get("status") or "missing",
+            "client_ip_forwarded_for_ref_count": client_ip_trust_review.get("forwarded_for_ref_count", 0),
+            "client_ip_edge_header_ref_count": client_ip_trust_review.get("edge_header_ref_count", 0),
+        },
         "safety": review.get("safety") or "Offline resource-control review only. Do not run rate or DoS tests.",
     }
 
@@ -17556,6 +17577,32 @@ def build_rate_limit_resource_review(
 ) -> dict[str, Any]:
     signals = []
 
+    def client_ip_ref_token(ref: dict[str, Any]) -> str:
+        explicit = str(ref.get("token") or "")
+        if explicit:
+            return explicit
+        sample = str(ref.get("sample") or "").lower()
+        for token in ["x-forwarded-for", "cf-connecting-ip", "x-real-ip", "getClientIp"]:
+            if token.lower() in sample:
+                return token
+        return ""
+
+    header_tokens = {
+        client_ip_ref_token(ref)
+        for ref in client_ip_header_refs
+        if isinstance(ref, dict) and client_ip_ref_token(ref)
+    }
+    forwarded_header_refs = [
+        ref
+        for ref in client_ip_header_refs
+        if client_ip_ref_token(ref) == "x-forwarded-for"
+    ]
+    edge_header_refs = [
+        ref
+        for ref in client_ip_header_refs
+        if client_ip_ref_token(ref) in {"cf-connecting-ip", "x-real-ip"}
+    ]
+
     def add_signal(signal_id: str, summary: str, refs: list[dict[str, Any]], review_question: str) -> None:
         signals.append(
             {
@@ -17574,6 +17621,13 @@ def build_rate_limit_resource_review(
             [*memory_rate_limit_refs[:3], *client_ip_header_refs[:3]],
             "Can deployment guarantees prove the client IP key is trusted and memory buckets are bounded or externally stored?",
         )
+    if memory_rate_limit_refs and forwarded_header_refs:
+        add_signal(
+            "forwarded-for-keyed-memory-bucket-review",
+            "The in-memory rate-limit key can depend on x-forwarded-for before deployment proxy trust is proven.",
+            [*forwarded_header_refs[:3], *memory_rate_limit_refs[:3]],
+            "Does the production edge overwrite x-forwarded-for, or can clients shard rate-limit buckets with spoofed header values?",
+        )
     if memory_rate_limit_refs and external_rate_limit_store_refs:
         add_signal(
             "external-store-fallback-to-memory",
@@ -17589,11 +17643,37 @@ def build_rate_limit_resource_review(
             "Do configured burst/sustained limits and key lifetimes bound memory growth under the real proxy trust model?",
         )
 
+    client_ip_trust_review = {
+        "status": (
+            "needs-proxy-trust-evidence"
+            if forwarded_header_refs
+            else "edge-header-context-indexed"
+            if edge_header_refs
+            else "no-client-ip-header-source"
+        ),
+        "priority": "medium" if forwarded_header_refs and memory_rate_limit_refs else "info",
+        "header_tokens": sorted(header_tokens),
+        "forwarded_for_ref_count": len(forwarded_header_refs),
+        "edge_header_ref_count": len(edge_header_refs),
+        "memory_fallback_ref_count": len(memory_rate_limit_refs),
+        "evidence": [*forwarded_header_refs[:4], *edge_header_refs[:4], *memory_rate_limit_refs[:4]],
+        "operator_evidence_needed": [
+            "Confirm whether the production edge overwrites x-forwarded-for before the application receives it.",
+            "Confirm whether requests can reach the app directly without the trusted edge or load balancer.",
+            "Confirm whether cf-connecting-ip or x-real-ip is injected by trusted infrastructure only.",
+        ],
+        "reportability_gate": (
+            "Header-keyed rate-limit code is not reportable by itself. Escalate only with deployment evidence that "
+            "an attacker controls the key material plus bounded-impact evidence, without flooding or rate testing."
+        ),
+    }
+
     return {
         "status": "needs-deployment-review" if signals else "no-static-resource-signal",
         "priority": "medium" if signals else "info",
         "signal_count": len(signals),
         "signals": signals,
+        "client_ip_trust_review": client_ip_trust_review,
         "reportability_gate": (
             "Static in-memory rate-limit fallback evidence is not reportable by itself. "
             "Escalate only with deployment evidence showing attacker-controlled key growth, missing external store, "
@@ -41184,20 +41264,38 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             for signal in rate_limit_resource_review.get("signals", [])
             if isinstance(signal, dict)
         }
+        rate_limit_client_ip_trust_review = (
+            rate_limit_resource_review.get("client_ip_trust_review", {})
+            if isinstance(rate_limit_resource_review.get("client_ip_trust_review"), dict)
+            else {}
+        )
         rate_limit_resource_review_passed = (
             rate_limit_resource_review.get("status") == "needs-deployment-review"
             and {
                 "client-keyed-memory-rate-limit-fallback",
+                "forwarded-for-keyed-memory-bucket-review",
                 "external-store-fallback-to-memory",
                 "bounded-rate-limit-guard-review",
             }.issubset(rate_limit_signal_ids)
+            and rate_limit_client_ip_trust_review.get("status") == "needs-proxy-trust-evidence"
+            and rate_limit_client_ip_trust_review.get("forwarded_for_ref_count", 0) >= 1
+            and rate_limit_client_ip_trust_review.get("memory_fallback_ref_count", 0) >= 1
             and rewrite_resource_hypothesis is not None
             and rewrite_resource_hypothesis.get("status") == "ready-for-offline-review"
             and rewrite_resource_hypothesis.get("impact") == "resource-exhaustion"
+            and rewrite_resource_hypothesis.get("resource_abuse_review", {}).get("client_ip_trust_status")
+            == "needs-proxy-trust-evidence"
+            and rewrite_resource_hypothesis.get("resource_abuse_review", {}).get(
+                "client_ip_forwarded_for_ref_count",
+                0,
+            )
+            >= 1
             and rewrite_resource_validation_item is not None
             and rewrite_resource_validation_item.get("status") == "ready-offline"
             and rewrite_resource_validation_item.get("resource_abuse_review", {}).get("status")
             == "needs-deployment-review"
+            and rewrite_resource_validation_item.get("resource_abuse_review", {}).get("client_ip_trust_status")
+            == "needs-proxy-trust-evidence"
             and rewrite_resource_gap is not None
             and rewrite_resource_gap.get("priority") == "medium"
             and rewrite_resource_queue_item is not None
@@ -47580,7 +47678,9 @@ def run_validation_plan(args: argparse.Namespace) -> int:
                     print(
                         "  resource_abuse_review="
                         f"{resource_review.get('status')} "
-                        f"static_signals={resource_review.get('signal_count', 0)}"
+                        f"static_signals={resource_review.get('signal_count', 0)} "
+                        f"client_ip_trust={resource_review.get('client_ip_trust_status') or 'missing'} "
+                        f"xff_refs={resource_review.get('client_ip_forwarded_for_ref_count', 0)}"
                     )
                 credential_review = (
                     item.get("credential_proxy_review")
