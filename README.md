@@ -524,6 +524,10 @@ response body in artifacts.
 `validation-plan`, `lead-dossier`, and `iteration-decision` carry the same
 rewrite-response approval packet so unattended loops can keep this as a
 one-request evidence closure instead of broad catch-all path enumeration.
+Fixed-upstream leads also expose a `rewrite-response-evidence-closure` plan:
+source context, read-only path selection, one redacted response sidecar or
+observation, impact classification, and finding-gate entry stay ordered and
+blocked until concrete impact evidence exists.
 If `endpoint-clusters.json` or the target profile does not list a static
 `next.config.*` rewrite, `rewrite-review`, `hypothesis-matrix`, and
 `validation-plan` can still merge source-discovered rewrite-proxy clusters into

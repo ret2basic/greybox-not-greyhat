@@ -11039,6 +11039,17 @@ def build_rewrite_evidence_closure(
         )
         if ref:
             commands.append(ref)
+    closure_plan = rewrite_response_evidence_closure_plan(
+        artifact_dir=artifact_dir,
+        profile=profile,
+        requirements=requirements,
+        rewrite_review=rewrite_review,
+        response_review=response_review,
+        response_item=response_item,
+        approval_packet=approval_packet,
+        approved_response_count=approved_response_count,
+        candidate_impact_count=candidate_impact_count,
+    )
     return {
         "status": methodology_closure_status(requirements, gate_ready=bool(candidate_impact_count)),
         "gate_ready": bool(candidate_impact_count),
@@ -11069,9 +11080,246 @@ def build_rewrite_evidence_closure(
             artifact_dir=artifact_dir,
         ),
         "rewrite_response_approval_packet": approval_packet,
+        "closure_plan": closure_plan,
         "finding_gate_entry_condition": (
             "Only enter finding-gate after one approved read-only response proves concrete sensitive-data exposure, "
             "path confusion, authorization bypass, or equivalent impact. Static rewrite configuration is not enough."
+        ),
+    }
+
+
+def rewrite_approval_sequence_step(approval_packet: dict[str, Any], step_id: str) -> dict[str, Any]:
+    for step in approval_packet.get("approval_sequence", []) or []:
+        if isinstance(step, dict) and step.get("id") == step_id:
+            return step
+    return {}
+
+
+def rewrite_response_evidence_closure_plan(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    requirements: list[dict[str, Any]],
+    rewrite_review: dict[str, Any],
+    response_review: dict[str, Any],
+    response_item: dict[str, Any],
+    approval_packet: dict[str, Any],
+    approved_response_count: int,
+    candidate_impact_count: int,
+) -> dict[str, Any]:
+    requirement_by_id = {
+        str(requirement.get("id") or ""): requirement
+        for requirement in requirements
+        if isinstance(requirement, dict)
+    }
+    response_summary = response_review.get("summary", {}) if isinstance(response_review.get("summary"), dict) else {}
+    recommended_request = (
+        approval_packet.get("recommended_request")
+        if isinstance(approval_packet.get("recommended_request"), dict)
+        else {}
+    )
+    source_context = (
+        approval_packet.get("source_context")
+        if isinstance(approval_packet.get("source_context"), dict)
+        else {}
+    )
+    sidecar_path = (
+        approval_packet.get("sidecar_path")
+        or response_review.get("sidecar_path")
+        or repo_relative_or_absolute(rewrite_response_sidecar_path(artifact_dir))
+    )
+    required_fields = normalize_string_list(approval_packet.get("redacted_sidecar_required_fields"))
+    finding_gate_blockers = normalize_string_list(approval_packet.get("finding_gate_blockers"))
+
+    def requirement_status(requirement_id: str) -> str:
+        requirement = requirement_by_id.get(requirement_id, {})
+        return str(requirement.get("status") or "waiting")
+
+    def requirement_next(requirement_id: str, fallback: str) -> str:
+        requirement = requirement_by_id.get(requirement_id, {})
+        return str(requirement.get("next_step") or fallback)
+
+    def combined_status(requirement_ids: list[str]) -> str:
+        statuses = [requirement_status(requirement_id) for requirement_id in requirement_ids]
+        if statuses and all(status == "passed" for status in statuses):
+            return "passed"
+        if statuses and all(status in {"passed", "ready-offline", "ready-after-resource-check"} for status in statuses):
+            return "ready-offline"
+        return "waiting"
+
+    def offline_command(subcommand: str, source: str) -> dict[str, Any] | None:
+        return methodology_command_ref(artifact_dir, profile, subcommand, source=source)
+
+    def packet_step_summary(step_id: str) -> dict[str, Any]:
+        step = rewrite_approval_sequence_step(approval_packet, step_id)
+        if not step:
+            return {}
+        return {
+            key: step.get(key)
+            for key in ["id", "status", "command"]
+            if step.get(key) is not None
+        }
+
+    steps = [
+        {
+            "id": "fixed-upstream-source-context",
+            "requirements": [
+                "rewrite-review-indexed",
+                "config-rewrite-source-indexed",
+                "source-guard-or-rewrite-shape-reviewed",
+            ],
+            "status": combined_status(
+                [
+                    "rewrite-review-indexed",
+                    "config-rewrite-source-indexed",
+                    "source-guard-or-rewrite-shape-reviewed",
+                ]
+            ),
+            "artifact": REWRITE_REVIEW_ARTIFACT,
+            "evidence": {
+                "rewrite_review_id": rewrite_review.get("id") or source_context.get("rewrite_review_id"),
+                "cluster_id": rewrite_review.get("cluster_id") or source_context.get("cluster_id"),
+                "fixed_upstreams": normalize_string_list(
+                    rewrite_review.get("fixed_upstreams") or source_context.get("fixed_upstreams")
+                )[:5],
+                "source_refs": compact_source_refs(
+                    [
+                        *normalize_string_list(rewrite_review.get("source_refs")),
+                        *normalize_string_list(source_context.get("source_refs")),
+                    ]
+                )[:8],
+            },
+            "offline_command": offline_command(
+                "rewrite-review --no-write --show-next",
+                "rewrite-closure-plan:source-context",
+            ),
+            "next_step": requirement_next(
+                "rewrite-review-indexed",
+                "Run rewrite-review --no-write --show-next to index the fixed-upstream rewrite/proxy shape.",
+            ),
+        },
+        {
+            "id": "read-only-path-selection",
+            "requirements": [
+                "approved-read-only-path-candidate",
+                "dynamic-or-mutating-paths-blocked",
+                "positive-source-guard-status-reviewed",
+            ],
+            "status": combined_status(
+                [
+                    "approved-read-only-path-candidate",
+                    "dynamic-or-mutating-paths-blocked",
+                    "positive-source-guard-status-reviewed",
+                ]
+            ),
+            "artifact": REWRITE_VALIDATION_CHECKLIST_ARTIFACT,
+            "recommended_request": recommended_request,
+            "packet_steps": [
+                packet_step_summary("promotion-preview"),
+                packet_step_summary("promotion-write"),
+            ],
+            "offline_command": offline_command(
+                "rewrite-validation-checklist --no-write --show-candidates --show-commands",
+                "rewrite-closure-plan:path-selection",
+            ),
+            "next_step": requirement_next(
+                "approved-read-only-path-candidate",
+                "Select exactly one concrete, in-scope, read-only local_path candidate before any request.",
+            ),
+        },
+        {
+            "id": "response-evidence-sidecar",
+            "requirement": "single-approved-response-observed",
+            "status": requirement_status("single-approved-response-observed"),
+            "artifact": sidecar_path,
+            "required_fields": required_fields[:6],
+            "evidence": {
+                "sidecar_status": response_summary.get("sidecar_status"),
+                "sidecar_rows": response_summary.get("sidecar_rows", 0),
+                "observed_approved_responses": approved_response_count,
+                "recommended_path": recommended_request.get("path"),
+            },
+            "packet_steps": [
+                packet_step_summary("resource-gate"),
+                packet_step_summary("single-burp-observe"),
+                packet_step_summary("response-review"),
+            ],
+            "offline_command": offline_command(
+                REWRITE_RESPONSE_OBSERVATION_CONTRACT_SUBCOMMAND,
+                "rewrite-closure-plan:response-evidence",
+            ),
+            "next_step": requirement_next(
+                "single-approved-response-observed",
+                "Provide one approved redacted response observation for exactly one reviewed read-only path.",
+            ),
+        },
+        {
+            "id": "impact-classification",
+            "requirement": "concrete-sensitive-data-or-path-confusion-impact",
+            "status": requirement_status("concrete-sensitive-data-or-path-confusion-impact"),
+            "artifact": REWRITE_RESPONSE_REVIEW_ARTIFACT,
+            "evidence": {
+                "candidate_impact_observations": candidate_impact_count,
+                "impact_precheck_observations": response_summary.get("impact_precheck_observations", 0),
+                "manual_impact_review_hints": response_summary.get("manual_impact_review_hints", 0),
+                "observation_status": response_item.get("status"),
+            },
+            "next_step": requirement_next(
+                "concrete-sensitive-data-or-path-confusion-impact",
+                "Escalate only if the response proves sensitive-data exposure, path confusion, authorization bypass, or equivalent impact.",
+            ),
+        },
+        {
+            "id": "finding-gate-entry",
+            "requirement": "finding-gate-impact",
+            "status": "ready-offline" if candidate_impact_count else "waiting",
+            "artifact": "finding-gate.json",
+            "evidence": {
+                "finding_gate_blockers": [] if candidate_impact_count else finding_gate_blockers[:5],
+                "candidate_impact_observations": candidate_impact_count,
+            },
+            "offline_command": offline_command(
+                "gate --no-write --show-items",
+                "rewrite-closure-plan:finding-gate-entry",
+            ),
+            "next_step": (
+                "Run finding-gate only after manual review confirms concrete rewrite-response impact."
+            ),
+        },
+    ]
+    incomplete_steps = [
+        step
+        for step in steps
+        if step.get("status") not in {"passed", "ready-offline", "ready-after-resource-check"}
+    ]
+    active_step = incomplete_steps[0] if incomplete_steps else {}
+    if candidate_impact_count:
+        status = "ready-for-finding-gate-review"
+    elif approved_response_count:
+        status = "needs-impact-classification"
+    elif active_step.get("id") == "read-only-path-selection":
+        status = "needs-read-only-path-selection"
+    elif active_step.get("id") == "response-evidence-sidecar":
+        status = "needs-redacted-response-evidence"
+    else:
+        status = "needs-closure-evidence"
+
+    return {
+        "id": "rewrite-response-evidence-closure",
+        "status": status,
+        "active_step": active_step.get("id"),
+        "recommended_request": recommended_request,
+        "sidecar_path": sidecar_path,
+        "steps": steps,
+        "finding_gate_blockers": [] if candidate_impact_count else finding_gate_blockers,
+        "reportability_gate": (
+            "A fixed-upstream rewrite lead is reportable only after one approved read-only response proves "
+            "unauthorized sensitive-data exposure, path confusion, authorization bypass, tenant-data exposure, "
+            "wallet/account-data exposure, or equivalent impact. Static routing and 2xx status are not enough."
+        ),
+        "safety": (
+            "Offline closure plan only. It emits redacted artifacts, commands, field requirements, and source context; "
+            "it does not read raw Burp history, send requests, invoke Burp tools, enumerate paths, or keep response bodies."
         ),
     }
 
@@ -42174,6 +42422,39 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             no_history_approval_packet.get("approval_sequence", []),
             sort_keys=True,
         )
+        no_history_rewrite_review = build_rewrite_review_run(
+            target=target,
+            profile=profile,
+            artifact_dir=root / "no-history-artifacts",
+        )
+        no_history_rewrite_item = (
+            (no_history_rewrite_review.get("items") or [{}])[0]
+            if no_history_rewrite_review.get("items")
+            else {}
+        )
+        no_history_closure = build_rewrite_evidence_closure(
+            artifact_dir=root / "no-history-artifacts",
+            profile=profile,
+            item={
+                "id": "HYP-rewrite-response-no-history-selftest",
+                "type": "cluster-strategy",
+                "cluster_id": no_history_rewrite_item.get("cluster_id"),
+                "path": no_history_rewrite_item.get("path"),
+                "impact": "fixed-upstream-proxy-confusion",
+                "rewrite_review": no_history_rewrite_item,
+            },
+        )
+        no_history_closure_plan = (
+            no_history_closure.get("closure_plan")
+            if isinstance(no_history_closure.get("closure_plan"), dict)
+            else {}
+        )
+        no_history_closure_plan_steps = [
+            item
+            for item in (no_history_closure_plan.get("steps", []) or [])
+            if isinstance(item, dict)
+        ]
+        no_history_closure_plan_text = json.dumps(no_history_closure_plan, sort_keys=True)
         precheck_artifact_dir = root / "precheck-artifacts"
         append_jsonl(
             precheck_artifact_dir / "burp-history-observations.jsonl",
@@ -42526,6 +42807,35 @@ def build_rewrite_response_review_selftest() -> dict[str, Any]:
             ),
             "expected": "missing approved rewrite responses expose a compact single-request approval packet with resource-gated active steps",
             "actual": no_history_approval_packet,
+        },
+        {
+            "id": "missing-approved-response-emits-rewrite-closure-plan",
+            "passed": (
+                no_history_closure_plan.get("id") == "rewrite-response-evidence-closure"
+                and no_history_closure_plan.get("status") == "needs-redacted-response-evidence"
+                and no_history_closure_plan.get("active_step") == "response-evidence-sidecar"
+                and (no_history_closure_plan.get("recommended_request") or {}).get("path") == approved_path
+                and str(no_history_closure_plan.get("sidecar_path") or "").endswith(
+                    REWRITE_RESPONSE_SIDECAR_ARTIFACT
+                )
+                and [item.get("id") for item in no_history_closure_plan_steps[:4]]
+                == [
+                    "fixed-upstream-source-context",
+                    "read-only-path-selection",
+                    "response-evidence-sidecar",
+                    "impact-classification",
+                ]
+                and no_history_closure_plan_steps[0].get("status") == "passed"
+                and no_history_closure_plan_steps[1].get("status") in {"passed", "ready-offline"}
+                and no_history_closure_plan_steps[2].get("status") == "waiting"
+                and "No approved redacted response observation" in no_history_closure_plan_text
+                and "sidecar-raw-should-not-appear" not in no_history_closure_plan_text
+            ),
+            "expected": "missing approved rewrite responses expose an ordered redacted closure plan before finding-gate entry",
+            "actual": {
+                "closure": no_history_closure,
+                "plan": no_history_closure_plan,
+            },
         },
         {
             "id": "approved-sensitive-response-enters-candidate-impact-review",
