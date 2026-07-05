@@ -180,6 +180,7 @@ TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT = "transaction-intent-policy-templa
 CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT = "credential-impact-checklist.json"
 OPERATOR_EVIDENCE_ARTIFACT = "operator-evidence.json"
 OPERATOR_EVIDENCE_REVIEW_ARTIFACT = "operator-evidence-review.json"
+OPERATOR_IMPACT_READINESS_ARTIFACT = "operator-impact-readiness.json"
 DISCOVERY_COVERAGE_ARTIFACT = "discovery-coverage.json"
 DISCOVERY_COVERAGE_SELFTEST_ARTIFACT = "discovery-coverage-selftest.json"
 REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
@@ -291,6 +292,7 @@ KNOWN_OPTIONAL_ARTIFACTS = [
     TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT,
     CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT,
     OPERATOR_EVIDENCE_ARTIFACT,
+    OPERATOR_IMPACT_READINESS_ARTIFACT,
     "artifact-health.json",
     "regression-suite.json",
     "orca-baseline.json",
@@ -24460,6 +24462,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     BOUNTY_INVALIDITY_REVIEW_ARTIFACT: "bounty-invalidity-review",
     TRANSACTION_INTENT_BOUNDARY_ARTIFACT: "transaction-intent-boundary",
     TRANSACTION_EVIDENCE_READINESS_ARTIFACT: "transaction-evidence-readiness",
+    OPERATOR_IMPACT_READINESS_ARTIFACT: "operator-impact-readiness",
     ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT: "oracle-plan --write-sidecar-template",
     REWRITE_RESPONSE_SIDECAR_TEMPLATE_ARTIFACT: "rewrite-response-review --write-sidecar-template",
     "finding-gate.json": "gate",
@@ -24505,6 +24508,7 @@ ARTIFACT_REPAIR_COMMAND_ORDER = [
     "bounty-invalidity-review",
     "transaction-intent-boundary",
     "transaction-evidence-readiness",
+    "operator-impact-readiness",
     "rewrite-response-review --write-sidecar-template",
     "report",
     "transaction-corpus-checklist --write-policy-template --skip-current-resource-check",
@@ -24535,6 +24539,7 @@ ARTIFACT_REPAIR_NO_WRITE_PREVIEW_COMMANDS = {
     "bounty-invalidity-review": "bounty-invalidity-review --no-write",
     "transaction-intent-boundary": "transaction-intent-boundary --no-write",
     "transaction-evidence-readiness": "transaction-evidence-readiness --no-write",
+    "operator-impact-readiness": "operator-impact-readiness --no-write",
     "rewrite-response-review --write-sidecar-template": (
         "rewrite-response-review --no-write --show-sidecar-template-json"
     ),
@@ -30364,6 +30369,20 @@ OPERATOR_RESOURCE_CONTROL_DECISION_IDS = {
     "websocket-upstream-header-trust-or-logging-policy",
 }
 
+OPERATOR_IMPACT_BOUNTY_LANES = {
+    "credentialed-provider-impact",
+    "resource-control",
+    "websocket-header-trust",
+}
+
+OPERATOR_WEBSOCKET_HEADER_DECISION_IDS = {
+    "edge-host-canonicalization-policy",
+    "host-origin-pair-reachability",
+    "websocket-connection-quota-impact",
+    "websocket-upstream-header-receipt-policy",
+    "websocket-upstream-header-trust-or-logging-policy",
+}
+
 
 def credentialed_upstream_cost_abuse_evidence_contract(
     *,
@@ -31549,6 +31568,417 @@ def build_operator_evidence_review(
         "safety": (
             "Offline sidecar review only. It reads local JSON and redacts summaries/source references; "
             "it sends no target, provider, Burp, wallet, or transaction traffic."
+        ),
+    }
+
+
+def bounty_invalidity_rows_by_gate_id(invalidity_review: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not isinstance(invalidity_review, dict):
+        return {}
+    rows = invalidity_review.get("invalidity_rows")
+    if not isinstance(rows, list):
+        return {}
+    by_gate: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        gate_id = str(row.get("gate_id") or "").strip()
+        if gate_id:
+            by_gate[gate_id] = row
+    return by_gate
+
+
+def operator_impact_readiness_check(
+    check_id: str,
+    label: str,
+    status: str,
+    evidence: Any,
+    next_step: str,
+) -> dict[str, Any]:
+    return {
+        "id": check_id,
+        "label": label,
+        "status": status,
+        "evidence": evidence,
+        "next_step": next_step,
+    }
+
+
+def operator_impact_contracts_by_id(operator_review: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    contracts: dict[str, dict[str, Any]] = {}
+    for contract in operator_review.get("closure_contracts", []) or []:
+        if not isinstance(contract, dict):
+            continue
+        contract_id = str(contract.get("id") or "").strip()
+        if contract_id:
+            contracts[contract_id] = contract
+    return contracts
+
+
+def operator_impact_contract_decision_ids(contract: dict[str, Any] | None) -> list[str]:
+    if not isinstance(contract, dict):
+        return []
+    evidence_contract = (
+        contract.get("evidence_contract")
+        if isinstance(contract.get("evidence_contract"), dict)
+        else {}
+    )
+    return ordered_unique_strings(
+        [
+            *normalize_string_list(contract.get("required_decision_ids")),
+            *normalize_string_list(evidence_contract.get("required_operator_decision_ids")),
+        ]
+    )
+
+
+def operator_impact_gate_required_decisions(
+    gate: dict[str, Any],
+    *,
+    contracts_by_id: dict[str, dict[str, Any]],
+) -> list[str]:
+    lane = str(gate.get("bounty_lane") or "")
+    if lane == "credentialed-provider-impact":
+        return operator_impact_contract_decision_ids(
+            contracts_by_id.get("credentialed-upstream-cost-abuse")
+        ) or sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS)
+    if lane == "websocket-header-trust":
+        return sorted(OPERATOR_WEBSOCKET_HEADER_DECISION_IDS)
+    if lane == "resource-control":
+        return operator_impact_contract_decision_ids(
+            contracts_by_id.get("rpc-resource-exhaustion")
+        ) or sorted(OPERATOR_RESOURCE_CONTROL_DECISION_IDS)
+    return []
+
+
+def operator_impact_contract_status(
+    *,
+    contract: dict[str, Any],
+    present_decision_ids: set[str],
+    validation_missing_decisions: set[str],
+) -> dict[str, Any]:
+    decision_ids = operator_impact_contract_decision_ids(contract)
+    missing = [
+        decision_id
+        for decision_id in decision_ids
+        if decision_id not in present_decision_ids or decision_id in validation_missing_decisions
+    ]
+    return {
+        "id": contract.get("id"),
+        "impact": contract.get("impact"),
+        "entrypoint": contract.get("entrypoint"),
+        "status": "passed" if decision_ids and not missing else "waiting",
+        "required_decision_ids": decision_ids,
+        "missing_decision_ids": missing,
+        "command_count": len(contract.get("commands", []) or []),
+    }
+
+
+def operator_impact_gate_readiness_row(
+    gate: dict[str, Any],
+    *,
+    required_decision_ids: list[str],
+    present_decision_ids: set[str],
+    validation_missing_decisions: set[str],
+    invalidity_by_gate_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    gate_id = str(gate.get("id") or "")
+    invalidity = invalidity_by_gate_id.get(gate_id, {})
+    missing_decisions = [
+        decision_id
+        for decision_id in required_decision_ids
+        if decision_id not in present_decision_ids or decision_id in validation_missing_decisions
+    ]
+    if not required_decision_ids:
+        evidence_status = "not-operator-evidence-gate"
+    elif missing_decisions:
+        evidence_status = "waiting-operator-evidence"
+    elif invalidity.get("invalid_if_reported_now"):
+        evidence_status = "ready-to-rerun-validation-gate"
+    else:
+        evidence_status = "ready-for-finding-gate-review"
+    return {
+        "gate_id": gate.get("id"),
+        "frontier_id": gate.get("frontier_id"),
+        "entrypoint": gate.get("entrypoint"),
+        "bounty_lane": gate.get("bounty_lane"),
+        "expected_severity": gate.get("expected_severity"),
+        "gate_type": gate.get("gate_type"),
+        "gate_status": gate.get("gate_status"),
+        "evidence_status": evidence_status,
+        "required_decision_ids": required_decision_ids,
+        "missing_decision_ids": missing_decisions,
+        "invalid_if_reported_now": bool(invalidity.get("invalid_if_reported_now")),
+        "primary_invalidity_category": invalidity.get("primary_invalidity_category"),
+        "minimum_fix": invalidity.get("minimum_fix"),
+        "validation_command": (normalize_string_list(gate.get("validation_commands")) or [None])[0],
+        "proof_goal": gate.get("proof_goal"),
+    }
+
+
+def build_operator_impact_readiness(
+    *,
+    target: str,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    operator_review: dict[str, Any] | None,
+    credential_impact_checklist: dict[str, Any] | None,
+    bounty_validation_gates: dict[str, Any] | None,
+    bounty_invalidity_review: dict[str, Any] | None,
+) -> dict[str, Any]:
+    review = operator_review if isinstance(operator_review, dict) else {}
+    checklist = credential_impact_checklist if isinstance(credential_impact_checklist, dict) else {}
+    gates_doc = bounty_validation_gates if isinstance(bounty_validation_gates, dict) else {}
+    invalidity_by_gate_id = bounty_invalidity_rows_by_gate_id(bounty_invalidity_review)
+    summary = review.get("summary") if isinstance(review.get("summary"), dict) else {}
+    sidecar_validation = (
+        review.get("sidecar_validation")
+        if isinstance(review.get("sidecar_validation"), dict)
+        else {}
+    )
+    sidecar_file = review.get("sidecar_file") if isinstance(review.get("sidecar_file"), dict) else {}
+    sidecar_file_status = str(summary.get("sidecar_file_status") or sidecar_file.get("status") or "missing")
+    sidecar_validation_status = str(summary.get("sidecar_validation_status") or sidecar_validation.get("status") or "missing")
+    present_decision_ids = {
+        str(item)
+        for item in normalize_string_list(
+            sidecar_validation.get("present_required_decisions") or summary.get("present_decision_ids")
+        )
+    }
+    validation_missing_decisions = {
+        str(item)
+        for item in normalize_string_list(
+            sidecar_validation.get("missing_required_decisions") or summary.get("missing_decisions")
+        )
+    }
+    required_decision_ids = ordered_unique_strings(
+        [
+            *normalize_string_list(sidecar_validation.get("required_decisions")),
+            *normalize_string_list(summary.get("provider_missing")),
+            *normalize_string_list(summary.get("missing_decisions")),
+            *normalize_string_list(summary.get("critical_missing")),
+        ]
+    )
+    invalid_rows = int(sidecar_validation.get("invalid_rows") or summary.get("sidecar_validation_invalid_rows") or 0)
+    warning_rows = int(sidecar_validation.get("warning_rows") or summary.get("sidecar_validation_warning_rows") or 0)
+    operator_gates = [
+        gate
+        for gate in gates_doc.get("gates", []) or []
+        if isinstance(gate, dict) and str(gate.get("bounty_lane") or "") in OPERATOR_IMPACT_BOUNTY_LANES
+    ]
+    contracts_by_id = operator_impact_contracts_by_id(review)
+    contract_rows = [
+        operator_impact_contract_status(
+            contract=contract,
+            present_decision_ids=present_decision_ids,
+            validation_missing_decisions=validation_missing_decisions,
+        )
+        for contract in contracts_by_id.values()
+    ]
+    gate_rows = [
+        operator_impact_gate_readiness_row(
+            gate,
+            required_decision_ids=operator_impact_gate_required_decisions(gate, contracts_by_id=contracts_by_id),
+            present_decision_ids=present_decision_ids,
+            validation_missing_decisions=validation_missing_decisions,
+            invalidity_by_gate_id=invalidity_by_gate_id,
+        )
+        for gate in operator_gates
+    ]
+    waiting_gates = [row for row in gate_rows if row.get("evidence_status") == "waiting-operator-evidence"]
+    ready_to_rerun = [row for row in gate_rows if row.get("evidence_status") == "ready-to-rerun-validation-gate"]
+    ready_for_gate = [row for row in gate_rows if row.get("evidence_status") == "ready-for-finding-gate-review"]
+    official_sidecar_present = sidecar_file_status in {"present", "provided-in-memory"} and int(summary.get("items") or 0) > 0
+    sidecar_complete = (
+        official_sidecar_present
+        and sidecar_validation_status in {"valid", "valid-with-warnings"}
+        and not validation_missing_decisions
+        and invalid_rows == 0
+    )
+    provider_summary = checklist.get("summary") if isinstance(checklist.get("summary"), dict) else {}
+    provider_missing = normalize_string_list(provider_summary.get("missing_provider_evidence"))
+
+    checks = [
+        operator_impact_readiness_check(
+            "operator-evidence-sidecar",
+            "A redacted operator-evidence.json sidecar exists and has reviewed non-placeholder rows.",
+            "passed" if official_sidecar_present else sidecar_file_status,
+            {
+                "sidecar_path": review.get("sidecar_path") or repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+                "sidecar_file_status": sidecar_file_status,
+                "items": int(summary.get("items") or 0),
+                "accepted_present_statuses": review.get("accepted_present_statuses", []),
+            },
+            "Create operator-evidence.json from the template only after replacing placeholders with redacted operator/provider evidence summaries.",
+        ),
+        operator_impact_readiness_check(
+            "operator-sidecar-validation",
+            "Required operator decisions are present, non-placeholder, and field-valid.",
+            "passed" if sidecar_complete else sidecar_validation_status,
+            {
+                "required_decisions": required_decision_ids,
+                "present_required_decisions": sorted(present_decision_ids),
+                "missing_required_decisions": sorted(validation_missing_decisions),
+                "invalid_rows": invalid_rows,
+                "warning_rows": warning_rows,
+            },
+            "Run operator-evidence-review --no-write --show-sidecar-validation and fix missing or invalid rows before gate review.",
+        ),
+        operator_impact_readiness_check(
+            "credentialed-upstream-impact-decisions",
+            "Provider quota, rate-limit, billing/credit, and usage-monitoring decisions are complete.",
+            "passed" if not set(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS) - present_decision_ids else "waiting",
+            {
+                "checklist_status": checklist.get("status") or "missing",
+                "provider_missing": provider_missing,
+                "missing_decision_ids": sorted(set(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS) - present_decision_ids),
+            },
+            "Fill the credentialed-upstream operator decisions, then rerun credential-impact-checklist with --skip-current-resource-check.",
+        ),
+        operator_impact_readiness_check(
+            "rpc-resource-and-header-decisions",
+            "Resource-control, Host/Origin, WebSocket header, and quota-impact operator decisions are complete.",
+            "passed" if not set(OPERATOR_RESOURCE_CONTROL_DECISION_IDS) - present_decision_ids else "waiting",
+            {
+                "rpc_proxy_parity_status": summary.get("rpc_proxy_parity_review_status") or "missing",
+                "rpc_client_ip_trust_status": summary.get("rpc_client_ip_trust_status") or "missing",
+                "missing_decision_ids": sorted(set(OPERATOR_RESOURCE_CONTROL_DECISION_IDS) - present_decision_ids),
+            },
+            "Fill the resource-control and RPC/WebSocket operator decisions, then rerun operator-evidence-review and bounty-validation-gates.",
+        ),
+        operator_impact_readiness_check(
+            "operator-bounty-gates",
+            "Operator-dependent bounty gates have enough official evidence for finding-gate review.",
+            "passed" if gate_rows and not waiting_gates else "waiting",
+            {
+                "operator_gates": len(gate_rows),
+                "waiting_gates": len(waiting_gates),
+                "ready_to_rerun_validation": len(ready_to_rerun),
+                "ready_for_finding_gate_review": len(ready_for_gate),
+            },
+            "Rerun bounty-validation-gates and adjudicate only after every operator-dependent gate has its required decisions present.",
+        ),
+    ]
+    failed_or_waiting = [check for check in checks if check.get("status") != "passed"]
+    if not operator_gates:
+        status = "no-operator-impact-gates"
+    elif sidecar_file_status == "missing":
+        status = "waiting-operator-evidence-sidecar"
+    elif invalid_rows or sidecar_validation_status == "invalid":
+        status = "invalid-operator-evidence-sidecar"
+    elif sidecar_complete and ready_to_rerun:
+        status = "ready-to-rerun-operator-validation-gates"
+    elif sidecar_complete and ready_for_gate:
+        status = "ready-for-operator-finding-gate-review"
+    elif official_sidecar_present:
+        status = "partial-operator-evidence"
+    else:
+        status = "waiting-operator-evidence-sidecar"
+
+    minimum_package = {
+        "operator_evidence_sidecar": review.get("sidecar_path") or repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+        "accepted_present_statuses": review.get("accepted_present_statuses", sorted(OPERATOR_EVIDENCE_PRESENT_STATUSES)),
+        "required_decision_ids": required_decision_ids,
+        "credentialed_upstream_decision_ids": sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS),
+        "resource_control_decision_ids": sorted(OPERATOR_RESOURCE_CONTROL_DECISION_IDS),
+        "websocket_header_decision_ids": sorted(OPERATOR_WEBSOCKET_HEADER_DECISION_IDS),
+        "manual_fields": [
+            "short redacted operator/provider evidence summary",
+            "source_ref to reviewed ticket, doc, dashboard, screenshot, log summary, or deployment note",
+            "status set to an accepted present status only after review",
+            "decision id matching one required operator evidence decision",
+        ],
+        "forbidden_fields": [
+            "provider API keys",
+            "bearer tokens",
+            "cookies",
+            "billing account identifiers",
+            "raw dashboards",
+            "private keys",
+            "seed phrases",
+            "wallet signatures",
+            "raw Burp history",
+            "stress-test output",
+        ],
+    }
+    commands = [
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-sidecar-validation --show-closure-contract",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "credential-impact-checklist --no-write --show-commands --show-evidence --skip-current-resource-check --show-evidence-contract",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "rpc-proxy-parity-review --no-write --show-checks",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "bounty-validation-gates --no-write --show-gates",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(
+            artifact_dir,
+            "bounty-invalidity-review --no-write --show-reasons",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+        validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+    ]
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-operator-impact-readiness-v1",
+        "status": status,
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "profile": profile_summary(profile),
+        "summary": {
+            "operator_gates": len(gate_rows),
+            "waiting_operator_gates": len(waiting_gates),
+            "ready_to_rerun_validation_gates": len(ready_to_rerun),
+            "ready_for_finding_gate_review": len(ready_for_gate),
+            "checks": len(checks),
+            "passed": sum(1 for check in checks if check.get("status") == "passed"),
+            "waiting_or_blocked": len(failed_or_waiting),
+            "sidecar_file_status": sidecar_file_status,
+            "sidecar_validation_status": sidecar_validation_status,
+            "sidecar_complete": sidecar_complete,
+            "present_decisions": len(present_decision_ids),
+            "required_decisions": len(required_decision_ids),
+            "missing_required_decisions": len(validation_missing_decisions),
+            "invalid_rows": invalid_rows,
+            "warning_rows": warning_rows,
+            "operator_review_status": review.get("status") or "missing",
+            "credential_impact_status": checklist.get("status") or "missing",
+            "bounty_validation_gates_status": gates_doc.get("status") or "missing",
+            "bounty_invalidity_status": (
+                bounty_invalidity_review.get("status")
+                if isinstance(bounty_invalidity_review, dict)
+                else "missing"
+            ),
+        },
+        "minimum_official_evidence_package": minimum_package,
+        "checks": checks,
+        "closure_contract_readiness": contract_rows,
+        "gate_readiness": gate_rows,
+        "first_blocker": failed_or_waiting[0] if failed_or_waiting else None,
+        "commands": commands,
+        "reportability_rule": (
+            "This readiness artifact is not evidence. Operator-dependent Medium+ promotion requires redacted official "
+            "operator/provider evidence, field-valid sidecar rows, lane-specific gate acceptance, and final adjudication."
+        ),
+        "next_step": (
+            failed_or_waiting[0].get("next_step")
+            if failed_or_waiting
+            else "Rerun bounty-validation-gates and adjudicate with the validated operator evidence sidecar."
+        ),
+        "safety": (
+            "Offline operator-impact readiness only. It reads local redacted artifacts, sends no target/provider traffic, "
+            "does not run Burp, does not stress resources, signs no wallets, and submits no transactions."
         ),
     }
 
@@ -49179,6 +49609,7 @@ def build_manifest_refresh_selftest() -> dict[str, Any]:
         refresh_expectation("rewrite-response-review", "run_rewrite_response_review"),
         refresh_expectation("deployment-review", "run_deployment_review"),
         refresh_expectation("operator-evidence-review", "run_operator_evidence_review"),
+        refresh_expectation("operator-impact-readiness", "run_operator_impact_readiness"),
         refresh_expectation("secret-exposure-review", "run_secret_exposure_review"),
         refresh_expectation("bounty-frontier", "run_bounty_frontier"),
         refresh_expectation("bounty-validation-gates", "run_bounty_validation_gates"),
@@ -70880,6 +71311,202 @@ def run_operator_evidence_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_operator_impact_readiness(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    operator_evidence, operator_evidence_file = load_operator_evidence_sidecar(artifact_dir)
+    deployment_review = build_deployment_resource_review(
+        source_root,
+        profile,
+        max_file_bytes=args.max_file_bytes,
+        max_files=args.max_files,
+        operator_evidence=operator_evidence,
+    )
+    rpc_method_policy, _rpc_method_policy_source = rpc_method_policy_for_hypothesis_matrix(
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
+    rpc_proxy_parity_review = load_or_build_rpc_proxy_parity_review(
+        source_root=source_root,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        max_file_bytes=args.max_file_bytes,
+    )
+    operator_review = build_operator_evidence_review(
+        target=target,
+        artifact_dir=artifact_dir,
+        operator_evidence=operator_evidence,
+        operator_evidence_file=operator_evidence_file,
+        deployment_review=deployment_review,
+        rpc_method_policy=rpc_method_policy,
+        rpc_proxy_parity_review=rpc_proxy_parity_review,
+        profile=profile,
+    )
+    transaction_flow_review = load_optional_json(artifact_dir / TRANSACTION_FLOW_REVIEW_ARTIFACT)
+    operator_evidence_active = bool(operator_evidence_items(operator_evidence))
+    if operator_evidence_active or not isinstance(transaction_flow_review, dict) or not isinstance(
+        transaction_flow_review.get("server_credential_proxy_review"),
+        dict,
+    ):
+        transaction_flow_review = build_transaction_flow_review(
+            source_root,
+            profile,
+            transaction_intent=load_optional_json(artifact_dir / "transaction-intent.json") or {},
+            rpc_method_policy=rpc_method_policy,
+            operator_evidence=operator_evidence,
+            max_file_bytes=args.max_file_bytes,
+            max_files=args.max_files,
+        )
+    credential_checklist = build_credential_impact_checklist(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        transaction_flow_review=transaction_flow_review,
+        deployment_review=deployment_review,
+        current_resource_snapshot=None,
+    )
+    gates = build_or_load_bounty_validation_gates_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    invalidity_review = load_optional_json(artifact_dir / BOUNTY_INVALIDITY_REVIEW_ARTIFACT)
+    if not isinstance(invalidity_review, dict):
+        invalidity_review = build_bounty_invalidity_review(
+            target=target,
+            profile=profile,
+            artifact_dir=artifact_dir,
+            bounty_validation_gates=gates,
+            adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+        )
+    readiness = build_operator_impact_readiness(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        operator_review=operator_review,
+        credential_impact_checklist=credential_checklist,
+        bounty_validation_gates=gates,
+        bounty_invalidity_review=invalidity_review,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if args.output
+        else artifact_dir / OPERATOR_IMPACT_READINESS_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(readiness))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="operator-impact-readiness",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = readiness.get("summary", {}) if isinstance(readiness.get("summary"), dict) else {}
+    print(f"Operator impact readiness: {readiness.get('status')}")
+    print(
+        "Readiness: "
+        f"gates={summary.get('operator_gates', 0)} "
+        f"waiting_gates={summary.get('waiting_operator_gates', 0)} "
+        f"rerun_ready={summary.get('ready_to_rerun_validation_gates', 0)} "
+        f"gate_ready={summary.get('ready_for_finding_gate_review', 0)} "
+        f"checks={summary.get('checks', 0)} "
+        f"passed={summary.get('passed', 0)} "
+        f"waiting={summary.get('waiting_or_blocked', 0)}"
+    )
+    print(
+        "Inputs: "
+        f"sidecar={summary.get('sidecar_file_status') or '-'} "
+        f"validation={summary.get('sidecar_validation_status') or '-'} "
+        f"present={summary.get('present_decisions', 0)} "
+        f"required={summary.get('required_decisions', 0)} "
+        f"missing={summary.get('missing_required_decisions', 0)} "
+        f"invalid_rows={summary.get('invalid_rows', 0)} "
+        f"operator_review={summary.get('operator_review_status') or '-'} "
+        f"credential={summary.get('credential_impact_status') or '-'} "
+        f"invalidity={summary.get('bounty_invalidity_status') or '-'}"
+    )
+    package = (
+        readiness.get("minimum_official_evidence_package")
+        if isinstance(readiness.get("minimum_official_evidence_package"), dict)
+        else {}
+    )
+    print(
+        "Minimum package: "
+        f"sidecar={package.get('operator_evidence_sidecar') or '-'} "
+        f"decisions={len(package.get('required_decision_ids', []) or [])} "
+        f"accepted={','.join(package.get('accepted_present_statuses', []) or []) or '-'}"
+    )
+    top_count = max(0, int(args.top))
+    if args.show_checks:
+        print("Checks:")
+        for check in (readiness.get("checks", []) or [])[:top_count]:
+            if not isinstance(check, dict):
+                continue
+            print(
+                f"- {check.get('status')} {check.get('id')}: "
+                f"{inline_summary_text(check.get('label'), max_chars=220)}"
+            )
+            if args.show_next:
+                print(f"  next={inline_summary_text(check.get('next_step'), max_chars=300)}")
+    if args.show_contracts:
+        print("Closure contracts:")
+        for contract in (readiness.get("closure_contract_readiness", []) or [])[:top_count]:
+            if not isinstance(contract, dict):
+                continue
+            missing = ",".join(normalize_string_list(contract.get("missing_decision_ids"))[:6]) or "none"
+            print(
+                f"- {contract.get('status')} {contract.get('id')} "
+                f"impact={contract.get('impact')} missing={missing}"
+            )
+    if args.show_gates:
+        print("Operator gates:")
+        for gate in (readiness.get("gate_readiness", []) or [])[:top_count]:
+            if not isinstance(gate, dict):
+                continue
+            missing = ",".join(normalize_string_list(gate.get("missing_decision_ids"))[:6]) or "none"
+            print(
+                f"- {gate.get('evidence_status')} {gate.get('gate_id')} "
+                f"lane={gate.get('bounty_lane')} severity={gate.get('expected_severity')} missing={missing}"
+            )
+            if args.show_next and gate.get("minimum_fix"):
+                print(f"  fix={inline_summary_text(gate.get('minimum_fix'), max_chars=300)}")
+    if args.show_commands:
+        print("Commands:")
+        for command_text in normalize_string_list(readiness.get("commands"))[:top_count]:
+            print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    first_blocker = (
+        readiness.get("first_blocker")
+        if isinstance(readiness.get("first_blocker"), dict)
+        else {}
+    )
+    if first_blocker:
+        print(
+            "First blocker: "
+            f"{first_blocker.get('id')} status={first_blocker.get('status')} "
+            f"next={inline_summary_text(first_blocker.get('next_step'), max_chars=300)}"
+        )
+    print(f"Rule: {inline_summary_text(readiness.get('reportability_rule'), max_chars=360)}")
+    print(f"Next: {inline_summary_text(readiness.get('next_step'), max_chars=360)}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if args.strict and readiness.get("status") not in {
+        "ready-to-rerun-operator-validation-gates",
+        "ready-for-operator-finding-gate-review",
+    }:
+        return 1
+    return 0
+
+
 def run_transaction_flow_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -75994,6 +76621,78 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless present non-placeholder operator evidence is indexed.",
     )
     operator_evidence_review.set_defaults(func=run_operator_evidence_review)
+
+    operator_impact_readiness = sub.add_parser(
+        "operator-impact-readiness",
+        help="Summarize operator-evidence.json readiness across provider, resource, and WebSocket bounty gates",
+    )
+    operator_impact_readiness.add_argument(
+        "--output",
+        help=(
+            f"Where to write {OPERATOR_IMPACT_READINESS_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{OPERATOR_IMPACT_READINESS_ARTIFACT}."
+        ),
+    )
+    operator_impact_readiness.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES,
+        help=(
+            "Maximum bytes to read per allowlisted deployment/source file when rebuilding supporting reviews. "
+            f"Defaults to {DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES}."
+        ),
+    )
+    operator_impact_readiness.add_argument(
+        "--max-files",
+        type=positive_int,
+        default=32,
+        help="Maximum allowlisted deployment/source files to scan when rebuilding supporting reviews. Defaults to 32.",
+    )
+    operator_impact_readiness.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of checks, gates, contracts, or commands to print.",
+    )
+    operator_impact_readiness.add_argument(
+        "--show-checks",
+        action="store_true",
+        help="Print operator impact readiness checks.",
+    )
+    operator_impact_readiness.add_argument(
+        "--show-next",
+        action="store_true",
+        help="Print next action per readiness check or gate when available.",
+    )
+    operator_impact_readiness.add_argument(
+        "--show-gates",
+        action="store_true",
+        help="Print operator-dependent bounty gate readiness rows.",
+    )
+    operator_impact_readiness.add_argument(
+        "--show-contracts",
+        action="store_true",
+        help="Print operator closure contract readiness rows.",
+    )
+    operator_impact_readiness.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print safe offline follow-up commands.",
+    )
+    operator_impact_readiness.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print operator impact readiness only; do not write {OPERATOR_IMPACT_READINESS_ARTIFACT} "
+            "or refreshed manifests."
+        ),
+    )
+    operator_impact_readiness.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless operator evidence is ready to rerun validation gates or finding-gate review.",
+    )
+    operator_impact_readiness.set_defaults(func=run_operator_impact_readiness)
 
     secret_exposure_review = sub.add_parser(
         "secret-exposure-review",
