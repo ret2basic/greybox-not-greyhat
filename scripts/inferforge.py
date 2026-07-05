@@ -171,6 +171,7 @@ REVIEW_BLOCKERS_ARTIFACT = "review-blockers.json"
 REVIEW_BLOCKERS_MARKDOWN_ARTIFACT = "review-blockers.md"
 REVIEW_BLOCKERS_SELFTEST_ARTIFACT = "review-blockers-selftest.json"
 ORACLE_PLAN_ARTIFACT = "oracle-plan.json"
+ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT = "oracle-operator-sidecar-templates.json"
 COMMAND_SAFETY_SELFTEST_ARTIFACT = "command-safety-selftest.json"
 ARTIFACT_HEALTH_SELFTEST_ARTIFACT = "artifact-health-selftest.json"
 MANIFEST_REFRESH_SELFTEST_ARTIFACT = "manifest-refresh-selftest.json"
@@ -19727,6 +19728,7 @@ OFFLINE_ARTIFACT_REPAIR_COMMANDS = {
     REVIEW_BLOCKERS_ARTIFACT: "review-blockers",
     REVIEW_BLOCKERS_MARKDOWN_ARTIFACT: "review-blockers",
     ORACLE_PLAN_ARTIFACT: "oracle-plan",
+    ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT: "oracle-plan --write-sidecar-template",
     "finding-gate.json": "gate",
     "adjudication.json": "adjudicate",
     "findings.json": "adjudicate",
@@ -39808,6 +39810,95 @@ def build_review_blockers_selftest() -> dict[str, Any]:
             ORACLE_PLAN_ARTIFACT: (gate_no_write_output_dir / ORACLE_PLAN_ARTIFACT).exists(),
             MANIFEST_NAME: (gate_no_write_output_dir / MANIFEST_NAME).exists(),
         }
+        oracle_plan_template_output_dir = Path(temp_dir) / "oracle-plan-template-output"
+        oracle_plan_template_output_dir.mkdir(parents=True, exist_ok=True)
+        write_json(
+            oracle_plan_template_output_dir / "finding-gate.json",
+            {
+                "generated_at": utc_now(),
+                "summary": {"gates": 0, "blocked_gate_previews": 1},
+                "gates": [],
+                "blocked_gate_previews": [
+                    {
+                        "suspicion_id": "BLOCKED-quote-provider-impact-credential-impact",
+                        "validation_item_id": "VAL-quote-provider-impact",
+                        "entrypoint": "POST /api/quote",
+                        "classification": "blocked-credential-impact-finding-gate-preview",
+                        "gate_status": "blocked-before-finding-gate",
+                        "severity": "medium",
+                        "packet_key": "credential_impact_approval_packet",
+                        "packet_type": "credential-impact",
+                        "packet_status": "waiting-provider-operator-evidence",
+                        "packet_context": {
+                            "recommended_evidence": {
+                                "entrypoint": "POST /api/quote",
+                                "provider": "M0",
+                                "missing_decision_ids": ["credentialed-upstream-billing-impact"],
+                            },
+                            "operator_evidence_sidecar": ".greybox/selftest-gate-blockers/operator-evidence.json",
+                            "accepted_present_statuses": ["confirmed", "present"],
+                            "redacted_sidecar_required_fields": [
+                                "one evidence_items[] row per missing provider/operator decision id",
+                                "summary must be short, non-placeholder, and redacted",
+                            ],
+                        },
+                        "validation_oracle": {
+                            "type": "provider-impact",
+                            "status": "waiting-evidence",
+                            "next_step": "Collect redacted provider/operator impact evidence.",
+                            "acceptance_checks": [
+                                "Redacted provider/operator evidence shows quota, billing, rate-limit, monitoring, or account impact.",
+                            ],
+                            "reject_if": [
+                                "Only public provider documentation or static credential presence is available.",
+                            ],
+                        },
+                        "checks": [
+                            {
+                                "id": "finding-gate-blockers-cleared",
+                                "passed": False,
+                                "evidence": ["No provider/operator billing impact evidence is present."],
+                                "blocker_count": 1,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        oracle_plan_template_args = parser.parse_args(
+            [
+                "--profile",
+                str(profile_path),
+                "--artifact-dir",
+                str(oracle_plan_template_output_dir),
+                "--target",
+                target,
+                "--source-root",
+                str(root),
+                "oracle-plan",
+                "--top",
+                "4",
+                "--show-details",
+                "--write-sidecar-template",
+            ]
+        )
+        oracle_plan_template_stdout_buffer = io.StringIO()
+        with contextlib.redirect_stdout(oracle_plan_template_stdout_buffer):
+            oracle_plan_template_return_code = oracle_plan_template_args.func(oracle_plan_template_args)
+        oracle_plan_template_stdout = oracle_plan_template_stdout_buffer.getvalue()
+        oracle_plan_template_doc = load_optional_json(
+            oracle_plan_template_output_dir / ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT
+        ) or {}
+        oracle_plan_template_outputs_exist = {
+            ORACLE_PLAN_ARTIFACT: (oracle_plan_template_output_dir / ORACLE_PLAN_ARTIFACT).exists(),
+            ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT: (
+                oracle_plan_template_output_dir / ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT
+            ).exists(),
+            OPERATOR_EVIDENCE_ARTIFACT: (
+                oracle_plan_template_output_dir / OPERATOR_EVIDENCE_ARTIFACT
+            ).exists(),
+            MANIFEST_NAME: (oracle_plan_template_output_dir / MANIFEST_NAME).exists(),
+        }
         discover_no_write_args = parser.parse_args(
             [
                 "--profile",
@@ -39999,6 +40090,7 @@ def build_review_blockers_selftest() -> dict[str, Any]:
     )
     gate_no_write_stdout_text = " ".join(gate_no_write_stdout.split())
     oracle_plan_no_write_stdout_text = " ".join(oracle_plan_no_write_stdout.split())
+    oracle_plan_template_stdout_text = " ".join(oracle_plan_template_stdout.split())
     assertions = [
         {
             "id": "default-status-external-only",
@@ -40457,6 +40549,38 @@ def build_review_blockers_selftest() -> dict[str, Any]:
                 "return_code": oracle_plan_no_write_return_code,
                 "stdout": oracle_plan_no_write_stdout.splitlines(),
                 "outputs_exist": oracle_plan_no_write_outputs_exist,
+            },
+        },
+        {
+            "id": "oracle-plan-writes-operator-sidecar-template-artifact",
+            "passed": (
+                oracle_plan_template_return_code == 0
+                and "Oracle plan: needs-oracle-evidence" in oracle_plan_template_stdout
+                and f"Wrote {oracle_plan_template_output_dir / ORACLE_PLAN_ARTIFACT}"
+                in oracle_plan_template_stdout
+                and f"Wrote {oracle_plan_template_output_dir / ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT}"
+                in oracle_plan_template_stdout
+                and oracle_plan_template_outputs_exist.get(ORACLE_PLAN_ARTIFACT) is True
+                and oracle_plan_template_outputs_exist.get(ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT) is True
+                and oracle_plan_template_outputs_exist.get(MANIFEST_NAME) is True
+                and oracle_plan_template_outputs_exist.get(OPERATOR_EVIDENCE_ARTIFACT) is False
+                and oracle_plan_template_doc.get("status") == "templates-present"
+                and oracle_plan_template_doc.get("template_count") == 1
+                and (
+                    (
+                        (oracle_plan_template_doc.get("templates") or [{}])[0].get("evidence_items")
+                        or [{}]
+                    )[0].get("id")
+                    == "credentialed-upstream-billing-impact"
+                )
+            ),
+            "expected": "oracle-plan can write a template artifact without creating operator-evidence.json evidence",
+            "actual": {
+                "return_code": oracle_plan_template_return_code,
+                "stdout": oracle_plan_template_stdout.splitlines(),
+                "stdout_text": oracle_plan_template_stdout_text,
+                "outputs_exist": oracle_plan_template_outputs_exist,
+                "template_doc": oracle_plan_template_doc,
             },
         },
         {
@@ -60902,11 +61026,24 @@ def run_oracle_plan(args: argparse.Namespace) -> int:
         profile=profile,
     )
     output_path = resolve_repo_path(args.output) if args.output else artifact_dir / ORACLE_PLAN_ARTIFACT
+    sidecar_template_output_path = (
+        resolve_repo_path(args.sidecar_template_output)
+        if getattr(args, "sidecar_template_output", None)
+        else artifact_dir / ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT
+    )
     refreshed_manifests = []
     if not no_write:
+        output_paths = [output_path]
         write_json(output_path, oracle_plan)
+        if getattr(args, "write_sidecar_template", False):
+            template_doc_for_write = oracle_plan_operator_sidecar_templates_doc(
+                oracle_plan,
+                limit=len(oracle_plan.get("actions", []) or []),
+            )
+            write_json(sidecar_template_output_path, sanitize_artifact_samples(template_doc_for_write))
+            output_paths.append(sidecar_template_output_path)
         refreshed_manifests = refresh_manifests_for_artifact_outputs(
-            output_paths=[output_path],
+            output_paths=output_paths,
             artifact_dir=artifact_dir,
             check_dirs=deduped_dirs,
             target=target,
@@ -60998,6 +61135,8 @@ def run_oracle_plan(args: argparse.Namespace) -> int:
         print("No files written (--no-write).")
     else:
         print(f"Wrote {output_path}")
+        if getattr(args, "write_sidecar_template", False):
+            print(f"Wrote {sidecar_template_output_path}")
         print_refreshed_manifests(refreshed_manifests)
     if args.strict and oracle_plan.get("status") != "no-oracle-blockers":
         return 1
@@ -67346,6 +67485,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-sidecar-template-json",
         action="store_true",
         help="Print per-oracle operator-evidence sidecar template JSON for displayed actions.",
+    )
+    oracle_plan.add_argument(
+        "--write-sidecar-template",
+        action="store_true",
+        help=(
+            f"Also write {ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT}; this is a pending template artifact, "
+            f"not {OPERATOR_EVIDENCE_ARTIFACT} evidence."
+        ),
+    )
+    oracle_plan.add_argument(
+        "--sidecar-template-output",
+        help=(
+            f"Where to write {ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{ORACLE_OPERATOR_SIDECAR_TEMPLATES_ARTIFACT}."
+        ),
     )
     oracle_plan.add_argument(
         "--no-write",
