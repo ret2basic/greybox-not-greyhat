@@ -432,6 +432,9 @@ into official sidecars.
 `evidence-prep-status --show-details` summarizes the paired sidecar contract
 with the first blocker, binding review status, and first pairing issue, so a
 bad `approval_reference` or SHA-256 mismatch is visible without opening the JSON.
+When the pair reaches `ready-for-decode`, the same contract exposes the gated
+no-write validation chain: `transaction-sidecar-review`, `decode-transactions`,
+`gate`, and `adjudicate`. Blocked pairs keep that command list empty.
 
 `methodology-review` also emits `bounty_harness_alignment`, a compact
 bug-bounty readiness check derived from the harness pattern of building system
