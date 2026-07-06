@@ -474,6 +474,12 @@ carry the same command-safety classifications. Commands in blocked stages remain
 `review-gated` or `manual-template`, and only stages whose local no-write
 commands all classify as ready expose `autorunnable_commands`.
 
+`claim-evidence-ledger` decomposes each claim into required evidence artifacts
+and verifier commands. Ledger rows now carry `verification_command_refs`,
+`verification_command_safety`, and `autorunnable_verification_commands`; missing
+or invalid official evidence keeps verifier commands `review-gated`, while only
+ready claim evidence can expose autorunnable no-write verifiers.
+
 `claim-evidence-requests` also uses that queue context for its default ordering:
 in bounty mode, evidence for the highest-ranked action comes before a broader
 coverage request that merely unblocks more lower-value claims. Each request now
