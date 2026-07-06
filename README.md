@@ -1454,7 +1454,10 @@ Use `prepare-transaction-token-account-metadata --no-write --show-jsonl` to
 render those rows as a pending template package. The package is not
 `transaction-token-accounts.jsonl` evidence and does not satisfy finding gates;
 write the official sidecar only after the public mint/owner rows are manually
-approved.
+approved. To preflight approved rows, pass `--metadata-input` and
+`--approval-reference`; `--write-official-sidecar` writes
+`transaction-token-accounts.jsonl` only when the rows are public, unpolluted,
+approved, and match the decoded metadata requirements.
 By default, decoded top-level SPL token transfer instructions must stay within
 the expected source and destination mints/accounts. A policy can set
 `allowExtraTokenTransfers: true` only after the route's extra token movement is
