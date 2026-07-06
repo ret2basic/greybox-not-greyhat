@@ -337,6 +337,14 @@ verifier command, and whether a shared evidence request is bound to more than
 one action. Shared `operator-evidence.json` requests are matched by lane/oracle
 type instead of filename alone, so provider/resource/websocket requests do not
 accidentally unblock build-secret evidence gates.
+`bounty-evidence-intake` is the offline file gate before those queued actions
+can move to lane validation. It checks requested evidence presence, format,
+approval/template markers, redaction risk, and operator-evidence lane scope.
+For transaction-integrity requests, it also treats `transaction-payloads.jsonl`
+and `transaction-intent-policy.json` as a required pair: the payload sidecar
+must yield a bounded transaction candidate, the intent policy must be valid, and
+`transaction-sidecar-review` must be ready for offline decode before the request
+is marked ready for lane validation.
 
 `claim-evidence-requests` also uses that queue context for its default ordering:
 in bounty mode, evidence for the highest-ranked action comes before a broader

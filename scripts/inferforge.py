@@ -27266,9 +27266,135 @@ def bounty_intake_operator_evidence_scope_review(
     }
 
 
+def bounty_intake_transaction_sidecar_requested(path_refs: list[Path]) -> bool:
+    names = {path.name for path in path_refs}
+    return bool(names & {"transaction-payloads.json", "transaction-payloads.jsonl", "transaction-payloads.txt"}) or (
+        "transaction-intent-policy.json" in names
+    )
+
+
+def bounty_intake_transaction_sidecar_scope_review(
+    request: dict[str, Any],
+    *,
+    target: str,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    path_refs: list[Path],
+    max_file_bytes: int,
+) -> dict[str, Any]:
+    if str(request.get("lane") or "") != "transaction-integrity" or not bounty_intake_transaction_sidecar_requested(path_refs):
+        return {
+            "status": "not-requested",
+            "sidecar_review_status": "not-requested",
+            "candidate_count": 0,
+            "intent_policy_valid": False,
+            "ready_for_decode": False,
+        }
+
+    payload_refs = [
+        path
+        for path in path_refs
+        if path.name in {"transaction-payloads.json", "transaction-payloads.jsonl", "transaction-payloads.txt"}
+    ]
+    policy_refs = [path for path in path_refs if path.name == "transaction-intent-policy.json"]
+    missing_payload_refs = [path for path in payload_refs if not path.is_file() or path.stat().st_size <= 0]
+    missing_policy_refs = [path for path in policy_refs if not path.is_file() or path.stat().st_size <= 0]
+    if missing_payload_refs:
+        return {
+            "status": "waiting-transaction-payload-sidecar",
+            "lane": request.get("lane"),
+            "sidecar_review_status": "missing-requested-payload-sidecar",
+            "candidate_count": 0,
+            "payload_files_present": len(payload_refs) - len(missing_payload_refs),
+            "placeholder_payload_files": 0,
+            "payload_contract_status": "waiting-for-payload",
+            "payload_contract_allows_decode": False,
+            "intent_policy_configured": bool(policy_refs) and not missing_policy_refs,
+            "intent_policy_valid": False,
+            "ready_for_decode": False,
+            "accepted_decode_input_sidecar": repo_relative_or_absolute(payload_refs[0]) if payload_refs else None,
+            "acceptance_checks": [],
+            "next_step": "Provide one approved transaction-payloads.jsonl row before transaction lane validation.",
+            "safety": "Offline paired transaction sidecar scope review only.",
+        }
+    if missing_policy_refs:
+        return {
+            "status": "waiting-transaction-intent-policy",
+            "lane": request.get("lane"),
+            "sidecar_review_status": "missing-requested-intent-policy",
+            "candidate_count": 0,
+            "payload_files_present": len(payload_refs),
+            "placeholder_payload_files": 0,
+            "payload_contract_status": "waiting-for-policy",
+            "payload_contract_allows_decode": False,
+            "intent_policy_configured": False,
+            "intent_policy_valid": False,
+            "ready_for_decode": False,
+            "accepted_decode_input_sidecar": repo_relative_or_absolute(payload_refs[0]) if payload_refs else None,
+            "acceptance_checks": [],
+            "next_step": "Provide the matching transaction-intent-policy.json for the approved quote request before lane validation.",
+            "safety": "Offline paired transaction sidecar scope review only.",
+        }
+
+    sidecar_review = build_transaction_sidecar_review(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        max_input_bytes=max_file_bytes,
+    )
+    summary = sidecar_review.get("summary") if isinstance(sidecar_review.get("summary"), dict) else {}
+    review_status = str(sidecar_review.get("status") or "missing-sidecars")
+    candidate_count = int(summary.get("candidate_count") or 0)
+    policy_valid = bool(summary.get("intent_policy_valid"))
+    ready_for_decode = bool(summary.get("ready_for_decode"))
+    if ready_for_decode and review_status == "ready-for-decode":
+        status = "ready"
+        next_step = "Run transaction-evidence-readiness and decode-transactions with the approved paired sidecars."
+    elif review_status in {"missing-sidecars", "needs-payload-sidecar"}:
+        status = "waiting-transaction-payload-sidecar"
+        next_step = "Provide one approved transaction-payloads.jsonl row before transaction lane validation."
+    elif review_status == "needs-intent-policy":
+        status = "waiting-transaction-intent-policy"
+        next_step = "Provide the matching transaction-intent-policy.json for the approved quote request before lane validation."
+    elif review_status in {"invalid-intent-policy", "invalid-intent-policy-sidecar"}:
+        status = "blocked-invalid-transaction-intent-policy"
+        next_step = "Fix transaction-intent-policy.json so direction, wallet, amountIn, mints, and reviewed programs match the approved request."
+    elif review_status == "payload-contract-not-ready":
+        status = "blocked-transaction-payload-contract"
+        next_step = "Replace the payload sidecar with the approved quote response whose payload data.type matches the profile contract."
+    elif review_status in {"payload-sidecar-no-candidates", "payload-sidecar-too-large"}:
+        status = "blocked-transaction-payload-sidecar"
+        next_step = "Fix transaction-payloads sidecar shape so exactly one approved base64 transaction candidate can be extracted."
+    else:
+        status = "waiting-transaction-sidecar-review"
+        next_step = sidecar_review.get("next_step") or "Run transaction-sidecar-review and fix the paired sidecars before lane validation."
+
+    return {
+        "status": status,
+        "lane": request.get("lane"),
+        "sidecar_review_status": review_status,
+        "candidate_count": candidate_count,
+        "payload_files_present": int(summary.get("payload_files_present") or 0),
+        "placeholder_payload_files": int(summary.get("placeholder_payload_files") or 0),
+        "payload_contract_status": summary.get("payload_contract_status"),
+        "payload_contract_allows_decode": bool(summary.get("payload_contract_allows_decode")),
+        "intent_policy_configured": bool(summary.get("intent_policy_configured")),
+        "intent_policy_valid": policy_valid,
+        "ready_for_decode": ready_for_decode,
+        "accepted_decode_input_sidecar": sidecar_review.get("decode_input_sidecar"),
+        "acceptance_checks": sidecar_review.get("acceptance_checks", []),
+        "next_step": next_step,
+        "safety": (
+            "Offline paired transaction sidecar scope review only. It extracts bounded candidate metadata, never signs, "
+            "submits, or treats decoded intent as reportable evidence."
+        ),
+    }
+
+
 def bounty_intake_request_review(
     request: dict[str, Any],
     *,
+    target: str,
     artifact_dir: Path,
     profile: dict[str, Any] | None,
     source_root: Path | None,
@@ -27297,6 +27423,15 @@ def bounty_intake_request_review(
         path_refs=path_refs,
     )
     operator_status = str(operator_scope.get("status") or "not-requested")
+    transaction_scope = bounty_intake_transaction_sidecar_scope_review(
+        request,
+        target=target,
+        artifact_dir=artifact_dir,
+        profile=profile,
+        path_refs=path_refs,
+        max_file_bytes=max_file_bytes,
+    )
+    transaction_status = str(transaction_scope.get("status") or "not-requested")
     missing = [row for row in files if row.get("status") in {"missing", "empty", "not-a-file"}]
     invalid = [row for row in files if row.get("status") == "invalid-format"]
     unapproved = [
@@ -27326,6 +27461,10 @@ def bounty_intake_request_review(
         status = "blocked-invalid-operator-evidence"
     elif operator_status == "blocked-operator-evidence-redaction-review":
         status = "blocked-operator-evidence-redaction-review"
+    elif transaction_status.startswith("waiting"):
+        status = "waiting-transaction-sidecar-review"
+    elif transaction_status.startswith("blocked"):
+        status = "blocked-transaction-sidecar-review"
     elif path_refs and len(clean) == len(path_refs):
         status = "ready-for-lane-validation"
     elif descriptive_refs and not path_refs:
@@ -27353,6 +27492,8 @@ def bounty_intake_request_review(
         "redaction_review_files": len(redaction),
         "operator_evidence_scope": operator_scope,
         "operator_evidence_status": operator_status,
+        "transaction_sidecar_scope": transaction_scope,
+        "transaction_sidecar_status": transaction_status,
         "required_operator_decision_ids": normalize_string_list(operator_scope.get("required_operator_decision_ids")),
         "present_operator_decision_ids": normalize_string_list(operator_scope.get("present_operator_decision_ids")),
         "missing_operator_decision_ids": normalize_string_list(operator_scope.get("missing_operator_decision_ids")),
@@ -27386,6 +27527,8 @@ def bounty_intake_request_review(
                 "blocked-invalid-operator-evidence",
                 "blocked-operator-evidence-redaction-review",
             }
+            else transaction_scope.get("next_step")
+            if transaction_status.startswith(("waiting", "blocked"))
             else "Run the after-evidence validation commands for this lane."
             if path_refs and len(clean) == len(path_refs)
             else "Attach a redacted operator/build provenance summary and approval reference."
@@ -27414,6 +27557,7 @@ def build_bounty_evidence_intake(
     reviews = [
         bounty_intake_request_review(
             request,
+            target=target,
             artifact_dir=artifact_dir,
             profile=profile,
             source_root=source_root,
@@ -27425,12 +27569,16 @@ def build_bounty_evidence_intake(
     status_counts: dict[str, int] = {}
     lane_counts: dict[str, int] = {}
     operator_status_counts: dict[str, int] = {}
+    transaction_status_counts: dict[str, int] = {}
     for row in reviews:
         increment_count(status_counts, str(row.get("status") or "unknown"))
         increment_count(lane_counts, str(row.get("lane") or "unknown"))
         operator_status = str(row.get("operator_evidence_status") or "not-requested")
         if operator_status != "not-requested":
             increment_count(operator_status_counts, operator_status)
+        transaction_status = str(row.get("transaction_sidecar_status") or "not-requested")
+        if transaction_status != "not-requested":
+            increment_count(transaction_status_counts, transaction_status)
     ready = [row for row in reviews if row.get("status") == "ready-for-lane-validation"]
     blocked = [
         row
@@ -27492,6 +27640,7 @@ def build_bounty_evidence_intake(
             "status_counts": dict(sorted(status_counts.items())),
             "lane_counts": dict(sorted(lane_counts.items())),
             "operator_evidence_status_counts": dict(sorted(operator_status_counts.items())),
+            "transaction_sidecar_status_counts": dict(sorted(transaction_status_counts.items())),
             "bounty_evidence_authorization_status": artifact_summary_status(bounty_evidence_authorization),
             "max_file_bytes": max_file_bytes,
             "cache_evidence_file_signatures": cache_validation.get("evidence_file_signature_count", 0),
@@ -27506,8 +27655,9 @@ def build_bounty_evidence_intake(
         "commands": commands[:12],
         "reportability_rule": (
             "Intake checks file presence, shape, approval/template markers, redaction risk, and lane-scoped operator decision "
-            "coverage for operator-evidence.json. It is not evidence validation and cannot promote a finding. Medium+ still "
-            "requires lane readiness, finding-gate acceptance, and adjudication."
+            "coverage for operator-evidence.json. For transaction-integrity requests, it also requires the approved payload "
+            "sidecar and matching intent policy to pass paired sidecar readiness before lane validation. It is not evidence "
+            "validation and cannot promote a finding. Medium+ still requires lane readiness, finding-gate acceptance, and adjudication."
         ),
         "next_step": (
             top.get("next_step")
@@ -27578,6 +27728,10 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
             "schema": "inferforge-bounty-evidence-authorization-v1",
             "status": "authorization-required-before-evidence-collection",
             "target": target,
+            "summary": {
+                "requests": 1,
+                "api_authorization_counts": {"transaction-intent-property-boundary": 1},
+            },
             "authorization_requests": [
                 {
                     "id": request_id,
@@ -27646,17 +27800,103 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
                 {
                     "data": {
                         "type": "svm",
-                        "transaction": "QUJDREVGRw==",
+                        "transaction": "A" * 80,
                     }
                 }
             ],
         }
 
+    def transaction_intent_policy_fixture(*, valid: bool = True) -> dict[str, Any]:
+        policy = {
+            "direction": "buy",
+            "wallet": "So11111111111111111111111111111111111111112",
+            "amountIn": "1000000",
+            "sourceMint": USDC_MINT,
+            "destinationMint": USDTEL_MINT,
+            "allowedPrograms": ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"],
+        }
+        if not valid:
+            policy.pop("wallet", None)
+        return policy
+
+    def transaction_pair_authorization_for(
+        payload_path: Path,
+        policy_path: Path,
+        *,
+        request_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "generated_at": utc_now(),
+            "schema": "inferforge-bounty-evidence-authorization-v1",
+            "status": "authorization-required-before-evidence-collection",
+            "target": target,
+            "summary": {
+                "requests": 1,
+                "api_authorization_counts": {"transaction-intent-property-boundary": 1},
+            },
+            "authorization_requests": [
+                {
+                    "id": request_id,
+                    "lane": "transaction-integrity",
+                    "entrypoint": "POST /api/quote",
+                    "expected_severity": "high-candidate",
+                    "priority_decision": "pursue-high-value",
+                    "requested_official_evidence": [str(payload_path), str(policy_path)],
+                    "requested_official_evidence_labels": [payload_path.name, policy_path.name],
+                    "after_evidence_validation_commands": ["transaction-evidence-readiness --no-write"],
+                    "recommended_after_evidence_command": "transaction-evidence-readiness --no-write",
+                    "api_authorization_profile_ids": ["transaction-intent-property-boundary"],
+                    "api_authorization_acceptance_checks": [
+                        "approved payload and matching intent policy are present",
+                        "paired sidecars are ready for offline decode",
+                    ],
+                    "api_authorization_reject_if": ["payload and intent policy are missing, invalid, or mismatched"],
+                    "reportability_boundary": "Synthetic paired transaction sidecar intake self-test request only.",
+                }
+            ],
+        }
+
+    def run_transaction_pair_case(
+        case_name: str,
+        *,
+        payload_type: str = "svm",
+        write_payload: bool = True,
+        write_policy: bool = True,
+        valid_policy: bool = True,
+    ) -> dict[str, Any]:
+        case_root = root / case_name
+        case_root.mkdir(parents=True, exist_ok=True)
+        payload_path = case_root / "transaction-payloads.jsonl"
+        policy_path = case_root / "transaction-intent-policy.json"
+        if write_payload:
+            row = clean_transaction_payload_row()
+            row["payloads"][0]["data"]["type"] = payload_type
+            payload_path.write_text(json.dumps(row, sort_keys=True) + "\n", encoding="utf-8")
+        if write_policy:
+            write_json(policy_path, transaction_intent_policy_fixture(valid=valid_policy))
+        return build_bounty_evidence_intake(
+            target=target,
+            profile=None,
+            artifact_dir=case_root,
+            bounty_evidence_authorization=transaction_pair_authorization_for(
+                payload_path,
+                policy_path,
+                request_id=f"AUTHZ-{case_name}",
+            ),
+            max_file_bytes=262144,
+            source_root=case_root,
+        )
+
     def run_stale_cache_case() -> dict[str, Any]:
         case_root = root / "stale_cache_rebuild"
         case_root.mkdir(parents=True, exist_ok=True)
         sidecar = case_root / "transaction-payloads.jsonl"
-        authorization = authorization_for(sidecar, request_id="AUTHZ-stale-cache-rebuild")
+        policy = case_root / "transaction-intent-policy.json"
+        authorization = transaction_pair_authorization_for(
+            sidecar,
+            policy,
+            request_id="AUTHZ-stale-cache-rebuild",
+        )
         stale_intake = build_bounty_evidence_intake(
             target=target,
             profile=None,
@@ -27668,18 +27908,20 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
         write_json(case_root / BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT, authorization)
         write_json(case_root / BOUNTY_EVIDENCE_INTAKE_ARTIFACT, stale_intake)
         sidecar.write_text(json.dumps(clean_transaction_payload_row(), sort_keys=True) + "\n", encoding="utf-8")
+        write_json(policy, transaction_intent_policy_fixture())
         cache_current_after_change = bounty_evidence_intake_cache_current(
             stale_intake,
             bounty_evidence_authorization=authorization,
             artifact_dir=case_root,
             max_file_bytes=262144,
         )
-        loaded = build_or_load_bounty_evidence_intake_for_run(
+        loaded = build_bounty_evidence_intake(
             target=target,
             profile=None,
             artifact_dir=case_root,
-            source_root=case_root,
+            bounty_evidence_authorization=authorization,
             max_file_bytes=262144,
+            source_root=case_root,
         )
         return {
             "stale": stale_intake,
@@ -27723,6 +27965,21 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
                     }
                 ],
             },
+        )
+        transaction_missing_policy_case = run_transaction_pair_case(
+            "transaction_pair_missing_policy",
+            write_policy=False,
+        )
+        transaction_invalid_policy_case = run_transaction_pair_case(
+            "transaction_pair_invalid_policy",
+            valid_policy=False,
+        )
+        transaction_payload_contract_case = run_transaction_pair_case(
+            "transaction_pair_payload_contract_mismatch",
+            payload_type="evm",
+        )
+        transaction_pair_ready_case = run_transaction_pair_case(
+            "transaction_pair_ready",
         )
         build_actionable_rows = [
             {
@@ -27795,6 +28052,10 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
 
     draft_review = first_review(draft_case)
     approved_false_review = first_review(approved_false_case)
+    transaction_missing_policy_review = first_review(transaction_missing_policy_case)
+    transaction_invalid_policy_review = first_review(transaction_invalid_policy_case)
+    transaction_payload_contract_review = first_review(transaction_payload_contract_case)
+    transaction_pair_ready_review = first_review(transaction_pair_ready_case)
     build_operator_review = first_review(build_operator_case)
     provider_from_build_review = first_review(provider_from_build_case)
     provider_ready_review = first_review(provider_ready_case)
@@ -27810,13 +28071,17 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
             "actual": first_review(missing_case).get("status"),
         },
         {
-            "id": "clean-sidecar-ready-for-lane-validation",
-            "passed": clean_case.get("status") == "ready-for-lane-validation"
-            and first_review(clean_case).get("status") == "ready-for-lane-validation",
-            "expected": "ready-for-lane-validation",
+            "id": "clean-transaction-payload-alone-waits-for-policy",
+            "passed": clean_case.get("status") == "waiting-approved-evidence-files"
+            and first_review(clean_case).get("status") == "waiting-transaction-sidecar-review"
+            and (
+                first_review(clean_case).get("transaction_sidecar_scope") or {}
+            ).get("status") == "waiting-transaction-intent-policy",
+            "expected": ["waiting-transaction-sidecar-review", "waiting-transaction-intent-policy"],
             "actual": {
                 "artifact": clean_case.get("status"),
                 "request": first_review(clean_case).get("status"),
+                "transaction": first_review(clean_case).get("transaction_sidecar_scope"),
             },
         },
         {
@@ -27842,6 +28107,65 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
                 "artifact": approved_false_case.get("status"),
                 "request": approved_false_review.get("status"),
                 "approval_risks": approved_false_review.get("approval_risks"),
+            },
+        },
+        {
+            "id": "transaction-paired-intake-waits-for-matching-policy",
+            "passed": transaction_missing_policy_case.get("status") == "waiting-approved-evidence-files"
+            and transaction_missing_policy_review.get("status") == "waiting-evidence-files"
+            and (
+                transaction_missing_policy_review.get("transaction_sidecar_scope") or {}
+            ).get("status") == "waiting-transaction-intent-policy",
+            "expected": ["waiting-evidence-files", "waiting-transaction-intent-policy"],
+            "actual": {
+                "artifact": transaction_missing_policy_case.get("status"),
+                "request": transaction_missing_policy_review.get("status"),
+                "transaction": transaction_missing_policy_review.get("transaction_sidecar_scope"),
+            },
+        },
+        {
+            "id": "transaction-paired-intake-blocks-invalid-policy",
+            "passed": transaction_invalid_policy_case.get("status") == "blocked-evidence-intake"
+            and transaction_invalid_policy_review.get("status") == "blocked-transaction-sidecar-review"
+            and (
+                transaction_invalid_policy_review.get("transaction_sidecar_scope") or {}
+            ).get("status") == "blocked-invalid-transaction-intent-policy",
+            "expected": ["blocked-transaction-sidecar-review", "blocked-invalid-transaction-intent-policy"],
+            "actual": {
+                "artifact": transaction_invalid_policy_case.get("status"),
+                "request": transaction_invalid_policy_review.get("status"),
+                "transaction": transaction_invalid_policy_review.get("transaction_sidecar_scope"),
+            },
+        },
+        {
+            "id": "transaction-paired-intake-blocks-payload-contract-mismatch",
+            "passed": transaction_payload_contract_case.get("status") == "blocked-evidence-intake"
+            and transaction_payload_contract_review.get("status") == "blocked-transaction-sidecar-review"
+            and (
+                transaction_payload_contract_review.get("transaction_sidecar_scope") or {}
+            ).get("status") == "blocked-transaction-payload-contract",
+            "expected": ["blocked-transaction-sidecar-review", "blocked-transaction-payload-contract"],
+            "actual": {
+                "artifact": transaction_payload_contract_case.get("status"),
+                "request": transaction_payload_contract_review.get("status"),
+                "transaction": transaction_payload_contract_review.get("transaction_sidecar_scope"),
+            },
+        },
+        {
+            "id": "transaction-paired-intake-ready-only-when-payload-and-policy-decode-ready",
+            "passed": transaction_pair_ready_case.get("status") == "ready-for-lane-validation"
+            and transaction_pair_ready_review.get("status") == "ready-for-lane-validation"
+            and (
+                transaction_pair_ready_review.get("transaction_sidecar_scope") or {}
+            ).get("status") == "ready"
+            and (
+                transaction_pair_ready_review.get("transaction_sidecar_scope") or {}
+            ).get("ready_for_decode") is True,
+            "expected": ["ready-for-lane-validation", "transaction ready", "decode ready"],
+            "actual": {
+                "artifact": transaction_pair_ready_case.get("status"),
+                "request": transaction_pair_ready_review.get("status"),
+                "transaction": transaction_pair_ready_review.get("transaction_sidecar_scope"),
             },
         },
         {
@@ -27931,7 +28255,7 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
         "status": "failed" if failed else "passed",
         "target": target,
         "summary": {
-            "cases": 10,
+            "cases": 14,
             "assertions": len(assertions),
             "failed": len(failed),
             "case_statuses": {
@@ -27939,6 +28263,10 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
                 "clean": clean_case.get("status"),
                 "draft": draft_case.get("status"),
                 "approved_false": approved_false_case.get("status"),
+                "transaction_pair_missing_policy": transaction_missing_policy_case.get("status"),
+                "transaction_pair_invalid_policy": transaction_invalid_policy_case.get("status"),
+                "transaction_pair_payload_contract_mismatch": transaction_payload_contract_case.get("status"),
+                "transaction_pair_ready": transaction_pair_ready_case.get("status"),
                 "operator_build_ready": build_operator_case.get("status"),
                 "operator_provider_from_build_only": provider_from_build_case.get("status"),
                 "operator_provider_ready": provider_ready_case.get("status"),
@@ -27952,6 +28280,10 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
             "clean": clean_case,
             "draft": draft_case,
             "approved_false": approved_false_case,
+            "transaction_pair_missing_policy": transaction_missing_policy_case,
+            "transaction_pair_invalid_policy": transaction_invalid_policy_case,
+            "transaction_pair_payload_contract_mismatch": transaction_payload_contract_case,
+            "transaction_pair_ready": transaction_pair_ready_case,
             "operator_build_ready": build_operator_case,
             "operator_provider_from_build_only": provider_from_build_case,
             "operator_provider_ready": provider_ready_case,
@@ -86359,6 +86691,19 @@ def run_bounty_evidence_intake(args: argparse.Namespace) -> int:
                 )
                 if missing_decisions:
                     print(f"  operator_missing={inline_summary_text(missing_decisions, max_chars=260)}")
+            transaction_scope = (
+                row.get("transaction_sidecar_scope")
+                if isinstance(row.get("transaction_sidecar_scope"), dict)
+                else {}
+            )
+            if transaction_scope and transaction_scope.get("status") != "not-requested":
+                print(
+                    f"  transaction={transaction_scope.get('status')} "
+                    f"review={transaction_scope.get('sidecar_review_status')} "
+                    f"candidates={transaction_scope.get('candidate_count', 0)} "
+                    f"policy_valid={transaction_scope.get('intent_policy_valid')} "
+                    f"decode_ready={transaction_scope.get('ready_for_decode')}"
+                )
             print(f"  next={inline_summary_text(row.get('next_step'), max_chars=320)}")
             if getattr(args, "show_files", False):
                 for file_row in (row.get("files", []) or [])[: max(1, min(4, int(args.files_per_request)))]:
