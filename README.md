@@ -1516,6 +1516,7 @@ python3 scripts/inferforge.py audit --ws-resource-probes
 python3 scripts/inferforge.py lead-dossier --no-write --show-commands --show-evidence --skip-current-resource-check
 python3 scripts/inferforge.py rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract --show-sidecar-template-json
 python3 scripts/inferforge.py transaction-payload-preflight --input ./approved-payloads.jsonl --no-write --show-records --show-commands
+python3 scripts/inferforge.py approved-quote-exchange-candidates --show-commands
 python3 scripts/inferforge.py prepare-approved-quote-operator-inputs --request-input ./approved-quote-request.http --payload-input ./approved-quote-response.http --approval-reference APPROVED-QUOTE-001 --no-write --show-preflight --show-commands
 python3 scripts/inferforge.py transaction-corpus-preflight --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --intent-input ./approved-quote-intent.json --no-write --show-policy-json --show-checks --show-commands
 python3 scripts/inferforge.py prepare-transaction-corpus-sidecars --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --intent-input ./approved-quote-intent.json --approval-reference APPROVED-QUOTE-001 --no-write --show-policy-json --show-checks --show-commands
@@ -1584,6 +1585,9 @@ When an approved HAR, Burp XML export, JSON-wrapped exchange, or raw HTTP
 exchange is staged directly under `.greybox/discover-check/operator-inputs`,
 `evidence-sidecar-drafts` and `bounty-shortest-path` surface the importable
 candidate and its exact no-write preview command.
+`approved-quote-exchange-candidates --show-commands` runs the same staged-file
+scanner directly and is read-only; with `--strict`, it exits non-zero unless at
+least one importable staged exchange is present.
 
 `transaction-corpus-preflight --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --intent-input ./approved-quote-intent.json --no-write --show-policy-json --show-checks --show-commands`
 is the paired offline intake check for one approved quote request body and the
