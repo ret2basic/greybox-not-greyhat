@@ -1567,11 +1567,14 @@ not evidence and does not satisfy finding gates until the official sidecar,
 matching intent policy, decode review, finding gate, and adjudication all agree.
 
 `prepare-approved-quote-operator-inputs --request-input ./approved-quote-request.http --payload-input ./approved-quote-response.http --approval-reference APPROVED-QUOTE-001 --no-write --show-preflight --show-commands`
-is the offline helper for Burp/raw-HTTP handoff. It strips raw HTTP headers from
-an approved quote request/response pair, keeps only the JSON bodies as candidate
-supporting operator inputs, and generates an approved quote intent draft from the
-derived wallet, recipient, mints, raw amount, optional minimum destination amount,
-chain, direction, and payload type. By default it previews only. With
+is the offline helper for Burp/raw-HTTP handoff. It also accepts
+`--exchange-input` for one approved raw HTTP exchange, JSON-wrapped exchange,
+HAR with one unique `POST /api/quote`, or Burp XML item export with one unique
+`POST /api/quote`. It strips raw HTTP headers from an approved quote
+request/response pair, keeps only the JSON bodies as candidate supporting
+operator inputs, and generates an approved quote intent draft from the derived
+wallet, recipient, mints, raw amount, optional minimum destination amount, chain,
+direction, and payload type. By default it previews only. With
 `--write-operator-inputs`, it writes the three supporting files under
 `.greybox/discover-check/operator-inputs`; this still does not create official
 evidence sidecars. Generated intent remains `approved_for_offline_validation=false`
