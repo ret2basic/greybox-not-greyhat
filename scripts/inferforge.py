@@ -26347,6 +26347,7 @@ def bounty_action_queue_cache_validation(
     bounty_evidence_authorization: dict[str, Any] | None,
     bounty_evidence_intake: dict[str, Any] | None,
     adjudication: dict[str, Any] | None,
+    claim_evidence_requests: dict[str, Any] | None = None,
     max_file_bytes: int,
 ) -> dict[str, Any]:
     dependencies = {
@@ -26354,9 +26355,10 @@ def bounty_action_queue_cache_validation(
         "bounty_evidence_authorization": bounty_evidence_authorization,
         "bounty_evidence_intake": bounty_evidence_intake,
         "adjudication": adjudication,
+        "claim_evidence_requests": claim_evidence_requests,
     }
     return {
-        "schema": "inferforge-bounty-action-queue-cache-v1",
+        "schema": "inferforge-bounty-action-queue-cache-v2",
         "max_file_bytes": max_file_bytes,
         "dependencies": {
             name: {
@@ -26375,6 +26377,7 @@ def bounty_action_queue_cache_current(
     bounty_evidence_authorization: dict[str, Any] | None,
     bounty_evidence_intake: dict[str, Any] | None,
     adjudication: dict[str, Any] | None,
+    claim_evidence_requests: dict[str, Any] | None = None,
     max_file_bytes: int,
 ) -> bool:
     if not bounty_action_queue_has_current_api_authorization_schema(queue):
@@ -26387,6 +26390,7 @@ def bounty_action_queue_cache_current(
         bounty_evidence_authorization=bounty_evidence_authorization,
         bounty_evidence_intake=bounty_evidence_intake,
         adjudication=adjudication,
+        claim_evidence_requests=claim_evidence_requests,
         max_file_bytes=max_file_bytes,
     )
     return cached == current
@@ -27677,6 +27681,132 @@ def bounty_action_score(action: dict[str, Any]) -> int:
     return max(0, kind_score + priority_score + severity_score + pursue_bonus - human_penalty - parked_penalty)
 
 
+BOUNTY_ACTION_LANE_CLAIM_ORACLE_TYPES = {
+    "transaction-integrity": {"transaction-intent"},
+    "sensitive-response-impact": {"single-response-impact"},
+    "credentialed-provider-impact": {"provider-impact"},
+    "resource-control": {"resource-control"},
+    "websocket-header-trust": {"websocket-header-forwarding"},
+}
+
+
+def bounty_action_claim_request_matches(action: dict[str, Any], request: dict[str, Any]) -> bool:
+    official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
+    official_name = str(official.get("name") or Path(str(official.get("artifact") or "")).name or "").strip()
+    if not official_name:
+        return False
+    lane = str(action.get("lane") or "")
+    request_oracles = set(normalize_string_list(request.get("oracle_types")))
+    lane_oracles = BOUNTY_ACTION_LANE_CLAIM_ORACLE_TYPES.get(lane, set())
+    if lane_oracles:
+        return bool(request_oracles.intersection(lane_oracles))
+
+    action_names = {
+        Path(str(value)).name
+        for value in [
+            *normalize_string_list(action.get("requested_evidence")),
+            *normalize_string_list(action.get("missing_official_evidence")),
+        ]
+        if str(value or "").strip()
+    }
+    if official_name == OPERATOR_EVIDENCE_ARTIFACT:
+        return False
+    return official_name in action_names
+
+
+def bounty_action_claim_request_rows(
+    action: dict[str, Any],
+    *,
+    claim_evidence_requests: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    request_rows = (
+        claim_evidence_requests.get("requests", [])
+        if isinstance(claim_evidence_requests, dict) and isinstance(claim_evidence_requests.get("requests"), list)
+        else []
+    )
+    matches = [
+        request
+        for request in request_rows
+        if isinstance(request, dict) and bounty_action_claim_request_matches(action, request)
+    ]
+    evidence_order = {
+        Path(str(value)).name: index
+        for index, value in enumerate(
+            [
+                *normalize_string_list(action.get("requested_evidence")),
+                *normalize_string_list(action.get("missing_official_evidence")),
+            ]
+        )
+        if str(value or "").strip()
+    }
+
+    def request_official_name(request: dict[str, Any]) -> str:
+        official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
+        return str(official.get("name") or Path(str(official.get("artifact") or "")).name or "").strip()
+
+    matches.sort(
+        key=lambda request: (
+            evidence_order.get(
+                request_official_name(request),
+                len(evidence_order) + 1,
+            ),
+            str(request.get("id") or ""),
+        )
+    )
+    compact_rows = []
+    for request in matches[:6]:
+        official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
+        draft = request.get("draft_assist") if isinstance(request.get("draft_assist"), dict) else {}
+        verify_commands = normalize_string_list(request.get("verification_commands"))
+        compact_rows.append(
+            {
+                "id": request.get("id"),
+                "request_status": request.get("request_status"),
+                "official_evidence": {
+                    "name": official.get("name"),
+                    "path": official.get("path"),
+                    "category": official.get("category"),
+                    "status": official.get("status"),
+                    "validator_status": official.get("validator_status"),
+                },
+                "claim_count": request.get("claim_count", 0),
+                "oracle_types": normalize_string_list(request.get("oracle_types"))[:4],
+                "entrypoints": normalize_string_list(request.get("entrypoints"))[:4],
+                "draft_status": draft.get("draft_status"),
+                "draft_path": draft.get("draft_path"),
+                "first_verification_command": verify_commands[0] if verify_commands else None,
+                "redaction_rules": normalize_string_list(request.get("redaction_rules"))[:4],
+                "next_step": request.get("next_step"),
+            }
+        )
+    return compact_rows
+
+
+def bounty_action_claim_request_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    claim_count = 0
+    status_counts: dict[str, int] = {}
+    categories: dict[str, int] = {}
+    draft_paths = []
+    first_verify = None
+    for row in rows:
+        claim_count += int(row.get("claim_count") or 0)
+        increment_count(status_counts, str(row.get("request_status") or "unknown"))
+        official = row.get("official_evidence") if isinstance(row.get("official_evidence"), dict) else {}
+        increment_count(categories, str(official.get("category") or "unknown"))
+        if row.get("draft_path"):
+            draft_paths.append(str(row.get("draft_path")))
+        if first_verify is None and row.get("first_verification_command"):
+            first_verify = str(row.get("first_verification_command"))
+    return {
+        "request_count": len(rows),
+        "claim_count": claim_count,
+        "status_counts": dict(sorted(status_counts.items())),
+        "category_counts": dict(sorted(categories.items())),
+        "draft_paths": ordered_unique_strings(draft_paths)[:6],
+        "first_verification_command": first_verify,
+    }
+
+
 def bounty_action_for_authorization_request(
     authorization: dict[str, Any],
     *,
@@ -27684,6 +27814,7 @@ def bounty_action_for_authorization_request(
     rollup: dict[str, Any],
     artifact_dir: Path,
     profile: dict[str, Any] | None,
+    claim_evidence_requests: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     requested_evidence = bounty_prep_order_required_artifacts(
         str(authorization.get("lane") or ""),
@@ -27775,6 +27906,16 @@ def bounty_action_for_authorization_request(
         "redaction_risks": normalize_string_list(intake.get("redaction_risks")),
         "reportability_boundary": authorization.get("reportability_boundary") or rollup.get("reportability_boundary"),
     }
+    claim_requests = bounty_action_claim_request_rows(
+        action,
+        claim_evidence_requests=claim_evidence_requests,
+    )
+    claim_request_summary = bounty_action_claim_request_summary(claim_requests)
+    action["claim_evidence_requests"] = claim_requests
+    action["claim_evidence_request_summary"] = claim_request_summary
+    action["claim_evidence_request_count"] = claim_request_summary.get("request_count", 0)
+    action["claim_evidence_claim_count"] = claim_request_summary.get("claim_count", 0)
+    action["claim_evidence_first_verification_command"] = claim_request_summary.get("first_verification_command")
     action["score"] = bounty_action_score(action)
     return action
 
@@ -27788,6 +27929,7 @@ def build_bounty_action_queue(
     bounty_evidence_authorization: dict[str, Any] | None,
     bounty_evidence_intake: dict[str, Any] | None,
     adjudication: dict[str, Any] | None,
+    claim_evidence_requests: dict[str, Any] | None = None,
     max_file_bytes: int = 262144,
 ) -> dict[str, Any]:
     auth_requests = (
@@ -27831,6 +27973,7 @@ def build_bounty_action_queue(
                 rollup=rollup,
                 artifact_dir=artifact_dir,
                 profile=profile,
+                claim_evidence_requests=claim_evidence_requests,
             )
         )
     if not actions:
@@ -27884,10 +28027,34 @@ def build_bounty_action_queue(
     kind_counts: dict[str, int] = {}
     actor_counts: dict[str, int] = {}
     evidence_gate_counts: dict[str, int] = {}
+    claim_request_by_key: dict[str, dict[str, Any]] = {}
+    claim_request_attachment_count = 0
+    claim_request_attachment_claim_count = 0
+    claim_request_status_counts: dict[str, int] = {}
+    claim_request_category_counts: dict[str, int] = {}
     for row in actions:
         increment_count(kind_counts, str(row.get("kind") or "unknown"))
         increment_count(actor_counts, str(row.get("actor") or "unknown"))
         increment_count(evidence_gate_counts, str(row.get("evidence_gate_status") or "unknown"))
+        claim_summary = row.get("claim_evidence_request_summary") if isinstance(row.get("claim_evidence_request_summary"), dict) else {}
+        claim_request_attachment_count += int(claim_summary.get("request_count") or 0)
+        claim_request_attachment_claim_count += int(claim_summary.get("claim_count") or 0)
+        for request in row.get("claim_evidence_requests", []) or []:
+            if not isinstance(request, dict):
+                continue
+            official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
+            request_key = str(
+                request.get("id")
+                or official.get("path")
+                or official.get("name")
+                or official.get("artifact")
+                or len(claim_request_by_key)
+            )
+            claim_request_by_key.setdefault(request_key, request)
+    for request in claim_request_by_key.values():
+        increment_count(claim_request_status_counts, str(request.get("request_status") or "unknown"))
+        official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
+        increment_count(claim_request_category_counts, str(official.get("category") or "unknown"))
     api_authorization_counts: dict[str, int] = {}
     for row in actions:
         for profile_id in normalize_string_list(row.get("api_authorization_profile_ids")):
@@ -27917,6 +28084,7 @@ def build_bounty_action_queue(
         bounty_evidence_authorization=bounty_evidence_authorization,
         bounty_evidence_intake=bounty_evidence_intake,
         adjudication=adjudication,
+        claim_evidence_requests=claim_evidence_requests,
         max_file_bytes=max_file_bytes,
     )
     return {
@@ -27939,11 +28107,20 @@ def build_bounty_action_queue(
             "kind_counts": dict(sorted(kind_counts.items())),
             "actor_counts": dict(sorted(actor_counts.items())),
             "evidence_gate_counts": dict(sorted(evidence_gate_counts.items())),
+            "claim_evidence_request_count": len(claim_request_by_key),
+            "claim_evidence_claim_count": sum(
+                int(request.get("claim_count") or 0) for request in claim_request_by_key.values()
+            ),
+            "claim_evidence_action_binding_count": claim_request_attachment_count,
+            "claim_evidence_action_binding_claim_count": claim_request_attachment_claim_count,
+            "claim_evidence_request_status_counts": dict(sorted(claim_request_status_counts.items())),
+            "claim_evidence_request_category_counts": dict(sorted(claim_request_category_counts.items())),
             "api_authorization_counts": dict(sorted(api_authorization_counts.items())),
             "bounty_readiness_rollup_status": artifact_summary_status(bounty_readiness_rollup),
             "bounty_evidence_authorization_status": artifact_summary_status(bounty_evidence_authorization),
             "bounty_evidence_intake_status": artifact_summary_status(bounty_evidence_intake),
             "adjudication_status": artifact_summary_status(adjudication),
+            "claim_evidence_requests_status": artifact_summary_status(claim_evidence_requests),
             "cache_dependency_count": len(cache_validation.get("dependencies", {}) or {}),
         },
         "cache_validation": cache_validation,
@@ -28735,13 +28912,179 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             priority=priority_case,
             rank=1,
         )
+        claim_evidence_requests_case = {
+            "generated_at": utc_now(),
+            "schema": "inferforge-claim-evidence-requests-v1",
+            "status": "ready-missing-evidence-requests",
+            "target": target,
+            "requests": [
+                {
+                    "id": "REQ-selftest-transaction-payloads",
+                    "request_status": "missing-official-evidence",
+                    "official_evidence": {
+                        "name": "transaction-payloads.jsonl",
+                        "path": repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl"),
+                        "category": "transaction-payload-sidecar",
+                        "status": "missing-evidence",
+                    },
+                    "claim_count": 2,
+                    "oracle_types": ["transaction-intent"],
+                    "entrypoints": ["POST /api/quote"],
+                    "draft_assist": {
+                        "draft_status": "draft-ready",
+                        "draft_path": repo_relative_or_absolute(
+                            artifact_dir / EVIDENCE_SIDECAR_DRAFT_DIR_NAME / "transaction-payloads.jsonl.draft"
+                        ),
+                    },
+                    "verification_commands": [
+                        validation_command_for_artifact_dir(
+                            artifact_dir,
+                            "transaction-sidecar-review --no-write --show-files",
+                            profile=None,
+                        )
+                    ],
+                    "redaction_rules": ["Do not include wallet secrets."],
+                    "next_step": "Synthetic request next step.",
+                }
+            ],
+            "summary": {
+                "requests": 1,
+                "claim_count": 2,
+                "request_status_counts": {"missing-official-evidence": 1},
+                "category_counts": {"transaction-payload-sidecar": 1},
+            },
+        }
+        operator_claim_evidence_requests_case = {
+            "generated_at": utc_now(),
+            "schema": "inferforge-claim-evidence-requests-v1",
+            "status": "ready-missing-evidence-requests",
+            "target": target,
+            "requests": [
+                {
+                    "id": "REQ-selftest-provider-operator-evidence",
+                    "request_status": "missing-official-evidence",
+                    "official_evidence": {
+                        "name": OPERATOR_EVIDENCE_ARTIFACT,
+                        "path": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+                        "category": "operator-evidence",
+                        "status": "missing-evidence",
+                    },
+                    "claim_count": 3,
+                    "oracle_types": ["provider-impact"],
+                    "entrypoints": ["GET /api/provider"],
+                    "draft_assist": {
+                        "draft_status": "draft-ready",
+                        "draft_path": repo_relative_or_absolute(
+                            artifact_dir / EVIDENCE_SIDECAR_DRAFT_DIR_NAME / "operator-evidence.provider.draft.json"
+                        ),
+                    },
+                    "verification_commands": [
+                        validation_command_for_artifact_dir(
+                            artifact_dir,
+                            "operator-evidence-review --no-write --show-decisions",
+                            profile=None,
+                        )
+                    ],
+                    "redaction_rules": ["Do not include provider tokens."],
+                    "next_step": "Synthetic provider evidence request.",
+                },
+                {
+                    "id": "REQ-selftest-resource-operator-evidence",
+                    "request_status": "missing-official-evidence",
+                    "official_evidence": {
+                        "name": OPERATOR_EVIDENCE_ARTIFACT,
+                        "path": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+                        "category": "operator-evidence",
+                        "status": "missing-evidence",
+                    },
+                    "claim_count": 1,
+                    "oracle_types": ["resource-control"],
+                    "entrypoints": ["POST /api/resource"],
+                    "draft_assist": {
+                        "draft_status": "draft-ready",
+                        "draft_path": repo_relative_or_absolute(
+                            artifact_dir / EVIDENCE_SIDECAR_DRAFT_DIR_NAME / "operator-evidence.resource.draft.json"
+                        ),
+                    },
+                    "verification_commands": [
+                        validation_command_for_artifact_dir(
+                            artifact_dir,
+                            "operator-evidence-review --no-write --show-decisions",
+                            profile=None,
+                        )
+                    ],
+                    "redaction_rules": ["Do not include account identifiers."],
+                    "next_step": "Synthetic resource evidence request.",
+                },
+                {
+                    "id": "REQ-selftest-websocket-operator-evidence",
+                    "request_status": "missing-official-evidence",
+                    "official_evidence": {
+                        "name": OPERATOR_EVIDENCE_ARTIFACT,
+                        "path": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+                        "category": "operator-evidence",
+                        "status": "missing-evidence",
+                    },
+                    "claim_count": 1,
+                    "oracle_types": ["websocket-header-forwarding"],
+                    "entrypoints": ["GET /ws"],
+                    "draft_assist": {
+                        "draft_status": "draft-ready",
+                        "draft_path": repo_relative_or_absolute(
+                            artifact_dir / EVIDENCE_SIDECAR_DRAFT_DIR_NAME / "operator-evidence.websocket.draft.json"
+                        ),
+                    },
+                    "verification_commands": [
+                        validation_command_for_artifact_dir(
+                            artifact_dir,
+                            "operator-evidence-review --no-write --show-decisions",
+                            profile=None,
+                        )
+                    ],
+                    "redaction_rules": ["Do not include headers with secrets."],
+                    "next_step": "Synthetic websocket evidence request.",
+                },
+            ],
+            "summary": {
+                "requests": 3,
+                "claim_count": 5,
+                "request_status_counts": {"missing-official-evidence": 3},
+                "category_counts": {"operator-evidence": 3},
+            },
+        }
         action_case = bounty_action_for_authorization_request(
             authorization_case,
             intake={"status": "waiting-approved-evidence-files"},
             rollup={"readiness_status": "waiting-minimal-transaction-evidence"},
             artifact_dir=artifact_dir,
             profile=None,
+            claim_evidence_requests=claim_evidence_requests_case,
         )
+        build_secret_operator_matches = bounty_action_claim_request_rows(
+            {
+                "lane": "build-secret-exposure",
+                "requested_evidence": [OPERATOR_EVIDENCE_ARTIFACT],
+                "missing_official_evidence": [OPERATOR_EVIDENCE_ARTIFACT],
+            },
+            claim_evidence_requests=operator_claim_evidence_requests_case,
+        )
+        operator_lane_match_counts = {
+            lane: len(
+                bounty_action_claim_request_rows(
+                    {
+                        "lane": lane,
+                        "requested_evidence": [OPERATOR_EVIDENCE_ARTIFACT],
+                        "missing_official_evidence": [OPERATOR_EVIDENCE_ARTIFACT],
+                    },
+                    claim_evidence_requests=operator_claim_evidence_requests_case,
+                )
+            )
+            for lane in [
+                "credentialed-provider-impact",
+                "resource-control",
+                "websocket-header-trust",
+            ]
+        }
         present_artifact_dir = Path(temp_dir) / "present-artifacts"
         present_artifact_dir.mkdir(parents=True)
         (present_artifact_dir / "transaction-payloads.jsonl").write_text(
@@ -28858,6 +29201,26 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             bounty_evidence_authorization=authorization_doc,
             bounty_evidence_intake=ready_intake_doc,
             adjudication=adjudication_doc,
+            max_file_bytes=262144,
+        )
+        stale_queue_current_with_claim_requests = bounty_action_queue_cache_current(
+            stale_queue_case,
+            bounty_readiness_rollup=rollup_doc,
+            bounty_evidence_authorization=authorization_doc,
+            bounty_evidence_intake=waiting_intake_doc,
+            adjudication=adjudication_doc,
+            claim_evidence_requests=claim_evidence_requests_case,
+            max_file_bytes=262144,
+        )
+        rebuilt_claim_queue_case = build_bounty_action_queue(
+            target=target,
+            profile=None,
+            artifact_dir=artifact_dir,
+            bounty_readiness_rollup=rollup_doc,
+            bounty_evidence_authorization=authorization_doc,
+            bounty_evidence_intake=waiting_intake_doc,
+            adjudication=adjudication_doc,
+            claim_evidence_requests=claim_evidence_requests_case,
             max_file_bytes=262144,
         )
         rebuilt_ready_queue_case = build_bounty_action_queue(
@@ -29002,6 +29365,36 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
     }
     action_api_acceptance_checks = normalize_string_list(action_case.get("api_authorization_acceptance_checks"))
     action_api_reject_if = normalize_string_list(action_case.get("api_authorization_reject_if"))
+    action_claim_summary = (
+        action_case.get("claim_evidence_request_summary")
+        if isinstance(action_case.get("claim_evidence_request_summary"), dict)
+        else {}
+    )
+    action_claim_requests = [
+        row
+        for row in action_case.get("claim_evidence_requests", []) or []
+        if isinstance(row, dict)
+    ]
+    rebuilt_claim_queue_summary = (
+        rebuilt_claim_queue_case.get("summary")
+        if isinstance(rebuilt_claim_queue_case.get("summary"), dict)
+        else {}
+    )
+    rebuilt_claim_action = (
+        rebuilt_claim_queue_case.get("actions", [])[0]
+        if isinstance(rebuilt_claim_queue_case.get("actions"), list) and rebuilt_claim_queue_case.get("actions")
+        else {}
+    )
+    stale_queue_claim_cache = (
+        stale_queue_case.get("cache_validation")
+        if isinstance(stale_queue_case.get("cache_validation"), dict)
+        else {}
+    )
+    rebuilt_claim_queue_cache = (
+        rebuilt_claim_queue_case.get("cache_validation")
+        if isinstance(rebuilt_claim_queue_case.get("cache_validation"), dict)
+        else {}
+    )
     template_api_acceptance_checks = ordered_unique_strings(
         [
             check
@@ -29266,6 +29659,56 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "action-queue-attaches-claim-evidence-requests",
+            "passed": (
+                action_case.get("claim_evidence_request_count") == 1
+                and action_case.get("claim_evidence_claim_count") == 2
+                and action_claim_summary.get("status_counts", {}).get("missing-official-evidence") == 1
+                and "transaction-sidecar-review"
+                in str(action_case.get("claim_evidence_first_verification_command") or "")
+                and bool(action_claim_requests)
+                and str(action_claim_requests[0].get("draft_path") or "").endswith("transaction-payloads.jsonl.draft")
+            ),
+            "expected": {
+                "request_count": 1,
+                "claim_count": 2,
+                "status": "missing-official-evidence",
+                "verifier": "transaction-sidecar-review",
+                "draft_suffix": "transaction-payloads.jsonl.draft",
+            },
+            "actual": {
+                "request_count": action_case.get("claim_evidence_request_count"),
+                "claim_count": action_case.get("claim_evidence_claim_count"),
+                "summary": action_claim_summary,
+                "first_verifier": action_case.get("claim_evidence_first_verification_command"),
+                "first_request": action_claim_requests[0] if action_claim_requests else {},
+            },
+        },
+        {
+            "id": "operator-evidence-claim-requests-stay-lane-scoped",
+            "passed": (
+                len(build_secret_operator_matches) == 0
+                and operator_lane_match_counts
+                == {
+                    "credentialed-provider-impact": 1,
+                    "resource-control": 1,
+                    "websocket-header-trust": 1,
+                }
+            ),
+            "expected": {
+                "build_secret_matches": 0,
+                "lane_matches": {
+                    "credentialed-provider-impact": 1,
+                    "resource-control": 1,
+                    "websocket-header-trust": 1,
+                },
+            },
+            "actual": {
+                "build_secret_matches": len(build_secret_operator_matches),
+                "lane_matches": operator_lane_match_counts,
+            },
+        },
+        {
             "id": "present-evidence-routes-to-intake",
             "passed": (
                 evidence_present_action_kind == "run-evidence-intake"
@@ -29298,6 +29741,36 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
                 "rebuilt_status": rebuilt_ready_queue_case.get("status"),
                 "rebuilt_kind": rebuilt_ready_action.get("kind"),
                 "rebuilt_agent_ready": rebuilt_ready_action.get("agent_can_continue_without_new_evidence"),
+            },
+        },
+        {
+            "id": "action-queue-cache-invalidates-when-claim-requests-change",
+            "passed": (
+                stale_queue_current_with_waiting is True
+                and stale_queue_current_with_claim_requests is False
+                and rebuilt_claim_queue_summary.get("claim_evidence_request_count") == 1
+                and rebuilt_claim_action.get("claim_evidence_claim_count") == 2
+                and (
+                    stale_queue_claim_cache.get("dependencies", {})
+                    .get("claim_evidence_requests", {})
+                    .get("fingerprint")
+                    != rebuilt_claim_queue_cache.get("dependencies", {})
+                    .get("claim_evidence_requests", {})
+                    .get("fingerprint")
+                )
+            ),
+            "expected": "stale queue cache invalidates when claim evidence request pack changes",
+            "actual": {
+                "stale_current_with_waiting": stale_queue_current_with_waiting,
+                "stale_current_with_claim_requests": stale_queue_current_with_claim_requests,
+                "rebuilt_summary": rebuilt_claim_queue_summary,
+                "rebuilt_claim_count": rebuilt_claim_action.get("claim_evidence_claim_count"),
+                "stale_claim_fingerprint": stale_queue_claim_cache.get("dependencies", {})
+                .get("claim_evidence_requests", {})
+                .get("fingerprint"),
+                "rebuilt_claim_fingerprint": rebuilt_claim_queue_cache.get("dependencies", {})
+                .get("claim_evidence_requests", {})
+                .get("fingerprint"),
             },
         },
         {
@@ -29337,6 +29810,16 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
                 and "transaction-intent-policy.json" in request_markdown_case
             ),
             "expected": "request brief contains evidence gate status and missing official evidence",
+            "actual": request_markdown_case,
+        },
+        {
+            "id": "request-brief-renders-claim-witness-requests",
+            "passed": (
+                "Claim witness requests:" in request_markdown_case
+                and "transaction-payloads.jsonl" in request_markdown_case
+                and "transaction-sidecar-review --no-write --show-files" in request_markdown_case
+            ),
+            "expected": "request brief contains claim witness request details and first verifier",
             "actual": request_markdown_case,
         },
         {
@@ -29385,6 +29868,7 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             "evidence_present_action_case": evidence_present_action_case,
             "stale_queue_case": stale_queue_case,
             "rebuilt_ready_queue_case": rebuilt_ready_queue_case,
+            "rebuilt_claim_queue_case": rebuilt_claim_queue_case,
             "stale_templates_case": stale_templates_case,
             "rebuilt_ready_templates_case": rebuilt_ready_templates_case,
         },
@@ -29517,6 +30001,32 @@ def bounty_evidence_request_markdown(
                 kind = bounty_brief_line(row.get("kind"), max_chars=120)
                 path = bounty_brief_line(row.get("path") or "-", max_chars=220)
                 lines.append(f"- `{status}` `{kind}` {label} path=`{path}`")
+        claim_requests = [
+            row
+            for row in action.get("claim_evidence_requests", []) or []
+            if isinstance(row, dict)
+        ]
+        if claim_requests:
+            lines.extend(["", "Claim witness requests:"])
+            for request in claim_requests[:4]:
+                official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
+                lines.append(
+                    f"- `{bounty_brief_line(request.get('request_status'), max_chars=120)}` "
+                    f"{bounty_brief_line(official.get('name') or official.get('path') or '-', max_chars=220)} "
+                    f"claims=`{request.get('claim_count', 0)}` "
+                    f"oracles=`{bounty_brief_line(', '.join(normalize_string_list(request.get('oracle_types'))[:3]), max_chars=180)}`"
+                )
+                if request.get("draft_path"):
+                    lines.append(f"  - Draft assist: `{bounty_brief_line(request.get('draft_path'), max_chars=240)}`")
+                if request.get("first_verification_command"):
+                    lines.extend(
+                        [
+                            "  - First verifier:",
+                            "```bash",
+                            str(request.get("first_verification_command")),
+                            "```",
+                        ]
+                    )
         api_profiles = [
             profile
             for profile in auth.get("api_authorization_profiles", []) or action.get("api_authorization_profiles", []) or []
@@ -83050,6 +83560,11 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
         source_root=source_root,
         max_file_bytes=int(args.max_file_bytes),
     )
+    claim_requests = build_claim_evidence_requests(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
     queue = build_bounty_action_queue(
         target=target,
         profile=profile,
@@ -83058,6 +83573,7 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
         bounty_evidence_authorization=authorization,
         bounty_evidence_intake=intake,
         adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+        claim_evidence_requests=claim_requests,
         max_file_bytes=int(args.max_file_bytes),
     )
     output_path = (
@@ -83093,10 +83609,30 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
         f"rollup={summary.get('bounty_readiness_rollup_status') or '-'} "
         f"authorization={summary.get('bounty_evidence_authorization_status') or '-'} "
         f"intake={summary.get('bounty_evidence_intake_status') or '-'} "
-        f"adjudication={summary.get('adjudication_status') or '-'}"
+        f"adjudication={summary.get('adjudication_status') or '-'} "
+        f"claim_requests={summary.get('claim_evidence_requests_status') or '-'}"
     )
     print(f"Kinds: {json.dumps(summary.get('kind_counts', {}), sort_keys=True)}")
     print(f"Evidence gates: {json.dumps(summary.get('evidence_gate_counts', {}), sort_keys=True)}")
+    if summary.get("claim_evidence_request_count"):
+        claim_request_summary_bits = [
+            f"requests={summary.get('claim_evidence_request_count', 0)}",
+            f"claims={summary.get('claim_evidence_claim_count', 0)}",
+        ]
+        if summary.get("claim_evidence_action_binding_count") != summary.get("claim_evidence_request_count"):
+            claim_request_summary_bits.extend(
+                [
+                    f"bindings={summary.get('claim_evidence_action_binding_count', 0)}",
+                    f"binding_claims={summary.get('claim_evidence_action_binding_claim_count', 0)}",
+                ]
+            )
+        claim_request_summary_bits.append(
+            f"statuses={json.dumps(summary.get('claim_evidence_request_status_counts', {}), sort_keys=True)}"
+        )
+        print(
+            "Claim evidence requests: "
+            + " ".join(claim_request_summary_bits)
+        )
     print(f"API profiles: {json.dumps(summary.get('api_authorization_counts', {}), sort_keys=True)}")
     display_limit = max(0, int(args.top))
     if getattr(args, "show_actions", False):
@@ -83115,6 +83651,26 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
                 print(f"  needs={inline_summary_text(evidence, max_chars=300)}")
             if row.get("evidence_gate_status"):
                 print(f"  evidence_gate={row.get('evidence_gate_status')}")
+            claim_summary = (
+                row.get("claim_evidence_request_summary")
+                if isinstance(row.get("claim_evidence_request_summary"), dict)
+                else {}
+            )
+            if claim_summary.get("request_count"):
+                print(
+                    "  claim_requests="
+                    f"{claim_summary.get('request_count', 0)} "
+                    f"claims={claim_summary.get('claim_count', 0)} "
+                    f"statuses={json.dumps(claim_summary.get('status_counts', {}), sort_keys=True)}"
+                )
+                draft_paths = normalize_string_list(claim_summary.get("draft_paths"))
+                if draft_paths:
+                    print(f"  claim_draft={inline_summary_text(draft_paths[0], max_chars=260)}")
+                if row.get("claim_evidence_first_verification_command") and getattr(args, "show_commands", False):
+                    print(
+                        "  claim_verify="
+                        f"{inline_summary_text(row.get('claim_evidence_first_verification_command'), max_chars=420)}"
+                    )
             api_profiles = ", ".join(normalize_string_list(row.get("api_authorization_profile_ids"))[:4])
             if api_profiles:
                 print(f"  api_profiles={inline_summary_text(api_profiles, max_chars=260)}")
@@ -83422,6 +83978,11 @@ def build_or_load_bounty_action_queue_for_run(
         max_file_bytes=max_file_bytes,
     )
     adjudication = load_optional_json(artifact_dir / "adjudication.json")
+    claim_requests = build_claim_evidence_requests(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
     queue = load_optional_json(artifact_dir / BOUNTY_ACTION_QUEUE_ARTIFACT)
     if bounty_action_queue_cache_current(
         queue,
@@ -83429,6 +83990,7 @@ def build_or_load_bounty_action_queue_for_run(
         bounty_evidence_authorization=authorization,
         bounty_evidence_intake=intake,
         adjudication=adjudication,
+        claim_evidence_requests=claim_requests,
         max_file_bytes=max_file_bytes,
     ):
         return queue
@@ -83440,6 +84002,7 @@ def build_or_load_bounty_action_queue_for_run(
         bounty_evidence_authorization=authorization,
         bounty_evidence_intake=intake,
         adjudication=adjudication,
+        claim_evidence_requests=claim_requests,
         max_file_bytes=max_file_bytes,
     )
 

@@ -329,6 +329,15 @@ whether each atomic claim has a contract, official approved evidence sidecars,
 offline verifier commands, and a finding-gate/adjudication path. A witness
 ladder is proof-work bookkeeping only: it does not create evidence sidecars and
 does not make a finding reportable.
+
+`bounty-action-queue` consumes the same claim evidence request pack and attaches
+matching witness requests to each queued bounty action. The queue shows the
+missing official evidence file, claim count, draft-assist path, first offline
+verifier command, and whether a shared evidence request is bound to more than
+one action. Shared `operator-evidence.json` requests are matched by lane/oracle
+type instead of filename alone, so provider/resource/websocket requests do not
+accidentally unblock build-secret evidence gates.
+
 `methodology-review` also emits `bounty_harness_alignment`, a compact
 bug-bounty readiness check derived from the harness pattern of building system
 context, ranking high-value leads, validating impact with a concrete oracle,
