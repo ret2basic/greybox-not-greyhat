@@ -491,6 +491,10 @@ Stage commands printed by `bounty-shortest-path --show-stages --show-commands`
 carry the same command-safety classifications. Commands in blocked stages remain
 `review-gated` or `manual-template`, and only stages whose local no-write
 commands all classify as ready expose `autorunnable_commands`.
+The top-level `Handoff commands`, `Verify commands`, and `After-ready commands`
+sections also print command-safety summaries and per-command labels, so
+placeholder handoff templates show as `manual-template` and missing-evidence
+verifiers show as `review-gated` instead of bare runnable-looking shell lines.
 
 `claim-evidence-ledger` decomposes each claim into required evidence artifacts
 and verifier commands. Ledger rows now carry `verification_command_refs`,
