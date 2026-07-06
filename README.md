@@ -363,6 +363,11 @@ highest-value action's minimum official evidence set, first missing artifact,
 claim-witness request, manual handoff/preflight commands, and after-evidence
 validation chain. It is an offline handoff summary only: it does not create
 sidecars, authorize traffic, or make a candidate reportable.
+Each packet includes `official_evidence_contracts` for the required sidecars:
+artifact name/path, category, format, required fields, reject conditions, paired
+evidence dependencies, and no-write validator commands. These contracts are
+acceptance criteria for approved evidence handoff; they are not evidence and do
+not bypass `bounty-evidence-intake`, finding-gate, or adjudication.
 
 `claim-evidence-requests` also uses that queue context for its default ordering:
 in bounty mode, evidence for the highest-ranked action comes before a broader
