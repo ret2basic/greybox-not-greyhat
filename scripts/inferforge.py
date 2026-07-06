@@ -28461,6 +28461,34 @@ def bounty_action_validation_command_refs(action_id: str, commands: list[str]) -
     ]
 
 
+def bounty_action_validation_execution_gate(
+    *,
+    agent_can_continue: bool,
+    requires_human_evidence: bool,
+    blocked_by_official_evidence: bool,
+    validation_command_safety: dict[str, Any],
+) -> str:
+    command_count = int(validation_command_safety.get("commands") or 0)
+    runnable_count = int(validation_command_safety.get("runnable") or 0)
+    if not agent_can_continue:
+        if blocked_by_official_evidence:
+            return "waiting-official-evidence"
+        if requires_human_evidence:
+            return "waiting-human-evidence"
+        return "not-agent-action"
+    if command_count <= 0:
+        return "blocked-missing-validation-command"
+    if int(validation_command_safety.get("unsafe_template_count") or 0):
+        return "blocked-unsafe-validation-command"
+    if int(validation_command_safety.get("blocked_external") or 0):
+        return "blocked-external-validation-command"
+    if int(validation_command_safety.get("requires_manual_input") or 0):
+        return "blocked-manual-validation-command"
+    if runnable_count != command_count:
+        return "blocked-nonrunnable-validation-command"
+    return "ready-offline-validation"
+
+
 def bounty_requested_evidence_path(value: Any, *, artifact_dir: Path) -> Path | None:
     text = str(value or "").strip()
     if not text:
@@ -28741,6 +28769,14 @@ def bounty_action_for_authorization_request(
         "fix-evidence-intake",
         "park-until-official-evidence",
     }
+    agent_can_continue = kind in {"validate-ready-evidence", "run-evidence-intake"}
+    blocked_by_official_evidence = kind in {"collect-approved-evidence", "park-until-official-evidence"}
+    validation_execution_gate = bounty_action_validation_execution_gate(
+        agent_can_continue=agent_can_continue,
+        requires_human_evidence=requires_human,
+        blocked_by_official_evidence=blocked_by_official_evidence,
+        validation_command_safety=validation_command_safety,
+    )
     api_profiles = [
         profile
         for profile in authorization.get("api_authorization_profiles", []) or []
@@ -28767,13 +28803,17 @@ def bounty_action_for_authorization_request(
         "readiness_status": rollup.get("readiness_status"),
         "gate_status": rollup.get("gate_status"),
         "requires_human_evidence": requires_human,
-        "agent_can_continue_without_new_evidence": kind in {"validate-ready-evidence", "run-evidence-intake"},
-        "blocked_by_official_evidence": kind in {"collect-approved-evidence", "park-until-official-evidence"},
+        "agent_can_continue_without_new_evidence": agent_can_continue,
+        "blocked_by_official_evidence": blocked_by_official_evidence,
         "safe_offline_command": safe_command,
         "validation_commands": validation_commands,
         "validation_command_count": len(validation_commands),
         "validation_command_refs": validation_command_refs,
         "validation_command_safety": validation_command_safety,
+        "validation_execution_gate": validation_execution_gate,
+        "autorunnable_validation_commands": (
+            validation_commands if validation_execution_gate == "ready-offline-validation" else []
+        ),
         "next_step": bounty_action_next_step(kind, authorization, intake),
         "requested_evidence": requested_evidence,
         "requested_evidence_status": evidence_status_rows,
@@ -28914,6 +28954,8 @@ def build_bounty_action_queue(
                 "validation_command_count": 1,
                 "validation_command_refs": refresh_command_refs,
                 "validation_command_safety": command_safety_summary(refresh_command_refs),
+                "validation_execution_gate": "ready-offline-validation",
+                "autorunnable_validation_commands": [refresh_command],
                 "next_step": "Refresh bounty evidence authorization and intake artifacts.",
                 "requested_evidence": [],
                 "requested_evidence_status": [],
@@ -28972,18 +29014,31 @@ def build_bounty_action_queue(
         for profile_id in normalize_string_list(row.get("api_authorization_profile_ids")):
             increment_count(api_authorization_counts, profile_id)
     ready_agent = [row for row in actions if row.get("agent_can_continue_without_new_evidence")]
+    automation_ready = [
+        row for row in actions if str(row.get("validation_execution_gate") or "") == "ready-offline-validation"
+    ]
+    validation_safety_blocked = [
+        row
+        for row in actions
+        if str(row.get("validation_execution_gate") or "").startswith("blocked-")
+    ]
     human_required = [row for row in actions if row.get("requires_human_evidence")]
     blocked = [row for row in actions if str(row.get("kind") or "") == "fix-evidence-intake"]
     parked = [row for row in actions if str(row.get("kind") or "") == "park-until-official-evidence"]
     top = actions[0] if actions else {}
     if blocked:
         status = "blocked-fix-evidence-intake-first"
-    elif ready_agent:
+    elif automation_ready:
         status = "ready-for-offline-validation-action"
+    elif validation_safety_blocked:
+        status = "blocked-validation-command-safety"
     elif human_required:
         status = "waiting-human-evidence-action"
     else:
         status = "no-bounty-actions"
+    validation_gate_counts: dict[str, int] = {}
+    for row in actions:
+        increment_count(validation_gate_counts, str(row.get("validation_execution_gate") or "unknown"))
     commands = ordered_unique_strings(
         [
             str(command)
@@ -28993,6 +29048,14 @@ def build_bounty_action_queue(
                 if isinstance(row.get("validation_commands"), list)
                 else [row.get("safe_offline_command")]
             )
+            if command
+        ]
+    )
+    autorunnable_commands = ordered_unique_strings(
+        [
+            str(command)
+            for row in actions
+            for command in normalize_string_list(row.get("autorunnable_validation_commands"))
             if command
         ]
     )
@@ -29028,6 +29091,8 @@ def build_bounty_action_queue(
             "human_required": len(human_required),
             "blocked": len(blocked),
             "parked": len(parked),
+            "automation_ready": len(automation_ready),
+            "validation_safety_blocked": len(validation_safety_blocked),
             "top_action": top.get("id"),
             "top_kind": top.get("kind"),
             "top_lane": top.get("lane"),
@@ -29035,6 +29100,7 @@ def build_bounty_action_queue(
             "kind_counts": dict(sorted(kind_counts.items())),
             "actor_counts": dict(sorted(actor_counts.items())),
             "evidence_gate_counts": dict(sorted(evidence_gate_counts.items())),
+            "validation_gate_counts": dict(sorted(validation_gate_counts.items())),
             "claim_evidence_request_count": len(claim_request_by_key),
             "claim_evidence_claim_count": sum(
                 int(request.get("claim_count") or 0) for request in claim_request_by_key.values()
@@ -29059,6 +29125,7 @@ def build_bounty_action_queue(
         "blocked_actions": blocked[:8],
         "parked_actions": parked[:8],
         "commands": commands[:12],
+        "autorunnable_commands": autorunnable_commands[:12],
         "reportability_rule": (
             "This queue is workflow control only. It does not collect evidence, validate impact, or promote findings. "
             "Reportability still requires official evidence, lane readiness, finding-gate acceptance, and adjudication."
@@ -30473,6 +30540,10 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
     )
     rebuilt_ready_validation_commands = normalize_string_list(rebuilt_ready_action.get("validation_commands"))
     rebuilt_ready_validation_text = "\n".join(rebuilt_ready_validation_commands)
+    rebuilt_ready_autorunnable_commands = normalize_string_list(
+        rebuilt_ready_action.get("autorunnable_validation_commands")
+    )
+    rebuilt_ready_autorunnable_text = "\n".join(rebuilt_ready_autorunnable_commands)
     rebuilt_ready_validation_refs = [
         row
         for row in rebuilt_ready_action.get("validation_command_refs", []) or []
@@ -30489,6 +30560,10 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
         else {}
     )
     rebuilt_ready_queue_commands_text = "\n".join(normalize_string_list(rebuilt_ready_queue_case.get("commands")))
+    rebuilt_ready_queue_autorunnable_commands = normalize_string_list(
+        rebuilt_ready_queue_case.get("autorunnable_commands")
+    )
+    rebuilt_ready_queue_autorunnable_text = "\n".join(rebuilt_ready_queue_autorunnable_commands)
     rebuilt_ready_queue_summary = (
         rebuilt_ready_queue_case.get("summary")
         if isinstance(rebuilt_ready_queue_case.get("summary"), dict)
@@ -31029,6 +31104,28 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
                 "refs": rebuilt_ready_validation_refs,
                 "action_safety": rebuilt_ready_action_safety,
                 "queue_safety": rebuilt_ready_queue_safety,
+            },
+        },
+        {
+            "id": "ready-transaction-action-allows-only-safe-offline-autorun",
+            "passed": (
+                rebuilt_ready_action.get("validation_execution_gate") == "ready-offline-validation"
+                and rebuilt_ready_validation_commands == rebuilt_ready_autorunnable_commands
+                and rebuilt_ready_queue_summary.get("automation_ready") == 1
+                and rebuilt_ready_queue_summary.get("validation_safety_blocked") == 0
+                and rebuilt_ready_queue_summary.get("validation_gate_counts", {}).get("ready-offline-validation") == 1
+                and rebuilt_ready_queue_autorunnable_commands == rebuilt_ready_validation_commands
+                and "transaction-evidence-readiness --no-write --show-checks" in rebuilt_ready_autorunnable_text
+                and "decode-transactions --no-write" in rebuilt_ready_queue_autorunnable_text
+                and not normalize_string_list(action_case.get("autorunnable_validation_commands"))
+            ),
+            "expected": "only ready no-write validation chains are exposed as autorunnable",
+            "actual": {
+                "action_gate": rebuilt_ready_action.get("validation_execution_gate"),
+                "action_autorunnable": rebuilt_ready_autorunnable_commands,
+                "queue_summary": rebuilt_ready_queue_summary,
+                "queue_autorunnable": rebuilt_ready_queue_autorunnable_commands,
+                "waiting_action_autorunnable": normalize_string_list(action_case.get("autorunnable_validation_commands")),
             },
         },
         {
@@ -87056,6 +87153,7 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
         "Queue: "
         f"actions={summary.get('actions', 0)} "
         f"agent_ready={summary.get('agent_ready', 0)} "
+        f"automation_ready={summary.get('automation_ready', 0)} "
         f"human_required={summary.get('human_required', 0)} "
         f"blocked={summary.get('blocked', 0)} "
         f"parked={summary.get('parked', 0)} "
@@ -87073,6 +87171,7 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
     )
     print(f"Kinds: {json.dumps(summary.get('kind_counts', {}), sort_keys=True)}")
     print(f"Evidence gates: {json.dumps(summary.get('evidence_gate_counts', {}), sort_keys=True)}")
+    print(f"Validation gates: {json.dumps(summary.get('validation_gate_counts', {}), sort_keys=True)}")
     command_safety = summary.get("command_safety", {}) if isinstance(summary.get("command_safety"), dict) else {}
     if command_safety:
         print(f"Command safety: {format_command_safety_summary(command_safety)}")
@@ -87113,6 +87212,8 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
                 print(f"  needs={inline_summary_text(evidence, max_chars=300)}")
             if row.get("evidence_gate_status"):
                 print(f"  evidence_gate={row.get('evidence_gate_status')}")
+            if row.get("validation_execution_gate"):
+                print(f"  validation_gate={row.get('validation_execution_gate')}")
             validation_command_safety = (
                 row.get("validation_command_safety")
                 if isinstance(row.get("validation_command_safety"), dict)
@@ -87226,6 +87327,11 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
         print("Commands:")
         for command_text in normalize_string_list(queue.get("commands"))[:display_limit]:
             print(f"- {inline_summary_text(command_text, max_chars=420)}")
+        autorunnable = normalize_string_list(queue.get("autorunnable_commands"))
+        if autorunnable:
+            print("Autorunnable validation commands:")
+            for command_text in autorunnable[:display_limit]:
+                print(f"- {inline_summary_text(command_text, max_chars=420)}")
     print(f"Rule: {inline_summary_text(queue.get('reportability_rule'), max_chars=360)}")
     print(f"Next: {inline_summary_text(queue.get('next_step'), max_chars=360)}")
     if no_write:

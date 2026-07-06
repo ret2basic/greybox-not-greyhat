@@ -353,7 +353,11 @@ does not make the evidence reportable by itself. Each queued action and the
 queue summary also record command-safety totals for that validation chain, so an
 agent can distinguish runnable no-write validators from manual templates,
 external probes, resource-gated commands, or unsafe shell templates before any
-automatic execution.
+automatic execution. `validation_execution_gate` is the final automation guard:
+only actions with `ready-offline-validation` expose
+`autorunnable_validation_commands`; actions waiting for official evidence,
+manual input, external probes, or unsafe templates remain visible as workflow
+items but are not presented as agent-runnable validation chains.
 
 `claim-evidence-requests` also uses that queue context for its default ordering:
 in bounty mode, evidence for the highest-ranked action comes before a broader
