@@ -201,6 +201,7 @@ TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
 TRANSACTION_SIDECAR_REVIEW_ARTIFACT = "transaction-sidecar-review.json"
 TRANSACTION_PAYLOAD_PREFLIGHT_ARTIFACT = "transaction-payload-preflight.json"
 TRANSACTION_CORPUS_PREFLIGHT_ARTIFACT = "transaction-corpus-preflight.json"
+TRANSACTION_CORPUS_SIDECAR_PREP_ARTIFACT = "transaction-corpus-sidecar-prep.json"
 TRANSACTION_EVIDENCE_READINESS_ARTIFACT = "transaction-evidence-readiness.json"
 TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT = "transaction-intent-policy-templates.json"
 CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT = "credential-impact-checklist.json"
@@ -22814,12 +22815,14 @@ def claim_evidence_request_source_readiness(
             status = "waiting-approved-quote-capture"
         preflight_command = transaction_payload_preflight_command(artifact_dir, profile=profile)
         corpus_preflight_command = transaction_corpus_preflight_command(artifact_dir, profile=profile)
+        sidecar_prepare_command = transaction_corpus_sidecar_prepare_command(artifact_dir, profile=profile)
         return {
             **base,
             "status": status,
             "local_candidate_count": local_count,
             "preflight_command": preflight_command,
             "corpus_preflight_command": corpus_preflight_command,
+            "sidecar_prepare_command": sidecar_prepare_command,
             "sources": [
                 {
                     "artifact": "burp-transaction-candidates.json",
@@ -22866,6 +22869,7 @@ def claim_evidence_request_source_readiness(
                 or repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json"),
                 "preflight_command": preflight_command,
                 "corpus_preflight_command": corpus_preflight_command,
+                "sidecar_prepare_command": sidecar_prepare_command,
                 "last_preflight_status": preflight.get("status") or None,
                 "accepted_payload_sidecars": normalize_string_list(approval_packet.get("accepted_payload_sidecars"))[:4],
                 "required_fields": normalize_string_list(approval_packet.get("redacted_sidecar_required_fields"))[:6],
@@ -28257,6 +28261,7 @@ def bounty_action_claim_request_rows(
                     "official_evidence_still_required": source.get("official_evidence_still_required", True),
                     "preflight_command": source.get("preflight_command"),
                     "corpus_preflight_command": source.get("corpus_preflight_command"),
+                    "sidecar_prepare_command": source.get("sidecar_prepare_command"),
                     "next_step": source.get("next_step"),
                     "handoff_contract": {
                         "status": handoff.get("status"),
@@ -28270,6 +28275,7 @@ def bounty_action_claim_request_rows(
                         "intent_policy_sidecar": handoff.get("intent_policy_sidecar"),
                         "preflight_command": handoff.get("preflight_command"),
                         "corpus_preflight_command": handoff.get("corpus_preflight_command"),
+                        "sidecar_prepare_command": handoff.get("sidecar_prepare_command"),
                         "last_preflight_status": handoff.get("last_preflight_status"),
                         "required_fields": normalize_string_list(handoff.get("required_fields"))[:4],
                         "offline_commands": normalize_string_list(handoff.get("offline_commands"))[:3],
@@ -30850,6 +30856,15 @@ def bounty_evidence_request_markdown(
                                 "  - Corpus preflight:",
                                 "```bash",
                                 str(source.get("corpus_preflight_command")),
+                                "```",
+                            ]
+                        )
+                    if source.get("sidecar_prepare_command"):
+                        lines.extend(
+                            [
+                                "  - Sidecar prepare:",
+                                "```bash",
+                                str(source.get("sidecar_prepare_command")),
                                 "```",
                             ]
                         )
@@ -59214,6 +59229,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         transaction_sidecar_review_output_dir = root / "transaction-sidecar-review-output"
         transaction_payload_preflight_output_dir = root / "transaction-payload-preflight-output"
         transaction_corpus_preflight_output_dir = root / "transaction-corpus-preflight-output"
+        transaction_corpus_sidecar_prep_output_dir = root / "transaction-corpus-sidecar-prep-output"
         transaction_corpus_checklist_output_dir = root / "transaction-corpus-checklist-output"
         credential_impact_checklist_output_dir = root / "credential-impact-checklist-output"
         operator_evidence_review_output_dir = root / "operator-evidence-review-output"
@@ -59606,6 +59622,32 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--show-commands",
                 ]
             )
+            transaction_corpus_sidecar_prep_return_code, transaction_corpus_sidecar_prep_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(transaction_corpus_sidecar_prep_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "prepare-transaction-corpus-sidecars",
+                    "--request-input",
+                    str(approved_quote_request_input),
+                    "--payload-input",
+                    str(approved_payload_preflight_input),
+                    "--approval-reference",
+                    "SELFTEST-APPROVED-CORPUS",
+                    "--redaction-note",
+                    "Synthetic no-write self-test corpus.",
+                    "--no-write",
+                    "--show-policy-json",
+                    "--show-payload-summary-json",
+                    "--show-checks",
+                    "--show-commands",
+                ]
+            )
             transaction_corpus_checklist_return_code, transaction_corpus_checklist_stdout = run_cli(
                 [
                     "--profile",
@@ -59903,6 +59945,22 @@ def build_no_write_selftest() -> dict[str, Any]:
             "transaction_corpus_preflight_manifest": (
                 transaction_corpus_preflight_output_dir / MANIFEST_NAME
             ).exists(),
+            "transaction_corpus_sidecar_prep_dir": transaction_corpus_sidecar_prep_output_dir.exists(),
+            "transaction_corpus_sidecar_prep_target_profile_json": (
+                transaction_corpus_sidecar_prep_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "transaction_corpus_sidecar_prep_json": (
+                transaction_corpus_sidecar_prep_output_dir / TRANSACTION_CORPUS_SIDECAR_PREP_ARTIFACT
+            ).exists(),
+            "transaction_corpus_sidecar_prep_official_payload_jsonl": (
+                transaction_corpus_sidecar_prep_output_dir / "transaction-payloads.jsonl"
+            ).exists(),
+            "transaction_corpus_sidecar_prep_official_policy_json": (
+                transaction_corpus_sidecar_prep_output_dir / "transaction-intent-policy.json"
+            ).exists(),
+            "transaction_corpus_sidecar_prep_manifest": (
+                transaction_corpus_sidecar_prep_output_dir / MANIFEST_NAME
+            ).exists(),
             "transaction_corpus_checklist_dir": transaction_corpus_checklist_output_dir.exists(),
             "transaction_corpus_checklist_target_profile_json": (
                 transaction_corpus_checklist_output_dir / TARGET_PROFILE_ARTIFACT
@@ -60000,6 +60058,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     transaction_sidecar_review_stdout_text = "\n".join(transaction_sidecar_review_stdout)
     transaction_payload_preflight_stdout_text = "\n".join(transaction_payload_preflight_stdout)
     transaction_corpus_preflight_stdout_text = "\n".join(transaction_corpus_preflight_stdout)
+    transaction_corpus_sidecar_prep_stdout_text = "\n".join(transaction_corpus_sidecar_prep_stdout)
     transaction_corpus_checklist_stdout_text = "\n".join(transaction_corpus_checklist_stdout)
     credential_impact_checklist_stdout_text = "\n".join(credential_impact_checklist_stdout)
     operator_evidence_review_stdout_text = "\n".join(operator_evidence_review_stdout)
@@ -61136,6 +61195,40 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": transaction_corpus_preflight_return_code,
                 "stdout": transaction_corpus_preflight_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "transaction-corpus-sidecar-prep-no-write-skips-artifacts",
+            "passed": (
+                transaction_corpus_sidecar_prep_return_code == 0
+                and "Transaction corpus sidecar prepare: ready-to-write-official-sidecars"
+                in transaction_corpus_sidecar_prep_stdout_text
+                and "Intent policy sidecar preview JSON:" in transaction_corpus_sidecar_prep_stdout_text
+                and "Payload sidecar summary JSON:" in transaction_corpus_sidecar_prep_stdout_text
+                and "Official sidecars written: false" in transaction_corpus_sidecar_prep_stdout_text
+                and "decode-transactions --no-write" in transaction_corpus_sidecar_prep_stdout_text
+                and "No files written (--no-write)." in transaction_corpus_sidecar_prep_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "transaction_corpus_sidecar_prep_dir",
+                        "transaction_corpus_sidecar_prep_target_profile_json",
+                        "transaction_corpus_sidecar_prep_json",
+                        "transaction_corpus_sidecar_prep_official_payload_jsonl",
+                        "transaction_corpus_sidecar_prep_official_policy_json",
+                        "transaction_corpus_sidecar_prep_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in transaction_corpus_sidecar_prep_stdout)
+            ),
+            "expected": (
+                "prepare-transaction-corpus-sidecars --no-write previews approved sidecar assembly without writing "
+                "official sidecars, prep artifacts, target profiles, or manifests"
+            ),
+            "actual": {
+                "return_code": transaction_corpus_sidecar_prep_return_code,
+                "stdout": transaction_corpus_sidecar_prep_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -63692,6 +63785,20 @@ def transaction_corpus_preflight_command(
     )
 
 
+def transaction_corpus_sidecar_prepare_command(
+    artifact_dir: Path,
+    *,
+    profile: dict[str, Any] | None,
+) -> str:
+    return validation_command_for_artifact_dir(
+        artifact_dir,
+        "prepare-transaction-corpus-sidecars --request-input REPLACE_WITH_APPROVED_QUOTE_REQUEST_JSON "
+        "--payload-input REPLACE_WITH_APPROVED_QUOTE_RESPONSE_OR_PAYLOAD "
+        "--approval-reference REPLACE_WITH_APPROVAL_REFERENCE --no-write --show-policy-json --show-commands",
+        profile=profile,
+    )
+
+
 def transaction_payload_preflight_segments(text: str, *, source: str) -> list[tuple[str, str]]:
     if not text.strip():
         return []
@@ -64507,6 +64614,215 @@ def build_transaction_corpus_preflight(
             "Offline corpus preflight only. It reads local files under byte caps, records redacted request intent and "
             "payload metadata, writes no official evidence sidecars, sends no requests, invokes no Burp tools, starts "
             "no browser, signs no wallet, submits no transaction, and changes no infrastructure."
+        ),
+    }
+
+
+def transaction_corpus_sidecar_payload_record(
+    *,
+    request_review: dict[str, Any],
+    payload_text: str,
+    request_meta: dict[str, Any],
+    payload_meta: dict[str, Any],
+    approval_reference: str,
+    redaction_notes: list[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    stripped_payload = payload_text.strip()
+    payload_value: Any
+    payload_format = "text"
+    try:
+        payload_value = json.loads(stripped_payload) if stripped_payload else None
+    except json.JSONDecodeError:
+        segments = transaction_payload_preflight_segments(payload_text, source=str(payload_meta.get("source") or "payload"))
+        json_segments = []
+        if segments:
+            for _segment_source, segment_text in segments:
+                try:
+                    json_segments.append(json.loads(segment_text))
+                except json.JSONDecodeError:
+                    json_segments = []
+                    break
+        if len(json_segments) == 1:
+            payload_value = json_segments[0]
+            payload_format = "jsonl-single-json"
+        else:
+            payload_value = {"transaction": stripped_payload}
+            payload_format = "extracted-text"
+    else:
+        payload_format = "json"
+
+    request_input = request_review.get("input") if isinstance(request_review.get("input"), dict) else request_meta
+    extracted_intent = (
+        request_review.get("extracted_intent")
+        if isinstance(request_review.get("extracted_intent"), dict)
+        else {}
+    )
+    record = {
+        "schema": "inferforge-approved-transaction-payload-sidecar-v1",
+        "approval_reference": approval_reference,
+        "redaction_notes": redaction_notes,
+        "request_text_sha256": request_input.get("text_sha256") or request_meta.get("text_sha256"),
+        "payload_text_sha256": payload_meta.get("text_sha256"),
+        "approved_request_intent": {
+            key: value
+            for key, value in extracted_intent.items()
+            if key in {"sourceMint", "destinationMint", "amountIn", "wallet", "recipient", "sourceChain", "destinationChain"}
+        },
+        "approved_payload": payload_value,
+    }
+    summary = {
+        "schema": record["schema"],
+        "approval_reference": approval_reference,
+        "payload_format": payload_format,
+        "payload_text_sha256": payload_meta.get("text_sha256"),
+        "request_text_sha256": request_input.get("text_sha256") or request_meta.get("text_sha256"),
+        "redaction_notes": redaction_notes,
+        "approved_payload_container": (
+            "json-object"
+            if isinstance(payload_value, dict)
+            else "json-array"
+            if isinstance(payload_value, list)
+            else "none"
+            if payload_value is None
+            else type(payload_value).__name__
+        ),
+        "intent_keys": sorted(record.get("approved_request_intent", {}).keys()),
+    }
+    return record, summary
+
+
+def build_transaction_corpus_sidecar_prepare(
+    *,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    request_text: str,
+    request_meta: dict[str, Any],
+    payload_text: str,
+    payload_meta: dict[str, Any],
+    explicit_direction: str | None,
+    approval_reference: str,
+    redaction_notes: list[str],
+    max_input_bytes: int,
+) -> dict[str, Any]:
+    corpus_preflight = build_transaction_corpus_preflight(
+        profile=profile,
+        artifact_dir=artifact_dir,
+        request_text=request_text,
+        request_meta=request_meta,
+        payload_text=payload_text,
+        payload_meta=payload_meta,
+        explicit_direction=explicit_direction,
+        max_input_bytes=max_input_bytes,
+    )
+    request_review = (
+        corpus_preflight.get("request_review")
+        if isinstance(corpus_preflight.get("request_review"), dict)
+        else {}
+    )
+    policy = (
+        request_review.get("intent_policy_preview")
+        if isinstance(request_review.get("intent_policy_preview"), dict)
+        else {}
+    )
+    target_payload_sidecar = artifact_dir / "transaction-payloads.jsonl"
+    target_policy_sidecar = artifact_dir / "transaction-intent-policy.json"
+    approval_reference = str(approval_reference or "").strip()
+    issues = []
+    if corpus_preflight.get("status") != "ready-for-approved-corpus-sidecars":
+        issues.append(
+            f"transaction-corpus-preflight status is {corpus_preflight.get('status')}; ready-for-approved-corpus-sidecars is required"
+        )
+    if not approval_reference:
+        issues.append("approval-reference is required before official sidecars can be prepared")
+    if not policy.get("valid"):
+        issues.append("derived transaction intent policy is not valid")
+    payload_record, payload_record_summary = transaction_corpus_sidecar_payload_record(
+        request_review=request_review,
+        payload_text=payload_text,
+        request_meta=request_meta,
+        payload_meta=payload_meta,
+        approval_reference=approval_reference or "missing",
+        redaction_notes=redaction_notes,
+    )
+    policy_sidecar = {
+        key: policy.get(key)
+        for key in ["direction", "wallet", "amountIn", "sourceMint", "destinationMint", "allowedPrograms"]
+        if policy.get(key) is not None
+    }
+    if not normalize_string_list(policy_sidecar.get("allowedPrograms")):
+        policy_sidecar.pop("allowedPrograms", None)
+    status = "ready-to-write-official-sidecars" if not issues else "not-ready-to-write-official-sidecars"
+    followup_commands = [
+        {
+            "id": "sidecar-review",
+            "command": validation_command_for_artifact_dir(
+                artifact_dir,
+                "transaction-sidecar-review --no-write --show-files --show-candidates --show-commands",
+                profile=profile,
+            ),
+            "purpose": "Review official sidecars after they are written.",
+        },
+        {
+            "id": "decode-preview",
+            "command": validation_command_for_artifact_dir(
+                artifact_dir,
+                f"decode-transactions --no-write --input {shlex.quote(repo_relative_or_absolute(target_payload_sidecar))} "
+                f"--intent-direction {shlex.quote(str(policy_sidecar.get('direction') or 'REPLACE_WITH_DIRECTION'))} "
+                f"--intent-wallet {shlex.quote(str(policy_sidecar.get('wallet') or 'REPLACE_WITH_WALLET'))} "
+                f"--intent-amount-in {shlex.quote(str(policy_sidecar.get('amountIn') or 'REPLACE_WITH_AMOUNT_IN'))} "
+                f"--max-input-bytes {max_input_bytes}",
+                profile=profile,
+            ),
+            "purpose": "Decode the approved sidecar without signing or submitting transactions.",
+        },
+        {
+            "id": "finding-gate-preview",
+            "command": validation_command_for_artifact_dir(
+                artifact_dir,
+                "gate --no-write --show-items",
+                profile=profile,
+            ),
+            "purpose": "Check whether decoded impact can enter finding-gate review.",
+        },
+    ]
+    for row in followup_commands:
+        row["command_safety_ref"] = validation_command_ref(
+            str(row.get("command") or ""),
+            source=f"prepare-transaction-corpus-sidecars:{row.get('id')}",
+        )
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-transaction-corpus-sidecar-prep-v1",
+        "status": status,
+        "issues": ordered_unique_strings(issues),
+        "approval_reference": approval_reference or None,
+        "redaction_notes": redaction_notes,
+        "target_official_sidecars": {
+            "payload": repo_relative_or_absolute(target_payload_sidecar),
+            "intent_policy": repo_relative_or_absolute(target_policy_sidecar),
+        },
+        "corpus_preflight_status": corpus_preflight.get("status"),
+        "corpus_preflight_summary": corpus_preflight.get("summary", {}),
+        "payload_sidecar_line_summary": payload_record_summary,
+        "intent_policy_sidecar_preview": policy_sidecar,
+        "payload_sidecar_line": payload_record,
+        "followup_commands": followup_commands,
+        "command_safety": command_safety_summary(
+            [
+                row.get("command_safety_ref")
+                for row in followup_commands
+                if isinstance(row.get("command_safety_ref"), dict)
+            ]
+        ),
+        "official_sidecars_written": False,
+        "finding_gate_boundary": (
+            "Preparing sidecars is not evidence validation, not a PoC, and not a finding. The official sidecars "
+            "must still pass transaction-sidecar-review, decode-transactions, finding-gate, and adjudication."
+        ),
+        "safety": (
+            "Offline sidecar preparation only. It reads approved local files under byte caps, writes official "
+            "sidecars only behind an explicit write flag and approval reference, sends no requests, invokes no Burp "
+            "tools, starts no browser, signs no wallet, submits no transaction, and changes no infrastructure."
         ),
     }
 
@@ -82760,46 +83076,7 @@ def run_transaction_corpus_preflight(args: argparse.Namespace) -> int:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         write_target_profile_artifact(artifact_dir, profile, target, source_root)
 
-    request_input = str(getattr(args, "request_input", "") or "").strip()
-    payload_input = str(getattr(args, "payload_input", "") or "").strip()
-    request_text = ""
-    payload_text = ""
-    request_meta: dict[str, Any] = {
-        "source": "missing",
-        "source_kind": "missing",
-        "raw_input_persisted": False,
-        "max_input_bytes": args.max_input_bytes,
-        "status": "missing-input",
-        "reason": "provide --request-input PATH or --request-input - with --payload-input PATH",
-    }
-    payload_meta: dict[str, Any] = {
-        "source": "missing",
-        "source_kind": "missing",
-        "raw_input_persisted": False,
-        "max_input_bytes": args.max_input_bytes,
-        "status": "missing-input",
-        "reason": "provide --payload-input PATH or --payload-input - with --request-input PATH",
-    }
-    if request_input == "-" and payload_input == "-":
-        request_meta["source"] = "stdin"
-        payload_meta["source"] = "stdin"
-        request_meta["source_kind"] = "stdin"
-        payload_meta["source_kind"] = "stdin"
-        request_meta["reason"] = "one stdin stream cannot safely provide both approved corpus inputs; use a file for one side"
-        payload_meta["reason"] = "one stdin stream cannot safely provide both approved corpus inputs; use a file for one side"
-    else:
-        if request_input:
-            request_text, request_meta = read_transaction_payload_preflight_input(
-                request_input,
-                max_input_bytes=args.max_input_bytes,
-            )
-        if payload_input:
-            payload_text, payload_meta = read_transaction_payload_preflight_input(
-                payload_input,
-                max_input_bytes=args.max_input_bytes,
-            )
-    request_meta["role"] = "approved-quote-request"
-    payload_meta["role"] = "approved-quote-response-or-payload"
+    request_text, request_meta, payload_text, payload_meta = read_transaction_corpus_pair_inputs(args)
     preflight = build_transaction_corpus_preflight(
         profile=profile,
         artifact_dir=artifact_dir,
@@ -82901,6 +83178,203 @@ def run_transaction_corpus_preflight(args: argparse.Namespace) -> int:
         print_refreshed_manifests(refreshed_manifests)
     if getattr(args, "strict", False) and preflight.get("status") != "ready-for-approved-corpus-sidecars":
         return 1
+    return 0
+
+
+def read_transaction_corpus_pair_inputs(args: argparse.Namespace) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
+    request_input = str(getattr(args, "request_input", "") or "").strip()
+    payload_input = str(getattr(args, "payload_input", "") or "").strip()
+    request_text = ""
+    payload_text = ""
+    request_meta: dict[str, Any] = {
+        "source": "missing",
+        "source_kind": "missing",
+        "raw_input_persisted": False,
+        "max_input_bytes": args.max_input_bytes,
+        "status": "missing-input",
+        "reason": "provide --request-input PATH or --request-input - with --payload-input PATH",
+    }
+    payload_meta: dict[str, Any] = {
+        "source": "missing",
+        "source_kind": "missing",
+        "raw_input_persisted": False,
+        "max_input_bytes": args.max_input_bytes,
+        "status": "missing-input",
+        "reason": "provide --payload-input PATH or --payload-input - with --request-input PATH",
+    }
+    if request_input == "-" and payload_input == "-":
+        request_meta["source"] = "stdin"
+        payload_meta["source"] = "stdin"
+        request_meta["source_kind"] = "stdin"
+        payload_meta["source_kind"] = "stdin"
+        request_meta["reason"] = "one stdin stream cannot safely provide both approved corpus inputs; use a file for one side"
+        payload_meta["reason"] = "one stdin stream cannot safely provide both approved corpus inputs; use a file for one side"
+    else:
+        if request_input:
+            request_text, request_meta = read_transaction_payload_preflight_input(
+                request_input,
+                max_input_bytes=args.max_input_bytes,
+            )
+        if payload_input:
+            payload_text, payload_meta = read_transaction_payload_preflight_input(
+                payload_input,
+                max_input_bytes=args.max_input_bytes,
+            )
+    request_meta["role"] = "approved-quote-request"
+    payload_meta["role"] = "approved-quote-response-or-payload"
+    return request_text, request_meta, payload_text, payload_meta
+
+
+def run_prepare_transaction_corpus_sidecars(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    write_official = bool(getattr(args, "write_official_sidecars", False))
+    if no_write and write_official:
+        print("Transaction corpus sidecar prepare error: --no-write cannot be combined with --write-official-sidecars")
+        return 2
+
+    request_text, request_meta, payload_text, payload_meta = read_transaction_corpus_pair_inputs(args)
+    prep = build_transaction_corpus_sidecar_prepare(
+        profile=profile,
+        artifact_dir=artifact_dir,
+        request_text=request_text,
+        request_meta=request_meta,
+        payload_text=payload_text,
+        payload_meta=payload_meta,
+        explicit_direction=getattr(args, "direction", None),
+        approval_reference=getattr(args, "approval_reference", None) or "",
+        redaction_notes=normalize_string_list(getattr(args, "redaction_note", None)),
+        max_input_bytes=args.max_input_bytes,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if getattr(args, "output", None)
+        else artifact_dir / TRANSACTION_CORPUS_SIDECAR_PREP_ARTIFACT
+    )
+    payload_sidecar_path = artifact_dir / "transaction-payloads.jsonl"
+    policy_sidecar_path = artifact_dir / "transaction-intent-policy.json"
+    target_sidecars = [payload_sidecar_path, policy_sidecar_path]
+    write_errors = []
+    if write_official and prep.get("status") != "ready-to-write-official-sidecars":
+        write_errors.append("preparation is not ready; rerun with --show-checks and fix issues before writing")
+    if write_official and not getattr(args, "replace", False):
+        existing = [repo_relative_or_absolute(path) for path in target_sidecars if path.exists()]
+        if existing:
+            write_errors.append(
+                "official sidecar already exists; use --replace only after reviewing the existing approved evidence: "
+                + ", ".join(existing)
+            )
+
+    refreshed_manifests = []
+    official_written = False
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+        if write_official and not write_errors:
+            payload_line = json.dumps(prep.get("payload_sidecar_line", {}), sort_keys=True)
+            payload_sidecar_path.write_text(payload_line + "\n", encoding="utf-8")
+            write_json(policy_sidecar_path, prep.get("intent_policy_sidecar_preview", {}))
+            official_written = True
+        prep["official_sidecars_written"] = official_written
+        prep["write_errors"] = write_errors
+        write_json(output_path, sanitize_artifact_samples(prep))
+        output_paths = [*target_profile_artifact_paths(artifact_dir), output_path]
+        if official_written:
+            output_paths.extend(target_sidecars)
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="prepare-transaction-corpus-sidecars",
+            output_paths=output_paths,
+        )
+    else:
+        prep["write_errors"] = write_errors
+
+    policy_preview = (
+        prep.get("intent_policy_sidecar_preview")
+        if isinstance(prep.get("intent_policy_sidecar_preview"), dict)
+        else {}
+    )
+    payload_summary = (
+        prep.get("payload_sidecar_line_summary")
+        if isinstance(prep.get("payload_sidecar_line_summary"), dict)
+        else {}
+    )
+    print(f"Transaction corpus sidecar prepare: {prep.get('status')}")
+    print(
+        "Inputs: "
+        f"request={request_meta.get('status') or '-'} "
+        f"payload={payload_meta.get('status') or '-'} "
+        f"preflight={prep.get('corpus_preflight_status') or '-'}"
+    )
+    print(
+        "Targets: "
+        f"payload={repo_relative_or_absolute(payload_sidecar_path)} "
+        f"policy={repo_relative_or_absolute(policy_sidecar_path)}"
+    )
+    print(
+        "Payload sidecar line: "
+        f"format={payload_summary.get('payload_format') or '-'} "
+        f"container={payload_summary.get('approved_payload_container') or '-'} "
+        f"payload_sha256={payload_summary.get('payload_text_sha256') or '-'}"
+    )
+    print(
+        "Intent policy: "
+        f"direction={policy_preview.get('direction') or '-'} "
+        f"wallet_present={bool(policy_preview.get('wallet'))} "
+        f"amountIn={policy_preview.get('amountIn') or '-'} "
+        f"allowed_programs={len(normalize_string_list(policy_preview.get('allowedPrograms')))}"
+    )
+    issues = normalize_string_list(prep.get("issues"))
+    if getattr(args, "show_checks", False):
+        print("Write checks:")
+        if issues:
+            for issue in issues[: max(0, int(args.top))]:
+                print(f"- failed {inline_summary_text(issue, max_chars=260)}")
+        else:
+            print("- passed corpus preflight and approval reference")
+        for error in write_errors[: max(0, int(args.top))]:
+            print(f"- write-blocked {inline_summary_text(error, max_chars=260)}")
+    if getattr(args, "show_policy_json", False):
+        print("Intent policy sidecar preview JSON:")
+        print(json.dumps(policy_preview, indent=2, sort_keys=True))
+    if getattr(args, "show_payload_summary_json", False):
+        print("Payload sidecar summary JSON:")
+        print(json.dumps(payload_summary, indent=2, sort_keys=True))
+    if getattr(args, "show_commands", False):
+        print("Follow-up commands:")
+        for row in (prep.get("followup_commands", []) or [])[: max(0, int(args.top))]:
+            if not isinstance(row, dict):
+                continue
+            safety = (
+                (row.get("command_safety_ref") or {}).get("classification")
+                if isinstance(row.get("command_safety_ref"), dict)
+                else "-"
+            )
+            print(
+                f"- {row.get('id')} safety={safety} "
+                f"command={inline_summary_text(row.get('command'), max_chars=520)}"
+            )
+    if getattr(args, "show_json", False):
+        print("Sidecar prep JSON:")
+        print(json.dumps(sanitize_artifact_samples(prep), indent=2, sort_keys=False))
+    print(f"Official sidecars written: {str(official_written).lower()}")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        if official_written:
+            print(f"Wrote {payload_sidecar_path}")
+            print(f"Wrote {policy_sidecar_path}")
+        elif write_errors:
+            print("Official sidecar write blocked:")
+            for error in write_errors[: max(0, int(args.top))]:
+                print(f"- {inline_summary_text(error, max_chars=320)}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and (prep.get("status") != "ready-to-write-official-sidecars" or write_errors):
+        return 1
+    if write_official and write_errors:
+        return 2
     return 0
 
 
@@ -84144,6 +84618,11 @@ def run_claim_evidence_requests(args: argparse.Namespace) -> int:
                     print(
                         "  corpus_preflight="
                         f"{inline_summary_text(source.get('corpus_preflight_command'), max_chars=420)}"
+                    )
+                if source.get("sidecar_prepare_command") and getattr(args, "show_requests", False):
+                    print(
+                        "  sidecar_prepare="
+                        f"{inline_summary_text(source.get('sidecar_prepare_command'), max_chars=420)}"
                     )
             if draft.get("draft_path"):
                 print(f"  draft_path={draft.get('draft_path')}")
@@ -85938,6 +86417,11 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
                         print(
                             "  claim_corpus_preflight="
                             f"{inline_summary_text(first_source.get('corpus_preflight_command'), max_chars=420)}"
+                        )
+                    if first_source.get("sidecar_prepare_command") and getattr(args, "show_commands", False):
+                        print(
+                            "  claim_sidecar_prepare="
+                            f"{inline_summary_text(first_source.get('sidecar_prepare_command'), max_chars=420)}"
                         )
                 if row.get("claim_evidence_first_verification_command") and getattr(args, "show_commands", False):
                     print(
@@ -90735,6 +91219,107 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless both request intent and payload are ready for official sidecar copy.",
     )
     transaction_corpus_preflight.set_defaults(func=run_transaction_corpus_preflight)
+
+    prepare_transaction_corpus_sidecars = sub.add_parser(
+        "prepare-transaction-corpus-sidecars",
+        help="Preview or explicitly write approved transaction payload and intent-policy sidecars from one corpus pair",
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--request-input",
+        help="Approved local JSON quote request body. Use '-' for stdin only when payload-input is a file.",
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--payload-input",
+        help="Matching approved JSON/JSONL/text quote response or extracted payload. Use '-' for stdin only when request-input is a file.",
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--approval-reference",
+        help="Human/operator approval reference for this exact request/response corpus. Required before official writes.",
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--redaction-note",
+        action="append",
+        help="Redaction note for this approved corpus. Repeat for multiple notes.",
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--direction",
+        choices=["buy", "sell"],
+        help="Optional approved direction; if omitted, direction is inferred from request mints.",
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--output",
+        help=(
+            f"Where to write {TRANSACTION_CORPUS_SIDECAR_PREP_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{TRANSACTION_CORPUS_SIDECAR_PREP_ARTIFACT}."
+        ),
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--max-input-bytes",
+        type=positive_int,
+        default=DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+        help=(
+            "Maximum bytes to read from each approved corpus input. "
+            f"Defaults to {DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES}."
+        ),
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of checks, write blockers, or commands to print.",
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--show-policy-json",
+        action="store_true",
+        help="Print the official transaction-intent-policy.json preview.",
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--show-payload-summary-json",
+        action="store_true",
+        help="Print the redacted payload sidecar line summary.",
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--show-checks",
+        action="store_true",
+        help="Print readiness and write-blocking checks.",
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print sidecar review, decode, and finding-gate follow-up commands.",
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--show-json",
+        action="store_true",
+        help="Print the sanitized sidecar-prep JSON report.",
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--write-official-sidecars",
+        action="store_true",
+        help=(
+            "Write transaction-payloads.jsonl and transaction-intent-policy.json only after the corpus preflight "
+            "is ready and --approval-reference is present."
+        ),
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--replace",
+        action="store_true",
+        help="Allow replacing existing official transaction sidecars after manual review.",
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Preview sidecar preparation only; do not write {TRANSACTION_CORPUS_SIDECAR_PREP_ARTIFACT}, official "
+            "sidecars, target profile, or refreshed manifests."
+        ),
+    )
+    prepare_transaction_corpus_sidecars.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless the approved corpus is ready to write official sidecars.",
+    )
+    prepare_transaction_corpus_sidecars.set_defaults(func=run_prepare_transaction_corpus_sidecars)
 
     transaction_sidecar_review = sub.add_parser(
         "transaction-sidecar-review",

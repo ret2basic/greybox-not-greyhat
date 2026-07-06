@@ -1194,6 +1194,7 @@ python3 scripts/inferforge.py lead-dossier --no-write --show-commands --show-evi
 python3 scripts/inferforge.py rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract --show-sidecar-template-json
 python3 scripts/inferforge.py transaction-payload-preflight --input ./approved-payloads.jsonl --no-write --show-records --show-commands
 python3 scripts/inferforge.py transaction-corpus-preflight --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --no-write --show-policy-json --show-checks --show-commands
+python3 scripts/inferforge.py prepare-transaction-corpus-sidecars --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --approval-reference APPROVED-QUOTE-001 --no-write --show-policy-json --show-checks --show-commands
 python3 scripts/inferforge.py transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract
 python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-commands --show-steps --show-payload-template-json --skip-current-resource-check
 python3 scripts/inferforge.py decode-transactions
@@ -1252,6 +1253,16 @@ side at a time; the other side must be a file so the tool never tries to read th
 same stream twice. A `ready-for-approved-corpus-sidecars` result only means the
 operator-reviewed request/response pair is ready to be copied into the official
 payload and intent-policy sidecars after approval.
+
+`prepare-transaction-corpus-sidecars --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --approval-reference APPROVED-QUOTE-001 --no-write --show-policy-json --show-checks --show-commands`
+previews that final offline assembly step. It reuses the paired corpus preflight,
+builds the exact `transaction-payloads.jsonl` JSONL line and
+`transaction-intent-policy.json` object that would be written, and prints the
+sidecar review, decode, and finding-gate follow-up commands. It writes no
+official sidecars unless `--write-official-sidecars` is also supplied, the
+preflight is ready, an approval reference is present, and existing sidecars are
+not being overwritten. Use `--replace` only after reviewing the existing official
+evidence files.
 
 `transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract` prints the
 accepted sidecar files, configured candidate paths, and compact JSON/JSONL/TXT
