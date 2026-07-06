@@ -9399,7 +9399,7 @@ METHODOLOGY_RESEARCH_SOURCES = [
     {
         "id": "owasp-wstg-business-logic",
         "title": "OWASP WSTG: Business Logic Testing",
-        "url": "https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/10-Business_Logic_Testing/README",
+        "url": "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/10-Business_Logic_Testing/README",
         "role": "business-logic-testing-reference",
         "takeaway": "Map each high-value endpoint to data validation, request forgery, integrity, workflow, and misuse/limit tests before running probes.",
     },
@@ -9416,6 +9416,20 @@ METHODOLOGY_RESEARCH_SOURCES = [
         "url": "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/",
         "role": "api-property-authorization-evidence-reference",
         "takeaway": "Mass-assignment or excessive-property exposure claims require proof that sensitive properties are readable or writable beyond the user's authorization.",
+    },
+    {
+        "id": "owasp-api4-resource-consumption",
+        "title": "OWASP API4:2023 Unrestricted Resource Consumption",
+        "url": "https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/",
+        "role": "api-resource-consumption-evidence-reference",
+        "takeaway": "Resource-consumption claims need bounded proof of missing limits, provider cost, quota, or availability impact without stress traffic.",
+    },
+    {
+        "id": "owasp-api6-sensitive-business-flows",
+        "title": "OWASP API6:2023 Unrestricted Access to Sensitive Business Flows",
+        "url": "https://owasp.org/API-Security/editions/2023/en/0xa6-unrestricted-access-to-sensitive-business-flows/",
+        "role": "api-sensitive-business-flow-reference",
+        "takeaway": "Bounty-relevant business-flow claims require naming the protected flow, expected anti-automation or workflow control, and concrete business harm.",
     },
     {
         "id": "portswigger-business-logic",
@@ -13416,8 +13430,18 @@ BUSINESS_LOGIC_TEST_LIBRARY: dict[str, dict[str, Any]] = {
     },
     "misuse-limits": {
         "title": "Application misuse and function-use limits",
-        "source_ids": ["owasp-wstg-business-logic", "portswigger-business-logic"],
+        "source_ids": [
+            "owasp-wstg-business-logic",
+            "owasp-api4-resource-consumption",
+            "owasp-api6-sensitive-business-flows",
+            "portswigger-business-logic",
+        ],
         "question": "Can repeated or unauthenticated use consume quota, availability, provider budget, or other scarce resources?",
+    },
+    "sensitive-business-flow": {
+        "title": "Sensitive business flow restriction",
+        "source_ids": ["owasp-api6-sensitive-business-flows", "portswigger-business-logic"],
+        "question": "Does the endpoint expose a protected purchase, quote, reservation, referral, provider, or workflow action that needs anti-automation, quota, role, or workflow controls?",
     },
 }
 
@@ -13497,7 +13521,7 @@ API_AUTHORIZATION_PROFILE_LIBRARY: dict[str, dict[str, Any]] = {
     },
     "function-use-limit-boundary": {
         "title": "Function-use and resource boundary",
-        "source_ids": ["owasp-wstg-business-logic"],
+        "source_ids": ["owasp-wstg-business-logic", "owasp-api4-resource-consumption", "owasp-api6-sensitive-business-flows"],
         "evidence_question": (
             "Can an attacker use an intended function in a way that consumes provider quota, rate budget, availability, "
             "or operator-controlled resources beyond the expected business limit?"
@@ -13505,6 +13529,7 @@ API_AUTHORIZATION_PROFILE_LIBRARY: dict[str, dict[str, Any]] = {
         "acceptance_checks": [
             "Operator/provider evidence proves the resource, quota, billing, monitoring, or availability boundary.",
             "Attacker-controllable input reaches that boundary without privileged credentials or destructive testing.",
+            "The missing or inappropriate resource limit is named: timeout, memory, process/file descriptor, batch size, page size, provider spending, rate, or operation frequency.",
             "Impact is demonstrated with non-stress evidence and accepted by finding-gate/adjudication.",
         ],
         "reject_if": [
@@ -13515,7 +13540,7 @@ API_AUTHORIZATION_PROFILE_LIBRARY: dict[str, dict[str, Any]] = {
     },
     "method-authorization-boundary": {
         "title": "Method authorization boundary",
-        "source_ids": ["owasp-wstg-business-logic"],
+        "source_ids": ["owasp-wstg-business-logic", "owasp-api6-sensitive-business-flows"],
         "evidence_question": (
             "Can a client invoke a sensitive API/RPC method, workflow step, or upstream capability that should be "
             "blocked by method, origin, auth, route, or policy controls?"
@@ -13531,6 +13556,24 @@ API_AUTHORIZATION_PROFILE_LIBRARY: dict[str, dict[str, Any]] = {
             "Proof relies on broad method enumeration, high-volume traffic, or unsafe state mutation.",
         ],
     },
+    "sensitive-business-flow-boundary": {
+        "title": "Sensitive business flow boundary",
+        "source_ids": ["owasp-api6-sensitive-business-flows", "owasp-wstg-business-logic", "portswigger-business-logic"],
+        "evidence_question": (
+            "Can an attacker automate, replay, reorder, or bypass a protected business flow in a way that creates "
+            "concrete business harm, provider cost, inventory/quota exhaustion, rewards abuse, or workflow integrity impact?"
+        ),
+        "acceptance_checks": [
+            "The sensitive business flow and expected restriction are explicitly named: anti-automation, workflow order, role, quota, inventory, provider budget, or operation frequency.",
+            "Approved evidence shows the restriction is missing or bypassed without stress traffic, broad automation, destructive mutation, or credential misuse.",
+            "The business harm is concrete and accepted by finding-gate: funds, quota, provider cost, inventory/reservation, rewards, account, availability, or workflow integrity.",
+        ],
+        "reject_if": [
+            "The endpoint is intentionally public, read-only, preview-only, idempotent, or has no protected business-flow consequence.",
+            "The only evidence is a normal user completing an intended flow, static source suspicion, or an unbounded automation idea.",
+            "Validation requires distributed automation, repeated purchases/actions, traffic bursts, stress testing, account farming, trading, or real user-state mutation.",
+        ],
+    },
 }
 
 
@@ -13538,7 +13581,11 @@ def api_authorization_profile_ids_for_hypothesis(item: dict[str, Any]) -> list[s
     impact = str(item.get("impact") or item.get("impact_hypothesis") or "")
     hypothesis_type = str(item.get("type") or item.get("hypothesis_type") or "")
     if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
-        return ["transaction-intent-property-boundary", "mass-assignment-property-boundary"]
+        return [
+            "transaction-intent-property-boundary",
+            "mass-assignment-property-boundary",
+            "sensitive-business-flow-boundary",
+        ]
     if impact in {
         "fixed-upstream-proxy-confusion",
         "improper-confidential-information-disclosure",
@@ -13550,9 +13597,9 @@ def api_authorization_profile_ids_for_hypothesis(item: dict[str, Any]) -> list[s
     if impact in {"mass-assignment-property-boundary"}:
         return ["mass-assignment-property-boundary", "object-authorization-boundary"]
     if impact in {"rpc-proxy-abuse", "production-testnet-boundary-confusion", "method-authorization-boundary"}:
-        return ["method-authorization-boundary", "function-use-limit-boundary"]
+        return ["method-authorization-boundary", "function-use-limit-boundary", "sensitive-business-flow-boundary"]
     if impact in {"credentialed-upstream-cost-abuse", "resource-exhaustion"}:
-        return ["function-use-limit-boundary", "method-authorization-boundary"]
+        return ["function-use-limit-boundary", "sensitive-business-flow-boundary", "method-authorization-boundary"]
     if impact in {"wallet-transaction-argument-manipulation"}:
         return ["transaction-intent-property-boundary", "object-authorization-boundary"]
     if impact in {"browser-route-exposure"}:
@@ -13585,23 +13632,23 @@ def business_logic_dimension_ids_for_hypothesis(item: dict[str, Any]) -> list[st
     impact = str(item.get("impact") or "")
     hypothesis_type = str(item.get("type") or item.get("hypothesis_type") or "")
     if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
-        return ["integrity-checks", "data-validation", "request-forgery", "workflow-circumvention"]
+        return ["integrity-checks", "data-validation", "request-forgery", "workflow-circumvention", "sensitive-business-flow"]
     if impact == "credentialed-upstream-cost-abuse" or hypothesis_type == "credential-proxy-review":
-        return ["misuse-limits", "request-forgery", "data-validation"]
+        return ["misuse-limits", "sensitive-business-flow", "request-forgery", "data-validation"]
     if impact == "resource-exhaustion" or hypothesis_type == "resource-abuse-review":
-        return ["misuse-limits", "request-forgery"]
+        return ["misuse-limits", "sensitive-business-flow", "request-forgery"]
     if impact == "rpc-proxy-abuse":
-        return ["request-forgery", "misuse-limits", "data-validation"]
+        return ["request-forgery", "misuse-limits", "sensitive-business-flow", "data-validation"]
     if impact == "fixed-upstream-proxy-confusion":
         return ["request-forgery", "data-validation", "integrity-checks"]
     if impact in {"unauthorized-state-change", "unauthorized-authenticated-action"}:
-        return ["workflow-circumvention", "request-forgery", "integrity-checks"]
+        return ["workflow-circumvention", "request-forgery", "integrity-checks", "sensitive-business-flow"]
     if impact in {"mass-assignment-property-boundary", "object-authorization-boundary"}:
         return ["data-validation", "request-forgery", "integrity-checks"]
     if impact in {"improper-confidential-information-disclosure", "browser-route-exposure"}:
         return ["data-validation", "integrity-checks"]
     if impact == "method-authorization-boundary":
-        return ["request-forgery", "workflow-circumvention", "misuse-limits"]
+        return ["request-forgery", "workflow-circumvention", "misuse-limits", "sensitive-business-flow"]
     return ["data-validation"]
 
 
@@ -13673,6 +13720,8 @@ def build_business_logic_methodology_map(
                 "owasp-wstg-business-logic",
                 "owasp-api1-bola",
                 "owasp-api3-bopla",
+                "owasp-api4-resource-consumption",
+                "owasp-api6-sensitive-business-flows",
                 "portswigger-business-logic",
             ],
         },
@@ -27989,7 +28038,11 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             ],
         )
     ]
-    expected_api_profile_ids = {"transaction-intent-property-boundary", "mass-assignment-property-boundary"}
+    expected_api_profile_ids = {
+        "transaction-intent-property-boundary",
+        "mass-assignment-property-boundary",
+        "sensitive-business-flow-boundary",
+    }
     workorder_api_profile_ids = set(normalize_string_list(workorder_case.get("api_authorization_profile_ids")))
     authorization_api_profile_ids = set(normalize_string_list(authorization_case.get("api_authorization_profile_ids")))
     action_api_profile_ids = set(normalize_string_list(action_case.get("api_authorization_profile_ids")))
@@ -28232,16 +28285,20 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             "id": "api-authorization-oracle-conditions-propagate",
             "passed": (
                 any("Offline decode shows" in str(check) for check in action_api_acceptance_checks)
+                and any("sensitive business flow" in str(check).lower() for check in action_api_acceptance_checks)
                 and any("decoded payload matches" in str(reject) for reject in action_api_reject_if)
+                and any("distributed automation" in str(reject).lower() for reject in action_api_reject_if)
                 and any("Offline decode shows" in str(check) for check in template_api_acceptance_checks)
+                and any("sensitive business flow" in str(check).lower() for check in template_api_acceptance_checks)
                 and any("decoded payload matches" in str(reject) for reject in template_api_reject_if)
+                and any("distributed automation" in str(reject).lower() for reject in template_api_reject_if)
             ),
-            "expected": "action and template carry API oracle acceptance and reject conditions",
+            "expected": "action and template carry transaction, business-flow, and reject oracle conditions",
             "actual": {
-                "action_acceptance": action_api_acceptance_checks[:6],
-                "action_reject_if": action_api_reject_if[:6],
-                "template_acceptance": template_api_acceptance_checks[:6],
-                "template_reject_if": template_api_reject_if[:6],
+                "action_acceptance": action_api_acceptance_checks[:8],
+                "action_reject_if": action_api_reject_if[:8],
+                "template_acceptance": template_api_acceptance_checks[:8],
+                "template_reject_if": template_api_reject_if[:8],
             },
         },
         {
@@ -28286,6 +28343,7 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
                 "Evidence oracle profiles:" in request_markdown_case
                 and "transaction-intent-property-boundary" in request_markdown_case
                 and "mass-assignment-property-boundary" in request_markdown_case
+                and "sensitive-business-flow-boundary" in request_markdown_case
             ),
             "expected": "request brief contains API authorization profile ids",
             "actual": request_markdown_case,
