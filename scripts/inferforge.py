@@ -26101,6 +26101,146 @@ def bounty_intake_evidence_path(raw: str, *, artifact_dir: Path) -> Path | None:
     return (artifact_dir / value).resolve()
 
 
+def bounty_intake_authorization_requests(
+    bounty_evidence_authorization: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    return (
+        [
+            request
+            for request in bounty_evidence_authorization.get("authorization_requests", [])
+            if isinstance(request, dict)
+        ]
+        if isinstance(bounty_evidence_authorization, dict)
+        and isinstance(bounty_evidence_authorization.get("authorization_requests"), list)
+        else []
+    )
+
+
+def bounty_intake_requested_evidence_paths(
+    requests: list[dict[str, Any]],
+    *,
+    artifact_dir: Path,
+) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for request in requests:
+        for item in normalize_string_list(request.get("requested_official_evidence")):
+            path = bounty_intake_evidence_path(item, artifact_dir=artifact_dir)
+            if path is None:
+                continue
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            paths.append(path)
+    return paths
+
+
+def bounty_intake_authorization_fingerprint(requests: list[dict[str, Any]]) -> str:
+    stable_requests = [
+        {
+            "id": request.get("id"),
+            "workorder_id": request.get("workorder_id"),
+            "gate_id": request.get("gate_id"),
+            "lane": request.get("lane"),
+            "entrypoint": request.get("entrypoint"),
+            "expected_severity": request.get("expected_severity"),
+            "priority_decision": request.get("priority_decision"),
+            "requested_official_evidence": normalize_string_list(request.get("requested_official_evidence")),
+            "requested_official_evidence_labels": normalize_string_list(request.get("requested_official_evidence_labels")),
+            "recommended_after_evidence_command": request.get("recommended_after_evidence_command"),
+        }
+        for request in requests
+    ]
+    encoded = json.dumps(stable_requests, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def bounty_intake_file_signature(path: Path, *, max_file_bytes: int) -> dict[str, Any]:
+    rel = repo_relative_or_absolute(path)
+    if not path.exists():
+        return {
+            "path": rel,
+            "name": path.name,
+            "status": "missing",
+            "exists": False,
+        }
+    if not path.is_file():
+        return {
+            "path": rel,
+            "name": path.name,
+            "status": "not-a-file",
+            "exists": True,
+        }
+    try:
+        stat = path.stat()
+    except OSError as error:
+        return {
+            "path": rel,
+            "name": path.name,
+            "status": "stat-failed",
+            "exists": True,
+            "error": redacted_error_summary(error),
+        }
+    signature = {
+        "path": rel,
+        "name": path.name,
+        "status": "present" if stat.st_size <= max_file_bytes else "too-large",
+        "exists": True,
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "max_file_bytes": max_file_bytes,
+    }
+    if stat.st_size <= max_file_bytes:
+        try:
+            signature["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as error:
+            signature["status"] = "read-failed"
+            signature["error"] = redacted_error_summary(error)
+    return signature
+
+
+def bounty_evidence_intake_cache_validation(
+    *,
+    bounty_evidence_authorization: dict[str, Any] | None,
+    artifact_dir: Path,
+    max_file_bytes: int,
+) -> dict[str, Any]:
+    requests = bounty_intake_authorization_requests(bounty_evidence_authorization)
+    paths = bounty_intake_requested_evidence_paths(requests, artifact_dir=artifact_dir)
+    signatures = [
+        bounty_intake_file_signature(path, max_file_bytes=max_file_bytes)
+        for path in paths
+    ]
+    return {
+        "schema": "inferforge-bounty-evidence-intake-cache-v1",
+        "authorization_fingerprint": bounty_intake_authorization_fingerprint(requests),
+        "evidence_file_signatures": signatures,
+        "evidence_file_signature_count": len(signatures),
+        "max_file_bytes": max_file_bytes,
+    }
+
+
+def bounty_evidence_intake_cache_current(
+    intake: dict[str, Any] | None,
+    *,
+    bounty_evidence_authorization: dict[str, Any] | None,
+    artifact_dir: Path,
+    max_file_bytes: int,
+) -> bool:
+    if not isinstance(intake, dict):
+        return False
+    cached = intake.get("cache_validation")
+    if not isinstance(cached, dict):
+        return False
+    current = bounty_evidence_intake_cache_validation(
+        bounty_evidence_authorization=bounty_evidence_authorization,
+        artifact_dir=artifact_dir,
+        max_file_bytes=max_file_bytes,
+    )
+    return cached == current
+
+
 def bounty_intake_parse_jsonl(text: str) -> tuple[list[Any], list[str]]:
     rows = []
     errors = []
@@ -26603,11 +26743,11 @@ def build_bounty_evidence_intake(
     max_file_bytes: int,
     source_root: Path | None = None,
 ) -> dict[str, Any]:
-    requests = (
-        bounty_evidence_authorization.get("authorization_requests", [])
-        if isinstance(bounty_evidence_authorization, dict)
-        and isinstance(bounty_evidence_authorization.get("authorization_requests"), list)
-        else []
+    requests = bounty_intake_authorization_requests(bounty_evidence_authorization)
+    cache_validation = bounty_evidence_intake_cache_validation(
+        bounty_evidence_authorization=bounty_evidence_authorization,
+        artifact_dir=artifact_dir,
+        max_file_bytes=max_file_bytes,
     )
     reviews = [
         bounty_intake_request_review(
@@ -26692,7 +26832,9 @@ def build_bounty_evidence_intake(
             "operator_evidence_status_counts": dict(sorted(operator_status_counts.items())),
             "bounty_evidence_authorization_status": artifact_summary_status(bounty_evidence_authorization),
             "max_file_bytes": max_file_bytes,
+            "cache_evidence_file_signatures": cache_validation.get("evidence_file_signature_count", 0),
         },
+        "cache_validation": cache_validation,
         "intake_reviews": reviews,
         "ready_requests": ready[:8],
         "blocked_requests": blocked[:8],
@@ -26726,6 +26868,10 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
             "schema": "inferforge-bounty-evidence-authorization-v1",
             "status": "authorization-required-before-evidence-collection",
             "target": target,
+            "summary": {
+                "requests": 1,
+                "api_authorization_counts": {"transaction-intent-property-boundary": 1},
+            },
             "authorization_requests": [
                 {
                     "id": request_id,
@@ -26737,6 +26883,9 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
                     "requested_official_evidence_labels": [path.name],
                     "after_evidence_validation_commands": ["transaction-sidecar-review --no-write --show-files"],
                     "recommended_after_evidence_command": "transaction-sidecar-review --no-write --show-files",
+                    "api_authorization_profile_ids": ["transaction-intent-property-boundary"],
+                    "api_authorization_acceptance_checks": ["approved payload and matching intent policy are present"],
+                    "api_authorization_reject_if": ["only source or template evidence exists"],
                     "reportability_boundary": "Synthetic intake self-test request only.",
                 }
             ],
@@ -26828,22 +26977,60 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
             source_root=case_root,
         )
 
+    def clean_transaction_payload_row() -> dict[str, Any]:
+        return {
+            "approval_reference": "self-test-approved-redacted-fixture",
+            "payloads": [
+                {
+                    "data": {
+                        "type": "svm",
+                        "transaction": "QUJDREVGRw==",
+                    }
+                }
+            ],
+        }
+
+    def run_stale_cache_case() -> dict[str, Any]:
+        case_root = root / "stale_cache_rebuild"
+        case_root.mkdir(parents=True, exist_ok=True)
+        sidecar = case_root / "transaction-payloads.jsonl"
+        authorization = authorization_for(sidecar, request_id="AUTHZ-stale-cache-rebuild")
+        stale_intake = build_bounty_evidence_intake(
+            target=target,
+            profile=None,
+            artifact_dir=case_root,
+            bounty_evidence_authorization=authorization,
+            max_file_bytes=262144,
+            source_root=case_root,
+        )
+        write_json(case_root / BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT, authorization)
+        write_json(case_root / BOUNTY_EVIDENCE_INTAKE_ARTIFACT, stale_intake)
+        sidecar.write_text(json.dumps(clean_transaction_payload_row(), sort_keys=True) + "\n", encoding="utf-8")
+        cache_current_after_change = bounty_evidence_intake_cache_current(
+            stale_intake,
+            bounty_evidence_authorization=authorization,
+            artifact_dir=case_root,
+            max_file_bytes=262144,
+        )
+        loaded = build_or_load_bounty_evidence_intake_for_run(
+            target=target,
+            profile=None,
+            artifact_dir=case_root,
+            source_root=case_root,
+            max_file_bytes=262144,
+        )
+        return {
+            "stale": stale_intake,
+            "cache_current_after_change": cache_current_after_change,
+            "loaded": loaded,
+        }
+
     with tempfile.TemporaryDirectory(prefix="inferforge-bounty-evidence-intake-selftest-") as temp_dir:
         root = Path(temp_dir)
         missing_case = run_case("missing", None)
         clean_case = run_case(
             "clean",
-            {
-                "approval_reference": "self-test-approved-redacted-fixture",
-                "payloads": [
-                    {
-                        "data": {
-                            "type": "svm",
-                            "transaction": "QUJDREVGRw==",
-                        }
-                    }
-                ],
-            },
+            clean_transaction_payload_row(),
         )
         draft_case = run_case(
             "draft",
@@ -26938,6 +27125,7 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
                 for decision_id in sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS)
             ],
         )
+        stale_cache_case = run_stale_cache_case()
 
     def first_review(case: dict[str, Any]) -> dict[str, Any]:
         rows = case.get("intake_reviews") if isinstance(case.get("intake_reviews"), list) else []
@@ -26950,6 +27138,8 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
     provider_ready_review = first_review(provider_ready_case)
     provider_warning_review = first_review(provider_warning_case)
     provider_pending_review = first_review(provider_pending_case)
+    stale_cache_stale_review = first_review(stale_cache_case.get("stale", {}))
+    stale_cache_loaded_review = first_review(stale_cache_case.get("loaded", {}))
     assertions = [
         {
             "id": "missing-sidecar-waits-for-evidence",
@@ -27056,6 +27246,21 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
                 "operator_evidence_scope": provider_pending_review.get("operator_evidence_scope"),
             },
         },
+        {
+            "id": "stale-intake-cache-invalidates-when-evidence-file-changes",
+            "passed": stale_cache_case.get("cache_current_after_change") is False
+            and stale_cache_stale_review.get("status") == "waiting-evidence-files"
+            and stale_cache_case.get("loaded", {}).get("status") == "ready-for-lane-validation"
+            and stale_cache_loaded_review.get("status") == "ready-for-lane-validation",
+            "expected": "cached missing-evidence intake is rebuilt after the evidence file appears",
+            "actual": {
+                "cache_current_after_change": stale_cache_case.get("cache_current_after_change"),
+                "stale_artifact": stale_cache_case.get("stale", {}).get("status"),
+                "stale_request": stale_cache_stale_review.get("status"),
+                "loaded_artifact": stale_cache_case.get("loaded", {}).get("status"),
+                "loaded_request": stale_cache_loaded_review.get("status"),
+            },
+        },
     ]
     failed = [item for item in assertions if not item.get("passed")]
     return {
@@ -27064,7 +27269,7 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
         "status": "failed" if failed else "passed",
         "target": target,
         "summary": {
-            "cases": 9,
+            "cases": 10,
             "assertions": len(assertions),
             "failed": len(failed),
             "case_statuses": {
@@ -27077,6 +27282,7 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
                 "operator_provider_ready": provider_ready_case.get("status"),
                 "operator_provider_warning": provider_warning_case.get("status"),
                 "operator_provider_pending": provider_pending_case.get("status"),
+                "stale_cache_rebuild": (stale_cache_case.get("loaded") or {}).get("status"),
             },
         },
         "cases": {
@@ -27089,6 +27295,7 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
             "operator_provider_ready": provider_ready_case,
             "operator_provider_warning": provider_warning_case,
             "operator_provider_pending": provider_pending_case,
+            "stale_cache_rebuild": stale_cache_case,
         },
         "assertions": assertions,
         "safety": (
@@ -82400,15 +82607,20 @@ def build_or_load_bounty_evidence_intake_for_run(
     source_root: Path,
     max_file_bytes: int,
 ) -> dict[str, Any]:
-    intake = load_optional_json(artifact_dir / BOUNTY_EVIDENCE_INTAKE_ARTIFACT)
-    if isinstance(intake, dict):
-        return intake
     authorization = build_or_load_bounty_evidence_authorization_for_run(
         target=target,
         profile=profile,
         artifact_dir=artifact_dir,
         source_root=source_root,
     )
+    intake = load_optional_json(artifact_dir / BOUNTY_EVIDENCE_INTAKE_ARTIFACT)
+    if bounty_evidence_intake_cache_current(
+        intake,
+        bounty_evidence_authorization=authorization,
+        artifact_dir=artifact_dir,
+        max_file_bytes=max_file_bytes,
+    ):
+        return intake
     return build_bounty_evidence_intake(
         target=target,
         profile=profile,
