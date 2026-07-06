@@ -28143,6 +28143,18 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             "actual": request_markdown_case,
         },
         {
+            "id": "request-brief-renders-evidence-gate-status",
+            "passed": (
+                "Evidence gate:" in request_markdown_case
+                and "blocked-missing-official-evidence-file" in request_markdown_case
+                and "Missing evidence gate items:" in request_markdown_case
+                and "transaction-payloads.jsonl" in request_markdown_case
+                and "transaction-intent-policy.json" in request_markdown_case
+            ),
+            "expected": "request brief contains evidence gate status and missing official evidence",
+            "actual": request_markdown_case,
+        },
+        {
             "id": "fresh-bounty-api-profile-artifacts-load",
             "passed": all(fresh_api_schema_cases.values()),
             "expected": {"all_fresh_cases": True},
@@ -28276,6 +28288,7 @@ def bounty_evidence_request_markdown(
                 f"- Action: `{bounty_brief_line(action.get('kind') or '-', max_chars=120)}`",
                 f"- Actor: `{bounty_brief_line(action.get('actor') or '-', max_chars=120)}`",
                 f"- Entrypoint: `{bounty_brief_line(action.get('entrypoint') or '-', max_chars=180)}`",
+                f"- Evidence gate: `{bounty_brief_line(action.get('evidence_gate_status') or '-', max_chars=160)}`",
                 f"- Request: {bounty_brief_line(action.get('next_step'), max_chars=520)}",
                 "",
                 "Required evidence:",
@@ -28287,6 +28300,28 @@ def bounty_evidence_request_markdown(
             max_chars=260,
         )
         lines.extend(evidence_lines or ["- Approved, redacted official evidence for this lane."])
+        missing_lines = bounty_brief_bullet_lines(action.get("missing_official_evidence"), max_items=8, max_chars=260)
+        if missing_lines:
+            lines.extend(["", "Missing evidence gate items:", *missing_lines])
+        present_lines = bounty_brief_bullet_lines(action.get("present_official_evidence"), max_items=8, max_chars=260)
+        if present_lines:
+            lines.extend(["", "Present evidence files:", *present_lines])
+        handoff_lines = bounty_brief_bullet_lines(action.get("operator_handoff_evidence"), max_items=6, max_chars=260)
+        if handoff_lines:
+            lines.extend(["", "Operator handoff evidence:", *handoff_lines])
+        status_rows = [
+            row
+            for row in action.get("requested_evidence_status", []) or []
+            if isinstance(row, dict)
+        ]
+        if status_rows:
+            lines.extend(["", "Evidence gate status:"])
+            for row in status_rows[:8]:
+                label = bounty_brief_line(row.get("label"), max_chars=220)
+                status = bounty_brief_line(row.get("status"), max_chars=120)
+                kind = bounty_brief_line(row.get("kind"), max_chars=120)
+                path = bounty_brief_line(row.get("path") or "-", max_chars=220)
+                lines.append(f"- `{status}` `{kind}` {label} path=`{path}`")
         api_profiles = [
             profile
             for profile in auth.get("api_authorization_profiles", []) or action.get("api_authorization_profiles", []) or []
@@ -28391,6 +28426,7 @@ def build_bounty_evidence_request_brief(
             "parked": summary.get("parked", 0),
             "top_lane": summary.get("top_lane"),
             "top_kind": summary.get("top_kind"),
+            "evidence_gate_counts": summary.get("evidence_gate_counts", {}),
             "bounty_action_queue_status": artifact_summary_status(bounty_action_queue),
             "bounty_evidence_authorization_status": artifact_summary_status(bounty_evidence_authorization),
             "markdown_lines": len(markdown.splitlines()),
@@ -81744,6 +81780,7 @@ def run_bounty_evidence_request(args: argparse.Namespace) -> int:
         f"queue={summary.get('bounty_action_queue_status') or '-'} "
         f"authorization={summary.get('bounty_evidence_authorization_status') or '-'}"
     )
+    print(f"Evidence gates: {json.dumps(summary.get('evidence_gate_counts', {}), sort_keys=True)}")
     print(f"Rule: {inline_summary_text(brief.get('reportability_rule'), max_chars=360)}")
     print(f"Next: {inline_summary_text(brief.get('next_step'), max_chars=360)}")
     if getattr(args, "show_brief", False):
