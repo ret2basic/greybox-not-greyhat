@@ -334,6 +334,10 @@ whether each atomic claim has a contract, official approved evidence sidecars,
 offline verifier commands, and a finding-gate/adjudication path. A witness
 ladder is proof-work bookkeeping only: it does not create evidence sidecars and
 does not make a finding reportable.
+Witness ladder stage commands also carry command-safety labels and autorunnable
+lists. Missing upstream evidence keeps verifier and finding-gate commands
+classified as `review-gated`, with no autorunnable commands exposed until the
+official sidecars pass the local gates.
 
 `bounty-evidence-workorders` turns blocked bounty lanes into bounded official
 evidence requests. Its summary and CLI include the top workorder's required
