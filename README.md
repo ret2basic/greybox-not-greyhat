@@ -1429,6 +1429,12 @@ payload sidecar.
 Add `--show-evidence-contract` to print the single-corpus quote capture,
 resource gate, Burp history import, sidecar review, and no-write decode preview
 sequence without sending requests, signing wallets, or submitting transactions.
+`transaction-evidence-readiness --no-write --show-commands` summarizes the
+same proof path and carries command-safety totals. Sidecar review, corpus
+checklist, and transaction-boundary review stay ready offline;
+`decode-transactions` stays review-gated until exactly one approved payload and
+matching intent policy are ready, and finding-gate/adjudication stay
+review-gated until decoded transaction-boundary evidence exists.
 
 `transaction-corpus-checklist` is the offline bridge between source-flow review
 and decoding. It reads the current quote collection, Burp transaction candidate,
