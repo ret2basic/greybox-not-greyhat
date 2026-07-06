@@ -563,12 +563,16 @@ chain, direction, payload type, approval reference, and `maxNumQuotes` before
 `prepare-transaction-corpus-sidecars` writes official sidecars.
 `evidence-sidecar-drafts` carries the same transaction pair binding metadata in
 its non-evidence draft workbook: `approval_reference`, `request_text_sha256`,
-`payload_text_sha256`, and `paired_payload_text_sha256`. The draft CLI prints
-the required binding fields with `--show-drafts`; placeholders still have to be
-replaced from one approved quote request/response pair before anything is copied
-into official sidecars. SHA-256 binding fields must be real 64-character hex
-digests; placeholders, short labels, or other non-hex metadata block pair
-binding even when the same invalid value appears in both files.
+`payload_text_sha256`, and `paired_payload_text_sha256`. When transaction
+payload/policy sidecars are required, the workbook also includes
+`approved-quote-intent.draft.json` as supporting operator input for
+`--intent-input`; it is not an official evidence sidecar and cannot satisfy the
+finding gate by itself. The draft CLI prints the required binding fields with
+`--show-drafts`; placeholders still have to be replaced from one approved quote
+request/response pair before anything is copied into official sidecars. SHA-256
+binding fields must be real 64-character hex digests; placeholders, short
+labels, or other non-hex metadata block pair binding even when the same invalid
+value appears in both files.
 `evidence-prep-status --show-details` summarizes the paired sidecar contract
 with the first blocker, binding review status, and first pairing issue, so a
 bad `approval_reference` or SHA-256 mismatch is visible without opening the JSON.
