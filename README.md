@@ -401,6 +401,10 @@ highest-value action's minimum official evidence set, first missing artifact,
 claim-witness request, manual handoff/preflight commands, and after-evidence
 validation chain. It is an offline handoff summary only: it does not create
 sidecars, authorize traffic, or make a candidate reportable.
+Packet handoff commands also carry `handoff_command_refs`, so the same
+`manual-template`/`review-gated` classification shown in
+`bounty-action-queue --show-actions --show-commands` is available to automation
+without inferring command safety from shell text.
 Each packet includes `official_evidence_contracts` for the required sidecars:
 artifact name/path, category, format, required fields, reject conditions, paired
 evidence dependencies, and no-write validator commands. These contracts are
