@@ -483,10 +483,12 @@ manifest into artifact counts, artifact formats, required pair-binding fields,
 copy policy, and reject rules. That makes the next handoff explicit without
 copying drafts, creating official sidecars, authorizing traffic, or promoting a
 lead past finding-gate/adjudication.
-Closure actions that recompute after-ready validation are also gated by the
-official evidence bundle: until every required contract is
-`ready-no-write-contract-validation`, their commands remain `review-gated` and
-the `command_gate` stays blocked until the official bundle is ready.
+When the lane has a known no-write validation chain, the shortest-path view can
+print it before evidence exists as `after_ready_mode=blocked-preview`. Those
+preview commands document the exact post-evidence chain, but they remain
+`review-gated`, `after_ready_autorun=false`, and blocked on the official
+evidence bundle until every required contract is
+`ready-no-write-contract-validation`.
 Stage commands printed by `bounty-shortest-path --show-stages --show-commands`
 carry the same command-safety classifications. Commands in blocked stages remain
 `review-gated` or `manual-template`, and only stages whose local no-write
