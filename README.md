@@ -1443,6 +1443,9 @@ decoded source-mint debit to the expected wallet owner. Missing token-account
 metadata does not create a finding; a concrete owner or mint mismatch is only a
 candidate transaction-integrity signal that still has to pass finding-gate and
 adjudication.
+Explicit token-account boundary checks still compare decoded `transfer` account
+edges even when the opcode omits mint; mint and owner attribution stay in review
+until public token-account metadata is available.
 By default, decoded top-level SPL token transfer instructions must stay within
 the expected source and destination mints/accounts. A policy can set
 `allowExtraTokenTransfers: true` only after the route's extra token movement is
