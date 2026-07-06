@@ -453,6 +453,11 @@ stopped.
 objective, including the harness phase and phase gate, and labels
 `assessment-mode-split` when the greybox coverage focus and bounty/adjudication
 unblocker point at different lanes.
+It also emits `assessment_mode_evidence_ledger`, a two-track accounting view for
+the active assessment objective and the bounty/adjudication reportability path.
+The ledger names each track's lane, first missing official artifact, autorun
+eligibility, and reportability gate, so offline loops can close greybox coverage
+without mistaking it for a valid Medium+ bounty report.
 `methodology-review` carries the same phase and phase-gate fields in its
 assessment-mode split and first-gap evidence packet views.
 Each contract also has a `validator_execution_gate`, so missing sidecars remain
