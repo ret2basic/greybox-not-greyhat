@@ -367,7 +367,10 @@ Each packet includes `official_evidence_contracts` for the required sidecars:
 artifact name/path, category, format, required fields, reject conditions, paired
 evidence dependencies, and no-write validator commands. These contracts are
 acceptance criteria for approved evidence handoff; they are not evidence and do
-not bypass `bounty-evidence-intake`, finding-gate, or adjudication.
+not bypass `bounty-evidence-intake`, finding-gate, or adjudication. Each
+contract also has a `validator_execution_gate`, so missing sidecars remain
+`waiting-official-evidence` even when their no-write validator commands are
+safe to preview.
 
 `claim-evidence-requests` also uses that queue context for its default ordering:
 in bounty mode, evidence for the highest-ranked action comes before a broader
