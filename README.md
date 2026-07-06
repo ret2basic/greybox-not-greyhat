@@ -382,6 +382,9 @@ not passed.
 `adjudicate` links that same queue/brief context as `next_evidence_unblocker`,
 so a no-finding run can distinguish `waiting-official-evidence` from
 `blocked-brief-quality` without promoting the candidate.
+`iteration-decision` prints that unblocker next to the active assessment
+objective and labels `assessment-mode-split` when the greybox coverage focus and
+bounty/adjudication unblocker point at different lanes.
 Each contract also has a `validator_execution_gate`, so missing sidecars remain
 `waiting-official-evidence` even when their no-write validator commands are
 safe to preview. The packet-level `official_evidence_contract_gate` aggregates
