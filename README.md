@@ -1450,6 +1450,11 @@ until public token-account metadata is available.
 summarize missing token-account metadata and print JSONL template rows for the
 public account, mint, and owner values that must be supplied before relying on
 offline owner attribution.
+Use `prepare-transaction-token-account-metadata --no-write --show-jsonl` to
+render those rows as a pending template package. The package is not
+`transaction-token-accounts.jsonl` evidence and does not satisfy finding gates;
+write the official sidecar only after the public mint/owner rows are manually
+approved.
 By default, decoded top-level SPL token transfer instructions must stay within
 the expected source and destination mints/accounts. A policy can set
 `allowExtraTokenTransfers: true` only after the route's extra token movement is
