@@ -348,7 +348,9 @@ approved evidence is still required. For transaction payload requests, the same
 source-readiness block carries a compact handoff contract from
 `transaction-corpus-checklist`: recommended quote method/path/direction, target
 sidecars, required redacted fields, blocked approval steps, and offline verifier
-commands. The contract is still not evidence and does not authorize traffic.
+commands. It also prints the offline `transaction-payload-preflight` command for
+checking one approved local payload before any official sidecar is created. The
+contract and preflight result are still not evidence and do not authorize traffic.
 
 `methodology-review` also emits `bounty_harness_alignment`, a compact
 bug-bounty readiness check derived from the harness pattern of building system
@@ -1188,6 +1190,7 @@ python3 scripts/inferforge.py audit --no-ws
 python3 scripts/inferforge.py audit --ws-resource-probes
 python3 scripts/inferforge.py lead-dossier --no-write --show-commands --show-evidence --skip-current-resource-check
 python3 scripts/inferforge.py rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract --show-sidecar-template-json
+python3 scripts/inferforge.py transaction-payload-preflight --input ./approved-payloads.jsonl --no-write --show-records --show-commands
 python3 scripts/inferforge.py transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract
 python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-commands --show-steps --show-payload-template-json --skip-current-resource-check
 python3 scripts/inferforge.py decode-transactions
@@ -1225,6 +1228,15 @@ those simple JSON paths are applied before the generic recursive/base64 scan so
 candidate summaries retain the provider-specific response location.
 When `quote_response.expected_payload_type` is set, JSON sidecars must also show
 that payload type before the sidecar is marked ready for decode.
+`transaction-payload-preflight --input ./approved-payloads.jsonl --no-write --show-records --show-commands`
+is the offline intake check for a single approved local quote response or extracted
+payload before it is copied into `transaction-payloads.jsonl`. It accepts JSON,
+JSONL, text, or stdin, enforces the same 4 MiB default cap, reports only hashes,
+shape records, candidate summaries, payload-type contract state, and redaction
+hits, and never writes the official sidecar. A `ready-for-approved-sidecar-copy`
+result means the input shape is compatible with the official sidecar; it is still
+not evidence and does not satisfy finding gates until the official sidecar,
+matching intent policy, decode review, finding gate, and adjudication all agree.
 `transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract` prints the
 accepted sidecar files, configured candidate paths, and compact JSON/JSONL/TXT
 payload-shape examples when a sidecar is present but no base64 transaction

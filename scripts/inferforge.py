@@ -128,6 +128,13 @@ MAX_REQUEST_CONTEXTS_PER_ENDPOINT = 6
 REDACTED_VALUE = "[redacted]"
 GENERIC_HTTP_ROUTE_STRATEGY_SETS = {"nextjs-api-routes", "blackbox-http-observed"}
 BASE64_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{80,}={0,2})(?![A-Za-z0-9+/=])")
+RAW_HTTP_MESSAGE_RE = re.compile(r"(?im)^(?:[A-Z]{3,12}\s+\S+\s+HTTP/\d(?:\.\d)?|HTTP/\d(?:\.\d)?\s+\d{3})\b")
+TRANSACTION_PAYLOAD_PREFLIGHT_FORBIDDEN_FIELD_RE = re.compile(
+    r"(?i)[\"']?"
+    r"(authorization|cookie|set-cookie|x-api-key|api[_-]?key|token|secret|password|private[_ -]?key|"
+    r"seed[_ -]?phrase|signed[_ -]?transaction|signature)"
+    r"[\"']?\s*[:=]"
+)
 PLACEHOLDER_ENV_RE = re.compile(r"^YOUR_[A-Z0-9_]+_HERE$", re.IGNORECASE)
 COMMAND_PLACEHOLDER_RE = re.compile(r"REPLACE_WITH_[A-Z0-9_]+")
 MANIFEST_NAME = "artifact-manifest.json"
@@ -192,6 +199,7 @@ TRANSACTION_FLOW_REVIEW_ARTIFACT = "transaction-flow-review.json"
 TRANSACTION_INTENT_BOUNDARY_ARTIFACT = "transaction-intent-boundary.json"
 TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
 TRANSACTION_SIDECAR_REVIEW_ARTIFACT = "transaction-sidecar-review.json"
+TRANSACTION_PAYLOAD_PREFLIGHT_ARTIFACT = "transaction-payload-preflight.json"
 TRANSACTION_EVIDENCE_READINESS_ARTIFACT = "transaction-evidence-readiness.json"
 TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT = "transaction-intent-policy-templates.json"
 CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT = "credential-impact-checklist.json"
@@ -22638,6 +22646,7 @@ def build_claim_evidence_requests(
         request["source_readiness"] = claim_evidence_request_source_readiness(
             request,
             artifact_dir=artifact_dir,
+            profile=profile,
         )
         requests.append(request)
     requests.sort(
@@ -22742,6 +22751,7 @@ def claim_evidence_request_source_readiness(
     request: dict[str, Any],
     *,
     artifact_dir: Path,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     name = claim_evidence_request_official_name(request)
     draft = request.get("draft_assist") if isinstance(request.get("draft_assist"), dict) else {}
@@ -22762,6 +22772,7 @@ def claim_evidence_request_source_readiness(
         quote_collection = load_optional_json(artifact_dir / "quote-collection.json") or {}
         sidecar_review = load_optional_json(artifact_dir / TRANSACTION_SIDECAR_REVIEW_ARTIFACT) or {}
         corpus_checklist = load_optional_json(artifact_dir / TRANSACTION_CORPUS_CHECKLIST_ARTIFACT) or {}
+        preflight = load_optional_json(artifact_dir / TRANSACTION_PAYLOAD_PREFLIGHT_ARTIFACT) or {}
         approval_packet = (
             corpus_checklist.get("transaction_corpus_approval_packet")
             if isinstance(corpus_checklist.get("transaction_corpus_approval_packet"), dict)
@@ -22789,12 +22800,23 @@ def claim_evidence_request_source_readiness(
             or 0
         )
         review_count = int_from_nested(sidecar_review, ["summary", "candidate_count"])
-        local_count = max(burp_count, quote_count, review_count)
-        status = "local-candidates-need-approval" if local_count else "waiting-approved-quote-capture"
+        preflight_count = int_from_nested(preflight, ["summary", "candidate_count"])
+        preflight_ready = preflight.get("status") == "ready-for-approved-sidecar-copy"
+        local_count = max(burp_count, quote_count, review_count, preflight_count if preflight_ready else 0)
+        if max(burp_count, quote_count, review_count) > 0:
+            status = "local-candidates-need-approval"
+        elif preflight_ready:
+            status = "local-preflight-ready"
+        elif preflight:
+            status = "local-preflight-needs-review"
+        else:
+            status = "waiting-approved-quote-capture"
+        preflight_command = transaction_payload_preflight_command(artifact_dir, profile=profile)
         return {
             **base,
             "status": status,
             "local_candidate_count": local_count,
+            "preflight_command": preflight_command,
             "sources": [
                 {
                     "artifact": "burp-transaction-candidates.json",
@@ -22819,6 +22841,13 @@ def claim_evidence_request_source_readiness(
                     "status": corpus_checklist.get("status") or artifact_summary_status(corpus_checklist),
                     "approval_packet_status": approval_packet.get("status"),
                 },
+                {
+                    "artifact": TRANSACTION_PAYLOAD_PREFLIGHT_ARTIFACT,
+                    "status": preflight.get("status") or artifact_summary_status(preflight),
+                    "candidate_count": preflight_count,
+                    "target_official_sidecar": preflight.get("target_official_sidecar"),
+                    "official_evidence_still_required": preflight.get("official_evidence_still_required"),
+                },
             ],
             "handoff_contract": {
                 "status": approval_packet.get("status") or "missing-transaction-corpus-approval-packet",
@@ -22832,6 +22861,8 @@ def claim_evidence_request_source_readiness(
                 or repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl"),
                 "intent_policy_sidecar": approval_packet.get("intent_policy_sidecar")
                 or repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json"),
+                "preflight_command": preflight_command,
+                "last_preflight_status": preflight.get("status") or None,
                 "accepted_payload_sidecars": normalize_string_list(approval_packet.get("accepted_payload_sidecars"))[:4],
                 "required_fields": normalize_string_list(approval_packet.get("redacted_sidecar_required_fields"))[:6],
                 "offline_commands": normalize_string_list(approval_packet.get("offline_commands"))[:4],
@@ -22848,8 +22879,10 @@ def claim_evidence_request_source_readiness(
             },
             "next_step": (
                 "Review the local transaction candidate source, then copy exactly one approved/redacted payload into the official sidecar."
-                if local_count
-                else "No local transaction payload candidate is available; collect or import exactly one approved quote response before creating the official sidecar."
+                if max(burp_count, quote_count, review_count) > 0
+                else "Copy the preflighted approved/redacted payload into the official sidecar, then rerun transaction-sidecar-review."
+                if preflight_ready
+                else "No local transaction payload candidate is available; run transaction-payload-preflight on exactly one approved quote response before creating the official sidecar."
             ),
         }
     if name == "transaction-intent-policy.json":
@@ -28218,6 +28251,7 @@ def bounty_action_claim_request_rows(
                     "status": source.get("status"),
                     "local_candidate_count": source.get("local_candidate_count", 0),
                     "official_evidence_still_required": source.get("official_evidence_still_required", True),
+                    "preflight_command": source.get("preflight_command"),
                     "next_step": source.get("next_step"),
                     "handoff_contract": {
                         "status": handoff.get("status"),
@@ -28229,6 +28263,8 @@ def bounty_action_claim_request_rows(
                         },
                         "payload_sidecar": handoff.get("payload_sidecar"),
                         "intent_policy_sidecar": handoff.get("intent_policy_sidecar"),
+                        "preflight_command": handoff.get("preflight_command"),
+                        "last_preflight_status": handoff.get("last_preflight_status"),
                         "required_fields": normalize_string_list(handoff.get("required_fields"))[:4],
                         "offline_commands": normalize_string_list(handoff.get("offline_commands"))[:3],
                     } if handoff else {},
@@ -29494,6 +29530,90 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             claim_evidence_requests_case["requests"][0],
             artifact_dir=artifact_dir,
         )
+        preflight_profile = default_target_profile()
+        preflight_payload = base64.b64encode(b"A" * 64).decode("ascii")
+
+        def preflight_input_meta(source: str, text: str) -> dict[str, Any]:
+            return {
+                "source": source,
+                "source_kind": "selftest",
+                "status": "loaded",
+                "bytes": len(text.encode("utf-8")),
+                "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "line_count": len(text.splitlines()),
+                "raw_input_persisted": False,
+                "max_input_bytes": DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+            }
+
+        preflight_ready_text = (
+            json.dumps(
+                {
+                    "payloads": [
+                        {
+                            "data": {
+                                "type": "svm",
+                                "transaction": preflight_payload,
+                            }
+                        }
+                    ]
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        transaction_payload_preflight_ready_case = build_transaction_payload_preflight(
+            profile=preflight_profile,
+            artifact_dir=artifact_dir,
+            input_text=preflight_ready_text,
+            input_meta=preflight_input_meta("selftest-approved-payload.jsonl", preflight_ready_text),
+            max_input_bytes=DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+        )
+        preflight_placeholder_text = json.dumps(
+            {
+                "source": "selftest-empty-placeholder",
+                "quote_response_count": 0,
+                "candidate_count": 0,
+                "candidates": [],
+            },
+            sort_keys=True,
+        )
+        transaction_payload_preflight_placeholder_case = build_transaction_payload_preflight(
+            profile=preflight_profile,
+            artifact_dir=artifact_dir,
+            input_text=preflight_placeholder_text,
+            input_meta=preflight_input_meta("selftest-empty-burp-transaction-candidates.json", preflight_placeholder_text),
+            max_input_bytes=DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+        )
+        preflight_mismatch_text = json.dumps(
+            {
+                "payloads": [
+                    {
+                        "data": {
+                            "type": "evm",
+                            "transaction": preflight_payload,
+                        }
+                    }
+                ]
+            },
+            sort_keys=True,
+        )
+        transaction_payload_preflight_mismatch_case = build_transaction_payload_preflight(
+            profile=preflight_profile,
+            artifact_dir=artifact_dir,
+            input_text=preflight_mismatch_text,
+            input_meta=preflight_input_meta("selftest-mismatched-payload.json", preflight_mismatch_text),
+            max_input_bytes=DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+        )
+        preflight_official_sidecars_written = [
+            repo_relative_or_absolute(path)
+            for path in [
+                artifact_dir / "transaction-payloads.jsonl",
+                artifact_dir / "transaction-intent-policy.json",
+                artifact_dir / OPERATOR_EVIDENCE_ARTIFACT,
+                artifact_dir / REWRITE_RESPONSE_SIDECAR_ARTIFACT,
+            ]
+            if path.exists()
+        ]
         operator_claim_evidence_requests_case = {
             "generated_at": utc_now(),
             "schema": "inferforge-claim-evidence-requests-v1",
@@ -30193,6 +30313,40 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             "actual": sidecar_exists,
         },
         {
+            "id": "transaction-payload-preflight-contract-gates-approved-copy",
+            "passed": (
+                transaction_payload_preflight_ready_case.get("status") == "ready-for-approved-sidecar-copy"
+                and transaction_payload_preflight_ready_case.get("official_evidence_still_required") is True
+                and transaction_payload_preflight_ready_case.get("summary", {}).get("candidate_count") == 1
+                and transaction_payload_preflight_ready_case.get("payload_contract_review", {}).get("status")
+                == "payload-type-matched"
+                and transaction_payload_preflight_ready_case.get("payload_contract_review", {}).get("allows_decode") is True
+                and "transaction-payloads.jsonl"
+                in str(transaction_payload_preflight_ready_case.get("target_official_sidecar") or "")
+                and "transaction-sidecar-review --no-write --show-files --show-candidates --show-commands"
+                in json.dumps(transaction_payload_preflight_ready_case.get("followup_commands", []), sort_keys=True)
+                and preflight_payload not in json.dumps(transaction_payload_preflight_ready_case, sort_keys=True)
+            ),
+            "expected": "approved SVM payload preflight is ready for sidecar copy but remains non-evidence and redacted",
+            "actual": transaction_payload_preflight_ready_case,
+        },
+        {
+            "id": "transaction-payload-preflight-rejects-placeholder-and-type-mismatch",
+            "passed": (
+                transaction_payload_preflight_placeholder_case.get("status") == "rejected-placeholder"
+                and transaction_payload_preflight_mismatch_case.get("status") == "payload-type-mismatch"
+                and transaction_payload_preflight_mismatch_case.get("payload_contract_review", {}).get("allows_decode")
+                is False
+                and not preflight_official_sidecars_written
+            ),
+            "expected": "empty placeholders and mismatched payload types cannot become official transaction payload evidence",
+            "actual": {
+                "placeholder": transaction_payload_preflight_placeholder_case,
+                "mismatch": transaction_payload_preflight_mismatch_case,
+                "official_sidecars_written": preflight_official_sidecars_written,
+            },
+        },
+        {
             "id": "api-authorization-profiles-propagate",
             "passed": (
                 expected_api_profile_ids <= workorder_api_profile_ids
@@ -30292,6 +30446,10 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
                 and transaction_source_handoff_quote_case.get("direction") == "buy"
                 and "transaction-payloads.jsonl"
                 in str(transaction_source_handoff_case.get("payload_sidecar") or "")
+                and "transaction-payload-preflight"
+                in str(transaction_source_readiness_case.get("preflight_command") or "")
+                and "transaction-payload-preflight"
+                in str(transaction_source_handoff_case.get("preflight_command") or "")
                 and "official sidecar" in str(transaction_source_readiness_case.get("next_step") or "")
             ),
             "expected": "local transaction candidates are surfaced with a handoff contract but still require approved official sidecar evidence",
@@ -30670,6 +30828,15 @@ def bounty_evidence_request_markdown(
                             f"{bounty_brief_line(recommended_quote.get('method') or '-', max_chars=20)} "
                             f"{bounty_brief_line(recommended_quote.get('path') or '-', max_chars=120)} "
                             f"direction=`{bounty_brief_line(recommended_quote.get('direction') or '-', max_chars=40)}`"
+                        )
+                    if source.get("preflight_command"):
+                        lines.extend(
+                            [
+                                "  - Payload preflight:",
+                                "```bash",
+                                str(source.get("preflight_command")),
+                                "```",
+                            ]
                         )
                     if source.get("next_step"):
                         lines.append(f"  - Source next: {bounty_brief_line(source.get('next_step'), max_chars=360)}")
@@ -43590,6 +43757,8 @@ def build_transaction_payload_shape_guidance(
 
 def empty_transaction_candidate_placeholder_summary(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
+        return None
+    if not any(key in value for key in ["candidate_count", "quote_response_count", "candidates"]):
         return None
     candidates = value.get("candidates")
     if candidates not in ([], None):
@@ -59025,6 +59194,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         methodology_review_output_dir = root / "methodology-review-output"
         lead_dossier_output_dir = root / "lead-dossier-output"
         transaction_sidecar_review_output_dir = root / "transaction-sidecar-review-output"
+        transaction_payload_preflight_output_dir = root / "transaction-payload-preflight-output"
         transaction_corpus_checklist_output_dir = root / "transaction-corpus-checklist-output"
         credential_impact_checklist_output_dir = root / "credential-impact-checklist-output"
         operator_evidence_review_output_dir = root / "operator-evidence-review-output"
@@ -59036,6 +59206,24 @@ def build_no_write_selftest() -> dict[str, Any]:
         import_history_output_dir = root / "import-history-output"
         oversized_history_path = root / "oversized-burp-history.txt"
         oversized_history_path.write_text("x" * 64, encoding="utf-8")
+        approved_payload_preflight_input = root / "approved-transaction-payload.jsonl"
+        approved_payload_preflight_input.write_text(
+            json.dumps(
+                {
+                    "payloads": [
+                        {
+                            "data": {
+                                "type": "svm",
+                                "transaction": base64.b64encode(b"A" * 64).decode("ascii"),
+                            }
+                        }
+                    ]
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         discovery_route_inventory_path = root / "discovery-route-inventory.json"
         write_json(
             discovery_route_inventory_path,
@@ -59345,6 +59533,24 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--show-evidence-contract",
                 ]
             )
+            transaction_payload_preflight_return_code, transaction_payload_preflight_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(transaction_payload_preflight_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "transaction-payload-preflight",
+                    "--input",
+                    str(approved_payload_preflight_input),
+                    "--no-write",
+                    "--show-records",
+                    "--show-commands",
+                ]
+            )
             transaction_corpus_checklist_return_code, transaction_corpus_checklist_stdout = run_cli(
                 [
                     "--profile",
@@ -59613,6 +59819,19 @@ def build_no_write_selftest() -> dict[str, Any]:
             "transaction_sidecar_review_manifest": (
                 transaction_sidecar_review_output_dir / MANIFEST_NAME
             ).exists(),
+            "transaction_payload_preflight_dir": transaction_payload_preflight_output_dir.exists(),
+            "transaction_payload_preflight_target_profile_json": (
+                transaction_payload_preflight_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "transaction_payload_preflight_json": (
+                transaction_payload_preflight_output_dir / TRANSACTION_PAYLOAD_PREFLIGHT_ARTIFACT
+            ).exists(),
+            "transaction_payload_preflight_official_jsonl": (
+                transaction_payload_preflight_output_dir / "transaction-payloads.jsonl"
+            ).exists(),
+            "transaction_payload_preflight_manifest": (
+                transaction_payload_preflight_output_dir / MANIFEST_NAME
+            ).exists(),
             "transaction_corpus_checklist_dir": transaction_corpus_checklist_output_dir.exists(),
             "transaction_corpus_checklist_target_profile_json": (
                 transaction_corpus_checklist_output_dir / TARGET_PROFILE_ARTIFACT
@@ -59708,6 +59927,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     methodology_review_stdout_text = "\n".join(methodology_review_stdout)
     lead_dossier_stdout_text = "\n".join(lead_dossier_stdout)
     transaction_sidecar_review_stdout_text = "\n".join(transaction_sidecar_review_stdout)
+    transaction_payload_preflight_stdout_text = "\n".join(transaction_payload_preflight_stdout)
     transaction_corpus_checklist_stdout_text = "\n".join(transaction_corpus_checklist_stdout)
     credential_impact_checklist_stdout_text = "\n".join(credential_impact_checklist_stdout)
     operator_evidence_review_stdout_text = "\n".join(operator_evidence_review_stdout)
@@ -60775,6 +60995,40 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": transaction_sidecar_review_return_code,
                 "stdout": transaction_sidecar_review_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "transaction-payload-preflight-no-write-skips-artifacts",
+            "passed": (
+                transaction_payload_preflight_return_code == 0
+                and "Transaction payload preflight: ready-for-approved-sidecar-copy" in transaction_payload_preflight_stdout_text
+                and "Target official sidecar:" in transaction_payload_preflight_stdout_text
+                and "Official sidecar written: false" in transaction_payload_preflight_stdout_text
+                and "Follow-up commands:" in transaction_payload_preflight_stdout_text
+                and "transaction-sidecar-review --no-write --show-files --show-candidates --show-commands"
+                in transaction_payload_preflight_stdout_text
+                and "decode-transactions --no-write" in transaction_payload_preflight_stdout_text
+                and "No files written (--no-write)." in transaction_payload_preflight_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "transaction_payload_preflight_dir",
+                        "transaction_payload_preflight_target_profile_json",
+                        "transaction_payload_preflight_json",
+                        "transaction_payload_preflight_official_jsonl",
+                        "transaction_payload_preflight_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in transaction_payload_preflight_stdout)
+            ),
+            "expected": (
+                "transaction-payload-preflight --no-write validates an approved payload shape without writing "
+                "preflight artifacts, official sidecars, or manifests"
+            ),
+            "actual": {
+                "return_code": transaction_payload_preflight_return_code,
+                "stdout": transaction_payload_preflight_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -63301,6 +63555,461 @@ def build_transaction_payload_shape_review(
         "safety": (
             "Shape-only sidecar review. It records JSON paths and payload kinds, not transaction base64, raw HTTP, "
             "private keys, signatures, or full response bodies."
+        ),
+    }
+
+
+def transaction_payload_preflight_command(
+    artifact_dir: Path,
+    *,
+    profile: dict[str, Any] | None,
+) -> str:
+    return validation_command_for_artifact_dir(
+        artifact_dir,
+        "transaction-payload-preflight --input REPLACE_WITH_APPROVED_LOCAL_PAYLOAD "
+        "--no-write --show-records --show-commands",
+        profile=profile,
+    )
+
+
+def transaction_payload_preflight_segments(text: str, *, source: str) -> list[tuple[str, str]]:
+    if not text.strip():
+        return []
+    try:
+        json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    else:
+        return [(source, text)]
+
+    non_empty_lines = [(index, line) for index, line in enumerate(text.splitlines(), start=1) if line.strip()]
+    jsonl_segments = []
+    for index, line in non_empty_lines:
+        try:
+            json.loads(line)
+        except json.JSONDecodeError:
+            jsonl_segments = []
+            break
+        jsonl_segments.append((f"{source}:{index}", line))
+    if jsonl_segments and len(jsonl_segments) == len(non_empty_lines):
+        return jsonl_segments
+    return [(source, text)]
+
+
+def transaction_payload_shape_review_from_files(files: list[dict[str, Any]]) -> dict[str, Any]:
+    status_counts: dict[str, int] = {}
+    kind_counts: dict[str, int] = {}
+    for row in files:
+        increment_count(status_counts, str(row.get("status") or "unknown"))
+        for kind, count in (row.get("kind_counts") or {}).items():
+            kind_counts[str(kind)] = kind_counts.get(str(kind), 0) + int(count or 0)
+
+    if status_counts.get("solana-transaction-payload-indexed") or status_counts.get("base64-text-candidate-like"):
+        status = "transaction-candidate-shape-indexed"
+    elif status_counts.get("transaction-shaped-payload-needs-path-review"):
+        status = "needs-candidate-path-review"
+    elif status_counts.get("evm-payloads-indexed"):
+        status = "evm-payloads-indexed"
+    elif files:
+        status = "no-transaction-payload-shape"
+    else:
+        status = "empty-input"
+
+    return {
+        "status": status,
+        "summary": {
+            "files": len(files),
+            "status_counts": dict(sorted(status_counts.items())),
+            "kind_counts": dict(sorted(kind_counts.items())),
+        },
+        "files": files,
+        "safety": (
+            "Shape-only preflight review. It records JSON paths and payload kinds, not transaction base64, raw HTTP, "
+            "private keys, signatures, or full response bodies."
+        ),
+    }
+
+
+def transaction_payload_preflight_redaction_hits(text: str) -> list[dict[str, Any]]:
+    hits = []
+    raw_http_matches = RAW_HTTP_MESSAGE_RE.findall(text)
+    if raw_http_matches:
+        hits.append(
+            {
+                "kind": "raw-http-message",
+                "count": len(raw_http_matches),
+                "reason": "Only the approved quote response body or extracted payload should be preflighted.",
+            }
+        )
+    secret_matches = SECRET_TEXT_RE.findall(text)
+    if secret_matches:
+        hits.append(
+            {
+                "kind": "secret-like-token",
+                "count": len(secret_matches),
+                "reason": "Secret-like header or token material must be removed before official evidence sidecars.",
+            }
+        )
+    forbidden_fields = [
+        str(field).lower().replace(" ", "_")
+        for field in TRANSACTION_PAYLOAD_PREFLIGHT_FORBIDDEN_FIELD_RE.findall(text)
+        if str(field).strip()
+    ]
+    if forbidden_fields:
+        hits.append(
+            {
+                "kind": "forbidden-field-name",
+                "count": len(forbidden_fields),
+                "fields": ordered_unique_strings(forbidden_fields)[:8],
+                "reason": "Forbidden field names require manual redaction/review before official sidecars.",
+            }
+        )
+    return hits
+
+
+def read_transaction_payload_preflight_input(
+    input_path_text: str | None,
+    *,
+    max_input_bytes: int,
+) -> tuple[str, dict[str, Any]]:
+    if input_path_text and str(input_path_text).strip() != "-":
+        path = resolve_repo_path(str(input_path_text))
+        meta: dict[str, Any] = {
+            "source": repo_relative_or_absolute(path),
+            "source_kind": "file",
+            "raw_input_persisted": False,
+            "max_input_bytes": max_input_bytes,
+        }
+        if not path.exists():
+            meta["status"] = "missing-input"
+            meta["reason"] = "input file does not exist"
+            return "", meta
+        if not path.is_file():
+            meta["status"] = "missing-input"
+            meta["reason"] = "input path is not a file"
+            return "", meta
+        try:
+            size = path.stat().st_size
+        except OSError as error:
+            meta["status"] = "read-failed"
+            meta["error"] = redacted_error_summary(error)
+            return "", meta
+        meta["bytes"] = size
+        if size > max_input_bytes:
+            meta["status"] = "too-large"
+            meta["reason"] = f"input exceeds max_transaction_candidate_input_bytes={max_input_bytes}"
+            return "", meta
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            meta["status"] = "read-failed"
+            meta["error"] = redacted_error_summary(error)
+            return "", meta
+        meta["status"] = "loaded"
+        meta["text_sha256"] = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+        meta["line_count"] = len(text.splitlines())
+        return text, meta
+
+    source_kind = "stdin" if input_path_text == "-" else "stdin-or-missing"
+    meta = {
+        "source": "stdin",
+        "source_kind": source_kind,
+        "raw_input_persisted": False,
+        "max_input_bytes": max_input_bytes,
+    }
+    if sys.stdin.isatty():
+        meta["status"] = "missing-input"
+        meta["reason"] = "provide --input PATH or pipe approved payload text on stdin"
+        return "", meta
+    try:
+        raw = sys.stdin.buffer.read(max_input_bytes + 1)
+    except OSError as error:
+        meta["status"] = "read-failed"
+        meta["error"] = redacted_error_summary(error)
+        return "", meta
+    if len(raw) > max_input_bytes:
+        meta["status"] = "too-large"
+        meta["bytes"] = len(raw)
+        meta["reason"] = f"stdin exceeds max_transaction_candidate_input_bytes={max_input_bytes}"
+        return "", meta
+    if not raw.strip():
+        meta["status"] = "missing-input"
+        meta["bytes"] = len(raw)
+        meta["reason"] = "stdin was empty"
+        return "", meta
+    text = raw.decode("utf-8", errors="replace")
+    meta["status"] = "loaded"
+    meta["bytes"] = len(raw)
+    meta["text_sha256"] = hashlib.sha256(raw).hexdigest()
+    meta["line_count"] = len(text.splitlines())
+    return text, meta
+
+
+def transaction_payload_preflight_status(
+    *,
+    input_meta: dict[str, Any],
+    placeholder_present: bool,
+    candidate_count: int,
+    payload_contract_review: dict[str, Any],
+    redaction_hits: list[dict[str, Any]],
+) -> tuple[str, str]:
+    input_status = str(input_meta.get("status") or "")
+    if input_status != "loaded":
+        return input_status or "missing-input", str(input_meta.get("reason") or "Input was not loaded.")
+    if placeholder_present:
+        return (
+            "rejected-placeholder",
+            "The input is an empty transaction-candidate placeholder, not an approved quote payload.",
+        )
+    if redaction_hits:
+        return (
+            "needs-review",
+            "Forbidden raw HTTP, secret-like, or signature/token fields must be removed before official evidence.",
+        )
+    if candidate_count <= 0:
+        return "no-transaction-candidate", "No base64 Solana transaction candidate was extracted from the input."
+    contract_status = str(payload_contract_review.get("status") or "")
+    if contract_status == "payload-type-mismatch":
+        return "payload-type-mismatch", str(payload_contract_review.get("review_note") or "Payload type mismatch.")
+    if contract_status == "payload-type-missing":
+        return "needs-review", str(payload_contract_review.get("review_note") or "Payload type requires review.")
+    if not payload_contract_review.get("allows_decode"):
+        return "needs-review", str(payload_contract_review.get("review_note") or "Payload contract is not decode-ready.")
+    if candidate_count != 1:
+        return (
+            "needs-review",
+            "More than one transaction candidate was extracted; keep the official sidecar to one approved corpus.",
+        )
+    return (
+        "ready-for-approved-sidecar-copy",
+        "Input shape is compatible with the official payload sidecar, but this preflight is not evidence.",
+    )
+
+
+def transaction_payload_preflight_followup_commands(
+    *,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    max_input_bytes: int,
+) -> list[dict[str, Any]]:
+    target_sidecar = repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl")
+    command_rows = [
+        {
+            "id": "payload-preflight-template",
+            "command": transaction_payload_preflight_command(artifact_dir, profile=profile),
+            "purpose": "Validate one approved local payload/response before copying it into the official sidecar.",
+        },
+        {
+            "id": "sidecar-review",
+            "command": validation_command_for_artifact_dir(
+                artifact_dir,
+                "transaction-sidecar-review --no-write --show-files --show-candidates --show-commands",
+                profile=profile,
+            ),
+            "purpose": "Verify the official payload sidecar and intent-policy readiness without writing artifacts.",
+        },
+        {
+            "id": "decode-preview",
+            "command": validation_command_for_artifact_dir(
+                artifact_dir,
+                f"decode-transactions --no-write --input {shlex.quote(target_sidecar)} --max-input-bytes {max_input_bytes}",
+                profile=profile,
+            ),
+            "purpose": "Decode only after the official payload sidecar and matching intent policy are reviewed.",
+        },
+    ]
+    for template in transaction_corpus_policy_templates(profile, artifact_dir, payload_sidecar=target_sidecar)[:2]:
+        if not isinstance(template, dict):
+            continue
+        if template.get("prepare_policy_preview_command"):
+            command_rows.append(
+                {
+                    "id": f"intent-policy-preview-{template.get('direction') or 'unknown'}",
+                    "command": template.get("prepare_policy_preview_command"),
+                    "purpose": "Preview the matching transaction-intent-policy template for the approved quote.",
+                }
+            )
+        if template.get("decode_preview_command"):
+            command_rows.append(
+                {
+                    "id": f"decode-template-preview-{template.get('direction') or 'unknown'}",
+                    "command": template.get("decode_preview_command"),
+                    "purpose": "Preview decode with explicit runtime intent placeholders filled by the operator.",
+                }
+            )
+    for row in command_rows:
+        command_text = str(row.get("command") or "")
+        row["command_safety_ref"] = validation_command_ref(
+            command_text,
+            source=f"transaction-payload-preflight:{row.get('id')}",
+        )
+    return command_rows
+
+
+def build_transaction_payload_preflight(
+    *,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    input_text: str,
+    input_meta: dict[str, Any],
+    max_input_bytes: int,
+) -> dict[str, Any]:
+    candidate_paths = quote_response_candidate_paths(profile)
+    source = str(input_meta.get("source") or "stdin")
+    segments = transaction_payload_preflight_segments(input_text, source=source)
+    files = [
+        inspect_transaction_payload_shape_text(segment_text, source=segment_source, candidate_paths=candidate_paths)
+        for segment_source, segment_text in segments
+    ]
+    shape_review = transaction_payload_shape_review_from_files(files)
+    shape_review["candidate_paths"] = candidate_paths
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for segment_source, segment_text in segments:
+        extract_transaction_candidates_from_text(
+            segment_text,
+            source=segment_source,
+            probe_id=None,
+            candidates=candidates,
+            seen=seen,
+            candidate_paths=candidate_paths,
+        )
+    candidate_summaries = [transaction_candidate_review_summary(candidate) for candidate in candidates]
+    payload_contract_review = build_payload_contract_review(
+        shape_review,
+        expected_payload_type=quote_response_expected_payload_type(profile),
+        candidate_count=len(candidates),
+    )
+    redaction_hits = (
+        transaction_payload_preflight_redaction_hits(input_text)
+        if str(input_meta.get("status") or "") == "loaded"
+        else []
+    )
+    placeholder_present = any(bool(row.get("placeholder")) for row in files)
+    status, status_reason = transaction_payload_preflight_status(
+        input_meta=input_meta,
+        placeholder_present=placeholder_present,
+        candidate_count=len(candidates),
+        payload_contract_review=payload_contract_review,
+        redaction_hits=redaction_hits,
+    )
+    target_sidecar = repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl")
+    followup_commands = transaction_payload_preflight_followup_commands(
+        profile=profile,
+        artifact_dir=artifact_dir,
+        max_input_bytes=max_input_bytes,
+    )
+    command_refs = [
+        row.get("command_safety_ref")
+        for row in followup_commands
+        if isinstance(row, dict) and isinstance(row.get("command_safety_ref"), dict)
+    ]
+    acceptance_checks = [
+        {
+            "id": "input-loaded",
+            "status": "passed" if input_meta.get("status") == "loaded" else "failed",
+            "evidence": {"source": input_meta.get("source"), "bytes": input_meta.get("bytes")},
+        },
+        {
+            "id": "not-empty-placeholder",
+            "status": "failed" if placeholder_present else "passed",
+            "evidence": [row.get("source") for row in files if row.get("placeholder")],
+        },
+        {
+            "id": "redaction-review",
+            "status": "failed" if redaction_hits else "passed",
+            "evidence": redaction_hits,
+        },
+        {
+            "id": "single-transaction-candidate",
+            "status": "passed" if len(candidates) == 1 else "failed" if candidates else "waiting",
+            "evidence": {"candidate_count": len(candidates)},
+        },
+        {
+            "id": "payload-contract-compatible",
+            "status": "passed"
+            if payload_contract_review.get("allows_decode")
+            else "failed"
+            if candidates
+            else "waiting",
+            "evidence": payload_contract_review,
+        },
+        {
+            "id": "official-sidecar-still-required",
+            "status": "waiting",
+            "evidence": {
+                "target_sidecar": target_sidecar,
+                "preflight_writes_official_sidecar": False,
+            },
+        },
+    ]
+    if status == "ready-for-approved-sidecar-copy":
+        next_step = (
+            f"After human approval, copy exactly this redacted payload/response into {target_sidecar}, then run "
+            "transaction-sidecar-review --no-write --show-files --show-candidates --show-commands."
+        )
+    elif status == "payload-type-mismatch":
+        next_step = "Use the quote response whose payloads[*].data.type matches the active profile, or update the profile after review."
+    elif status == "rejected-placeholder":
+        next_step = "Replace the placeholder with exactly one approved quote response body or extracted base64 transaction payload."
+    elif status == "no-transaction-candidate":
+        next_step = "Provide the quote response body containing payloads[*].data.transaction or one extracted base64 transaction payload."
+    elif status == "needs-review":
+        next_step = "Review and redact the input, then rerun transaction-payload-preflight before creating the official sidecar."
+    else:
+        next_step = "Provide --input PATH or pipe one approved/redacted payload body on stdin."
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-transaction-payload-preflight-v1",
+        "status": status,
+        "status_reason": status_reason,
+        "input": input_meta,
+        "target_official_sidecar": target_sidecar,
+        "official_evidence_still_required": True,
+        "max_input_bytes": max_input_bytes,
+        "segments": [
+            {
+                "source": source_label,
+                "bytes": len(segment_text.encode("utf-8", errors="replace")),
+                "sha256": hashlib.sha256(segment_text.encode("utf-8", errors="replace")).hexdigest(),
+            }
+            for source_label, segment_text in segments[:12]
+        ],
+        "summary": {
+            "segments": len(segments),
+            "candidate_count": len(candidates),
+            "shape_status": shape_review.get("status"),
+            "payload_contract_status": payload_contract_review.get("status"),
+            "payload_contract_allows_decode": bool(payload_contract_review.get("allows_decode")),
+            "redaction_hits": len(redaction_hits),
+            "placeholder_present": placeholder_present,
+            "expected_payload_type": payload_contract_review.get("expected_payload_type"),
+        },
+        "shape_review": shape_review,
+        "payload_contract_review": payload_contract_review,
+        "candidate_summaries": candidate_summaries[:12],
+        "redaction_review": {
+            "status": "failed" if redaction_hits else "passed",
+            "hits": redaction_hits,
+            "forbidden_fields": [
+                "raw HTTP requests/responses",
+                *BOUNTY_WORKORDER_GLOBAL_FORBIDDEN_FIELDS,
+            ],
+        },
+        "acceptance_checks": acceptance_checks,
+        "followup_commands": followup_commands,
+        "command_safety": command_safety_summary(command_refs),
+        "next_step": next_step,
+        "finding_gate_boundary": (
+            "Transaction payload preflight is not evidence, not a PoC, and not a finding. It never satisfies "
+            "finding-gate/adjudication without the official sidecar, matching intent policy, offline decode review, "
+            "and concrete impact decision."
+        ),
+        "safety": (
+            "Offline payload preflight only. It reads one local input or stdin under a byte cap, records hashes and "
+            "redacted metadata only, writes no official evidence sidecar, sends no requests, invokes no Burp tools, "
+            "starts no browser, signs no wallet, submits no transaction, and changes no infrastructure."
         ),
     }
 
@@ -81421,6 +82130,132 @@ def print_transaction_payload_template_json(guidance: dict[str, Any]) -> None:
     print(json.dumps(sanitize_artifact_samples(template), indent=2, sort_keys=False))
 
 
+def run_transaction_payload_preflight(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    input_text, input_meta = read_transaction_payload_preflight_input(
+        getattr(args, "input", None),
+        max_input_bytes=args.max_input_bytes,
+    )
+    preflight = build_transaction_payload_preflight(
+        profile=profile,
+        artifact_dir=artifact_dir,
+        input_text=input_text,
+        input_meta=input_meta,
+        max_input_bytes=args.max_input_bytes,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if getattr(args, "output", None)
+        else artifact_dir / TRANSACTION_PAYLOAD_PREFLIGHT_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(preflight))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="transaction-payload-preflight",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = preflight.get("summary", {}) if isinstance(preflight.get("summary"), dict) else {}
+    print(f"Transaction payload preflight: {preflight.get('status')}")
+    print(
+        "Input: "
+        f"source={input_meta.get('source') or '-'} "
+        f"status={input_meta.get('status') or '-'} "
+        f"bytes={input_meta.get('bytes', '-')} "
+        f"segments={summary.get('segments', 0)}"
+    )
+    print(
+        "Payload: "
+        f"candidates={summary.get('candidate_count', 0)} "
+        f"shape={summary.get('shape_status') or '-'} "
+        f"contract={summary.get('payload_contract_status') or '-'} "
+        f"expected_type={summary.get('expected_payload_type') or '-'} "
+        f"allows_decode={summary.get('payload_contract_allows_decode')} "
+        f"redaction_hits={summary.get('redaction_hits', 0)} "
+        f"placeholder={summary.get('placeholder_present')}"
+    )
+    print(f"Target official sidecar: {preflight.get('target_official_sidecar')}")
+    if getattr(args, "show_records", False):
+        shape_review = preflight.get("shape_review") if isinstance(preflight.get("shape_review"), dict) else {}
+        for file_row in (shape_review.get("files", []) or [])[: max(0, int(args.top))]:
+            if not isinstance(file_row, dict):
+                continue
+            print(
+                f"- shape_source={file_row.get('source')} "
+                f"status={file_row.get('status')} "
+                f"configured_hits={file_row.get('configured_candidate_path_hits', 0)} "
+                f"base64_hits={file_row.get('base64_regex_hits', 0)}"
+            )
+            placeholder = file_row.get("placeholder") if isinstance(file_row.get("placeholder"), dict) else {}
+            if placeholder:
+                print(f"  placeholder={inline_summary_text(placeholder.get('note'), max_chars=220)}")
+            for record in (file_row.get("records", []) or [])[:2]:
+                if not isinstance(record, dict):
+                    continue
+                print(
+                    "  shape="
+                    f"{record.get('kind')} path={record.get('json_path')} "
+                    f"type={record.get('payload_type') or '-'} chain={record.get('chain') or '-'}"
+                )
+        for candidate in (preflight.get("candidate_summaries", []) or [])[: max(0, int(args.top))]:
+            if not isinstance(candidate, dict):
+                continue
+            print(
+                f"- candidate={candidate.get('id')} source={candidate.get('source')} "
+                f"path={candidate.get('json_path')} bytes={candidate.get('decoded_byte_length')} "
+                f"sha256={candidate.get('base64_sha256')}"
+            )
+    redaction_review = (
+        preflight.get("redaction_review")
+        if isinstance(preflight.get("redaction_review"), dict)
+        else {}
+    )
+    if redaction_review.get("hits"):
+        print("Redaction hits:")
+        for hit in (redaction_review.get("hits") or [])[: max(0, int(args.top))]:
+            if not isinstance(hit, dict):
+                continue
+            print(
+                f"- {hit.get('kind')} count={hit.get('count', 0)} "
+                f"fields={','.join(normalize_string_list(hit.get('fields'))) or '-'}"
+            )
+    if getattr(args, "show_commands", False):
+        print("Follow-up commands:")
+        for row in (preflight.get("followup_commands", []) or [])[: max(0, int(args.top))]:
+            if not isinstance(row, dict):
+                continue
+            safety = (
+                (row.get("command_safety_ref") or {}).get("classification")
+                if isinstance(row.get("command_safety_ref"), dict)
+                else "-"
+            )
+            print(
+                f"- {row.get('id')} safety={safety} "
+                f"command={inline_summary_text(row.get('command'), max_chars=420)}"
+            )
+    if getattr(args, "show_json", False):
+        print("Preflight JSON:")
+        print(json.dumps(sanitize_artifact_samples(preflight), indent=2, sort_keys=False))
+    print(f"Next: {inline_summary_text(preflight.get('next_step'), max_chars=360)}")
+    print("Official sidecar written: false")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and preflight.get("status") != "ready-for-approved-sidecar-copy":
+        return 1
+    return 0
+
+
 def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -82649,6 +83484,13 @@ def run_claim_evidence_requests(args: argparse.Namespace) -> int:
                         f"{handoff.get('status') or '-'} "
                         f"quote={recommended_quote.get('method') or '-'} {recommended_quote.get('path') or '-'} "
                         f"direction={recommended_quote.get('direction') or '-'}"
+                    )
+                    if handoff.get("last_preflight_status"):
+                        print(f"  preflight_status={handoff.get('last_preflight_status')}")
+                if source.get("preflight_command") and getattr(args, "show_requests", False):
+                    print(
+                        "  preflight="
+                        f"{inline_summary_text(source.get('preflight_command'), max_chars=420)}"
                     )
             if draft.get("draft_path"):
                 print(f"  draft_path={draft.get('draft_path')}")
@@ -84431,6 +85273,13 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
                             f"{handoff.get('status') or '-'} "
                             f"quote={recommended_quote.get('method') or '-'} {recommended_quote.get('path') or '-'} "
                             f"direction={recommended_quote.get('direction') or '-'}"
+                        )
+                        if handoff.get("last_preflight_status"):
+                            print(f"  claim_preflight_status={handoff.get('last_preflight_status')}")
+                    if first_source.get("preflight_command") and getattr(args, "show_commands", False):
+                        print(
+                            "  claim_preflight="
+                            f"{inline_summary_text(first_source.get('preflight_command'), max_chars=420)}"
                         )
                 if row.get("claim_evidence_first_verification_command") and getattr(args, "show_commands", False):
                     print(
@@ -89094,6 +89943,66 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the derived policy only; do not write transaction-intent-policy.json or refreshed manifests.",
     )
     prepare_intent_policy.set_defaults(func=run_prepare_transaction_intent_policy)
+
+    transaction_payload_preflight = sub.add_parser(
+        "transaction-payload-preflight",
+        help="Preflight one approved transaction payload or quote response before creating official sidecars",
+    )
+    transaction_payload_preflight.add_argument(
+        "--input",
+        help="Approved local JSON, JSONL, or text payload file to inspect. Use '-' for stdin.",
+    )
+    transaction_payload_preflight.add_argument(
+        "--output",
+        help=(
+            f"Where to write {TRANSACTION_PAYLOAD_PREFLIGHT_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{TRANSACTION_PAYLOAD_PREFLIGHT_ARTIFACT}."
+        ),
+    )
+    transaction_payload_preflight.add_argument(
+        "--max-input-bytes",
+        type=positive_int,
+        default=DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+        help=(
+            "Maximum bytes to read from the preflight input. "
+            f"Defaults to {DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES}."
+        ),
+    )
+    transaction_payload_preflight.add_argument(
+        "--top",
+        type=positive_int,
+        default=6,
+        help="Number of shape records, candidates, or commands to print.",
+    )
+    transaction_payload_preflight.add_argument(
+        "--show-records",
+        action="store_true",
+        help="Print redacted shape records and candidate summaries.",
+    )
+    transaction_payload_preflight.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print the sidecar review, intent policy, and decode follow-up commands.",
+    )
+    transaction_payload_preflight.add_argument(
+        "--show-json",
+        action="store_true",
+        help="Print the sanitized preflight JSON report.",
+    )
+    transaction_payload_preflight.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print preflight only; do not write {TRANSACTION_PAYLOAD_PREFLIGHT_ARTIFACT}, official sidecars, "
+            "or refreshed manifests."
+        ),
+    )
+    transaction_payload_preflight.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless the input is ready for approved sidecar copy.",
+    )
+    transaction_payload_preflight.set_defaults(func=run_transaction_payload_preflight)
 
     transaction_sidecar_review = sub.add_parser(
         "transaction-sidecar-review",
