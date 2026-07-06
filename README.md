@@ -370,7 +370,9 @@ acceptance criteria for approved evidence handoff; they are not evidence and do
 not bypass `bounty-evidence-intake`, finding-gate, or adjudication. Each
 contract also has a `validator_execution_gate`, so missing sidecars remain
 `waiting-official-evidence` even when their no-write validator commands are
-safe to preview.
+safe to preview. The packet-level `official_evidence_contract_gate` aggregates
+those contracts and only exposes `autorunnable_contract_validator_commands` when
+every required sidecar contract is ready for no-write validation.
 
 `claim-evidence-requests` also uses that queue context for its default ordering:
 in bounty mode, evidence for the highest-ranked action comes before a broader
