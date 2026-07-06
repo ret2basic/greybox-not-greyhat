@@ -408,7 +408,8 @@ It also emits `assessment_mode_comparison`, which scores the same candidates as
 both `greybox` and `blackbox` without changing the profile. This makes it clear
 when coverage-first and bounty-first modes would pursue different top leads, and
 how many secondary candidates blackbox mode would park behind the dominant
-bounty path.
+bounty path. Add `--show-funnel --show-mode-comparison` to print those stage
+blockers and per-mode scores directly in the no-write CLI output.
 
 Use `lead-dossier` when you want the same evidence closure in a tighter
 bug-bounty style lead file. It applies the “read code, constrain by
