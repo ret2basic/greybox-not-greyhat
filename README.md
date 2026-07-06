@@ -345,6 +345,11 @@ and `transaction-intent-policy.json` as a required pair: the payload sidecar
 must yield a bounded transaction candidate, the intent policy must be valid, and
 `transaction-sidecar-review` must be ready for offline decode before the request
 is marked ready for lane validation.
+When intake does mark a request ready, `bounty-action-queue` keeps the action
+agent-offline and attaches an ordered `validation_commands` chain. For
+transaction-integrity this runs transaction evidence readiness, offline decode,
+finding gate, and adjudication in order; the chain is workflow control only and
+does not make the evidence reportable by itself.
 
 `claim-evidence-requests` also uses that queue context for its default ordering:
 in bounty mode, evidence for the highest-ranked action comes before a broader

@@ -28409,6 +28409,51 @@ def bounty_action_safe_command(
     return str(authorization.get("recommended_preview_command") or "")
 
 
+def bounty_action_validation_commands(
+    kind: str,
+    authorization: dict[str, Any],
+    intake: dict[str, Any],
+    *,
+    safe_command: str,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+) -> list[str]:
+    commands = [safe_command] if safe_command else []
+    if kind != "validate-ready-evidence":
+        return ordered_unique_strings(commands)
+
+    lane = str(authorization.get("lane") or intake.get("lane") or "")
+    if lane == "transaction-integrity":
+        commands.extend(
+            [
+                validation_command_for_artifact_dir(artifact_dir, "decode-transactions --no-write", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+            ]
+        )
+    elif lane == "sensitive-response-impact":
+        commands.extend(
+            [
+                validation_command_for_artifact_dir(
+                    artifact_dir,
+                    "rewrite-response-review --no-write --show-observations --show-sidecar-validation",
+                    profile=profile,
+                ),
+                validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+            ]
+        )
+    else:
+        commands.extend(
+            [
+                validation_command_for_artifact_dir(artifact_dir, "bounty-validation-gates --no-write --show-gates", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
+            ]
+        )
+    return ordered_unique_strings(commands)
+
+
 def bounty_requested_evidence_path(value: Any, *, artifact_dir: Path) -> Path | None:
     text = str(value or "").strip()
     if not text:
@@ -28673,6 +28718,14 @@ def bounty_action_for_authorization_request(
         artifact_dir=artifact_dir,
         profile=profile,
     )
+    validation_commands = bounty_action_validation_commands(
+        kind,
+        authorization,
+        intake,
+        safe_command=safe_command,
+        artifact_dir=artifact_dir,
+        profile=profile,
+    )
     requires_human = kind in {
         "collect-approved-evidence",
         "fix-evidence-intake",
@@ -28707,6 +28760,8 @@ def bounty_action_for_authorization_request(
         "agent_can_continue_without_new_evidence": kind in {"validate-ready-evidence", "run-evidence-intake"},
         "blocked_by_official_evidence": kind in {"collect-approved-evidence", "park-until-official-evidence"},
         "safe_offline_command": safe_command,
+        "validation_commands": validation_commands,
+        "validation_command_count": len(validation_commands),
         "next_step": bounty_action_next_step(kind, authorization, intake),
         "requested_evidence": requested_evidence,
         "requested_evidence_status": evidence_status_rows,
@@ -28841,6 +28896,8 @@ def build_bounty_action_queue(
                 "agent_can_continue_without_new_evidence": True,
                 "blocked_by_official_evidence": False,
                 "safe_offline_command": refresh_command,
+                "validation_commands": [refresh_command],
+                "validation_command_count": 1,
                 "next_step": "Refresh bounty evidence authorization and intake artifacts.",
                 "requested_evidence": [],
                 "requested_evidence_status": [],
@@ -28913,9 +28970,14 @@ def build_bounty_action_queue(
         status = "no-bounty-actions"
     commands = ordered_unique_strings(
         [
-            str(row.get("safe_offline_command") or "")
+            str(command)
             for row in actions
-            if row.get("safe_offline_command")
+            for command in (
+                row.get("validation_commands")
+                if isinstance(row.get("validation_commands"), list)
+                else [row.get("safe_offline_command")]
+            )
+            if command
         ]
     )
     cache_validation = bounty_action_queue_cache_validation(
@@ -30381,6 +30443,9 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
         if isinstance(rebuilt_ready_queue_case.get("actions"), list) and rebuilt_ready_queue_case.get("actions")
         else {}
     )
+    rebuilt_ready_validation_commands = normalize_string_list(rebuilt_ready_action.get("validation_commands"))
+    rebuilt_ready_validation_text = "\n".join(rebuilt_ready_validation_commands)
+    rebuilt_ready_queue_commands_text = "\n".join(normalize_string_list(rebuilt_ready_queue_case.get("commands")))
     stale_template_cache = (
         stale_templates_case.get("cache_validation")
         if isinstance(stale_templates_case.get("cache_validation"), dict)
@@ -30856,6 +30921,28 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
                 "rebuilt_status": rebuilt_ready_queue_case.get("status"),
                 "rebuilt_kind": rebuilt_ready_action.get("kind"),
                 "rebuilt_agent_ready": rebuilt_ready_action.get("agent_can_continue_without_new_evidence"),
+            },
+        },
+        {
+            "id": "ready-transaction-action-carries-offline-validation-chain",
+            "passed": rebuilt_ready_action.get("kind") == "validate-ready-evidence"
+            and rebuilt_ready_action.get("validation_command_count") == 4
+            and "transaction-evidence-readiness --no-write --show-checks" in rebuilt_ready_validation_text
+            and "decode-transactions --no-write" in rebuilt_ready_validation_text
+            and "gate --no-write --show-items" in rebuilt_ready_validation_text
+            and "adjudicate --no-write" in rebuilt_ready_validation_text
+            and "decode-transactions --no-write" in rebuilt_ready_queue_commands_text
+            and "adjudicate --no-write" in rebuilt_ready_queue_commands_text,
+            "expected": [
+                "transaction-evidence-readiness",
+                "decode-transactions",
+                "gate --no-write --show-items",
+                "adjudicate --no-write",
+            ],
+            "actual": {
+                "validation_command_count": rebuilt_ready_action.get("validation_command_count"),
+                "validation_commands": rebuilt_ready_validation_commands,
+                "queue_commands": normalize_string_list(rebuilt_ready_queue_case.get("commands")),
             },
         },
         {
@@ -87015,6 +87102,9 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
                 command_text = row.get("safe_offline_command")
                 if command_text:
                     print(f"  command={inline_summary_text(command_text, max_chars=420)}")
+                validation_commands = normalize_string_list(row.get("validation_commands"))
+                for command_text in validation_commands[1:4]:
+                    print(f"  validation={inline_summary_text(command_text, max_chars=420)}")
             if getattr(args, "show_blockers", False):
                 risks = ", ".join(normalize_string_list(row.get("redaction_risks"))[:4])
                 if risks:
