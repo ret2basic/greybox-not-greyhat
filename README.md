@@ -410,6 +410,10 @@ source-only context, missing official evidence, unproven pair binding, unchecked
 negative controls, blocked offline validation, and missing finding-gate
 acceptance are listed as explicit report blockers before any bounty report can
 be treated as valid.
+`bounty-invalidity-review --show-reasons` mirrors that same packet-level
+reviewer preflight into its top invalidity row and summary, so action queue,
+human brief, readiness rollup, and invalidity review all explain the same
+report-blocking reasons instead of producing separate blocker lists.
 Packet handoff commands also carry `handoff_command_refs`, so the same
 `manual-template`/`review-gated` classification shown in
 `bounty-action-queue --show-actions --show-commands` is available to automation
