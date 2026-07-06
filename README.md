@@ -410,8 +410,9 @@ Each contract also has a `validator_execution_gate`, so missing sidecars remain
 safe to preview. The packet-level `official_evidence_contract_gate` aggregates
 those contracts and only exposes `autorunnable_contract_validator_commands` when
 every required sidecar contract is ready for no-write validation. Use
-`bounty-action-queue --show-contracts` to print the packet's required fields,
-reject conditions, paired sidecars, and copy policy without opening the JSON.
+`bounty-action-queue --show-contracts --show-intake-manifest` to print the
+packet's required fields, reject conditions, paired sidecars, intake artifact
+counts, pair-binding fields, and copy policy without opening the JSON.
 
 Use `bounty-shortest-path` when the loop needs the shortest current path to one
 valid Medium/High/Critical bounty report instead of a broad coverage queue:
