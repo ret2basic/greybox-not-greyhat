@@ -456,6 +456,11 @@ bad `approval_reference` or SHA-256 mismatch is visible without opening the JSON
 When the pair reaches `ready-for-decode`, the same contract exposes the gated
 no-write validation chain: `transaction-sidecar-review`, `decode-transactions`,
 `gate`, and `adjudicate`. Blocked pairs keep that command list empty.
+`bounty-prep-sync --show-checks --show-details` also compares the top
+`bounty-action-queue` request with the next evidence packet's
+`evidence_intake_manifest`, including artifact coverage, pair-binding status,
+binding-field count, copy policy, and reject-rule count, before asking anyone to
+fill official sidecars.
 
 `methodology-review` also emits `bounty_harness_alignment`, a compact
 bug-bounty readiness check derived from the harness pattern of building system
