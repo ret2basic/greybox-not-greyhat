@@ -1602,11 +1602,12 @@ minimum destination amount, optional recipient, chain, direction, and `maxNumQuo
 preflight at `intent-needs-review`. It derives the intent policy preview from the
 request's configured sender, amount, source mint, and destination mint fields,
 verifies that the response/payload has exactly one compatible transaction
-candidate, checks response `amountIn`, route mints/chains, recipient, and quote
-container count against the approved request when the response exposes those
-fields, prints the exact policy and decode follow-up commands, and still writes
-no official sidecars. Stdin is supported for only one side at a time; the other
-sides must be files so the tool never tries to read the same stream twice.
+candidate, checks response `amountIn`, route mints/chains, recipient, quote
+container count, and payload `data.chain` against the approved request when the
+response exposes those fields, prints the exact policy and decode follow-up
+commands, and still writes no official sidecars. Stdin is supported for only one
+side at a time; the other sides must be files so the tool never tries to read
+the same stream twice.
 A `ready-for-approved-corpus-sidecars` result only means the operator-reviewed
 request/response/intent set is ready to be copied into the official payload and
 intent-policy sidecars after approval.
