@@ -200,6 +200,7 @@ TRANSACTION_INTENT_BOUNDARY_ARTIFACT = "transaction-intent-boundary.json"
 TRANSACTION_CORPUS_CHECKLIST_ARTIFACT = "transaction-corpus-checklist.json"
 TRANSACTION_SIDECAR_REVIEW_ARTIFACT = "transaction-sidecar-review.json"
 TRANSACTION_PAYLOAD_PREFLIGHT_ARTIFACT = "transaction-payload-preflight.json"
+TRANSACTION_CORPUS_PREFLIGHT_ARTIFACT = "transaction-corpus-preflight.json"
 TRANSACTION_EVIDENCE_READINESS_ARTIFACT = "transaction-evidence-readiness.json"
 TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT = "transaction-intent-policy-templates.json"
 CREDENTIAL_IMPACT_CHECKLIST_ARTIFACT = "credential-impact-checklist.json"
@@ -22812,11 +22813,13 @@ def claim_evidence_request_source_readiness(
         else:
             status = "waiting-approved-quote-capture"
         preflight_command = transaction_payload_preflight_command(artifact_dir, profile=profile)
+        corpus_preflight_command = transaction_corpus_preflight_command(artifact_dir, profile=profile)
         return {
             **base,
             "status": status,
             "local_candidate_count": local_count,
             "preflight_command": preflight_command,
+            "corpus_preflight_command": corpus_preflight_command,
             "sources": [
                 {
                     "artifact": "burp-transaction-candidates.json",
@@ -22862,6 +22865,7 @@ def claim_evidence_request_source_readiness(
                 "intent_policy_sidecar": approval_packet.get("intent_policy_sidecar")
                 or repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json"),
                 "preflight_command": preflight_command,
+                "corpus_preflight_command": corpus_preflight_command,
                 "last_preflight_status": preflight.get("status") or None,
                 "accepted_payload_sidecars": normalize_string_list(approval_packet.get("accepted_payload_sidecars"))[:4],
                 "required_fields": normalize_string_list(approval_packet.get("redacted_sidecar_required_fields"))[:6],
@@ -22882,7 +22886,7 @@ def claim_evidence_request_source_readiness(
                 if max(burp_count, quote_count, review_count) > 0
                 else "Copy the preflighted approved/redacted payload into the official sidecar, then rerun transaction-sidecar-review."
                 if preflight_ready
-                else "No local transaction payload candidate is available; run transaction-payload-preflight on exactly one approved quote response before creating the official sidecar."
+                else "No local transaction payload candidate is available; run transaction-corpus-preflight on one approved quote request plus its matching quote response before creating official sidecars."
             ),
         }
     if name == "transaction-intent-policy.json":
@@ -28252,6 +28256,7 @@ def bounty_action_claim_request_rows(
                     "local_candidate_count": source.get("local_candidate_count", 0),
                     "official_evidence_still_required": source.get("official_evidence_still_required", True),
                     "preflight_command": source.get("preflight_command"),
+                    "corpus_preflight_command": source.get("corpus_preflight_command"),
                     "next_step": source.get("next_step"),
                     "handoff_contract": {
                         "status": handoff.get("status"),
@@ -28264,6 +28269,7 @@ def bounty_action_claim_request_rows(
                         "payload_sidecar": handoff.get("payload_sidecar"),
                         "intent_policy_sidecar": handoff.get("intent_policy_sidecar"),
                         "preflight_command": handoff.get("preflight_command"),
+                        "corpus_preflight_command": handoff.get("corpus_preflight_command"),
                         "last_preflight_status": handoff.get("last_preflight_status"),
                         "required_fields": normalize_string_list(handoff.get("required_fields"))[:4],
                         "offline_commands": normalize_string_list(handoff.get("offline_commands"))[:3],
@@ -30835,6 +30841,15 @@ def bounty_evidence_request_markdown(
                                 "  - Payload preflight:",
                                 "```bash",
                                 str(source.get("preflight_command")),
+                                "```",
+                            ]
+                        )
+                    if source.get("corpus_preflight_command"):
+                        lines.extend(
+                            [
+                                "  - Corpus preflight:",
+                                "```bash",
+                                str(source.get("corpus_preflight_command")),
                                 "```",
                             ]
                         )
@@ -59014,6 +59029,9 @@ def build_no_write_selftest() -> dict[str, Any]:
             "default_target": target,
             "default_source_root": str(root),
             "strategy_sets": ["nextjs-api-routes"],
+            "quote_intent": json_clone(default_target_profile().get("quote_intent", {})),
+            "quote_request": json_clone(default_target_profile().get("quote_request", {})),
+            "quote_response": json_clone(default_target_profile().get("quote_response", {})),
             "clusters": [
                 {
                     "id": "no-write",
@@ -59195,6 +59213,7 @@ def build_no_write_selftest() -> dict[str, Any]:
         lead_dossier_output_dir = root / "lead-dossier-output"
         transaction_sidecar_review_output_dir = root / "transaction-sidecar-review-output"
         transaction_payload_preflight_output_dir = root / "transaction-payload-preflight-output"
+        transaction_corpus_preflight_output_dir = root / "transaction-corpus-preflight-output"
         transaction_corpus_checklist_output_dir = root / "transaction-corpus-checklist-output"
         credential_impact_checklist_output_dir = root / "credential-impact-checklist-output"
         operator_evidence_review_output_dir = root / "operator-evidence-review-output"
@@ -59219,6 +59238,21 @@ def build_no_write_selftest() -> dict[str, Any]:
                         }
                     ]
                 },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        approved_quote_request_input = root / "approved-quote-request.json"
+        approved_quote_request_input.write_text(
+            json.dumps(
+                build_quote_request_body(
+                    profile,
+                    "buy",
+                    DEFAULT_TEST_WALLET,
+                    "1000000",
+                    recipient=DEFAULT_TEST_WALLET,
+                ),
                 sort_keys=True,
             )
             + "\n",
@@ -59551,6 +59585,27 @@ def build_no_write_selftest() -> dict[str, Any]:
                     "--show-commands",
                 ]
             )
+            transaction_corpus_preflight_return_code, transaction_corpus_preflight_stdout = run_cli(
+                [
+                    "--profile",
+                    str(profile_path),
+                    "--artifact-dir",
+                    str(transaction_corpus_preflight_output_dir),
+                    "--target",
+                    target,
+                    "--source-root",
+                    str(root),
+                    "transaction-corpus-preflight",
+                    "--request-input",
+                    str(approved_quote_request_input),
+                    "--payload-input",
+                    str(approved_payload_preflight_input),
+                    "--no-write",
+                    "--show-policy-json",
+                    "--show-checks",
+                    "--show-commands",
+                ]
+            )
             transaction_corpus_checklist_return_code, transaction_corpus_checklist_stdout = run_cli(
                 [
                     "--profile",
@@ -59832,6 +59887,22 @@ def build_no_write_selftest() -> dict[str, Any]:
             "transaction_payload_preflight_manifest": (
                 transaction_payload_preflight_output_dir / MANIFEST_NAME
             ).exists(),
+            "transaction_corpus_preflight_dir": transaction_corpus_preflight_output_dir.exists(),
+            "transaction_corpus_preflight_target_profile_json": (
+                transaction_corpus_preflight_output_dir / TARGET_PROFILE_ARTIFACT
+            ).exists(),
+            "transaction_corpus_preflight_json": (
+                transaction_corpus_preflight_output_dir / TRANSACTION_CORPUS_PREFLIGHT_ARTIFACT
+            ).exists(),
+            "transaction_corpus_preflight_official_payload_jsonl": (
+                transaction_corpus_preflight_output_dir / "transaction-payloads.jsonl"
+            ).exists(),
+            "transaction_corpus_preflight_official_policy_json": (
+                transaction_corpus_preflight_output_dir / "transaction-intent-policy.json"
+            ).exists(),
+            "transaction_corpus_preflight_manifest": (
+                transaction_corpus_preflight_output_dir / MANIFEST_NAME
+            ).exists(),
             "transaction_corpus_checklist_dir": transaction_corpus_checklist_output_dir.exists(),
             "transaction_corpus_checklist_target_profile_json": (
                 transaction_corpus_checklist_output_dir / TARGET_PROFILE_ARTIFACT
@@ -59928,6 +59999,7 @@ def build_no_write_selftest() -> dict[str, Any]:
     lead_dossier_stdout_text = "\n".join(lead_dossier_stdout)
     transaction_sidecar_review_stdout_text = "\n".join(transaction_sidecar_review_stdout)
     transaction_payload_preflight_stdout_text = "\n".join(transaction_payload_preflight_stdout)
+    transaction_corpus_preflight_stdout_text = "\n".join(transaction_corpus_preflight_stdout)
     transaction_corpus_checklist_stdout_text = "\n".join(transaction_corpus_checklist_stdout)
     credential_impact_checklist_stdout_text = "\n".join(credential_impact_checklist_stdout)
     operator_evidence_review_stdout_text = "\n".join(operator_evidence_review_stdout)
@@ -61029,6 +61101,41 @@ def build_no_write_selftest() -> dict[str, Any]:
             "actual": {
                 "return_code": transaction_payload_preflight_return_code,
                 "stdout": transaction_payload_preflight_stdout,
+                "outputs_exist": output_paths,
+            },
+        },
+        {
+            "id": "transaction-corpus-preflight-no-write-skips-artifacts",
+            "passed": (
+                transaction_corpus_preflight_return_code == 0
+                and "Transaction corpus preflight: ready-for-approved-corpus-sidecars"
+                in transaction_corpus_preflight_stdout_text
+                and "Intent policy preview JSON:" in transaction_corpus_preflight_stdout_text
+                and "Follow-up commands:" in transaction_corpus_preflight_stdout_text
+                and "prepare-transaction-intent-policy --direction buy" in transaction_corpus_preflight_stdout_text
+                and "decode-transactions --no-write" in transaction_corpus_preflight_stdout_text
+                and "Official sidecars written: false" in transaction_corpus_preflight_stdout_text
+                and "No files written (--no-write)." in transaction_corpus_preflight_stdout
+                and not any(
+                    output_paths[key]
+                    for key in [
+                        "transaction_corpus_preflight_dir",
+                        "transaction_corpus_preflight_target_profile_json",
+                        "transaction_corpus_preflight_json",
+                        "transaction_corpus_preflight_official_payload_jsonl",
+                        "transaction_corpus_preflight_official_policy_json",
+                        "transaction_corpus_preflight_manifest",
+                    ]
+                )
+                and not any(line.startswith("Refreshed ") for line in transaction_corpus_preflight_stdout)
+            ),
+            "expected": (
+                "transaction-corpus-preflight --no-write derives intent policy and payload readiness without writing "
+                "preflight artifacts, official sidecars, or manifests"
+            ),
+            "actual": {
+                "return_code": transaction_corpus_preflight_return_code,
+                "stdout": transaction_corpus_preflight_stdout,
                 "outputs_exist": output_paths,
             },
         },
@@ -63572,6 +63679,19 @@ def transaction_payload_preflight_command(
     )
 
 
+def transaction_corpus_preflight_command(
+    artifact_dir: Path,
+    *,
+    profile: dict[str, Any] | None,
+) -> str:
+    return validation_command_for_artifact_dir(
+        artifact_dir,
+        "transaction-corpus-preflight --request-input REPLACE_WITH_APPROVED_QUOTE_REQUEST_JSON "
+        "--payload-input REPLACE_WITH_APPROVED_QUOTE_RESPONSE_OR_PAYLOAD --no-write --show-policy-json --show-commands",
+        profile=profile,
+    )
+
+
 def transaction_payload_preflight_segments(text: str, *, source: str) -> list[tuple[str, str]]:
     if not text.strip():
         return []
@@ -64010,6 +64130,383 @@ def build_transaction_payload_preflight(
             "Offline payload preflight only. It reads one local input or stdin under a byte cap, records hashes and "
             "redacted metadata only, writes no official evidence sidecar, sends no requests, invokes no Burp tools, "
             "starts no browser, signs no wallet, submits no transaction, and changes no infrastructure."
+        ),
+    }
+
+
+def parse_transaction_corpus_request_body(text: str) -> tuple[Any, dict[str, Any]]:
+    try:
+        parsed = json.loads(text) if text.strip() else None
+    except json.JSONDecodeError as error:
+        return None, {
+            "status": "invalid-json",
+            "error": redacted_error_summary(error),
+        }
+    if not isinstance(parsed, dict):
+        return parsed, {
+            "status": "invalid-request-shape",
+            "reason": "request input must be a JSON object containing the approved quote request body",
+        }
+    return parsed, {"status": "parsed"}
+
+
+def transaction_corpus_direction_candidates(
+    *,
+    profile: dict[str, Any] | None,
+    source_mint: Any,
+    destination_mint: Any,
+) -> list[dict[str, Any]]:
+    matches = []
+    scaffold = build_transaction_intent_policy_scaffold(profile)
+    for row in scaffold.get("directions", []) or []:
+        if not isinstance(row, dict):
+            continue
+        expected_source = str(row.get("sourceMint") or "")
+        expected_destination = str(row.get("destinationMint") or "")
+        if not expected_source or not expected_destination:
+            continue
+        source_matches = str(source_mint or "") == expected_source
+        destination_matches = str(destination_mint or "") == expected_destination
+        matches.append(
+            {
+                "direction": row.get("direction"),
+                "sourceMint": expected_source,
+                "destinationMint": expected_destination,
+                "source_matches": source_matches,
+                "destination_matches": destination_matches,
+                "matches": source_matches and destination_matches,
+                "allowedPrograms": normalize_string_list(row.get("allowedPrograms")),
+                "programAllowlistStatus": "configured" if row.get("allowedPrograms") else "manual-review-required",
+            }
+        )
+    return matches
+
+
+def build_transaction_corpus_request_review(
+    *,
+    profile: dict[str, Any] | None,
+    request_text: str,
+    request_meta: dict[str, Any],
+    explicit_direction: str | None = None,
+) -> dict[str, Any]:
+    parsed, parse_review = parse_transaction_corpus_request_body(request_text)
+    fields = quote_request_policy_fields(profile)
+    extracted: dict[str, Any] = {}
+    if isinstance(parsed, dict):
+        extracted = {
+            "sourceMint": quote_request_get_path(parsed, fields.get("source_mint")),
+            "destinationMint": quote_request_get_path(parsed, fields.get("destination_mint")),
+            "amountIn": quote_request_get_path(parsed, fields.get("amount")),
+            "wallet": quote_request_get_path(parsed, fields.get("sender")),
+            "recipient": quote_request_get_path(parsed, fields.get("recipient")),
+            "maxNumQuotes": quote_request_get_path(parsed, fields.get("max_num_quotes")),
+            "sourceChain": quote_request_get_path(parsed, fields.get("source_chain")),
+            "destinationChain": quote_request_get_path(parsed, fields.get("destination_chain")),
+        }
+    direction_matches = transaction_corpus_direction_candidates(
+        profile=profile,
+        source_mint=extracted.get("sourceMint"),
+        destination_mint=extracted.get("destinationMint"),
+    )
+    matching_directions = [
+        str(row.get("direction") or "")
+        for row in direction_matches
+        if row.get("matches") and row.get("direction")
+    ]
+    direction = str(explicit_direction or "").strip().lower() or (
+        matching_directions[0] if len(matching_directions) == 1 else ""
+    )
+    policy = normalize_transaction_intent_policy(
+        {
+            "direction": direction,
+            "wallet": extracted.get("wallet"),
+            "amountIn": str(extracted.get("amountIn")).strip()
+            if extracted.get("amountIn") is not None
+            else None,
+            "sourceMint": extracted.get("sourceMint"),
+            "destinationMint": extracted.get("destinationMint"),
+        },
+        profile,
+    )
+    issues = normalize_string_list(parse_review.get("reason"))
+    if request_meta.get("status") != "loaded":
+        issues.append(str(request_meta.get("reason") or "request input was not loaded"))
+    if parse_review.get("status") != "parsed":
+        issues.append(str(parse_review.get("status") or "request input could not be parsed"))
+    if explicit_direction and direction not in matching_directions:
+        issues.append("explicit direction does not match the request mint pair")
+    if not direction:
+        issues.append("request source/destination mints did not match exactly one configured direction")
+    if not isinstance(extracted.get("wallet"), str) or not str(extracted.get("wallet") or "").strip():
+        issues.append("request sender/wallet is missing")
+    if extracted.get("recipient") not in (None, extracted.get("wallet")):
+        issues.append("request recipient differs from sender; manual approval is required before intent policy")
+    amount = extracted.get("amountIn")
+    if not isinstance(amount, str) or not re.fullmatch(r"[1-9]\d*", amount.strip()):
+        issues.append("request amountIn must be a positive integer string")
+    if policy.get("issues"):
+        issues.extend(normalize_string_list(policy.get("issues")))
+    issues = ordered_unique_strings(issues)
+    status = "request-ready-for-intent-policy" if not issues and policy.get("valid") else "request-needs-review"
+    if request_meta.get("status") != "loaded":
+        status = str(request_meta.get("status") or "missing-request-input")
+    elif parse_review.get("status") != "parsed":
+        status = str(parse_review.get("status") or "invalid-request-json")
+    return {
+        "status": status,
+        "input": request_meta,
+        "parse_review": parse_review,
+        "policy_fields": fields,
+        "extracted_intent": {
+            key: value
+            for key, value in extracted.items()
+            if value is not None
+        },
+        "direction": direction or None,
+        "matching_directions": matching_directions,
+        "direction_candidates": direction_matches,
+        "intent_policy_preview": policy,
+        "issues": issues,
+        "safety": (
+            "Offline approved-request review only. It records public quote intent fields and hashes, not raw secrets, "
+            "does not send requests, and does not write official evidence sidecars."
+        ),
+    }
+
+
+def transaction_corpus_preflight_followup_commands(
+    *,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    request_review: dict[str, Any],
+    max_input_bytes: int,
+) -> list[dict[str, Any]]:
+    policy = request_review.get("intent_policy_preview") if isinstance(request_review.get("intent_policy_preview"), dict) else {}
+    direction = str(policy.get("direction") or "")
+    wallet = str(policy.get("wallet") or "")
+    amount_in = str(policy.get("amountIn") or "")
+    target_payload_sidecar = repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl")
+    rows = [
+        {
+            "id": "corpus-preflight-template",
+            "command": transaction_corpus_preflight_command(artifact_dir, profile=profile),
+            "purpose": "Validate one approved quote request plus the matching quote response/payload before official sidecars.",
+        },
+        {
+            "id": "payload-preflight-template",
+            "command": transaction_payload_preflight_command(artifact_dir, profile=profile),
+            "purpose": "Validate the response/payload shape separately if only that input is available.",
+        },
+        {
+            "id": "sidecar-review",
+            "command": validation_command_for_artifact_dir(
+                artifact_dir,
+                "transaction-sidecar-review --no-write --show-files --show-candidates --show-commands",
+                profile=profile,
+            ),
+            "purpose": "Review official sidecars after the approved payload and policy are copied into place.",
+        },
+    ]
+    if direction and wallet and amount_in:
+        prepare_parts = [
+            "prepare-transaction-intent-policy",
+            "--direction",
+            direction,
+            "--wallet",
+            wallet,
+            "--amount-in",
+            amount_in,
+        ]
+        decode_parts = [
+            "decode-transactions",
+            "--no-write",
+            "--input",
+            target_payload_sidecar,
+            "--intent-direction",
+            direction,
+            "--intent-wallet",
+            wallet,
+            "--intent-amount-in",
+            amount_in,
+            "--max-input-bytes",
+            str(max_input_bytes),
+        ]
+        for program_id in normalize_string_list(policy.get("allowedPrograms")):
+            prepare_parts.extend(["--intent-allowed-program", program_id])
+            decode_parts.extend(["--intent-allowed-program", program_id])
+        rows.extend(
+            [
+                {
+                    "id": "intent-policy-preview",
+                    "command": validation_command_for_artifact_dir(
+                        artifact_dir,
+                        " ".join(shlex.quote(str(part)) for part in [*prepare_parts, "--no-write"]),
+                        profile=profile,
+                    ),
+                    "purpose": "Preview the exact intent policy derived from the approved request.",
+                },
+                {
+                    "id": "intent-policy-write",
+                    "command": validation_command_for_artifact_dir(
+                        artifact_dir,
+                        " ".join(shlex.quote(str(part)) for part in prepare_parts),
+                        profile=profile,
+                    ),
+                    "purpose": "Write transaction-intent-policy.json only after the approved request is reviewed.",
+                },
+                {
+                    "id": "decode-preview",
+                    "command": validation_command_for_artifact_dir(
+                        artifact_dir,
+                        " ".join(shlex.quote(str(part)) for part in decode_parts),
+                        profile=profile,
+                    ),
+                    "purpose": "Decode after official sidecars exist, using the same approved intent fields.",
+                },
+            ]
+        )
+    for row in rows:
+        row["command_safety_ref"] = validation_command_ref(
+            str(row.get("command") or ""),
+            source=f"transaction-corpus-preflight:{row.get('id')}",
+        )
+    return rows
+
+
+def transaction_corpus_preflight_status(
+    *,
+    request_review: dict[str, Any],
+    payload_preflight: dict[str, Any],
+) -> tuple[str, str]:
+    if request_review.get("input", {}).get("status") != "loaded":
+        return "missing-request-input", "Provide one approved quote request body JSON file."
+    if payload_preflight.get("input", {}).get("status") != "loaded":
+        return "missing-payload-input", "Provide the matching approved quote response or extracted transaction payload."
+    if request_review.get("status") != "request-ready-for-intent-policy":
+        return "request-needs-review", "The approved quote request does not yet produce a valid intent policy."
+    if payload_preflight.get("status") != "ready-for-approved-sidecar-copy":
+        return "payload-preflight-not-ready", "The approved quote response/payload is not ready for official sidecar copy."
+    return (
+        "ready-for-approved-corpus-sidecars",
+        "Request intent and payload shape are compatible with official sidecars, but this preflight is not evidence.",
+    )
+
+
+def build_transaction_corpus_preflight(
+    *,
+    profile: dict[str, Any] | None,
+    artifact_dir: Path,
+    request_text: str,
+    request_meta: dict[str, Any],
+    payload_text: str,
+    payload_meta: dict[str, Any],
+    explicit_direction: str | None,
+    max_input_bytes: int,
+) -> dict[str, Any]:
+    request_review = build_transaction_corpus_request_review(
+        profile=profile,
+        request_text=request_text,
+        request_meta=request_meta,
+        explicit_direction=explicit_direction,
+    )
+    payload_preflight = build_transaction_payload_preflight(
+        profile=profile,
+        artifact_dir=artifact_dir,
+        input_text=payload_text,
+        input_meta=payload_meta,
+        max_input_bytes=max_input_bytes,
+    )
+    status, status_reason = transaction_corpus_preflight_status(
+        request_review=request_review,
+        payload_preflight=payload_preflight,
+    )
+    followup_commands = transaction_corpus_preflight_followup_commands(
+        profile=profile,
+        artifact_dir=artifact_dir,
+        request_review=request_review,
+        max_input_bytes=max_input_bytes,
+    )
+    command_refs = [
+        row.get("command_safety_ref")
+        for row in followup_commands
+        if isinstance(row, dict) and isinstance(row.get("command_safety_ref"), dict)
+    ]
+    target_payload_sidecar = repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl")
+    target_policy_sidecar = repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json")
+    acceptance_checks = [
+        {
+            "id": "request-intent-policy-ready",
+            "status": "passed" if request_review.get("status") == "request-ready-for-intent-policy" else "failed",
+            "evidence": {
+                "direction": request_review.get("direction"),
+                "issues": request_review.get("issues", []),
+            },
+        },
+        {
+            "id": "payload-preflight-ready",
+            "status": "passed" if payload_preflight.get("status") == "ready-for-approved-sidecar-copy" else "failed",
+            "evidence": {
+                "status": payload_preflight.get("status"),
+                "candidate_count": (payload_preflight.get("summary") or {}).get("candidate_count"),
+            },
+        },
+        {
+            "id": "official-sidecars-still-required",
+            "status": "waiting",
+            "evidence": {
+                "payload_sidecar": target_payload_sidecar,
+                "intent_policy_sidecar": target_policy_sidecar,
+                "preflight_writes_official_sidecars": False,
+            },
+        },
+    ]
+    if status == "ready-for-approved-corpus-sidecars":
+        next_step = (
+            f"After human approval, copy the payload into {target_payload_sidecar}, write the derived policy into "
+            f"{target_policy_sidecar}, then run transaction-sidecar-review and decode-transactions --no-write."
+        )
+    elif status == "request-needs-review":
+        next_step = "Fix or explicitly approve the quote request intent fields, then rerun transaction-corpus-preflight."
+    elif status == "payload-preflight-not-ready":
+        next_step = "Fix or redact the quote response/payload until transaction-payload-preflight is ready."
+    else:
+        next_step = "Provide both --request-input and --payload-input from the same approved quote corpus."
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-transaction-corpus-preflight-v1",
+        "status": status,
+        "status_reason": status_reason,
+        "request_review": request_review,
+        "payload_preflight": payload_preflight,
+        "target_official_sidecars": {
+            "payload": target_payload_sidecar,
+            "intent_policy": target_policy_sidecar,
+        },
+        "official_evidence_still_required": True,
+        "summary": {
+            "request_status": request_review.get("status"),
+            "payload_status": payload_preflight.get("status"),
+            "direction": request_review.get("direction"),
+            "intent_policy_valid": bool(
+                (request_review.get("intent_policy_preview") or {}).get("valid")
+                if isinstance(request_review.get("intent_policy_preview"), dict)
+                else False
+            ),
+            "payload_candidate_count": (payload_preflight.get("summary") or {}).get("candidate_count"),
+            "payload_contract_status": (payload_preflight.get("summary") or {}).get("payload_contract_status"),
+        },
+        "acceptance_checks": acceptance_checks,
+        "followup_commands": followup_commands,
+        "command_safety": command_safety_summary(command_refs),
+        "next_step": next_step,
+        "finding_gate_boundary": (
+            "Transaction corpus preflight is not evidence, not a PoC, and not a finding. It only prepares the "
+            "operator-reviewed handoff into official sidecars, decode review, finding gate, and adjudication."
+        ),
+        "safety": (
+            "Offline corpus preflight only. It reads local files under byte caps, records redacted request intent and "
+            "payload metadata, writes no official evidence sidecars, sends no requests, invokes no Burp tools, starts "
+            "no browser, signs no wallet, submits no transaction, and changes no infrastructure."
         ),
     }
 
@@ -82256,6 +82753,157 @@ def run_transaction_payload_preflight(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_transaction_corpus_preflight(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, source_root = resolve_run_context(args)
+    no_write = bool(args.no_write)
+    if not no_write:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        write_target_profile_artifact(artifact_dir, profile, target, source_root)
+
+    request_input = str(getattr(args, "request_input", "") or "").strip()
+    payload_input = str(getattr(args, "payload_input", "") or "").strip()
+    request_text = ""
+    payload_text = ""
+    request_meta: dict[str, Any] = {
+        "source": "missing",
+        "source_kind": "missing",
+        "raw_input_persisted": False,
+        "max_input_bytes": args.max_input_bytes,
+        "status": "missing-input",
+        "reason": "provide --request-input PATH or --request-input - with --payload-input PATH",
+    }
+    payload_meta: dict[str, Any] = {
+        "source": "missing",
+        "source_kind": "missing",
+        "raw_input_persisted": False,
+        "max_input_bytes": args.max_input_bytes,
+        "status": "missing-input",
+        "reason": "provide --payload-input PATH or --payload-input - with --request-input PATH",
+    }
+    if request_input == "-" and payload_input == "-":
+        request_meta["source"] = "stdin"
+        payload_meta["source"] = "stdin"
+        request_meta["source_kind"] = "stdin"
+        payload_meta["source_kind"] = "stdin"
+        request_meta["reason"] = "one stdin stream cannot safely provide both approved corpus inputs; use a file for one side"
+        payload_meta["reason"] = "one stdin stream cannot safely provide both approved corpus inputs; use a file for one side"
+    else:
+        if request_input:
+            request_text, request_meta = read_transaction_payload_preflight_input(
+                request_input,
+                max_input_bytes=args.max_input_bytes,
+            )
+        if payload_input:
+            payload_text, payload_meta = read_transaction_payload_preflight_input(
+                payload_input,
+                max_input_bytes=args.max_input_bytes,
+            )
+    request_meta["role"] = "approved-quote-request"
+    payload_meta["role"] = "approved-quote-response-or-payload"
+    preflight = build_transaction_corpus_preflight(
+        profile=profile,
+        artifact_dir=artifact_dir,
+        request_text=request_text,
+        request_meta=request_meta,
+        payload_text=payload_text,
+        payload_meta=payload_meta,
+        explicit_direction=getattr(args, "direction", None),
+        max_input_bytes=args.max_input_bytes,
+    )
+    output_path = (
+        resolve_repo_path(args.output)
+        if getattr(args, "output", None)
+        else artifact_dir / TRANSACTION_CORPUS_PREFLIGHT_ARTIFACT
+    )
+    refreshed_manifests = []
+    if not no_write:
+        write_json(output_path, sanitize_artifact_samples(preflight))
+        refreshed_manifests = refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="transaction-corpus-preflight",
+            output_paths=[*target_profile_artifact_paths(artifact_dir), output_path],
+        )
+
+    summary = preflight.get("summary", {}) if isinstance(preflight.get("summary"), dict) else {}
+    request_review = preflight.get("request_review") if isinstance(preflight.get("request_review"), dict) else {}
+    payload_preflight = preflight.get("payload_preflight") if isinstance(preflight.get("payload_preflight"), dict) else {}
+    request_issues = normalize_string_list(request_review.get("issues"))
+    payload_summary = payload_preflight.get("summary") if isinstance(payload_preflight.get("summary"), dict) else {}
+    print(f"Transaction corpus preflight: {preflight.get('status')}")
+    print(
+        "Request: "
+        f"status={request_review.get('status') or '-'} "
+        f"direction={request_review.get('direction') or '-'} "
+        f"issues={len(request_issues)}"
+    )
+    extracted = request_review.get("extracted_intent") if isinstance(request_review.get("extracted_intent"), dict) else {}
+    print(
+        "Intent: "
+        f"wallet_present={bool(extracted.get('wallet'))} "
+        f"amountIn={extracted.get('amountIn') or '-'} "
+        f"source={extracted.get('sourceMint') or '-'} "
+        f"destination={extracted.get('destinationMint') or '-'}"
+    )
+    print(
+        "Payload: "
+        f"status={payload_preflight.get('status') or '-'} "
+        f"candidates={payload_summary.get('candidate_count', 0)} "
+        f"contract={payload_summary.get('payload_contract_status') or '-'} "
+        f"redaction_hits={payload_summary.get('redaction_hits', 0)}"
+    )
+    print(
+        "Target official sidecars: "
+        f"payload={preflight.get('target_official_sidecars', {}).get('payload') if isinstance(preflight.get('target_official_sidecars'), dict) else '-'} "
+        f"policy={preflight.get('target_official_sidecars', {}).get('intent_policy') if isinstance(preflight.get('target_official_sidecars'), dict) else '-'}"
+    )
+    if request_issues and getattr(args, "show_checks", False):
+        print("Request issues:")
+        for issue in request_issues[: max(0, int(args.top))]:
+            print(f"- {inline_summary_text(issue, max_chars=240)}")
+    if getattr(args, "show_policy_json", False):
+        policy = (
+            request_review.get("intent_policy_preview")
+            if isinstance(request_review.get("intent_policy_preview"), dict)
+            else {}
+        )
+        print("Intent policy preview JSON:")
+        print(json.dumps(policy, indent=2, sort_keys=True))
+    if getattr(args, "show_checks", False):
+        print("Acceptance checks:")
+        for check in (preflight.get("acceptance_checks", []) or [])[: max(0, int(args.top))]:
+            if not isinstance(check, dict):
+                continue
+            print(f"- {check.get('id')}: {check.get('status')}")
+    if getattr(args, "show_commands", False):
+        print("Follow-up commands:")
+        for row in (preflight.get("followup_commands", []) or [])[: max(0, int(args.top))]:
+            if not isinstance(row, dict):
+                continue
+            safety = (
+                (row.get("command_safety_ref") or {}).get("classification")
+                if isinstance(row.get("command_safety_ref"), dict)
+                else "-"
+            )
+            print(
+                f"- {row.get('id')} safety={safety} "
+                f"command={inline_summary_text(row.get('command'), max_chars=520)}"
+            )
+    if getattr(args, "show_json", False):
+        print("Corpus preflight JSON:")
+        print(json.dumps(sanitize_artifact_samples(preflight), indent=2, sort_keys=False))
+    print(f"Next: {inline_summary_text(preflight.get('next_step'), max_chars=420)}")
+    print("Official sidecars written: false")
+    if no_write:
+        print("No files written (--no-write).")
+    else:
+        print(f"Wrote {output_path}")
+        print_refreshed_manifests(refreshed_manifests)
+    if getattr(args, "strict", False) and preflight.get("status") != "ready-for-approved-corpus-sidecars":
+        return 1
+    return 0
+
+
 def run_transaction_sidecar_review(args: argparse.Namespace) -> int:
     profile, artifact_dir, target, source_root = resolve_run_context(args)
     no_write = bool(args.no_write)
@@ -83491,6 +84139,11 @@ def run_claim_evidence_requests(args: argparse.Namespace) -> int:
                     print(
                         "  preflight="
                         f"{inline_summary_text(source.get('preflight_command'), max_chars=420)}"
+                    )
+                if source.get("corpus_preflight_command") and getattr(args, "show_requests", False):
+                    print(
+                        "  corpus_preflight="
+                        f"{inline_summary_text(source.get('corpus_preflight_command'), max_chars=420)}"
                     )
             if draft.get("draft_path"):
                 print(f"  draft_path={draft.get('draft_path')}")
@@ -85280,6 +85933,11 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
                         print(
                             "  claim_preflight="
                             f"{inline_summary_text(first_source.get('preflight_command'), max_chars=420)}"
+                        )
+                    if first_source.get("corpus_preflight_command") and getattr(args, "show_commands", False):
+                        print(
+                            "  claim_corpus_preflight="
+                            f"{inline_summary_text(first_source.get('corpus_preflight_command'), max_chars=420)}"
                         )
                 if row.get("claim_evidence_first_verification_command") and getattr(args, "show_commands", False):
                     print(
@@ -90003,6 +90661,80 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return non-zero unless the input is ready for approved sidecar copy.",
     )
     transaction_payload_preflight.set_defaults(func=run_transaction_payload_preflight)
+
+    transaction_corpus_preflight = sub.add_parser(
+        "transaction-corpus-preflight",
+        help="Preflight an approved quote request plus matching quote response/payload before official sidecars",
+    )
+    transaction_corpus_preflight.add_argument(
+        "--request-input",
+        help="Approved local JSON quote request body. Use '-' for stdin only when payload-input is a file.",
+    )
+    transaction_corpus_preflight.add_argument(
+        "--payload-input",
+        help="Matching approved JSON/JSONL/text quote response or extracted payload. Use '-' for stdin only when request-input is a file.",
+    )
+    transaction_corpus_preflight.add_argument(
+        "--direction",
+        choices=["buy", "sell"],
+        help="Optional approved direction; if omitted, direction is inferred from request mints.",
+    )
+    transaction_corpus_preflight.add_argument(
+        "--output",
+        help=(
+            f"Where to write {TRANSACTION_CORPUS_PREFLIGHT_ARTIFACT}. "
+            f"Defaults to --artifact-dir/{TRANSACTION_CORPUS_PREFLIGHT_ARTIFACT}."
+        ),
+    )
+    transaction_corpus_preflight.add_argument(
+        "--max-input-bytes",
+        type=positive_int,
+        default=DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+        help=(
+            "Maximum bytes to read from each corpus preflight input. "
+            f"Defaults to {DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES}."
+        ),
+    )
+    transaction_corpus_preflight.add_argument(
+        "--top",
+        type=positive_int,
+        default=8,
+        help="Number of checks, issues, or commands to print.",
+    )
+    transaction_corpus_preflight.add_argument(
+        "--show-policy-json",
+        action="store_true",
+        help="Print the derived transaction-intent-policy preview JSON.",
+    )
+    transaction_corpus_preflight.add_argument(
+        "--show-checks",
+        action="store_true",
+        help="Print request issues and acceptance checks.",
+    )
+    transaction_corpus_preflight.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Print follow-up sidecar, policy, and decode commands.",
+    )
+    transaction_corpus_preflight.add_argument(
+        "--show-json",
+        action="store_true",
+        help="Print the sanitized corpus preflight JSON report.",
+    )
+    transaction_corpus_preflight.add_argument(
+        "--no-write",
+        action="store_true",
+        help=(
+            f"Print corpus preflight only; do not write {TRANSACTION_CORPUS_PREFLIGHT_ARTIFACT}, official sidecars, "
+            "or refreshed manifests."
+        ),
+    )
+    transaction_corpus_preflight.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return non-zero unless both request intent and payload are ready for official sidecar copy.",
+    )
+    transaction_corpus_preflight.set_defaults(func=run_transaction_corpus_preflight)
 
     transaction_sidecar_review = sub.add_parser(
         "transaction-sidecar-review",

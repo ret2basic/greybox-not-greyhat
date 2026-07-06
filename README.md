@@ -348,9 +348,11 @@ approved evidence is still required. For transaction payload requests, the same
 source-readiness block carries a compact handoff contract from
 `transaction-corpus-checklist`: recommended quote method/path/direction, target
 sidecars, required redacted fields, blocked approval steps, and offline verifier
-commands. It also prints the offline `transaction-payload-preflight` command for
-checking one approved local payload before any official sidecar is created. The
-contract and preflight result are still not evidence and do not authorize traffic.
+commands. It also prints the offline `transaction-payload-preflight` and
+`transaction-corpus-preflight` commands for checking one approved local payload,
+or one approved quote request plus its matching response, before any official
+sidecar is created. The contract and preflight result are still not evidence and
+do not authorize traffic.
 
 `methodology-review` also emits `bounty_harness_alignment`, a compact
 bug-bounty readiness check derived from the harness pattern of building system
@@ -1191,6 +1193,7 @@ python3 scripts/inferforge.py audit --ws-resource-probes
 python3 scripts/inferforge.py lead-dossier --no-write --show-commands --show-evidence --skip-current-resource-check
 python3 scripts/inferforge.py rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract --show-sidecar-template-json
 python3 scripts/inferforge.py transaction-payload-preflight --input ./approved-payloads.jsonl --no-write --show-records --show-commands
+python3 scripts/inferforge.py transaction-corpus-preflight --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --no-write --show-policy-json --show-checks --show-commands
 python3 scripts/inferforge.py transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract
 python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-commands --show-steps --show-payload-template-json --skip-current-resource-check
 python3 scripts/inferforge.py decode-transactions
@@ -1237,6 +1240,19 @@ hits, and never writes the official sidecar. A `ready-for-approved-sidecar-copy`
 result means the input shape is compatible with the official sidecar; it is still
 not evidence and does not satisfy finding gates until the official sidecar,
 matching intent policy, decode review, finding gate, and adjudication all agree.
+
+`transaction-corpus-preflight --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --no-write --show-policy-json --show-checks --show-commands`
+is the paired offline intake check for one approved quote request body and the
+matching approved quote response or extracted payload. It derives the intent
+policy preview from the request's configured sender, amount, source mint, and
+destination mint fields, verifies that the response/payload has exactly one
+compatible transaction candidate, prints the exact policy and decode follow-up
+commands, and still writes no official sidecars. Stdin is supported for only one
+side at a time; the other side must be a file so the tool never tries to read the
+same stream twice. A `ready-for-approved-corpus-sidecars` result only means the
+operator-reviewed request/response pair is ready to be copied into the official
+payload and intent-policy sidecars after approval.
+
 `transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract` prints the
 accepted sidecar files, configured candidate paths, and compact JSON/JSONL/TXT
 payload-shape examples when a sidecar is present but no base64 transaction
