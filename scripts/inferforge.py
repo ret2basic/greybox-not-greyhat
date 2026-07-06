@@ -163,6 +163,7 @@ CLAIM_WITNESS_LADDER_ARTIFACT = "claim-witness-ladder.json"
 CLAIM_EVIDENCE_REQUESTS_ARTIFACT = "claim-evidence-requests.json"
 SECRET_EXPOSURE_REVIEW_ARTIFACT = "secret-exposure-review.json"
 BUILD_PROVENANCE_READINESS_ARTIFACT = "build-provenance-readiness.json"
+BUILD_PROVENANCE_READINESS_SELFTEST_ARTIFACT = "build-provenance-readiness-selftest.json"
 BOUNTY_FRONTIER_ARTIFACT = "bounty-frontier.json"
 BOUNTY_VALIDATION_GATES_ARTIFACT = "bounty-validation-gates.json"
 BOUNTY_INVALIDITY_REVIEW_ARTIFACT = "bounty-invalidity-review.json"
@@ -24601,11 +24602,10 @@ def bounty_evidence_workorder_lane_spec(
     if lane == "build-secret-exposure":
         return {
             "evidence_goal": "Prove a real non-placeholder build secret was retained or disclosed in a build artifact, cache, log, registry object, or attestation.",
-            "human_action": "Provide redacted build provenance tied to the exact Dockerfile build step.",
-            "official_artifacts": [
-                "redacted build provenance: image history/config, cache/log excerpt, registry artifact, or builder attestation"
-            ],
+            "human_action": "Provide operator-evidence.json rows with redacted build provenance tied to the exact Dockerfile build step.",
+            "official_artifacts": [repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)],
             "must_capture": [
+                "build-provenance decision id from build-provenance-readiness",
                 "source file and line for the build-secret static signal",
                 "redacted proof that a real non-placeholder secret was supplied to that build step",
                 "redacted image history/config, layer/cache metadata, CI/build log excerpt, registry artifact, or builder attestation",
@@ -24618,8 +24618,8 @@ def bounty_evidence_workorder_lane_spec(
                 "evidence contains raw secret values or unredacted logs",
             ],
             "template_commands": [
-                validation_command_for_artifact_dir(artifact_dir, "secret-exposure-review --no-write --show-findings", profile=profile),
                 validation_command_for_artifact_dir(artifact_dir, "build-provenance-readiness --no-write --show-signals --show-checks --show-next --show-commands --show-template-json --top 8", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "secret-exposure-review --no-write --show-findings", profile=profile),
             ],
             "after_evidence_commands": [
                 validation_command_for_artifact_dir(artifact_dir, "build-provenance-readiness --no-write --show-signals --show-checks --show-next --show-commands --show-template-json --top 8", profile=profile),
@@ -24774,20 +24774,20 @@ def bounty_evidence_workorder_for_rollup_row(
 ) -> dict[str, Any]:
     lane = str(row.get("lane") or "unknown")
     lane_spec = bounty_evidence_workorder_lane_spec(lane, artifact_dir=artifact_dir, profile=profile)
-    required_evidence = bounty_prep_order_required_artifacts(
-        lane,
-        [
-            *normalize_string_list(row.get("required_official_evidence")),
-            *normalize_string_list(lane_spec.get("official_artifacts")),
-        ],
-    )
-    required_labels = bounty_prep_order_required_artifacts(
-        lane,
-        [
-            *normalize_string_list(row.get("required_official_evidence_labels")),
-            *[bounty_validation_evidence_label(value) for value in normalize_string_list(required_evidence)],
-        ],
-    )
+    raw_required_evidence = [
+        *normalize_string_list(row.get("required_official_evidence")),
+        *normalize_string_list(lane_spec.get("official_artifacts")),
+    ]
+    if lane == "build-secret-exposure":
+        raw_required_evidence = normalize_string_list(lane_spec.get("official_artifacts"))
+    required_evidence = bounty_prep_order_required_artifacts(lane, raw_required_evidence)
+    raw_required_labels = [
+        *normalize_string_list(row.get("required_official_evidence_labels")),
+        *[bounty_validation_evidence_label(value) for value in normalize_string_list(required_evidence)],
+    ]
+    if lane == "build-secret-exposure":
+        raw_required_labels = [bounty_validation_evidence_label(value) for value in normalize_string_list(required_evidence)]
+    required_labels = bounty_prep_order_required_artifacts(lane, raw_required_labels)
     template_commands = normalize_string_list(lane_spec.get("template_commands"))
     after_evidence_commands = ordered_unique_strings(
         [
@@ -29529,9 +29529,11 @@ def build_provenance_static_signal_summary(rows: list[dict[str, Any]]) -> dict[s
 def build_provenance_evidence_requirements(actionable_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     requirements = []
     for row in actionable_rows:
+        decision_id = build_provenance_operator_decision_id(row)
         requirements.append(
             {
                 "id": row.get("id"),
+                "operator_decision_id": decision_id,
                 "kind": row.get("kind"),
                 "file": row.get("file"),
                 "line": row.get("line"),
@@ -29552,6 +29554,126 @@ def build_provenance_evidence_requirements(actionable_rows: list[dict[str, Any]]
     return requirements
 
 
+def build_provenance_operator_decision_id(row: dict[str, Any]) -> str:
+    source_id = str(
+        row.get("id")
+        or f"{row.get('file') or 'Dockerfile'}-{row.get('line') or 'line'}-{row.get('kind') or 'build-secret'}"
+    )
+    return f"build-provenance-{safe_probe_id(source_id)}"
+
+
+def build_provenance_operator_decisions(actionable_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    decisions = []
+    for requirement in build_provenance_evidence_requirements(actionable_rows):
+        decision_id = str(requirement.get("operator_decision_id") or "").strip()
+        if not decision_id:
+            continue
+        decisions.append(
+            {
+                "id": decision_id,
+                "source_signal_id": requirement.get("id"),
+                "source_file": requirement.get("file"),
+                "source_line": requirement.get("line"),
+                "signal_kind": requirement.get("kind"),
+                "signal_name": requirement.get("name"),
+                "deployment_status": "missing-evidence",
+                "operator_evidence_needed": [
+                    "Confirm a real non-placeholder secret was supplied to this exact build step.",
+                    "Confirm a redacted image history/config, layer/cache, build log, registry artifact, or builder attestation proves retention or disclosure.",
+                    "Tie the redacted evidence to the source file, line, and build step without embedding raw secret values.",
+                    "Summarize plausible package-registry, deployment, account, or service impact without exposing sensitive identifiers.",
+                ],
+                "required_proof": requirement.get("required_proof", []),
+                "reject_if": requirement.get("reject_if", []),
+            }
+        )
+    return decisions
+
+
+def build_provenance_operator_evidence_review(
+    *,
+    target: str,
+    artifact_dir: Path,
+    actionable_rows: list[dict[str, Any]],
+    operator_evidence: dict[str, Any] | None,
+    operator_evidence_file: dict[str, Any] | None,
+) -> dict[str, Any]:
+    decisions = build_provenance_operator_decisions(actionable_rows)
+    required_decision_ids = [str(row.get("id")) for row in decisions if row.get("id")]
+    sidecar_path = repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)
+    sidecar_file = operator_evidence_file if isinstance(operator_evidence_file, dict) else {
+        "path": sidecar_path,
+        "name": OPERATOR_EVIDENCE_ARTIFACT,
+        "status": "provided-in-memory" if isinstance(operator_evidence, dict) else "missing",
+    }
+    accepted_present_statuses = sorted(OPERATOR_EVIDENCE_PRESENT_STATUSES)
+    sidecar_validation = operator_evidence_sidecar_validation_review(
+        operator_evidence=operator_evidence,
+        sidecar_file=sidecar_file,
+        required_decision_ids=required_decision_ids,
+        accepted_present_statuses=accepted_present_statuses,
+    )
+    present_required = normalize_string_list(sidecar_validation.get("present_required_decisions"))
+    missing_required = normalize_string_list(sidecar_validation.get("missing_required_decisions"))
+    invalid_rows = int(sidecar_validation.get("invalid_rows") or 0)
+    warning_rows = int(sidecar_validation.get("warning_rows") or 0)
+    present_required_set = {str(item) for item in present_required}
+    coverage = []
+    for decision in decisions:
+        decision_id = str(decision.get("id") or "")
+        refs = operator_evidence_refs_for_decision(operator_evidence, decision_id)
+        coverage.append(
+            {
+                **decision,
+                "operator_evidence_status": "present" if decision_id in present_required_set else "missing",
+                "operator_evidence_refs": refs,
+            }
+        )
+    ready = bool(required_decision_ids) and not missing_required and invalid_rows == 0 and warning_rows == 0
+    if not required_decision_ids:
+        status = "no-build-provenance-decisions"
+    elif str(sidecar_file.get("status") or "") == "missing":
+        status = "missing"
+    elif invalid_rows:
+        status = "invalid"
+    elif warning_rows:
+        status = "blocked-redaction-warning"
+    elif missing_required:
+        status = "missing-required-decisions"
+    elif ready:
+        status = "ready"
+    else:
+        status = "waiting"
+    template = build_operator_evidence_sidecar_template(
+        target=target,
+        provider="build/operator",
+        missing_decisions=[
+            decision
+            for decision in decisions
+            if str(decision.get("id") or "") not in present_required_set
+        ],
+    )
+    return {
+        "status": status,
+        "sidecar_path": sidecar_path,
+        "sidecar_file": sidecar_file,
+        "sidecar_validation": sidecar_validation,
+        "required_decision_ids": required_decision_ids,
+        "present_required_decision_ids": present_required,
+        "missing_required_decision_ids": missing_required,
+        "invalid_rows": invalid_rows,
+        "warning_rows": warning_rows,
+        "decision_coverage": coverage,
+        "sidecar_template": template,
+        "ready_for_build_provenance_gate": ready,
+        "accepted_present_statuses": accepted_present_statuses,
+        "redaction_rule": (
+            "Build provenance operator evidence must use redacted summaries and source references only; "
+            "raw tokens, .npmrc contents, bearer material, cookies, private keys, and unredacted CI logs block readiness."
+        ),
+    }
+
+
 def build_provenance_evidence_template(
     *,
     target: str,
@@ -29566,6 +29688,7 @@ def build_provenance_evidence_template(
                 "source_line": requirement.get("line"),
                 "signal_kind": requirement.get("kind"),
                 "signal_name": requirement.get("name"),
+                "operator_decision_id": requirement.get("operator_decision_id"),
                 "approved": False,
                 "status": "draft",
                 "approval_reference": "REPLACE_WITH_OPERATOR_APPROVAL_OR_TICKET",
@@ -29590,7 +29713,7 @@ def build_provenance_evidence_template(
         "artifact_dir": repo_relative_or_absolute(artifact_dir),
         "draft_only": True,
         "approved": False,
-        "target_official_evidence": "redacted build provenance supplied outside official sidecar files",
+        "target_official_evidence": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
         "accepted_evidence_kinds": [
             "redacted docker image history or config",
             "redacted build cache or layer metadata",
@@ -29604,7 +29727,7 @@ def build_provenance_evidence_template(
             "Do not include raw secret values, full tokens, full .npmrc contents, bearer tokens, cookies, private keys, seed phrases, or unredacted CI logs.",
             "Use approval references, source lines, artifact metadata, hashes, timestamps, and short redacted summaries instead of raw sensitive content.",
             "Keep approved=false until a reviewer/operator has approved the redacted provenance for this exact build step.",
-            "Run build-provenance-readiness and bounty-evidence-intake after approved provenance exists.",
+            "Copy reviewed decisions into operator-evidence.json, then run operator-evidence-review and build-provenance-readiness.",
         ],
         "safety": (
             "Draft handoff template only. It is not evidence, not a finding, writes no official sidecar, sends no traffic, "
@@ -29621,6 +29744,8 @@ def build_provenance_readiness_from_reviews(
     secret_review: dict[str, Any] | None,
     bounty_validation_gates: dict[str, Any] | None,
     bounty_invalidity_review: dict[str, Any] | None,
+    operator_evidence: dict[str, Any] | None = None,
+    operator_evidence_file: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     review = secret_review if isinstance(secret_review, dict) else {}
     actionable_rows = build_secret_actionable_rows(review)
@@ -29629,7 +29754,21 @@ def build_provenance_readiness_from_reviews(
     static_summary = build_provenance_static_signal_summary(actionable_rows)
     gate_exists = bool(gate)
     invalid_now = bool(invalidity_row.get("invalid_if_reported_now"))
-    official_evidence_ready = gate_exists and bool(invalidity_row) and not invalid_now and bool(actionable_rows)
+    operator_provenance_review = build_provenance_operator_evidence_review(
+        target=target,
+        artifact_dir=artifact_dir,
+        actionable_rows=actionable_rows,
+        operator_evidence=operator_evidence,
+        operator_evidence_file=operator_evidence_file,
+    )
+    operator_provenance_ready = bool(operator_provenance_review.get("ready_for_build_provenance_gate"))
+    official_evidence_ready = (
+        gate_exists
+        and bool(invalidity_row)
+        and not invalid_now
+        and bool(actionable_rows)
+        and operator_provenance_ready
+    )
     checks = [
         build_provenance_readiness_check(
             "static-build-secret-signals",
@@ -29641,22 +29780,27 @@ def build_provenance_readiness_from_reviews(
         build_provenance_readiness_check(
             "redacted-build-provenance-evidence",
             "Redacted build provenance proves actual secret retention or disclosure.",
-            "passed" if official_evidence_ready else "waiting",
+            "passed" if operator_provenance_ready else operator_provenance_review.get("status") or "waiting",
             {
-                "required_official_evidence": gate.get("required_official_evidence")
-                or invalidity_row.get("required_official_evidence")
-                or [
-                    "redacted build provenance: image history/config, cache/log excerpt, registry artifact, or builder attestation"
-                ],
+                "operator_evidence_sidecar": operator_provenance_review.get("sidecar_path")
+                or repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+                "required_operator_decision_ids": operator_provenance_review.get("required_decision_ids", []),
+                "present_required_decision_ids": operator_provenance_review.get("present_required_decision_ids", []),
+                "missing_required_decision_ids": operator_provenance_review.get("missing_required_decision_ids", []),
+                "sidecar_validation_status": (
+                    operator_provenance_review.get("sidecar_validation", {}) or {}
+                ).get("status"),
+                "invalid_rows": operator_provenance_review.get("invalid_rows", 0),
+                "warning_rows": operator_provenance_review.get("warning_rows", 0),
                 "minimum_fix": invalidity_row.get("minimum_fix"),
                 "invalid_if_reported_now": invalid_now,
             },
-            "Provide redacted build provenance showing a real secret was retained or disclosed; source-only Dockerfile evidence stays invalid.",
+            "Provide operator-evidence.json rows for every build-provenance decision; source-only Dockerfile evidence stays invalid.",
         ),
         build_provenance_readiness_check(
             "secret-value-redaction-boundary",
             "Evidence is sufficient to prove exposure while omitting raw secret values.",
-            "passed" if official_evidence_ready else "review-required" if actionable_rows else "waiting",
+            "passed" if operator_provenance_ready else "review-required" if actionable_rows else "waiting",
             {
                 "forbidden_fields": [
                     "raw token values",
@@ -29681,7 +29825,11 @@ def build_provenance_readiness_from_reviews(
         build_provenance_readiness_check(
             "build-secret-bounty-gate",
             "Bounty validation gate accepts retention/disclosure impact for build-secret exposure.",
-            "passed" if official_evidence_ready else "blocked",
+            "passed"
+            if official_evidence_ready
+            else "ready-to-rerun-validation-gate"
+            if operator_provenance_ready
+            else "blocked",
             {
                 "gate_id": gate.get("id"),
                 "gate_status": gate.get("gate_status"),
@@ -29699,11 +29847,15 @@ def build_provenance_readiness_from_reviews(
         status = "no-static-build-secret-signals"
     elif official_evidence_ready:
         status = "ready-for-build-secret-gate-review"
+    elif operator_provenance_ready:
+        status = "ready-to-rerun-build-secret-validation-gates"
     else:
         status = "waiting-redacted-build-provenance"
     minimum_package = {
         "evidence_type": "redacted-build-provenance",
         "source_review_artifact": repo_relative_or_absolute(artifact_dir / SECRET_EXPOSURE_REVIEW_ARTIFACT),
+        "operator_evidence_sidecar": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+        "required_operator_decision_ids": operator_provenance_review.get("required_decision_ids", []),
         "required_static_signal_count": len(actionable_rows),
         "evidence_requirements": build_provenance_evidence_requirements(actionable_rows),
         "accepted_sources": [
@@ -29743,6 +29895,11 @@ def build_provenance_readiness_from_reviews(
         ),
         validation_command_for_artifact_dir(
             artifact_dir,
+            "operator-evidence-review --no-write --show-missing --show-template --show-template-json --show-sidecar-validation --show-closure-contract",
+            profile=profile,
+        ),
+        validation_command_for_artifact_dir(
+            artifact_dir,
             "bounty-validation-gates --no-write --show-gates",
             profile=profile,
         ),
@@ -29775,11 +29932,17 @@ def build_provenance_readiness_from_reviews(
                 if isinstance(bounty_invalidity_review, dict)
                 else "missing"
             ),
+            "operator_evidence_status": operator_provenance_review.get("status"),
+            "operator_provenance_ready": operator_provenance_ready,
+            "operator_missing_decisions": len(operator_provenance_review.get("missing_required_decision_ids", []) or []),
+            "operator_invalid_rows": operator_provenance_review.get("invalid_rows", 0),
+            "operator_warning_rows": operator_provenance_review.get("warning_rows", 0),
             "template_status": evidence_template.get("status"),
             "template_rows": len(evidence_template.get("template_rows", []) or []),
         },
         "static_signal_summary": static_summary,
         "minimum_official_evidence_package": minimum_package,
+        "operator_evidence_review": operator_provenance_review,
         "build_provenance_template": evidence_template,
         "checks": checks,
         "first_blocker": failed_or_waiting[0] if failed_or_waiting else None,
@@ -29796,6 +29959,253 @@ def build_provenance_readiness_from_reviews(
         "safety": (
             "Offline build-provenance readiness only. It reads local source/review artifacts, sends no target traffic, "
             "does not query registries or Docker daemons, and must not include raw secret values."
+        ),
+    }
+
+
+def build_provenance_readiness_selftest() -> dict[str, Any]:
+    target = "http://127.0.0.1:9997"
+    with tempfile.TemporaryDirectory(prefix="inferforge-build-provenance-readiness-selftest-") as temp_dir:
+        root = Path(temp_dir)
+        source_root = root / "app"
+        artifact_dir = root / "artifacts"
+        source_root.mkdir(parents=True)
+        artifact_dir.mkdir(parents=True)
+        (source_root / "Dockerfile").write_text(
+            textwrap.dedent(
+                """
+                FROM node:22 AS deps
+                ARG NODE_AUTH_TOKEN
+                ENV NODE_AUTH_TOKEN=$NODE_AUTH_TOKEN
+                RUN echo "@selftest:registry=https://npm.pkg.github.com/" > .npmrc && \\
+                    echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> .npmrc
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        secret_review = build_secret_exposure_review(
+            source_root=source_root,
+            profile=None,
+            max_file_bytes=64 * 1024,
+            max_files=8,
+        )
+        actionable_rows = build_secret_actionable_rows(secret_review)
+        required_decision_ids = [
+            str(row.get("id"))
+            for row in build_provenance_operator_decisions(actionable_rows)
+            if row.get("id")
+        ]
+        gates = {
+            "status": "blocked-missing-official-evidence",
+            "gates": [
+                {
+                    "id": "GATE-selftest-build-provenance",
+                    "bounty_lane": "build-secret-exposure",
+                    "gate_status": "blocked-missing-official-evidence",
+                    "required_official_evidence": [repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)],
+                    "validation_commands": [
+                        validation_command_for_artifact_dir(
+                            artifact_dir,
+                            "build-provenance-readiness --no-write --show-checks",
+                            profile=None,
+                        )
+                    ],
+                }
+            ],
+        }
+        invalidity_waiting = {
+            "status": "invalid-if-reported-now",
+            "invalidity_rows": [
+                {
+                    "bounty_lane": "build-secret-exposure",
+                    "invalid_if_reported_now": True,
+                    "primary_invalidity_category": "missing-build-provenance",
+                    "minimum_fix": "Provide redacted operator-evidence.json build provenance rows and rerun gates.",
+                    "required_official_evidence": [repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)],
+                }
+            ],
+        }
+        invalidity_clear = {
+            "status": "no-invalidity",
+            "invalidity_rows": [
+                {
+                    "bounty_lane": "build-secret-exposure",
+                    "invalid_if_reported_now": False,
+                    "primary_invalidity_category": None,
+                    "required_official_evidence": [repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT)],
+                }
+            ],
+        }
+        clean_operator_evidence = {
+            "schema": "inferforge-operator-evidence-v1",
+            "evidence_items": [
+                {
+                    "id": decision_id,
+                    "status": "confirmed",
+                    "evidence_type": "builder-attestation",
+                    "summary": (
+                        "Redacted builder attestation confirms a real package registry credential was supplied, "
+                        "retained in build provenance for the referenced Dockerfile step, and has package registry impact."
+                    ),
+                    "source_ref": f"SEC-BUILD-{index}",
+                }
+                for index, decision_id in enumerate(required_decision_ids, start=1)
+            ],
+        }
+        polluted_operator_evidence = {
+            "schema": "inferforge-operator-evidence-v1",
+            "evidence_items": [
+                {
+                    "id": decision_id,
+                    "status": "confirmed",
+                    "evidence_type": "build-log",
+                    "summary": "Redacted proof confirms build provenance retention.",
+                    "source_ref": f"SEC-BUILD-{index}",
+                    "raw_secret": "npm_xxx_SHOULD_NOT_BE_PRESENT",
+                }
+                for index, decision_id in enumerate(required_decision_ids, start=1)
+            ],
+        }
+        missing_case = build_provenance_readiness_from_reviews(
+            target=target,
+            profile=None,
+            artifact_dir=artifact_dir,
+            secret_review=secret_review,
+            bounty_validation_gates=gates,
+            bounty_invalidity_review=invalidity_waiting,
+            operator_evidence=None,
+            operator_evidence_file={
+                "path": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+                "name": OPERATOR_EVIDENCE_ARTIFACT,
+                "status": "missing",
+            },
+        )
+        clean_waiting_gate_case = build_provenance_readiness_from_reviews(
+            target=target,
+            profile=None,
+            artifact_dir=artifact_dir,
+            secret_review=secret_review,
+            bounty_validation_gates=gates,
+            bounty_invalidity_review=invalidity_waiting,
+            operator_evidence=clean_operator_evidence,
+            operator_evidence_file={
+                "path": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+                "name": OPERATOR_EVIDENCE_ARTIFACT,
+                "status": "provided-in-memory",
+            },
+        )
+        clean_ready_case = build_provenance_readiness_from_reviews(
+            target=target,
+            profile=None,
+            artifact_dir=artifact_dir,
+            secret_review=secret_review,
+            bounty_validation_gates=gates,
+            bounty_invalidity_review=invalidity_clear,
+            operator_evidence=clean_operator_evidence,
+            operator_evidence_file={
+                "path": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+                "name": OPERATOR_EVIDENCE_ARTIFACT,
+                "status": "provided-in-memory",
+            },
+        )
+        polluted_case = build_provenance_readiness_from_reviews(
+            target=target,
+            profile=None,
+            artifact_dir=artifact_dir,
+            secret_review=secret_review,
+            bounty_validation_gates=gates,
+            bounty_invalidity_review=invalidity_waiting,
+            operator_evidence=polluted_operator_evidence,
+            operator_evidence_file={
+                "path": repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+                "name": OPERATOR_EVIDENCE_ARTIFACT,
+                "status": "provided-in-memory",
+            },
+        )
+    assertions = [
+        {
+            "id": "missing-operator-evidence-waits",
+            "passed": (
+                missing_case.get("status") == "waiting-redacted-build-provenance"
+                and (missing_case.get("operator_evidence_review") or {}).get("status") == "missing"
+                and (missing_case.get("summary") or {}).get("operator_provenance_ready") is False
+            ),
+            "expected": "missing operator-evidence keeps build provenance waiting",
+            "actual": {
+                "status": missing_case.get("status"),
+                "operator": (missing_case.get("operator_evidence_review") or {}).get("status"),
+                "summary": missing_case.get("summary"),
+            },
+        },
+        {
+            "id": "clean-operator-evidence-reruns-gate",
+            "passed": (
+                clean_waiting_gate_case.get("status") == "ready-to-rerun-build-secret-validation-gates"
+                and (clean_waiting_gate_case.get("summary") or {}).get("operator_provenance_ready") is True
+                and (clean_waiting_gate_case.get("summary") or {}).get("official_evidence_ready") is False
+            ),
+            "expected": "clean operator evidence is ready but stale invalidity still requires validation-gate rerun",
+            "actual": {
+                "status": clean_waiting_gate_case.get("status"),
+                "summary": clean_waiting_gate_case.get("summary"),
+            },
+        },
+        {
+            "id": "clean-operator-evidence-can-clear-readiness",
+            "passed": (
+                clean_ready_case.get("status") == "ready-for-build-secret-gate-review"
+                and (clean_ready_case.get("summary") or {}).get("operator_provenance_ready") is True
+                and (clean_ready_case.get("summary") or {}).get("official_evidence_ready") is True
+            ),
+            "expected": "clean operator evidence plus cleared invalidity makes readiness gate-ready",
+            "actual": {
+                "status": clean_ready_case.get("status"),
+                "summary": clean_ready_case.get("summary"),
+            },
+        },
+        {
+            "id": "polluted-operator-evidence-blocked",
+            "passed": (
+                polluted_case.get("status") == "waiting-redacted-build-provenance"
+                and (polluted_case.get("operator_evidence_review") or {}).get("status") == "blocked-redaction-warning"
+                and int((polluted_case.get("summary") or {}).get("operator_warning_rows") or 0) > 0
+            ),
+            "expected": "raw secret-like fields or redaction warnings block build provenance readiness",
+            "actual": {
+                "status": polluted_case.get("status"),
+                "operator": (polluted_case.get("operator_evidence_review") or {}).get("status"),
+                "summary": polluted_case.get("summary"),
+            },
+        },
+    ]
+    failed = [item for item in assertions if not item.get("passed")]
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-build-provenance-readiness-selftest-v1",
+        "status": "failed" if failed else "passed",
+        "summary": {
+            "cases": 4,
+            "assertions": len(assertions),
+            "failed": len(failed),
+            "required_operator_decisions": len(required_decision_ids),
+            "case_statuses": {
+                "missing": missing_case.get("status"),
+                "clean_waiting_gate": clean_waiting_gate_case.get("status"),
+                "clean_ready": clean_ready_case.get("status"),
+                "polluted": polluted_case.get("status"),
+            },
+        },
+        "cases": {
+            "missing": missing_case,
+            "clean_waiting_gate": clean_waiting_gate_case,
+            "clean_ready": clean_ready_case,
+            "polluted": polluted_case,
+        },
+        "assertions": assertions,
+        "safety": (
+            "Synthetic local fixture only. It writes temporary files under tempfile, sends no requests, calls no Burp tool, "
+            "starts no browser, creates no workspace evidence sidecars, and includes no raw real secrets."
         ),
     }
 
@@ -80117,6 +80527,7 @@ def run_build_provenance_readiness(args: argparse.Namespace) -> int:
             bounty_validation_gates=gates,
             adjudication=load_optional_json(artifact_dir / "adjudication.json"),
         )
+    operator_evidence, operator_evidence_file = load_operator_evidence_sidecar(artifact_dir)
     readiness = build_provenance_readiness_from_reviews(
         target=target,
         profile=profile,
@@ -80124,6 +80535,8 @@ def run_build_provenance_readiness(args: argparse.Namespace) -> int:
         secret_review=secret_review,
         bounty_validation_gates=gates,
         bounty_invalidity_review=invalidity_review,
+        operator_evidence=operator_evidence,
+        operator_evidence_file=operator_evidence_file,
     )
     output_path = (
         resolve_repo_path(args.output)
@@ -80149,6 +80562,8 @@ def run_build_provenance_readiness(args: argparse.Namespace) -> int:
         f"waiting={summary.get('waiting_or_blocked', 0)} "
         f"static_signals={summary.get('static_signals', 0)} "
         f"template_rows={summary.get('template_rows', 0)} "
+        f"operator={summary.get('operator_evidence_status') or '-'} "
+        f"operator_ready={summary.get('operator_provenance_ready')} "
         f"official_ready={summary.get('official_evidence_ready')} "
         f"invalid_now={summary.get('invalid_if_reported_now')}"
     )
@@ -80167,6 +80582,7 @@ def run_build_provenance_readiness(args: argparse.Namespace) -> int:
         "Minimum package: "
         f"type={package.get('evidence_type') or '-'} "
         f"signals={package.get('required_static_signal_count', 0)} "
+        f"operator_decisions={len(normalize_string_list(package.get('required_operator_decision_ids')))} "
         f"sources={','.join(normalize_string_list(package.get('accepted_sources'))[:5]) or '-'}"
     )
     top_count = max(0, int(args.top))
@@ -80206,6 +80622,19 @@ def run_build_provenance_readiness(args: argparse.Namespace) -> int:
         )
         print("Build provenance template JSON:")
         print(json.dumps(sanitize_artifact_samples(template_doc), indent=2, sort_keys=True))
+        operator_review = (
+            readiness.get("operator_evidence_review")
+            if isinstance(readiness.get("operator_evidence_review"), dict)
+            else {}
+        )
+        operator_template = (
+            operator_review.get("sidecar_template")
+            if isinstance(operator_review.get("sidecar_template"), dict)
+            else {}
+        )
+        if operator_template:
+            print("Build provenance operator-evidence template JSON:")
+            print(json.dumps(sanitize_artifact_samples(operator_template), indent=2, sort_keys=True))
     first_blocker = (
         readiness.get("first_blocker")
         if isinstance(readiness.get("first_blocker"), dict)
@@ -80227,6 +80656,38 @@ def run_build_provenance_readiness(args: argparse.Namespace) -> int:
     if args.strict and readiness.get("status") != "ready-for-build-secret-gate-review":
         return 1
     return 0
+
+
+def run_build_provenance_readiness_selftest(args: argparse.Namespace) -> int:
+    profile, artifact_dir, target, _source_root = resolve_run_context(args)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result = build_provenance_readiness_selftest()
+    result["current_profile_context"] = profile_summary(profile)
+    output_path = artifact_dir / BUILD_PROVENANCE_READINESS_SELFTEST_ARTIFACT
+    write_json(output_path, sanitize_artifact_samples(result))
+    summary = result.get("summary", {}) if isinstance(result.get("summary"), dict) else {}
+    print(f"Build provenance readiness self-test: {result['status']}")
+    print(
+        "Cases: "
+        f"cases={summary.get('cases', 0)} "
+        f"assertions={summary.get('assertions', 0)} "
+        f"failed={summary.get('failed', 0)} "
+        f"operator_decisions={summary.get('required_operator_decisions', 0)} "
+        f"statuses={json.dumps(summary.get('case_statuses', {}), sort_keys=True)}"
+    )
+    failed = [item for item in result.get("assertions", []) if not item.get("passed")]
+    if failed:
+        print(f"Failed assertions: {', '.join(str(item.get('id')) for item in failed)}")
+    print(f"Wrote {output_path}")
+    print_refreshed_manifests(
+        refresh_current_artifact_manifest(
+            artifact_dir=artifact_dir,
+            target=target,
+            command="self-test-build-provenance-readiness",
+            output_paths=[output_path],
+        )
+    )
+    return 0 if result["status"] == "passed" else 1
 
 
 def run_bounty_frontier(args: argparse.Namespace) -> int:
@@ -86912,6 +87373,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a synthetic self-test for bounty evidence intake approval/template blockers",
     )
     bounty_evidence_intake_selftest.set_defaults(func=run_bounty_evidence_intake_selftest)
+
+    build_provenance_readiness_selftest = sub.add_parser(
+        "self-test-build-provenance-readiness",
+        help="Run a synthetic self-test for build provenance operator-evidence gating",
+    )
+    build_provenance_readiness_selftest.set_defaults(func=run_build_provenance_readiness_selftest)
 
     collect_quote = sub.add_parser(
         "collect-quote",
