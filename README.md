@@ -1446,6 +1446,10 @@ adjudication.
 Explicit token-account boundary checks still compare decoded `transfer` account
 edges even when the opcode omits mint; mint and owner attribution stay in review
 until public token-account metadata is available.
+`decode-transactions` and `transaction-sidecar-review --show-commands` also
+summarize missing token-account metadata and print JSONL template rows for the
+public account, mint, and owner values that must be supplied before relying on
+offline owner attribution.
 By default, decoded top-level SPL token transfer instructions must stay within
 the expected source and destination mints/accounts. A policy can set
 `allowExtraTokenTransfers: true` only after the route's extra token movement is
