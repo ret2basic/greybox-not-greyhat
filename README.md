@@ -429,6 +429,9 @@ its non-evidence draft workbook: `approval_reference`, `request_text_sha256`,
 the required binding fields with `--show-drafts`; placeholders still have to be
 replaced from one approved quote request/response pair before anything is copied
 into official sidecars.
+`evidence-prep-status --show-details` summarizes the paired sidecar contract
+with the first blocker, binding review status, and first pairing issue, so a
+bad `approval_reference` or SHA-256 mismatch is visible without opening the JSON.
 
 `methodology-review` also emits `bounty_harness_alignment`, a compact
 bug-bounty readiness check derived from the harness pattern of building system
