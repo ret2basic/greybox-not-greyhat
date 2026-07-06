@@ -1773,6 +1773,14 @@ compiled instruction program IDs are in `allowedPrograms` when that allowlist is
 configured. Address table lookups can require manual review unless
 `transaction-address-tables.json` or `transaction-address-lookups.json` supplies
 public lookup-table metadata.
+If no `allowedPrograms` policy is configured, transaction corpus and sidecar
+reviews now include a `program_allowlist_review.review_package` for each
+direction. The package records the decode check to review, required inputs,
+pass/fail criteria, policy fields to update, and the finding-gate rule: an
+unreviewed decoded program list is not enough for Medium+ promotion. After
+reviewing one approved decoded payload, copy only the approved decoded program
+IDs into `transaction-intent-policy.json` or the profile direction before
+treating program behavior as passed.
 When an approved public token-account metadata sidecar is available,
 `transaction-token-accounts.json` or `transaction-token-accounts.jsonl` may also
 provide rows with `address`, `mint`, and `owner`. Those rows let
