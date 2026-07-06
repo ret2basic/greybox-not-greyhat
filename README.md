@@ -1425,10 +1425,21 @@ transaction intent policy supplies `sourceMint` and `destinationMint`.
 and explicit CLI or policy-file allowlists take precedence. The current checks
 verify that the decoded transaction has the expected wallet account, the wallet
 is a signer, both expected mints appear in static account keys when available,
-compiled instructions are present, and all compiled instruction program IDs are
-in `allowedPrograms` when that allowlist is configured. Address table lookups
-can require manual review because loaded accounts are not expanded from chain
-state.
+compiled instructions are present, decoded source-mint transfer amounts match
+`amountIn` when available, explicit `sourceTokenAccount` and
+`destinationTokenAccount` values match decoded SPL transfer accounts, and all
+compiled instruction program IDs are in `allowedPrograms` when that allowlist is
+configured. Address table lookups can require manual review unless
+`transaction-address-tables.json` or `transaction-address-lookups.json` supplies
+public lookup-table metadata.
+When an approved public token-account metadata sidecar is available,
+`transaction-token-accounts.json` or `transaction-token-accounts.jsonl` may also
+provide rows with `address`, `mint`, and `owner`. Those rows let
+`decode-transactions` verify that explicit source and destination token accounts
+belong to the expected wallet/recipient and mint. Missing token-account metadata
+does not create a finding; a concrete owner or mint mismatch is only a candidate
+transaction-integrity signal that still has to pass finding-gate and
+adjudication.
 `transaction-intent.json.reportability_review` summarizes whether decoded
 checks are merely waiting for corpus/policy, passed for the current corpus, or
 contain signer, wallet, mint, or program mismatches that are ready for a
