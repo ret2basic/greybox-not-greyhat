@@ -400,6 +400,13 @@ python3 scripts/inferforge.py --artifact-dir .greybox/target-set \
 The matrix is not a finding list. It labels reportability gates, scope/resource
 gates, and impact hypotheses so the harness can choose whether to do offline
 review, wait for memory pressure to clear, or run one low-risk validation step.
+Each hypothesis also carries business-logic test dimensions and API
+authorization evidence profiles. These profiles map leads to concrete proof
+models such as transaction-intent mismatch, object-level authorization failure,
+object-property exposure or mass assignment, method authorization bypass, and
+function-use/resource-boundary abuse. They are oracle hints only: BOLA/BOPLA or
+business-logic labels do not become findings without approved endpoint-specific
+evidence and finding-gate acceptance.
 If `endpoint-clusters.json` has not been written yet, the matrix falls back to
 the active target profile or `target-profile.json`, so newly discovered profiles
 can still produce offline hypotheses before an audit run exists. Statically

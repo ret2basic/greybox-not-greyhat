@@ -6369,6 +6369,12 @@ def triage_blackbox_asset_candidate(candidate: dict[str, Any], method_hint: str 
             "risk": "medium",
             "active_probe_policy": "handshake-only-after-review",
             "reason": "WebSocket candidate extracted from static assets; review scope and message semantics before sending frames.",
+            "impact_hypotheses": [
+                {
+                    "impact": "method-authorization-boundary",
+                    "question": "Can the WebSocket endpoint accept a sensitive method, subscription, or workflow message without the expected auth/origin boundary?",
+                }
+            ],
             "safe_next_step": "If in scope, perform at most one handshake-only connection without subscriptions or messages.",
         }
 
@@ -6378,6 +6384,16 @@ def triage_blackbox_asset_candidate(candidate: dict[str, Any], method_hint: str 
             "risk": "high",
             "active_probe_policy": "manual-review-required",
             "reason": f"Method hint `{method}` may mutate state or touch business operations.",
+            "impact_hypotheses": [
+                {
+                    "impact": "unauthorized-authenticated-action",
+                    "question": "Can a crafted request perform a protected business action without the expected auth, owner, or workflow precondition?",
+                },
+                {
+                    "impact": "mass-assignment-property-boundary",
+                    "question": "Can extra client-supplied properties alter internal order, account, wallet, or workflow state?",
+                },
+            ],
             "safe_next_step": "Do not probe automatically; review auth, account, order, and transaction semantics first.",
         }
 
@@ -6387,6 +6403,16 @@ def triage_blackbox_asset_candidate(candidate: dict[str, Any], method_hint: str 
             "risk": "high",
             "active_probe_policy": "manual-review-required",
             "reason": f"API-like path contains sensitive token(s): {', '.join(sensitive_tokens)}.",
+            "impact_hypotheses": [
+                {
+                    "impact": "improper-confidential-information-disclosure",
+                    "question": "Can one approved read-only response expose sensitive object properties or account data to the wrong requester?",
+                },
+                {
+                    "impact": "object-authorization-boundary",
+                    "question": "Can attacker-controlled identifiers select another user's account, wallet, project, or order object?",
+                },
+            ],
             "safe_next_step": "Do not probe automatically; derive a read-only reproduction plan before any request.",
         }
 
@@ -6396,6 +6422,12 @@ def triage_blackbox_asset_candidate(candidate: dict[str, Any], method_hint: str 
             "risk": "medium",
             "active_probe_policy": "head-or-get-after-review",
             "reason": "API-like candidate without a state-changing method hint still needs scope and auth-context review.",
+            "impact_hypotheses": [
+                {
+                    "impact": "object-authorization-boundary",
+                    "question": "Can read-only API parameters select an object outside the requester's authorization boundary?",
+                }
+            ],
             "safe_next_step": "Promote only if the endpoint is known read-only and in scope; prefer HEAD before GET.",
         }
 
@@ -6404,6 +6436,12 @@ def triage_blackbox_asset_candidate(candidate: dict[str, Any], method_hint: str 
         "risk": "low",
         "active_probe_policy": "head-or-get-after-review",
         "reason": "Page-route-like candidate without API or mutation method hints.",
+        "impact_hypotheses": [
+            {
+                "impact": "browser-route-exposure",
+                "question": "Can the route expose sensitive client state, cached data, or configuration that enables a higher-impact pivot?",
+            }
+        ],
         "safe_next_step": "After scope review, this can usually be promoted as a low-risk HEAD/GET page-route candidate.",
     }
 
@@ -6641,10 +6679,14 @@ def build_blackbox_asset_map(
     candidates = merge_asset_candidates(candidate_lists)
     triage_class_counts: dict[str, int] = {}
     triage_risk_counts: dict[str, int] = {}
+    candidate_impact_hypothesis_counts: dict[str, int] = {}
     for candidate in candidates:
         triage = candidate.get("triage", {}) if isinstance(candidate.get("triage"), dict) else {}
         increment_count(triage_class_counts, str(triage.get("class") or "unknown"))
         increment_count(triage_risk_counts, str(triage.get("risk") or candidate.get("risk") or "unknown"))
+        for hypothesis in triage.get("impact_hypotheses", []) or []:
+            if isinstance(hypothesis, dict) and hypothesis.get("impact"):
+                increment_count(candidate_impact_hypothesis_counts, str(hypothesis["impact"]))
     page_headers = page_fetch.get("headers", {}) if isinstance(page_fetch, dict) and isinstance(page_fetch.get("headers"), dict) else {}
     return {
         "generated_at": utc_now(),
@@ -6681,6 +6723,7 @@ def build_blackbox_asset_map(
             "candidate_limit_reached": candidate_limit is not None and len(candidates) >= candidate_limit,
             "triage_class_counts": triage_class_counts,
             "triage_risk_counts": triage_risk_counts,
+            "candidate_impact_hypothesis_counts": candidate_impact_hypothesis_counts,
         },
         "candidates": candidates,
         "safety": [
@@ -8958,6 +9001,7 @@ def build_lead_portfolio(
                 "scope_decision": scope_decision,
                 "triage_class": triage_class,
                 "risk": triage.get("risk"),
+                "impact_hypotheses": triage.get("impact_hypotheses", []),
                 "reportability_gate": triage.get("reportability_gate") or "Lead only until concrete in-scope impact is demonstrated.",
                 "next_step": next_step,
                 "evidence_refs": [BLACKBOX_ASSET_CANDIDATES_ARTIFACT, SCOPE_POLICY_ARTIFACT],
@@ -9358,6 +9402,20 @@ METHODOLOGY_RESEARCH_SOURCES = [
         "url": "https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/10-Business_Logic_Testing/README",
         "role": "business-logic-testing-reference",
         "takeaway": "Map each high-value endpoint to data validation, request forgery, integrity, workflow, and misuse/limit tests before running probes.",
+    },
+    {
+        "id": "owasp-api1-bola",
+        "title": "OWASP API1:2023 Broken Object Level Authorization",
+        "url": "https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/",
+        "role": "api-authorization-evidence-reference",
+        "takeaway": "Treat attacker-controlled object identifiers as bounty-relevant only when evidence proves unauthorized object access, manipulation, or destruction.",
+    },
+    {
+        "id": "owasp-api3-bopla",
+        "title": "OWASP API3:2023 Broken Object Property Level Authorization",
+        "url": "https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/",
+        "role": "api-property-authorization-evidence-reference",
+        "takeaway": "Mass-assignment or excessive-property exposure claims require proof that sensitive properties are readable or writable beyond the user's authorization.",
     },
     {
         "id": "portswigger-business-logic",
@@ -13364,6 +13422,165 @@ BUSINESS_LOGIC_TEST_LIBRARY: dict[str, dict[str, Any]] = {
 }
 
 
+API_AUTHORIZATION_PROFILE_LIBRARY: dict[str, dict[str, Any]] = {
+    "transaction-intent-property-boundary": {
+        "title": "Transaction intent property boundary",
+        "source_ids": ["owasp-wstg-business-logic", "owasp-api3-bopla"],
+        "evidence_question": (
+            "Can attacker-controlled quote fields or upstream transaction properties change signer, recipient, mint, "
+            "amount, instruction, writable account, or program behavior beyond the approved user intent?"
+        ),
+        "acceptance_checks": [
+            "Approved transaction payload and matching intent policy identify the exact wallet, direction, amount, mint pair, and allowed programs.",
+            "Offline decode shows a signer/account/mint/amount/program/property mismatch that the user did not authorize.",
+            "Finding-gate ties the mismatch to concrete user-funds or transaction-integrity impact without signing or submitting.",
+        ],
+        "reject_if": [
+            "Only source-flow suspicion, public docs, or a template sidecar exists.",
+            "The decoded payload matches the approved intent policy.",
+            "Proof requires wallet signing, transaction submission, trading, or collecting private material.",
+        ],
+    },
+    "object-authorization-boundary": {
+        "title": "Object authorization boundary",
+        "source_ids": ["owasp-api1-bola", "owasp-wstg-business-logic"],
+        "evidence_question": (
+            "Can an attacker choose an object, account, project, wallet, order, tenant, or path identifier and access "
+            "or mutate something they should not control?"
+        ),
+        "acceptance_checks": [
+            "The tested identifier is attacker-controllable and belongs to an object or route family with an expected owner/scope boundary.",
+            "Approved evidence shows unauthorized read, modification, deletion, or workflow access for that object boundary.",
+            "Counter-evidence has checked source guards, auth checks, route allowlists, and expected public/read-only behavior.",
+        ],
+        "reject_if": [
+            "The identifier only selects public data or intended read-only content.",
+            "Source or response evidence shows the object is guarded by the expected owner/scope check.",
+            "The claim depends on enumeration, crawling, broad fuzzing, or unapproved cross-account testing.",
+        ],
+    },
+    "sensitive-property-exposure-boundary": {
+        "title": "Sensitive property exposure boundary",
+        "source_ids": ["owasp-api3-bopla", "owasp-wstg-business-logic"],
+        "evidence_question": (
+            "Does one approved response expose sensitive object properties, account state, wallet data, internal "
+            "identifiers, auth state, or upstream policy details that the requester should not see?"
+        ),
+        "acceptance_checks": [
+            "Exactly one approved, in-scope, read-only response is normalized and redacted.",
+            "The exposed property is sensitive for the requester role or business context, not merely a public field.",
+            "Finding-gate can tie the property exposure to concrete user, account, funds, operator, or authorization impact.",
+        ],
+        "reject_if": [
+            "The evidence is only a route, rewrite, upstream host, status code, or config reference.",
+            "The response contains only public, intended, or non-sensitive properties.",
+            "The response was collected through broad endpoint discovery, raw history dumps, or unredacted storage.",
+        ],
+    },
+    "mass-assignment-property-boundary": {
+        "title": "Mass-assignment property boundary",
+        "source_ids": ["owasp-api3-bopla", "owasp-wstg-business-logic"],
+        "evidence_question": (
+            "Can client-supplied extra or privileged properties change internal state, quote semantics, order details, "
+            "workflow flags, billing/account fields, or authorization-relevant values?"
+        ),
+        "acceptance_checks": [
+            "The privileged or unexpected property is named and mapped to an internal effect or sensitive object property.",
+            "Approved evidence shows the property is accepted or acted on beyond the user's authorization.",
+            "The effect has concrete business, account, funds, workflow, or operator impact and passes finding-gate.",
+        ],
+        "reject_if": [
+            "The property is ignored, rejected, or only changes a harmless validation error.",
+            "The effect is frontend-only, expected behavior, or lacks a protected object/property boundary.",
+            "Validation requires destructive state changes, real trades, wallet signing, or broad fuzzing.",
+        ],
+    },
+    "function-use-limit-boundary": {
+        "title": "Function-use and resource boundary",
+        "source_ids": ["owasp-wstg-business-logic"],
+        "evidence_question": (
+            "Can an attacker use an intended function in a way that consumes provider quota, rate budget, availability, "
+            "or operator-controlled resources beyond the expected business limit?"
+        ),
+        "acceptance_checks": [
+            "Operator/provider evidence proves the resource, quota, billing, monitoring, or availability boundary.",
+            "Attacker-controllable input reaches that boundary without privileged credentials or destructive testing.",
+            "Impact is demonstrated with non-stress evidence and accepted by finding-gate/adjudication.",
+        ],
+        "reject_if": [
+            "Evidence is only a static missing rate-limit branch or public provider documentation.",
+            "No quota, billing, monitoring, availability, or operator-impact consequence is proven.",
+            "Validation would require floods, stress testing, quota depletion, or denial-of-service traffic.",
+        ],
+    },
+    "method-authorization-boundary": {
+        "title": "Method authorization boundary",
+        "source_ids": ["owasp-wstg-business-logic"],
+        "evidence_question": (
+            "Can a client invoke a sensitive API/RPC method, workflow step, or upstream capability that should be "
+            "blocked by method, origin, auth, route, or policy controls?"
+        ),
+        "acceptance_checks": [
+            "The sensitive method or workflow step and expected denial policy are explicitly named.",
+            "Approved evidence shows the method or workflow is reachable or accepted contrary to that policy.",
+            "The reachable method creates concrete user, funds, sensitive-data, quota, availability, or operator impact.",
+        ],
+        "reject_if": [
+            "The method is intentionally public, read-only, or only returns public chain/application data.",
+            "Source or response evidence shows the expected method/origin/auth/rate policy blocks the behavior.",
+            "Proof relies on broad method enumeration, high-volume traffic, or unsafe state mutation.",
+        ],
+    },
+}
+
+
+def api_authorization_profile_ids_for_hypothesis(item: dict[str, Any]) -> list[str]:
+    impact = str(item.get("impact") or item.get("impact_hypothesis") or "")
+    hypothesis_type = str(item.get("type") or item.get("hypothesis_type") or "")
+    if impact == "transaction-integrity" or hypothesis_type == "transaction-flow-review":
+        return ["transaction-intent-property-boundary", "mass-assignment-property-boundary"]
+    if impact in {
+        "fixed-upstream-proxy-confusion",
+        "improper-confidential-information-disclosure",
+        "object-authorization-boundary",
+    }:
+        return ["sensitive-property-exposure-boundary", "object-authorization-boundary"]
+    if impact in {"unauthorized-state-change", "unauthorized-authenticated-action"}:
+        return ["object-authorization-boundary", "mass-assignment-property-boundary"]
+    if impact in {"mass-assignment-property-boundary"}:
+        return ["mass-assignment-property-boundary", "object-authorization-boundary"]
+    if impact in {"rpc-proxy-abuse", "production-testnet-boundary-confusion", "method-authorization-boundary"}:
+        return ["method-authorization-boundary", "function-use-limit-boundary"]
+    if impact in {"credentialed-upstream-cost-abuse", "resource-exhaustion"}:
+        return ["function-use-limit-boundary", "method-authorization-boundary"]
+    if impact in {"wallet-transaction-argument-manipulation"}:
+        return ["transaction-intent-property-boundary", "object-authorization-boundary"]
+    if impact in {"browser-route-exposure"}:
+        return ["sensitive-property-exposure-boundary"]
+    if hypothesis_type.startswith("lead:runtime-config-host"):
+        return ["object-authorization-boundary", "sensitive-property-exposure-boundary"]
+    return ["object-authorization-boundary"]
+
+
+def api_authorization_profiles_for_hypothesis(item: dict[str, Any]) -> list[dict[str, Any]]:
+    profiles = []
+    for profile_id in api_authorization_profile_ids_for_hypothesis(item):
+        template = API_AUTHORIZATION_PROFILE_LIBRARY.get(profile_id)
+        if not template:
+            continue
+        profiles.append(
+            {
+                "id": profile_id,
+                "title": template.get("title"),
+                "source_ids": template.get("source_ids", []),
+                "evidence_question": template.get("evidence_question"),
+                "acceptance_checks": template.get("acceptance_checks", []),
+                "reject_if": template.get("reject_if", []),
+            }
+        )
+    return profiles
+
+
 def business_logic_dimension_ids_for_hypothesis(item: dict[str, Any]) -> list[str]:
     impact = str(item.get("impact") or "")
     hypothesis_type = str(item.get("type") or item.get("hypothesis_type") or "")
@@ -13377,8 +13594,14 @@ def business_logic_dimension_ids_for_hypothesis(item: dict[str, Any]) -> list[st
         return ["request-forgery", "misuse-limits", "data-validation"]
     if impact == "fixed-upstream-proxy-confusion":
         return ["request-forgery", "data-validation", "integrity-checks"]
-    if impact == "unauthorized-state-change":
+    if impact in {"unauthorized-state-change", "unauthorized-authenticated-action"}:
         return ["workflow-circumvention", "request-forgery", "integrity-checks"]
+    if impact in {"mass-assignment-property-boundary", "object-authorization-boundary"}:
+        return ["data-validation", "request-forgery", "integrity-checks"]
+    if impact in {"improper-confidential-information-disclosure", "browser-route-exposure"}:
+        return ["data-validation", "integrity-checks"]
+    if impact == "method-authorization-boundary":
+        return ["request-forgery", "workflow-circumvention", "misuse-limits"]
     return ["data-validation"]
 
 
@@ -13406,11 +13629,15 @@ def build_business_logic_methodology_map(
 ) -> dict[str, Any]:
     rows = []
     dimension_counts: dict[str, int] = {}
+    api_authorization_counts: dict[str, int] = {}
     blocked_count = 0
     for thread in high_value_threads[: max(1, int(limit))]:
         tests = business_logic_tests_for_hypothesis(thread)
         for test in tests:
             increment_count(dimension_counts, str(test.get("id") or "unknown"))
+        api_profiles = api_authorization_profiles_for_hypothesis(thread)
+        for profile in api_profiles:
+            increment_count(api_authorization_counts, str(profile.get("id") or "unknown"))
         status = str(thread.get("status") or "")
         if status.startswith("blocked"):
             blocked_count += 1
@@ -13423,6 +13650,7 @@ def build_business_logic_methodology_map(
                 "impact": thread.get("impact"),
                 "path": thread.get("path"),
                 "business_logic_tests": tests,
+                "api_authorization_profiles": api_profiles,
                 "next_offline_command": thread.get("next_offline_command"),
                 "current_blocker": thread.get("current_blocker"),
                 "reportability_gate": thread.get("reportability_gate"),
@@ -13440,13 +13668,19 @@ def build_business_logic_methodology_map(
             "threads": len(rows),
             "blocked_threads": blocked_count,
             "dimension_counts": dict(sorted(dimension_counts.items())),
-            "source_ids": ["owasp-wstg-business-logic", "portswigger-business-logic"],
+            "api_authorization_counts": dict(sorted(api_authorization_counts.items())),
+            "source_ids": [
+                "owasp-wstg-business-logic",
+                "owasp-api1-bola",
+                "owasp-api3-bopla",
+                "portswigger-business-logic",
+            ],
         },
         "threads": rows,
         "reportability_gate": (
             "Business-logic mapping is a prioritization aid only. A Medium/High/Critical claim still needs "
             "endpoint-specific evidence proving data validation failure, forged request impact, integrity mismatch, "
-            "workflow bypass, or resource/provider misuse."
+            "workflow bypass, API object/property authorization failure, or resource/provider misuse."
         ),
         "safety": (
             "Offline methodology mapping only. It does not execute requests, run scanners, sign wallets, submit "
@@ -14050,6 +14284,20 @@ def lead_dossier_business_tests(
     return []
 
 
+def lead_dossier_api_authorization_profiles(
+    business_logic_map: dict[str, Any],
+    thread_id: Any,
+) -> list[dict[str, Any]]:
+    for row in business_logic_map.get("threads", []) or []:
+        if isinstance(row, dict) and row.get("thread_id") == thread_id:
+            return [
+                profile
+                for profile in row.get("api_authorization_profiles", []) or []
+                if isinstance(profile, dict)
+            ]
+    return []
+
+
 def transaction_integrity_lead_evidence_contract(
     *,
     thread: dict[str, Any],
@@ -14617,6 +14865,7 @@ def lead_dossier_strict_validation_checklist(
         profile=profile,
         artifact_dir=artifact_dir,
     )
+    api_authorization_profiles = api_authorization_profiles_for_hypothesis(thread)
     path_options = lead_dossier_path_options(thread)
     code_refs = lead_dossier_code_refs(thread, limit=8)
     missing_requirements = [str(item) for item in closure.get("missing_requirements", []) or []]
@@ -14680,6 +14929,7 @@ def lead_dossier_strict_validation_checklist(
             {
                 "validation_question": thread.get("validation_question"),
                 "business_logic_tests": business_logic_tests_for_hypothesis(thread),
+                "api_authorization_profiles": api_authorization_profiles,
             },
             "State the attacker-controlled request field, route, or workflow boundary before testing.",
         ),
@@ -14690,6 +14940,11 @@ def lead_dossier_strict_validation_checklist(
                 "impact": thread.get("impact"),
                 "reportability_gate": reportability_gate,
                 "gate_ready": gate_ready,
+                "api_authorization_profile_ids": [
+                    profile.get("id")
+                    for profile in api_authorization_profiles
+                    if isinstance(profile, dict)
+                ],
             },
             "Do not enter finding-gate until concrete user, funds, quota, availability, or sensitive-data impact is evidenced.",
         ),
@@ -14838,6 +15093,10 @@ def build_lead_dossier(
                 "code_refs": lead_dossier_code_refs(thread),
                 "path_options": lead_dossier_path_options(thread),
                 "business_logic_tests": lead_dossier_business_tests(business_logic_map, thread.get("id")),
+                "api_authorization_profiles": lead_dossier_api_authorization_profiles(
+                    business_logic_map,
+                    thread.get("id"),
+                ),
                 "evidence_contract": lead_dossier_evidence_contract(
                     thread,
                     profile=profile,
@@ -15151,6 +15410,10 @@ def hypothesis_status_for_followup(
 def add_hypothesis(hypotheses: list[dict[str, Any]], item: dict[str, Any]) -> None:
     item["id"] = str(item.get("id") or f"HYP-{len(hypotheses) + 1}")
     item["evidence_refs"] = compact_source_refs(item.get("evidence_refs", []) or [])
+    if not isinstance(item.get("business_logic_tests"), list):
+        item["business_logic_tests"] = business_logic_tests_for_hypothesis(item)
+    if not isinstance(item.get("api_authorization_profiles"), list):
+        item["api_authorization_profiles"] = api_authorization_profiles_for_hypothesis(item)
     item["safety"] = str(
         item.get("safety")
         or "Hypothesis only. Do not report or probe without explicit scope, resource, and impact gates."
@@ -15176,6 +15439,19 @@ def hypothesis_from_lead(
     priority = hypothesis_priority_from_values(lead.get("priority"), "medium" if lead_type == "runtime-config-host" else None)
     if terminal and priority in {"critical", "high"}:
         priority = "medium"
+    lead_impact_hypotheses = [
+        item
+        for item in lead.get("impact_hypotheses", []) or []
+        if isinstance(item, dict)
+    ]
+    primary_impact = lead_impact_hypotheses[0] if lead_impact_hypotheses else {}
+    impact = str(primary_impact.get("impact") or "").strip() or None
+    impact_question = (
+        primary_impact.get("question")
+        or primary_impact.get("summary")
+        or primary_impact.get("impact")
+        or "Validate whether this lead can produce concrete user, funds, order, sensitive-data, takeover, or persistent content impact."
+    )
     return {
         "id": f"HYP-lead-{safe_hypothesis_id(lead.get('id'), host, path)}",
         "type": f"lead:{lead_type}",
@@ -15190,9 +15466,9 @@ def hypothesis_from_lead(
         "path": path,
         "scope_decision": scope_decision,
         "source_status": status,
-        "impact_hypothesis": (
-            "Validate whether this lead can produce concrete user, funds, order, sensitive-data, takeover, or persistent content impact."
-        ),
+        "impact": impact,
+        "impact_hypotheses": lead_impact_hypotheses,
+        "impact_hypothesis": impact_question,
         "reportability_gate": lead.get("reportability_gate") or "Lead is not reportable without concrete in-scope impact evidence.",
         "next_step": (
             "Keep parked unless scope or takeover evidence changes."
@@ -16911,6 +17187,8 @@ def build_hypothesis_matrix_run(
     status_counts: dict[str, int] = {}
     priority_counts: dict[str, int] = {}
     type_counts: dict[str, int] = {}
+    business_logic_counts: dict[str, int] = {}
+    api_authorization_counts: dict[str, int] = {}
     ready_count = 0
     resource_gated_count = 0
     for item in deduped:
@@ -16918,6 +17196,12 @@ def build_hypothesis_matrix_run(
         increment_count(status_counts, item_status)
         increment_count(priority_counts, str(item.get("priority") or "info"))
         increment_count(type_counts, str(item.get("type") or "unknown"))
+        for test in item.get("business_logic_tests", []) or []:
+            if isinstance(test, dict):
+                increment_count(business_logic_counts, str(test.get("id") or "unknown"))
+        for profile_item in item.get("api_authorization_profiles", []) or []:
+            if isinstance(profile_item, dict):
+                increment_count(api_authorization_counts, str(profile_item.get("id") or "unknown"))
         if item_status in {"ready-for-offline-review", "ready-for-low-risk-validation"}:
             ready_count += 1
         if item_status == "resource-gated":
@@ -16946,6 +17230,8 @@ def build_hypothesis_matrix_run(
             "status_counts": dict(sorted(status_counts.items())),
             "priority_counts": dict(sorted(priority_counts.items())),
             "type_counts": dict(sorted(type_counts.items())),
+            "business_logic_counts": dict(sorted(business_logic_counts.items())),
+            "api_authorization_counts": dict(sorted(api_authorization_counts.items())),
             "harness_loop": harness_loop.get("status"),
             "resource_snapshot": artifact_summary_status(resource_snapshot),
             "endpoint_clusters_source": endpoint_clusters_source,
@@ -17024,6 +17310,8 @@ def build_hypothesis_matrix_rollup(
     status_counts: dict[str, int] = {}
     priority_counts: dict[str, int] = {}
     type_counts: dict[str, int] = {}
+    business_logic_counts: dict[str, int] = {}
+    api_authorization_counts: dict[str, int] = {}
     ready_count = 0
     resource_gated_count = 0
     for item in hypotheses:
@@ -17031,6 +17319,12 @@ def build_hypothesis_matrix_rollup(
         increment_count(status_counts, item_status)
         increment_count(priority_counts, str(item.get("priority") or "info"))
         increment_count(type_counts, str(item.get("type") or "unknown"))
+        for test in item.get("business_logic_tests", []) or []:
+            if isinstance(test, dict):
+                increment_count(business_logic_counts, str(test.get("id") or "unknown"))
+        for profile_item in item.get("api_authorization_profiles", []) or []:
+            if isinstance(profile_item, dict):
+                increment_count(api_authorization_counts, str(profile_item.get("id") or "unknown"))
         if item_status in {"ready-for-offline-review", "ready-for-low-risk-validation"}:
             ready_count += 1
         if item_status == "resource-gated":
@@ -17063,6 +17357,8 @@ def build_hypothesis_matrix_rollup(
             "status_counts": dict(sorted(status_counts.items())),
             "priority_counts": dict(sorted(priority_counts.items())),
             "type_counts": dict(sorted(type_counts.items())),
+            "business_logic_counts": dict(sorted(business_logic_counts.items())),
+            "api_authorization_counts": dict(sorted(api_authorization_counts.items())),
             "run_status_counts": dict(sorted(run_status_counts.items())),
         },
         "runs": runs,
@@ -65295,6 +65591,28 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
             artifact_dir=fallback_matrix_dir,
         )
         blackbox_hypothesis_matrix_text_sample = json.dumps(blackbox_hypothesis_matrix_sample, sort_keys=True)
+        blackbox_orders_hypothesis = next(
+            (
+                item
+                for item in blackbox_hypothesis_matrix_sample.get("hypotheses", []) or []
+                if isinstance(item, dict)
+                and item.get("path") == "/api/orders?market=&token="
+            ),
+            {},
+        )
+        blackbox_orders_api_profile_ids = {
+            profile.get("id")
+            for profile in blackbox_orders_hypothesis.get("api_authorization_profiles", []) or []
+            if isinstance(profile, dict)
+        }
+        blackbox_orders_business_test_ids = {
+            test.get("id")
+            for test in blackbox_orders_hypothesis.get("business_logic_tests", []) or []
+            if isinstance(test, dict)
+        }
+        blackbox_asset_candidate_impact_counts = (
+            blackbox_asset_map_sample.get("summary", {}).get("candidate_impact_hypothesis_counts", {})
+        )
         blackbox_validation_plan_sample = build_validation_plan_run(
             target="https://blackbox.test",
             profile=blackbox_normalized_profile,
@@ -66739,6 +67057,10 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_asset_triage[("WS", "quote.blackbox.test", "/ws/v1/quotes?symbol=")].get("class") == "websocket-handshake-review"
         and blackbox_asset_triage[("GET", "blackbox.test", "/api/v1/markets")].get("class") == "api-read-candidate-review"
         and blackbox_asset_map_sample.get("summary", {}).get("triage_risk_counts", {}).get("high") == 1
+        and blackbox_asset_candidate_impact_counts.get("unauthorized-authenticated-action") == 1
+        and blackbox_asset_candidate_impact_counts.get("mass-assignment-property-boundary") == 1
+        and blackbox_asset_candidate_impact_counts.get("object-authorization-boundary") == 1
+        and blackbox_asset_candidate_impact_counts.get("method-authorization-boundary") == 1
         and blackbox_asset_profile_summary_sample.get("status") == "generated"
         and blackbox_asset_profile_summary_sample.get("generated_clusters") == 1
         and blackbox_asset_profile_summary_sample.get("generated_burp_observations") == 1
@@ -66810,10 +67132,16 @@ def run_profile_routing_selftest(args: argparse.Namespace) -> int:
         and blackbox_hypothesis_matrix_sample.get("status") == "has-ranked-hypotheses"
         and blackbox_hypothesis_matrix_sample.get("summary", {}).get("hypotheses", 0) >= 3
         and blackbox_hypothesis_matrix_sample.get("summary", {}).get("ready_hypotheses", 0) >= 1
+        and blackbox_hypothesis_matrix_sample.get("summary", {}).get("api_authorization_counts", {}).get("object-authorization-boundary", 0) >= 1
+        and blackbox_hypothesis_matrix_sample.get("summary", {}).get("api_authorization_counts", {}).get("mass-assignment-property-boundary", 0) >= 1
         and any(
             item.get("type") == "cluster-strategy"
             for item in blackbox_hypothesis_matrix_sample.get("hypotheses", [])
         )
+        and blackbox_orders_hypothesis.get("impact") == "unauthorized-authenticated-action"
+        and "object-authorization-boundary" in blackbox_orders_api_profile_ids
+        and "mass-assignment-property-boundary" in blackbox_orders_api_profile_ids
+        and "workflow-circumvention" in blackbox_orders_business_test_ids
         and not any(
             item.get("type") == "transaction-flow-review"
             for item in blackbox_hypothesis_matrix_sample.get("hypotheses", [])
@@ -75236,7 +75564,8 @@ def run_methodology_review(args: argparse.Namespace) -> int:
             "Business logic map: "
             f"{business_logic_map.get('status')} "
             f"threads={bl_summary.get('threads', 0)} "
-            f"dimensions={json.dumps(bl_summary.get('dimension_counts', {}), sort_keys=True)}"
+            f"dimensions={json.dumps(bl_summary.get('dimension_counts', {}), sort_keys=True)} "
+            f"api_profiles={json.dumps(bl_summary.get('api_authorization_counts', {}), sort_keys=True)}"
         )
         for row in (business_logic_map.get("threads", []) or [])[: min(3, max(0, int(args.limit)))]:
             test_ids = [
@@ -75244,9 +75573,15 @@ def run_methodology_review(args: argparse.Namespace) -> int:
                 for test in row.get("business_logic_tests", []) or []
                 if isinstance(test, dict)
             ]
+            api_profile_ids = [
+                str(profile.get("id"))
+                for profile in row.get("api_authorization_profiles", []) or []
+                if isinstance(profile, dict)
+            ]
             print(
                 f"- {row.get('priority')} {row.get('status')} "
-                f"path={row.get('path') or '-'} tests={','.join(test_ids[:4])}"
+                f"path={row.get('path') or '-'} tests={','.join(test_ids[:4])} "
+                f"api={','.join(api_profile_ids[:4])}"
             )
     evidence_closure = review.get("evidence_closure", {}) if isinstance(review.get("evidence_closure"), dict) else {}
     if evidence_closure:
@@ -75832,6 +76167,8 @@ def run_hypothesis_matrix(args: argparse.Namespace) -> int:
         f"statuses={json.dumps(summary.get('status_counts', {}), sort_keys=True)}"
     )
     print(f"Types: {json.dumps(summary.get('type_counts', {}), sort_keys=True)}")
+    print(f"Business logic: {json.dumps(summary.get('business_logic_counts', {}), sort_keys=True)}")
+    print(f"API authorization: {json.dumps(summary.get('api_authorization_counts', {}), sort_keys=True)}")
 
     top_count = max(0, int(args.top))
     if top_count:
@@ -75846,6 +76183,13 @@ def run_hypothesis_matrix(args: argparse.Namespace) -> int:
             if args.show_next:
                 print(f"  next={inline_summary_text(item.get('next_step'), max_chars=220)}")
                 print(f"  gate={inline_summary_text(item.get('reportability_gate'), max_chars=220)}")
+                api_profiles = [
+                    str(profile.get("id"))
+                    for profile in item.get("api_authorization_profiles", []) or []
+                    if isinstance(profile, dict) and profile.get("id")
+                ]
+                if api_profiles:
+                    print(f"  api_profiles={','.join(api_profiles[:4])}")
 
     if no_write:
         print("No files written (--no-write).")
