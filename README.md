@@ -1080,7 +1080,10 @@ Profiles separate endpoint discovery from concrete probe paths:
   path templates, source refs, fixed upstreams, approval requirements,
   promotion placeholders, command safety totals, and labeled generated command
   templates so the human review step can approve one concrete local read-only
-  path without opening the JSON artifact. After review, use
+  path without opening the JSON artifact. Placeholder promotion commands remain
+  `manual-template`, the resource health check is labeled `resource-gated`, and
+  the active Burp observation template is `review-gated` with an external
+  blocker. After review, use
   `promote-observation-candidate` to write a separate reviewed profile.
   Promotion is a profile edit only; it does not send HTTP traffic.
 - Generic `nextjs-api-routes` clusters with concrete probe paths receive only
