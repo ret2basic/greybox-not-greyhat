@@ -337,6 +337,9 @@ verifier command, and whether a shared evidence request is bound to more than
 one action. Shared `operator-evidence.json` requests are matched by lane/oracle
 type instead of filename alone, so provider/resource/websocket requests do not
 accidentally unblock build-secret evidence gates.
+`claim-evidence-requests` also uses that queue context for its default ordering:
+in bounty mode, evidence for the highest-ranked action comes before a broader
+coverage request that merely unblocks more lower-value claims.
 
 `methodology-review` also emits `bounty_harness_alignment`, a compact
 bug-bounty readiness check derived from the harness pattern of building system

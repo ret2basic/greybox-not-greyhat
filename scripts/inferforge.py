@@ -22688,7 +22688,7 @@ def build_claim_evidence_requests(
         "claim_witness_ladder_status": ladder_doc.get("status"),
         "evidence_sidecar_drafts_status": draft_doc.get("status") if isinstance(draft_doc, dict) else None,
         "next_step": (
-            "Work the top request first; it unlocks the most blocked claims. Keep official sidecars approved and redacted only."
+            "Work the top coverage request first; it unlocks the most blocked claims. Keep official sidecars approved and redacted only."
             if requests
             else "No evidence requests were produced; refresh claim-witness-ladder and evidence-prep-status."
         ),
@@ -22699,6 +22699,213 @@ def build_claim_evidence_requests(
             "Offline evidence request pack only. It reads local artifacts and draft metadata, sends no requests, invokes no Burp tools, "
             "runs no scanners, signs no wallets, submits no transactions, and creates no official evidence sidecars."
         ),
+    }
+
+
+def claim_evidence_request_official_name(request: dict[str, Any]) -> str:
+    official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
+    return str(
+        official.get("name")
+        or Path(str(official.get("artifact") or official.get("path") or "")).name
+        or ""
+    ).strip()
+
+
+def claim_evidence_request_status_rank(status: Any) -> int:
+    text = str(status or "")
+    if text in {"missing-official-evidence", "invalid-official-evidence"}:
+        return 0
+    if text == "waiting-official-evidence-review":
+        return 1
+    if text == "official-evidence-ready":
+        return 2
+    return 3
+
+
+def bounty_prioritize_claim_evidence_requests(
+    request_pack: dict[str, Any],
+    bounty_action_queue: dict[str, Any] | None,
+) -> dict[str, Any]:
+    requests = [
+        {**request}
+        for request in request_pack.get("requests", []) or []
+        if isinstance(request, dict)
+    ]
+    if not requests:
+        doc = {
+            **request_pack,
+            "summary": {
+                **(request_pack.get("summary") if isinstance(request_pack.get("summary"), dict) else {}),
+                "ordering_policy": "no-requests",
+                "bounty_priority_status": "no-evidence-requests",
+            },
+            "requests": [],
+        }
+        return doc
+
+    request_by_key: dict[str, dict[str, Any]] = {}
+    for request in requests:
+        official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
+        for key in [
+            request.get("id"),
+            official.get("path"),
+            official.get("name"),
+            official.get("artifact"),
+            claim_evidence_request_official_name(request),
+        ]:
+            text = str(key or "").strip()
+            if text:
+                request_by_key.setdefault(text, request)
+
+    priority_by_request_id: dict[str, dict[str, Any]] = {}
+    actions = (
+        bounty_action_queue.get("actions", [])
+        if isinstance(bounty_action_queue, dict) and isinstance(bounty_action_queue.get("actions"), list)
+        else []
+    )
+    for action_rank, action in enumerate([row for row in actions if isinstance(row, dict)], start=1):
+        claim_rows = [
+            row
+            for row in action.get("claim_evidence_requests", []) or []
+            if isinstance(row, dict)
+        ]
+        for action_request_rank, claim_row in enumerate(claim_rows, start=1):
+            official = claim_row.get("official_evidence") if isinstance(claim_row.get("official_evidence"), dict) else {}
+            request = None
+            for key in [
+                claim_row.get("id"),
+                official.get("path"),
+                official.get("name"),
+                official.get("artifact"),
+            ]:
+                text = str(key or "").strip()
+                if text and text in request_by_key:
+                    request = request_by_key[text]
+                    break
+            if request is None:
+                continue
+            request_id = str(request.get("id") or claim_evidence_request_official_name(request) or len(priority_by_request_id))
+            action_score = int(action.get("score") or 0)
+            binding = {
+                "action_id": action.get("id"),
+                "action_rank": action_rank,
+                "action_request_rank": action_request_rank,
+                "score": action_score,
+                "lane": action.get("lane"),
+                "kind": action.get("kind"),
+                "actor": action.get("actor"),
+                "expected_severity": action.get("expected_severity"),
+                "entrypoint": action.get("entrypoint"),
+            }
+            current = priority_by_request_id.get(request_id)
+            if current is None:
+                priority_by_request_id[request_id] = {
+                    "status": "bounty-prioritized",
+                    "action_id": action.get("id"),
+                    "action_rank": action_rank,
+                    "action_request_rank": action_request_rank,
+                    "score": action_score,
+                    "lane": action.get("lane"),
+                    "kind": action.get("kind"),
+                    "actor": action.get("actor"),
+                    "expected_severity": action.get("expected_severity"),
+                    "entrypoint": action.get("entrypoint"),
+                    "action_bindings": [binding],
+                }
+                continue
+            current_bindings = current.get("action_bindings") if isinstance(current.get("action_bindings"), list) else []
+            if binding not in current_bindings:
+                current_bindings.append(binding)
+                current["action_bindings"] = current_bindings
+            current_key = (
+                int(current.get("action_rank") or 999999),
+                int(current.get("action_request_rank") or 999999),
+                -int(current.get("score") or 0),
+            )
+            next_key = (action_rank, action_request_rank, -action_score)
+            if next_key < current_key:
+                current.update(
+                    {
+                        "action_id": action.get("id"),
+                        "action_rank": action_rank,
+                        "action_request_rank": action_request_rank,
+                        "score": action_score,
+                        "lane": action.get("lane"),
+                        "kind": action.get("kind"),
+                        "actor": action.get("actor"),
+                        "expected_severity": action.get("expected_severity"),
+                        "entrypoint": action.get("entrypoint"),
+                    }
+                )
+
+    prioritized_requests = []
+    for request in requests:
+        request_id = str(request.get("id") or claim_evidence_request_official_name(request) or "")
+        priority = priority_by_request_id.get(request_id)
+        if priority:
+            bindings = priority.get("action_bindings") if isinstance(priority.get("action_bindings"), list) else []
+            request["bounty_priority"] = {
+                **priority,
+                "action_binding_count": len(bindings),
+                "action_lanes": ordered_unique_strings([str(row.get("lane") or "") for row in bindings if isinstance(row, dict)]),
+            }
+        else:
+            request["bounty_priority"] = {
+                "status": "coverage-only",
+                "reason": "No current bounty action is attached to this request; keep it for greybox coverage, not top bounty order.",
+            }
+        prioritized_requests.append(request)
+
+    def request_sort_key(request: dict[str, Any]) -> tuple[Any, ...]:
+        priority = request.get("bounty_priority") if isinstance(request.get("bounty_priority"), dict) else {}
+        prioritized = priority.get("status") == "bounty-prioritized"
+        return (
+            claim_evidence_request_status_rank(request.get("request_status")),
+            0 if prioritized else 1,
+            int(priority.get("action_rank") or 999999),
+            int(priority.get("action_request_rank") or 999999),
+            -int(priority.get("score") or 0),
+            -int(request.get("claim_count") or 0),
+            claim_evidence_request_official_name(request),
+            str(request.get("id") or ""),
+        )
+
+    prioritized_requests.sort(key=request_sort_key)
+    top = prioritized_requests[0] if prioritized_requests else {}
+    top_priority = top.get("bounty_priority") if isinstance(top.get("bounty_priority"), dict) else {}
+    matched_count = sum(
+        1
+        for request in prioritized_requests
+        if isinstance(request.get("bounty_priority"), dict)
+        and request.get("bounty_priority", {}).get("status") == "bounty-prioritized"
+    )
+    summary = request_pack.get("summary") if isinstance(request_pack.get("summary"), dict) else {}
+    next_step = request_pack.get("next_step")
+    if top_priority.get("status") == "bounty-prioritized":
+        next_step = (
+            f"Work the top bounty-prioritized request first: {claim_evidence_request_official_name(top)} "
+            f"for action #{top_priority.get('action_rank')} {top_priority.get('lane')}. "
+            "Keep official sidecars approved and redacted only."
+        )
+    return {
+        **request_pack,
+        "summary": {
+            **summary,
+            "ordering_policy": "bounty-first-action-queue",
+            "bounty_priority_status": "aligned-with-bounty-action-queue" if matched_count else "coverage-only",
+            "bounty_prioritized_requests": matched_count,
+            "coverage_only_requests": len(prioritized_requests) - matched_count,
+            "top_bounty_request_id": top.get("id") if top_priority.get("status") == "bounty-prioritized" else None,
+            "top_bounty_request_name": claim_evidence_request_official_name(top)
+            if top_priority.get("status") == "bounty-prioritized"
+            else None,
+            "top_bounty_action_rank": top_priority.get("action_rank"),
+            "top_bounty_lane": top_priority.get("lane"),
+            "top_bounty_score": top_priority.get("score"),
+        },
+        "requests": prioritized_requests,
+        "next_step": next_step,
+        "ordering_policy": "bounty-first-action-queue",
     }
 
 
@@ -29223,6 +29430,36 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             claim_evidence_requests=claim_evidence_requests_case,
             max_file_bytes=262144,
         )
+        bounty_priority_request_pack_case = bounty_prioritize_claim_evidence_requests(
+            {
+                "generated_at": utc_now(),
+                "schema": "inferforge-claim-evidence-requests-v1",
+                "status": "ready-missing-evidence-requests",
+                "target": target,
+                "requests": [
+                    {
+                        **operator_claim_evidence_requests_case["requests"][0],
+                        "claim_count": 9,
+                        "unblocks_claims": [
+                            {"claim_id": f"CLAIM-selftest-provider-{index}"}
+                            for index in range(9)
+                        ],
+                    },
+                    claim_evidence_requests_case["requests"][0],
+                ],
+                "summary": {
+                    "requests": 2,
+                    "claims_unblocked": 10,
+                    "request_status_counts": {"missing-official-evidence": 2},
+                    "category_counts": {
+                        "operator-evidence": 1,
+                        "transaction-payload-sidecar": 1,
+                    },
+                },
+                "next_step": "Synthetic coverage-first next step.",
+            },
+            bounty_action_queue=rebuilt_claim_queue_case,
+        )
         rebuilt_ready_queue_case = build_bounty_action_queue(
             target=target,
             profile=None,
@@ -29393,6 +29630,22 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
     rebuilt_claim_queue_cache = (
         rebuilt_claim_queue_case.get("cache_validation")
         if isinstance(rebuilt_claim_queue_case.get("cache_validation"), dict)
+        else {}
+    )
+    bounty_priority_summary = (
+        bounty_priority_request_pack_case.get("summary")
+        if isinstance(bounty_priority_request_pack_case.get("summary"), dict)
+        else {}
+    )
+    bounty_priority_first_request = (
+        bounty_priority_request_pack_case.get("requests", [])[0]
+        if isinstance(bounty_priority_request_pack_case.get("requests"), list)
+        and bounty_priority_request_pack_case.get("requests")
+        else {}
+    )
+    bounty_priority_first = (
+        bounty_priority_first_request.get("bounty_priority")
+        if isinstance(bounty_priority_first_request.get("bounty_priority"), dict)
         else {}
     )
     template_api_acceptance_checks = ordered_unique_strings(
@@ -29774,6 +30027,24 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "claim-evidence-requests-use-bounty-priority-before-coverage-count",
+            "passed": (
+                claim_evidence_request_official_name(bounty_priority_first_request) == "transaction-payloads.jsonl"
+                and bounty_priority_first.get("status") == "bounty-prioritized"
+                and bounty_priority_first.get("action_rank") == 1
+                and bounty_priority_first.get("lane") == "transaction-integrity"
+                and bounty_priority_summary.get("bounty_priority_status") == "aligned-with-bounty-action-queue"
+                and bounty_priority_summary.get("top_bounty_request_name") == "transaction-payloads.jsonl"
+                and "bounty-prioritized request first" in str(bounty_priority_request_pack_case.get("next_step") or "")
+            ),
+            "expected": "bounty-prioritized transaction request sorts before higher-count coverage-only operator request",
+            "actual": {
+                "first_request": bounty_priority_first_request,
+                "summary": bounty_priority_summary,
+                "next_step": bounty_priority_request_pack_case.get("next_step"),
+            },
+        },
+        {
             "id": "template-cache-invalidates-when-queue-changes",
             "passed": stale_templates_current_with_waiting is True
             and stale_templates_current_with_ready is False
@@ -29869,6 +30140,7 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             "stale_queue_case": stale_queue_case,
             "rebuilt_ready_queue_case": rebuilt_ready_queue_case,
             "rebuilt_claim_queue_case": rebuilt_claim_queue_case,
+            "bounty_priority_request_pack_case": bounty_priority_request_pack_case,
             "stale_templates_case": stale_templates_case,
             "rebuilt_ready_templates_case": rebuilt_ready_templates_case,
         },
@@ -81876,6 +82148,40 @@ def run_claim_evidence_requests(args: argparse.Namespace) -> int:
         ladder_doc=ladder_doc if isinstance(ladder_doc, dict) else None,
         draft_doc=draft_doc if isinstance(draft_doc, dict) else None,
     )
+    rollup = build_or_load_bounty_readiness_rollup_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    authorization = build_or_load_bounty_evidence_authorization_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+    )
+    intake = build_or_load_bounty_evidence_intake_for_run(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        source_root=source_root,
+        max_file_bytes=int(getattr(args, "max_file_bytes", 262144)),
+    )
+    bounty_queue = build_bounty_action_queue(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+        bounty_readiness_rollup=rollup,
+        bounty_evidence_authorization=authorization,
+        bounty_evidence_intake=intake,
+        adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+        claim_evidence_requests=request_pack,
+        max_file_bytes=int(getattr(args, "max_file_bytes", 262144)),
+    )
+    request_pack = bounty_prioritize_claim_evidence_requests(
+        request_pack,
+        bounty_action_queue=bounty_queue,
+    )
     output_path = (
         resolve_repo_path(args.output)
         if args.output
@@ -81906,6 +82212,16 @@ def run_claim_evidence_requests(args: argparse.Namespace) -> int:
         f"drafts={summary.get('draft_status') or '-'} "
         f"categories={json.dumps(summary.get('category_counts', {}), sort_keys=True)}"
     )
+    if summary.get("bounty_priority_status"):
+        print(
+            "Priority: "
+            f"status={summary.get('bounty_priority_status')} "
+            f"policy={summary.get('ordering_policy') or '-'} "
+            f"top_request={summary.get('top_bounty_request_name') or '-'} "
+            f"top_lane={summary.get('top_bounty_lane') or '-'} "
+            f"prioritized={summary.get('bounty_prioritized_requests', 0)} "
+            f"coverage_only={summary.get('coverage_only_requests', 0)}"
+        )
     if getattr(args, "show_requests", False):
         display_limit = max(0, int(args.top))
         for request in (request_pack.get("requests", []) or [])[:display_limit]:
@@ -81913,13 +82229,23 @@ def run_claim_evidence_requests(args: argparse.Namespace) -> int:
                 continue
             official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
             draft = request.get("draft_assist") if isinstance(request.get("draft_assist"), dict) else {}
+            priority = request.get("bounty_priority") if isinstance(request.get("bounty_priority"), dict) else {}
             print(
                 f"- {request.get('id')}: {request.get('request_status')} "
                 f"name={official.get('name') or '-'} "
                 f"category={official.get('category') or '-'} "
                 f"claims={request.get('claim_count', 0)} "
-                f"draft={draft.get('draft_status') or '-'}"
+                f"draft={draft.get('draft_status') or '-'} "
+                f"priority={priority.get('status') or '-'}"
             )
+            if priority.get("status") == "bounty-prioritized":
+                print(
+                    "  bounty_action="
+                    f"rank={priority.get('action_rank')} "
+                    f"lane={priority.get('lane') or '-'} "
+                    f"score={priority.get('score') or 0} "
+                    f"severity={priority.get('expected_severity') or '-'}"
+                )
             if draft.get("draft_path"):
                 print(f"  draft_path={draft.get('draft_path')}")
             if request.get("entrypoints"):
@@ -88789,6 +89115,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         default=8,
         help="Number of official evidence requests to print with --show-requests.",
+    )
+    claim_evidence_requests.add_argument(
+        "--max-file-bytes",
+        type=positive_int,
+        default=262144,
+        help="Maximum bytes to read if evidence intake must be built for bounty-priority ordering. Defaults to 262144.",
     )
     claim_evidence_requests.add_argument(
         "--show-requests",
