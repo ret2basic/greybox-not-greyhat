@@ -457,6 +457,10 @@ manifest into artifact counts, artifact formats, required pair-binding fields,
 copy policy, and reject rules. That makes the next handoff explicit without
 copying drafts, creating official sidecars, authorizing traffic, or promoting a
 lead past finding-gate/adjudication.
+Closure actions that recompute after-ready validation are also gated by the
+official evidence bundle: until every required contract is
+`ready-no-write-contract-validation`, their commands remain `review-gated` and
+the `command_gate` stays blocked until the official bundle is ready.
 
 `claim-evidence-requests` also uses that queue context for its default ordering:
 in bounty mode, evidence for the highest-ranked action comes before a broader
