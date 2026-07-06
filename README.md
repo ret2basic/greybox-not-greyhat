@@ -571,11 +571,14 @@ finding gate by itself. The draft CLI prints the required binding fields with
 `--show-drafts` and now includes an operator-input handoff pointing at
 `.greybox/discover-check/operator-inputs/approved-quote-request.json`,
 `approved-quote-response.json`, and `approved-quote-intent.json`, plus the
-no-write corpus preflight command that consumes those files. Placeholders still
-have to be replaced from one approved quote request/response pair before
-anything is copied into official sidecars. SHA-256 binding fields must be real
-64-character hex digests; placeholders, short labels, or other non-hex metadata
-block pair binding even when the same invalid value appears in both files.
+no-write corpus preflight command that consumes those files. The handoff reports
+whether each local input file is missing or present, using path metadata only;
+it does not read or print request/response content in the workbook view.
+Placeholders still have to be replaced from one approved quote request/response
+pair before anything is copied into official sidecars. SHA-256 binding fields
+must be real 64-character hex digests; placeholders, short labels, or other
+non-hex metadata block pair binding even when the same invalid value appears in
+both files.
 `evidence-prep-status --show-details` summarizes the paired sidecar contract
 with the first blocker, binding review status, and first pairing issue, so a
 bad `approval_reference` or SHA-256 mismatch is visible without opening the JSON.
