@@ -384,6 +384,9 @@ only actions with `ready-offline-validation` expose
 manual input, external probes, or unsafe templates classify their validation
 commands as gated workflow items and are not presented as agent-runnable
 validation chains.
+With `--show-actions --show-commands`, each printed action command includes its
+command-safety classification so blocked validation previews are visible as
+`review-gated` rather than bare shell commands.
 Each action also carries a `harness_phase` model. This records the current
 finder/evidence/intake/triager/adjudication phase, the phase gate blocking
 promotion, and whether agent autorun is allowed. Source-positive leads stay in
