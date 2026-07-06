@@ -1436,9 +1436,10 @@ When an approved public token-account metadata sidecar is available,
 `transaction-token-accounts.json` or `transaction-token-accounts.jsonl` may also
 provide rows with `address`, `mint`, and `owner`. Those rows let
 `decode-transactions` verify that explicit source and destination token accounts
-belong to the expected wallet/recipient and mint. Missing token-account metadata
-does not create a finding; a concrete owner or mint mismatch is only a candidate
-transaction-integrity signal that still has to pass finding-gate and
+belong to the expected wallet/recipient and mint. They also let InferForge bind
+the decoded source-mint debit to the expected wallet owner. Missing token-account
+metadata does not create a finding; a concrete owner or mint mismatch is only a
+candidate transaction-integrity signal that still has to pass finding-gate and
 adjudication.
 By default, decoded top-level SPL token transfer instructions must stay within
 the expected source and destination mints/accounts. A policy can set
