@@ -1794,6 +1794,13 @@ adjudication.
 Explicit token-account boundary checks still compare decoded `transfer` account
 edges even when the opcode omits mint; mint and owner attribution stay in review
 until public token-account metadata is available.
+`transaction-evidence-readiness --show-checks` also prints post-payload review
+packages for address lookup coverage, token-account metadata coverage, and
+program allowlist review. These packages name the accepted sidecar paths, required
+conditions, pass/fail criteria, preview commands where applicable, and the
+finding-gate boundary. They are workflow controls only: unresolved lookup-table
+or token-account metadata keeps address-dependent claims in review, and missing
+metadata by itself is never a Medium+ finding.
 `decode-transactions` and `transaction-sidecar-review --show-commands` also
 summarize missing token-account metadata and print JSONL template rows for the
 public account, mint, and owner values that must be supplied before relying on
