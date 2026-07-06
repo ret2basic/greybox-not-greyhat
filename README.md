@@ -461,6 +461,10 @@ Closure actions that recompute after-ready validation are also gated by the
 official evidence bundle: until every required contract is
 `ready-no-write-contract-validation`, their commands remain `review-gated` and
 the `command_gate` stays blocked until the official bundle is ready.
+Stage commands printed by `bounty-shortest-path --show-stages --show-commands`
+carry the same command-safety classifications. Commands in blocked stages remain
+`review-gated` or `manual-template`, and only stages whose local no-write
+commands all classify as ready expose `autorunnable_commands`.
 
 `claim-evidence-requests` also uses that queue context for its default ordering:
 in bounty mode, evidence for the highest-ranked action comes before a broader
