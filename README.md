@@ -840,6 +840,9 @@ After the reviewed profile has produced a normalized observation, use
 `rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract --show-sidecar-template-json`
 to review only the existing `burp-history-observations.jsonl` rows for that
 rewrite and keep the single-path promotion/observe/review contract visible. It
+prints command-safety summaries for item-level and top-level follow-up commands,
+so no-write promotion previews and later local gate/adjudication previews show
+their per-command classifications instead of bare shell lines. It
 separates “one approved response observed” from “candidate
 sensitive-field or path confusion impact evidence”, redacts response samples,
 and still requires a manual finding-gate decision before anything is treated as
