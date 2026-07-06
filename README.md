@@ -358,6 +358,15 @@ only actions with `ready-offline-validation` expose
 `autorunnable_validation_commands`; actions waiting for official evidence,
 manual input, external probes, or unsafe templates remain visible as workflow
 items but are not presented as agent-runnable validation chains.
+Each action also carries a `harness_phase` model. This records the current
+finder/evidence/intake/triager/adjudication phase, the phase gate blocking
+promotion, and whether agent autorun is allowed. Source-positive leads stay in
+the finder or official-evidence phase with
+`triager-blocked-waiting-official-evidence`; only approved evidence that passes
+intake can move to `ready-offline-triager-validation`, and even then Medium+
+promotion remains blocked until finding-gate and adjudication accept the
+impact. The queue summary and `next_evidence_packet` repeat these phase gates so
+unattended loops do not mix lead generation with validation.
 The queue also emits `next_evidence_packet`, a compact view of the current
 highest-value action's minimum official evidence set, first missing artifact,
 claim-witness request, manual handoff/preflight commands, and after-evidence
