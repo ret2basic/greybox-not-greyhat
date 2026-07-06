@@ -515,6 +515,14 @@ The top-level `Handoff commands`, `Verify commands`, and `After-ready commands`
 sections also print command-safety summaries and per-command labels, so
 placeholder handoff templates show as `manual-template` and missing-evidence
 verifiers show as `review-gated` instead of bare runnable-looking shell lines.
+`bounty-lane-priorities --show-lanes --show-commands` prints the current
+lane-level workflow ranking before the frontier/action queue layers. Each row
+now includes a `scorecard` and `blackbox_value` block that separates expected
+payout weight, source strength, evidence distance, validity-gap penalties, value
+tier, and the blackbox completion unit. High/Critical candidates are tagged as
+`one-valid-high-impact-finding`, while Medium rows are explicitly secondary when
+a stronger valid bounty path is still open. `--show-priorities` is accepted as a
+compatibility alias for `--show-lanes`.
 `bounty-frontier --show-frontiers --show-commands` prints the same verifier
 command labels at the frontier ranking layer: blocked missing-evidence rows keep
 their verifier commands `review-gated`, while ready evidence-verification rows
