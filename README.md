@@ -745,6 +745,12 @@ credentialed upstream proxy, it also adds a cost/quota review that requires
 provider or operator impact evidence before reportability. The scaffold records
 which buy/sell mint pairs and `allowedPrograms` are already known and which
 runtime values still need an approved quote corpus, wallet, and raw `amountIn`.
+The quote source contract also carries `source_intent_guard_summary`, which
+collapses those server-side request-key, mint-pair, sender/recipient, amount,
+and quote-count guards into a positive-control status such as
+`source-intent-guards-indexed`. This lowers false-positive pressure from request
+field tampering while keeping the residual blocker explicit:
+`approved-payload-decode-required`.
 It sends no requests, does not open a wallet, and never signs or submits
 transactions.
 When RPC source shows client-keyed in-memory rate-limit fallback behavior, the
