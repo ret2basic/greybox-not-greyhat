@@ -344,7 +344,11 @@ coverage request that merely unblocks more lower-value claims. Each request now
 includes source-readiness metadata from local candidate/review artifacts, such as
 whether a transaction payload candidate exists locally, whether an intent policy
 template is ready, whether a single-observation plan exists, and whether official
-approved evidence is still required.
+approved evidence is still required. For transaction payload requests, the same
+source-readiness block carries a compact handoff contract from
+`transaction-corpus-checklist`: recommended quote method/path/direction, target
+sidecars, required redacted fields, blocked approval steps, and offline verifier
+commands. The contract is still not evidence and does not authorize traffic.
 
 `methodology-review` also emits `bounty_harness_alignment`, a compact
 bug-bounty readiness check derived from the harness pattern of building system

@@ -22761,6 +22761,27 @@ def claim_evidence_request_source_readiness(
         burp_candidates = load_optional_json(artifact_dir / "burp-transaction-candidates.json") or {}
         quote_collection = load_optional_json(artifact_dir / "quote-collection.json") or {}
         sidecar_review = load_optional_json(artifact_dir / TRANSACTION_SIDECAR_REVIEW_ARTIFACT) or {}
+        corpus_checklist = load_optional_json(artifact_dir / TRANSACTION_CORPUS_CHECKLIST_ARTIFACT) or {}
+        approval_packet = (
+            corpus_checklist.get("transaction_corpus_approval_packet")
+            if isinstance(corpus_checklist.get("transaction_corpus_approval_packet"), dict)
+            else {}
+        )
+        recommended_quote = (
+            approval_packet.get("recommended_quote")
+            if isinstance(approval_packet.get("recommended_quote"), dict)
+            else {}
+        )
+        approval_sequence = [
+            row
+            for row in approval_packet.get("approval_sequence", []) or []
+            if isinstance(row, dict)
+        ]
+        handoff_blockers = [
+            row
+            for row in approval_sequence
+            if str(row.get("status") or "") not in {"ready", "ready-after-import"}
+        ]
         burp_count = int(burp_candidates.get("candidate_count") or 0)
         quote_count = int(
             quote_collection.get("candidate_count")
@@ -22793,7 +22814,38 @@ def claim_evidence_request_source_readiness(
                     "candidate_count": review_count,
                     "ready_for_decode": int_from_nested(sidecar_review, ["summary", "ready_for_decode"]),
                 },
+                {
+                    "artifact": TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
+                    "status": corpus_checklist.get("status") or artifact_summary_status(corpus_checklist),
+                    "approval_packet_status": approval_packet.get("status"),
+                },
             ],
+            "handoff_contract": {
+                "status": approval_packet.get("status") or "missing-transaction-corpus-approval-packet",
+                "packet_artifact": TRANSACTION_CORPUS_CHECKLIST_ARTIFACT,
+                "recommended_quote": {
+                    key: recommended_quote.get(key)
+                    for key in ["method", "path", "direction", "sourceMint", "destinationMint", "expectedPayloadType"]
+                    if recommended_quote.get(key) is not None
+                },
+                "payload_sidecar": approval_packet.get("payload_sidecar")
+                or repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl"),
+                "intent_policy_sidecar": approval_packet.get("intent_policy_sidecar")
+                or repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json"),
+                "accepted_payload_sidecars": normalize_string_list(approval_packet.get("accepted_payload_sidecars"))[:4],
+                "required_fields": normalize_string_list(approval_packet.get("redacted_sidecar_required_fields"))[:6],
+                "offline_commands": normalize_string_list(approval_packet.get("offline_commands"))[:4],
+                "blocked_steps": [
+                    {
+                        "id": row.get("id"),
+                        "status": row.get("status"),
+                        "risk": row.get("risk"),
+                    }
+                    for row in handoff_blockers[:6]
+                ],
+                "finding_gate_blockers": normalize_string_list(approval_packet.get("finding_gate_blockers"))[:5],
+                "safety": "Handoff contract only. It does not approve evidence, send target traffic, sign wallets, or write official sidecars.",
+            },
             "next_step": (
                 "Review the local transaction candidate source, then copy exactly one approved/redacted payload into the official sidecar."
                 if local_count
@@ -28139,6 +28191,12 @@ def bounty_action_claim_request_rows(
         official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
         draft = request.get("draft_assist") if isinstance(request.get("draft_assist"), dict) else {}
         source = request.get("source_readiness") if isinstance(request.get("source_readiness"), dict) else {}
+        handoff = source.get("handoff_contract") if isinstance(source.get("handoff_contract"), dict) else {}
+        recommended_quote = (
+            handoff.get("recommended_quote")
+            if isinstance(handoff.get("recommended_quote"), dict)
+            else {}
+        )
         verify_commands = normalize_string_list(request.get("verification_commands"))
         compact_rows.append(
             {
@@ -28161,6 +28219,19 @@ def bounty_action_claim_request_rows(
                     "local_candidate_count": source.get("local_candidate_count", 0),
                     "official_evidence_still_required": source.get("official_evidence_still_required", True),
                     "next_step": source.get("next_step"),
+                    "handoff_contract": {
+                        "status": handoff.get("status"),
+                        "packet_artifact": handoff.get("packet_artifact"),
+                        "recommended_quote": {
+                            key: recommended_quote.get(key)
+                            for key in ["method", "path", "direction", "expectedPayloadType"]
+                            if recommended_quote.get(key) is not None
+                        },
+                        "payload_sidecar": handoff.get("payload_sidecar"),
+                        "intent_policy_sidecar": handoff.get("intent_policy_sidecar"),
+                        "required_fields": normalize_string_list(handoff.get("required_fields"))[:4],
+                        "offline_commands": normalize_string_list(handoff.get("offline_commands"))[:3],
+                    } if handoff else {},
                 } if source else {},
                 "first_verification_command": verify_commands[0] if verify_commands else None,
                 "redaction_rules": normalize_string_list(request.get("redaction_rules"))[:4],
@@ -29371,6 +29442,54 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             + "\n",
             encoding="utf-8",
         )
+        (artifact_dir / TRANSACTION_CORPUS_CHECKLIST_ARTIFACT).write_text(
+            json.dumps(
+                {
+                    "generated_at": utc_now(),
+                    "status": "needs-approved-quote-corpus",
+                    "transaction_corpus_approval_packet": {
+                        "status": "ready-offline-approval",
+                        "recommended_quote": {
+                            "method": "POST",
+                            "path": "/api/quote",
+                            "direction": "buy",
+                            "expectedPayloadType": "svm",
+                        },
+                        "payload_sidecar": repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl"),
+                        "intent_policy_sidecar": repo_relative_or_absolute(
+                            artifact_dir / "transaction-intent-policy.json"
+                        ),
+                        "accepted_payload_sidecars": [
+                            repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl"),
+                            repo_relative_or_absolute(artifact_dir / "transaction-payloads.json"),
+                        ],
+                        "redacted_sidecar_required_fields": [
+                            "exactly one approved POST /api/quote response body",
+                            "payloads[*].data.transaction",
+                            "no raw Burp history or wallet secrets",
+                        ],
+                        "offline_commands": [
+                            validation_command_for_artifact_dir(
+                                artifact_dir,
+                                "transaction-sidecar-review --no-write --show-files",
+                                profile=None,
+                            )
+                        ],
+                        "approval_sequence": [
+                            {
+                                "id": "single-approved-quote-capture",
+                                "status": "blocked-until-resource-gate-and-manual-approval",
+                                "risk": "active-single-approved-http-request",
+                            }
+                        ],
+                        "finding_gate_blockers": ["No decoded transaction mismatch has been reviewed yet."],
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         transaction_source_readiness_case = claim_evidence_request_source_readiness(
             claim_evidence_requests_case["requests"][0],
             artifact_dir=artifact_dir,
@@ -29862,6 +29981,16 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
         if isinstance(bounty_priority_first_request.get("bounty_priority"), dict)
         else {}
     )
+    transaction_source_handoff_case = (
+        transaction_source_readiness_case.get("handoff_contract")
+        if isinstance(transaction_source_readiness_case.get("handoff_contract"), dict)
+        else {}
+    )
+    transaction_source_handoff_quote_case = (
+        transaction_source_handoff_case.get("recommended_quote")
+        if isinstance(transaction_source_handoff_case.get("recommended_quote"), dict)
+        else {}
+    )
     template_api_acceptance_checks = ordered_unique_strings(
         [
             check
@@ -30158,9 +30287,14 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
                 and transaction_source_readiness_case.get("local_candidate_count") == 1
                 and transaction_source_readiness_case.get("official_evidence_still_required") is True
                 and transaction_source_readiness_case.get("approval_required") is True
+                and transaction_source_handoff_case.get("status") == "ready-offline-approval"
+                and transaction_source_handoff_quote_case.get("path") == "/api/quote"
+                and transaction_source_handoff_quote_case.get("direction") == "buy"
+                and "transaction-payloads.jsonl"
+                in str(transaction_source_handoff_case.get("payload_sidecar") or "")
                 and "official sidecar" in str(transaction_source_readiness_case.get("next_step") or "")
             ),
-            "expected": "local transaction candidates are surfaced but still require approved official sidecar evidence",
+            "expected": "local transaction candidates are surfaced with a handoff contract but still require approved official sidecar evidence",
             "actual": transaction_source_readiness_case,
         },
         {
@@ -30523,6 +30657,20 @@ def bounty_evidence_request_markdown(
                         f"`{bounty_brief_line(source.get('status') or '-', max_chars=120)}` "
                         f"local_candidates=`{source.get('local_candidate_count', 0)}`"
                     )
+                    handoff = source.get("handoff_contract") if isinstance(source.get("handoff_contract"), dict) else {}
+                    recommended_quote = (
+                        handoff.get("recommended_quote")
+                        if isinstance(handoff.get("recommended_quote"), dict)
+                        else {}
+                    )
+                    if handoff:
+                        lines.append(
+                            "  - Handoff: "
+                            f"`{bounty_brief_line(handoff.get('status') or '-', max_chars=120)}` "
+                            f"{bounty_brief_line(recommended_quote.get('method') or '-', max_chars=20)} "
+                            f"{bounty_brief_line(recommended_quote.get('path') or '-', max_chars=120)} "
+                            f"direction=`{bounty_brief_line(recommended_quote.get('direction') or '-', max_chars=40)}`"
+                        )
                     if source.get("next_step"):
                         lines.append(f"  - Source next: {bounty_brief_line(source.get('next_step'), max_chars=360)}")
                 if request.get("first_verification_command"):
@@ -82489,6 +82637,19 @@ def run_claim_evidence_requests(args: argparse.Namespace) -> int:
                     f"local_candidates={source.get('local_candidate_count', 0)} "
                     f"official_required={source.get('official_evidence_still_required')}"
                 )
+                handoff = source.get("handoff_contract") if isinstance(source.get("handoff_contract"), dict) else {}
+                recommended_quote = (
+                    handoff.get("recommended_quote")
+                    if isinstance(handoff.get("recommended_quote"), dict)
+                    else {}
+                )
+                if handoff:
+                    print(
+                        "  handoff="
+                        f"{handoff.get('status') or '-'} "
+                        f"quote={recommended_quote.get('method') or '-'} {recommended_quote.get('path') or '-'} "
+                        f"direction={recommended_quote.get('direction') or '-'}"
+                    )
             if draft.get("draft_path"):
                 print(f"  draft_path={draft.get('draft_path')}")
             if request.get("entrypoints"):
@@ -84254,6 +84415,23 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
                         f"{first_source.get('status') or '-'} "
                         f"local_candidates={first_source.get('local_candidate_count', 0)}"
                     )
+                    handoff = (
+                        first_source.get("handoff_contract")
+                        if isinstance(first_source.get("handoff_contract"), dict)
+                        else {}
+                    )
+                    recommended_quote = (
+                        handoff.get("recommended_quote")
+                        if isinstance(handoff.get("recommended_quote"), dict)
+                        else {}
+                    )
+                    if handoff:
+                        print(
+                            "  claim_handoff="
+                            f"{handoff.get('status') or '-'} "
+                            f"quote={recommended_quote.get('method') or '-'} {recommended_quote.get('path') or '-'} "
+                            f"direction={recommended_quote.get('direction') or '-'}"
+                        )
                 if row.get("claim_evidence_first_verification_command") and getattr(args, "show_commands", False):
                     print(
                         "  claim_verify="
