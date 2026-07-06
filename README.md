@@ -1263,8 +1263,9 @@ official sidecars unless `--write-official-sidecars` is also supplied, the
 preflight is ready, an approval reference is present, and existing sidecars are
 not being overwritten. Use `--replace` only after reviewing the existing official
 evidence files. `self-test-transactions` exercises this write path inside a
-temporary artifact directory and then requires `transaction-sidecar-review` to
-return `ready-for-decode` for the prepared sidecars.
+temporary artifact directory, requires `transaction-sidecar-review` to return
+`ready-for-decode`, then runs `decode-transactions --no-write` and confirms no
+`transaction-intent.json` artifact is written.
 
 `transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract` prints the
 accepted sidecar files, configured candidate paths, and compact JSON/JSONL/TXT

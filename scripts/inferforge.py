@@ -66224,6 +66224,9 @@ def build_transaction_decoder_selftest(
     prepared_sidecar_return_code = 1
     prepared_sidecar_review: dict[str, Any] = {}
     prepared_sidecar_prep_doc: dict[str, Any] = {}
+    prepared_decode_return_code = 1
+    prepared_decode_stdout: list[str] = []
+    prepared_decode_wrote_transaction_intent = True
     with tempfile.TemporaryDirectory() as temp_dir:
         guard_artifact_dir = Path(temp_dir) / "transaction-sidecar-guard"
         guard_artifact_dir.mkdir()
@@ -66386,7 +66389,15 @@ def build_transaction_decoder_selftest(
         prepared_artifact_dir = Path(temp_dir) / "transaction-sidecar-prepared"
         prepared_artifact_dir.mkdir()
         prepared_profile_path = Path(temp_dir) / "prepared-profile.json"
-        write_json(prepared_profile_path, profile or default_target_profile())
+        prepared_profile = json_clone(profile or default_target_profile())
+        prepared_quote_intent = (
+            prepared_profile.get("quote_intent")
+            if isinstance(prepared_profile.get("quote_intent"), dict)
+            else {}
+        )
+        prepared_quote_intent["allowedPrograms"] = [payload["allowedProgram"]]
+        prepared_profile["quote_intent"] = prepared_quote_intent
+        write_json(prepared_profile_path, prepared_profile)
         prepared_request_input = Path(temp_dir) / "approved-quote-request.json"
         write_json(
             prepared_request_input,
@@ -66445,9 +66456,30 @@ def build_transaction_decoder_selftest(
         ) or {}
         prepared_sidecar_review = build_transaction_sidecar_review(
             target=DEFAULT_TARGET,
-            profile=profile,
+            profile=prepared_profile,
             artifact_dir=prepared_artifact_dir,
         )
+        prepared_decode_stdout_buffer = io.StringIO()
+        with contextlib.redirect_stdout(prepared_decode_stdout_buffer):
+            prepared_decode_return_code = run_decode_transactions(
+                argparse.Namespace(
+                    profile=str(prepared_profile_path),
+                    artifact_dir=str(prepared_artifact_dir),
+                    target=DEFAULT_TARGET,
+                    source_root=str(source_root),
+                    node=node,
+                    input=None,
+                    max_input_bytes=DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+                    intent_policy=None,
+                    intent_direction=None,
+                    intent_wallet=None,
+                    intent_amount_in=None,
+                    intent_allowed_program=None,
+                    no_write=True,
+                )
+            )
+        prepared_decode_stdout = prepared_decode_stdout_buffer.getvalue().splitlines()
+        prepared_decode_wrote_transaction_intent = (prepared_artifact_dir / "transaction-intent.json").exists()
     sidecar_guard_passed = (
         sidecar_guard_intent.get("candidates_seen") == 0
         and sidecar_guard_intent.get("resource_limits", {}).get("max_transaction_candidate_input_bytes") == 32
@@ -66570,6 +66602,7 @@ def build_transaction_decoder_selftest(
         and "EVM executable payloads" in str(sidecar_evm_review.get("next_step") or "")
     )
     prepared_sidecar_text = json.dumps(prepared_sidecar_review, sort_keys=True)
+    prepared_decode_stdout_text = "\n".join(prepared_decode_stdout)
     prepared_sidecar_passed = (
         prepared_sidecar_return_code == 0
         and prepared_sidecar_prep_doc.get("status") == "ready-to-write-official-sidecars"
@@ -66582,6 +66615,15 @@ def build_transaction_decoder_selftest(
         and prepared_sidecar_review.get("payload_contract_review", {}).get("allows_decode") is True
         and prepared_sidecar_review.get("decode_commands")
         and payload["base64"] not in prepared_sidecar_text
+    )
+    prepared_decode_no_write_passed = (
+        prepared_decode_return_code == 0
+        and "Transaction decode: preview" in prepared_decode_stdout_text
+        and "Transactions: 1 candidates, 1 decoded" in prepared_decode_stdout_text
+        and "Intent gate: status=intent-checks-passed severity=none ready_for_finding_gate=False"
+        in prepared_decode_stdout_text
+        and "No files written (--no-write)." in prepared_decode_stdout
+        and prepared_decode_wrote_transaction_intent is False
     )
     sidecar_contracts = [
         item
@@ -66704,6 +66746,7 @@ def build_transaction_decoder_selftest(
         and sidecar_empty_passed
         and sidecar_evm_passed
         and prepared_sidecar_passed
+        and prepared_decode_no_write_passed
         and sidecar_contract_passed
         and sidecar_empty_approval_packet_passed
         and sidecar_empty_closure_plan_passed
@@ -66801,6 +66844,12 @@ def build_transaction_decoder_selftest(
             "payload_contract_review": prepared_sidecar_review.get("payload_contract_review", {}),
             "candidate_summaries": prepared_sidecar_review.get("candidate_summaries", []),
             "decode_commands": prepared_sidecar_review.get("decode_commands", []),
+        },
+        "prepared_sidecar_decode_no_write": {
+            "status": "passed" if prepared_decode_no_write_passed else "failed",
+            "return_code": prepared_decode_return_code,
+            "wrote_transaction_intent": prepared_decode_wrote_transaction_intent,
+            "stdout": prepared_decode_stdout,
         },
         "sidecar_evidence_contract": {
             "status": "passed" if sidecar_contract_passed else "failed",
