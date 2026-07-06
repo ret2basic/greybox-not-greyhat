@@ -1445,7 +1445,10 @@ By default, decoded top-level SPL token transfer instructions must stay within
 the expected source and destination mints/accounts. A policy can set
 `allowExtraTokenTransfers: true` only after the route's extra token movement is
 reviewed; otherwise unexpected transfer mints or unexpected explicit token
-account boundaries are treated as candidate transaction-integrity impact.
+account boundaries are treated as candidate transaction-integrity impact. When
+token-account metadata is available, same-mint transfers from a non-wallet
+source owner or to a non-recipient destination owner are also treated as
+unapproved transfer scope.
 Compute budget instructions are decoded as well. Set `maxComputeUnitLimit`,
 `maxComputeUnitPriceMicroLamports`, and `maxPriorityFeeLamports` in the intent
 policy to cap priority-fee exposure; when both unit limit and unit price are
