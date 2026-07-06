@@ -682,6 +682,14 @@ contracts. The credential contract spells out provider quota/rate-limit/billing
 impact gates; the RPC contract spells out which operator decisions must be
 proven, which header-trust/fallback conditions are reportable, and which safe
 evidence sources can support the claim without traffic volume.
+Use `operator-impact-readiness --no-write --show-commands` with optional
+`--show-checks`, `--show-next`, `--show-gates`, and `--show-contracts` to
+summarize the same operator-impact proof path and command-safety totals. The
+operator sidecar review, credential impact checklist, and RPC proxy parity review
+stay ready as offline checks; bounty validation, invalidity review, finding-gate,
+and adjudication commands remain review-gated until the required redacted
+operator/provider evidence is present and the relevant operator-impact gate is
+ready.
 `operator-evidence-review` also emits `resource_control_approval_packet`, a
 compact offline packet for the RPC/resource-control thread. It names the
 resource entrypoint, redacted operator-evidence sidecar, accepted present
