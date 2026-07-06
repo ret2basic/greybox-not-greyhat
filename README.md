@@ -495,6 +495,14 @@ The top-level `Handoff commands`, `Verify commands`, and `After-ready commands`
 sections also print command-safety summaries and per-command labels, so
 placeholder handoff templates show as `manual-template` and missing-evidence
 verifiers show as `review-gated` instead of bare runnable-looking shell lines.
+`bounty-frontier --show-frontiers --show-commands` prints the same verifier
+command labels at the frontier ranking layer: blocked missing-evidence rows keep
+their verifier commands `review-gated`, while ready evidence-verification rows
+can expose runnable no-write verifiers. This is still workflow control only and
+does not create evidence sidecars or bypass finding-gate/adjudication.
+`bounty-validation-gates --show-gates --show-commands` mirrors those labels at
+the Medium+ validation-gate layer so blocked gates do not expose their verifier
+commands as autorunnable.
 
 `claim-evidence-ledger` decomposes each claim into required evidence artifacts
 and verifier commands. Ledger rows now carry `verification_command_refs`,
