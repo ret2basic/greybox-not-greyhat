@@ -1456,6 +1456,11 @@ destination-mint transfers and gates a concrete shortfall as candidate
 transaction-integrity impact; if the output amount is not visible in the
 unsigned transaction payload, the check stays in manual review instead of
 claiming a finding.
+For paired corpus preparation, `prepare-transaction-corpus-sidecars` can derive
+`minDestinationAmount` from a unique positive-integer `amountOut` in the same
+approved quote response/payload that supplies `transaction-payloads.jsonl`.
+Ambiguous or non-integer `amountOut` values stay in review and must be approved
+manually before they are used as the output-amount policy.
 `transaction-intent.json.reportability_review` summarizes whether decoded
 checks are merely waiting for corpus/policy, passed for the current corpus, or
 contain signer, wallet, mint, or program mismatches that are ready for a
