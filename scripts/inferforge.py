@@ -39035,6 +39035,13 @@ def build_transaction_evidence_readiness(
         or corpus_summary.get("payload_sidecar_placeholders")
         or 0
     )
+    payload_sidecar_files_present = int(
+        sidecar_summary.get("payload_files_present")
+        or corpus_summary.get("payload_sidecar_files_present")
+        or 0
+    )
+    non_placeholder_payload_sidecar_files = max(0, payload_sidecar_files_present - placeholder_count)
+    candidate_bearing_payload_files = int(sidecar_summary.get("candidate_bearing_payload_files") or 0)
     ready_for_decode = single_payload_ready and (
         bool(sidecar_summary.get("ready_for_decode")) or str(corpus.get("status") or "") == "ready-to-decode"
     )
@@ -39074,7 +39081,11 @@ def build_transaction_evidence_readiness(
             {
                 "payload_candidates": payload_candidate_count,
                 "single_payload_ready": single_payload_ready,
+                "payload_sidecar_files_present": payload_sidecar_files_present,
+                "non_placeholder_payload_sidecar_files": non_placeholder_payload_sidecar_files,
+                "candidate_bearing_payload_files": candidate_bearing_payload_files,
                 "placeholder_payload_files": placeholder_count,
+                "placeholder_payloads_are_evidence": False,
                 "accepted_sidecars": approval_packet.get("accepted_payload_sidecars", []),
             },
             official_payload_next_step,
@@ -39213,7 +39224,11 @@ def build_transaction_evidence_readiness(
             "passed": sum(1 for check in checks if check.get("status") == "passed"),
             "waiting_or_blocked": len(failed_or_waiting),
             "payload_candidates": payload_candidate_count,
+            "payload_sidecar_files_present": payload_sidecar_files_present,
+            "non_placeholder_payload_sidecar_files": non_placeholder_payload_sidecar_files,
+            "candidate_bearing_payload_files": candidate_bearing_payload_files,
             "placeholder_payload_files": placeholder_count,
+            "placeholder_payloads_are_evidence": False,
             "policy_configured": policy_configured,
             "policy_valid": policy_valid,
             "ready_for_decode": ready_for_decode,
@@ -40300,6 +40315,9 @@ def build_transaction_corpus_checklist(
     placeholder_payload_sidecar_files = [
         row for row in present_payload_sidecar_files if row.get("placeholder")
     ]
+    non_placeholder_payload_sidecar_files = [
+        row for row in present_payload_sidecar_files if not row.get("placeholder")
+    ]
     payload_shape_guidance = build_transaction_payload_shape_guidance(profile, artifact_dir)
     intent_policy_sidecar_path = repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json")
     intent_policy_sidecar_templates = [
@@ -40404,6 +40422,10 @@ def build_transaction_corpus_checklist(
                 "transaction_intent_candidates": candidates_seen,
                 "burp_transaction_candidates": burp_candidate_count,
                 "quote_collection_success": quote_success,
+                "payload_sidecar_files_present": len(present_payload_sidecar_files),
+                "non_placeholder_payload_sidecar_files": len(non_placeholder_payload_sidecar_files),
+                "placeholder_payload_sidecar_files": len(placeholder_payload_sidecar_files),
+                "placeholder_payloads_are_evidence": False,
             },
         },
         {
@@ -40464,7 +40486,9 @@ def build_transaction_corpus_checklist(
         "quote_collection_classification": quote_diagnosis.get("classification") or "missing",
         "quote_collection_success": quote_success,
         "payload_sidecar_files_present": len(present_payload_sidecar_files),
+        "non_placeholder_payload_sidecar_files": len(non_placeholder_payload_sidecar_files),
         "payload_sidecar_placeholders": len(placeholder_payload_sidecar_files),
+        "placeholder_payloads_are_evidence": False,
         "burp_transaction_candidates": burp_candidate_count,
         "transaction_intent_candidates": candidates_seen,
         "decoded_transactions": decoded_transactions,
@@ -60992,7 +61016,9 @@ def build_transaction_decoder_selftest(
     sidecar_empty_passed = (
         sidecar_empty_review.get("status") == "payload-sidecar-no-candidates"
         and sidecar_empty_review.get("summary", {}).get("placeholder_payload_files") == 1
+        and sidecar_empty_corpus_checklist.get("summary", {}).get("non_placeholder_payload_sidecar_files") == 0
         and sidecar_empty_corpus_checklist.get("summary", {}).get("payload_sidecar_placeholders") == 1
+        and sidecar_empty_corpus_checklist.get("summary", {}).get("placeholder_payloads_are_evidence") is False
         and sidecar_empty_corpus_steps.get("payload-sidecar", {}).get("status") == "waiting-placeholder"
         and sidecar_empty_guidance.get("configured_candidate_paths") == quote_response_candidate_paths(profile)
         and len(sidecar_empty_guidance.get("examples", []) or []) >= 3
@@ -77075,6 +77101,8 @@ def run_transaction_evidence_readiness(args: argparse.Namespace) -> int:
         f"passed={summary.get('passed', 0)} "
         f"waiting={summary.get('waiting_or_blocked', 0)} "
         f"payloads={summary.get('payload_candidates', 0)} "
+        f"sidecars={summary.get('payload_sidecar_files_present', 0)} "
+        f"non_placeholder={summary.get('non_placeholder_payload_sidecar_files', 0)} "
         f"placeholders={summary.get('placeholder_payload_files', 0)} "
         f"policy_valid={summary.get('policy_valid')} "
         f"decode_ready={summary.get('ready_for_decode')} "
@@ -77681,6 +77709,7 @@ def run_transaction_corpus_checklist(args: argparse.Namespace) -> int:
     print(
         "Payload sidecars: "
         f"present={summary.get('payload_sidecar_files_present', 0)} "
+        f"non_placeholder={summary.get('non_placeholder_payload_sidecar_files', 0)} "
         f"placeholders={summary.get('payload_sidecar_placeholders', 0)}"
     )
     print(
