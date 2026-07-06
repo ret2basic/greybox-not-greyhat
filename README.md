@@ -1586,9 +1586,10 @@ matching intent policy, decode review, finding gate, and adjudication all agree.
 
 `prepare-approved-quote-operator-inputs --request-input ./approved-quote-request.http --payload-input ./approved-quote-response.http --approval-reference APPROVED-QUOTE-001 --no-write --show-preflight --show-commands`
 is the offline helper for Burp/raw-HTTP handoff. It also accepts
-`--exchange-input` for one approved raw HTTP exchange, JSON-wrapped exchange,
-HAR with one unique `POST /api/quote`, or Burp XML item export with one unique
-`POST /api/quote`. It strips raw HTTP headers from an approved quote
+`--exchange-input` for one approved raw HTTP exchange, Burp "Copy as cURL"
+request followed by the matching raw HTTP response, JSON-wrapped cURL/response
+exchange, JSON-wrapped raw HTTP exchange, HAR with one unique `POST /api/quote`,
+or Burp XML item export with one unique `POST /api/quote`. It strips raw HTTP headers from an approved quote
 request/response pair, keeps only the JSON bodies as candidate supporting
 operator inputs, and generates an approved quote intent draft from the derived
 wallet, recipient, mints, raw amount, optional minimum destination amount, chain,
@@ -1598,13 +1599,18 @@ direction, and payload type. By default it previews only. With
 evidence sidecars. Generated intent remains `approved_for_offline_validation=false`
 unless `--approve-offline-validation` is supplied after operator review, and an
 approved import also requires a real `--approval-reference`.
-When an approved HAR, Burp XML export, JSON-wrapped exchange, or raw HTTP
-exchange is staged directly under `.greybox/discover-check/operator-inputs`,
+The cURL importer never executes the command and rejects `@file` data references;
+it only reconstructs a raw HTTP request from inline arguments before the existing
+header-stripping preflight runs. A JSON-wrapped cURL handoff can use fields like
+`copy_as_curl`, `response`, and optional `status` when the response is available as a JSON
+body instead of a raw HTTP response.
+When an approved HAR, Burp XML export, cURL+response, JSON-wrapped exchange, or
+raw HTTP exchange is staged directly under `.greybox/discover-check/operator-inputs`,
 `evidence-sidecar-drafts` and `bounty-shortest-path` surface the importable
 candidate and its exact no-write preview command. The staged-file scanner also
 checks approved export files in subdirectories up to two levels deep, such as
-`operator-inputs/exports/burp/*.xml`, while keeping the same candidate-count and
-per-file byte caps.
+`operator-inputs/exports/burp/*.xml` or `operator-inputs/exports/cURL/*.cURL`,
+while keeping the same candidate-count and per-file byte caps.
 `approved-quote-exchange-candidates --show-commands` runs the same staged-file
 scanner directly and is read-only; with `--strict`, it exits non-zero unless at
 least one importable staged exchange is present.
