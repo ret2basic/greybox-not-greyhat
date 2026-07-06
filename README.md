@@ -768,7 +768,11 @@ reviewed in-scope read-only path, set `approved: true` only for that response,
 and keep the sidecar to method/path/status/content-type, high-level impact
 indicators, sensitive field paths, and a short redacted impact summary. Do not
 store cookies, bearer tokens, API keys, private keys, seed phrases, signatures,
-raw Burp history, or full response bodies.
+raw Burp history, or full response bodies. `response-evidence-readiness`
+summarizes the same minimum package and now carries command-safety totals: the
+sidecar/template review command stays ready, while validation gate,
+finding-gate, and adjudication commands remain review-gated until the approved
+response sidecar has candidate impact evidence.
 If candidate impact is present, `gate --no-write --show-items` imports it as a
 redacted manual-review gate item; it does not mark the issue reportable by
 itself. When no evidence is ready for gate review, the same command prints
