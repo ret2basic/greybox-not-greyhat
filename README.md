@@ -593,7 +593,9 @@ preflight and sidecar-prepare previews for those operator-input files. The
 preflight command remains review-gated while any input file is missing and
 becomes ready only after all three local input files are present; the
 sidecar-prepare preview remains a manual template until the approval reference
-placeholder is replaced.
+placeholder is replaced. The shortest-path `Next:` line follows the same
+operator-input state, pointing to missing files first and to the ready no-write
+preflight once all three inputs exist.
 When the pair reaches `ready-for-decode`, the same contract exposes the gated
 no-write validation chain: `transaction-sidecar-review`, `decode-transactions`,
 `gate`, and `adjudicate`. Blocked pairs keep that command list empty.
