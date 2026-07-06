@@ -23744,7 +23744,7 @@ BOUNTY_READINESS_PREVIEW_SUBCOMMAND_BY_ARTIFACT = {
         "--show-contracts --show-commands --top 8"
     ),
     BUILD_PROVENANCE_READINESS_ARTIFACT: (
-        "build-provenance-readiness --no-write --show-signals --show-checks --show-next --show-commands --top 8"
+        "build-provenance-readiness --no-write --show-signals --show-checks --show-next --show-commands --show-template-json --top 8"
     ),
     RESPONSE_EVIDENCE_READINESS_ARTIFACT: (
         "response-evidence-readiness --no-write --show-checks --show-next --show-package --show-commands --top 8"
@@ -24274,10 +24274,10 @@ def bounty_evidence_workorder_lane_spec(
             ],
             "template_commands": [
                 validation_command_for_artifact_dir(artifact_dir, "secret-exposure-review --no-write --show-findings", profile=profile),
-                validation_command_for_artifact_dir(artifact_dir, "build-provenance-readiness --no-write --show-signals --show-checks --show-next --show-commands --top 8", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "build-provenance-readiness --no-write --show-signals --show-checks --show-next --show-commands --show-template-json --top 8", profile=profile),
             ],
             "after_evidence_commands": [
-                validation_command_for_artifact_dir(artifact_dir, "build-provenance-readiness --no-write --show-signals --show-checks --show-next --show-commands --top 8", profile=profile),
+                validation_command_for_artifact_dir(artifact_dir, "build-provenance-readiness --no-write --show-signals --show-checks --show-next --show-commands --show-template-json --top 8", profile=profile),
                 validation_command_for_artifact_dir(artifact_dir, "bounty-validation-gates --no-write --show-gates", profile=profile),
                 validation_command_for_artifact_dir(artifact_dir, "gate --no-write --show-items", profile=profile),
                 validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
@@ -28258,6 +28258,67 @@ def build_provenance_evidence_requirements(actionable_rows: list[dict[str, Any]]
     return requirements
 
 
+def build_provenance_evidence_template(
+    *,
+    target: str,
+    artifact_dir: Path,
+    actionable_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rows = []
+    for requirement in build_provenance_evidence_requirements(actionable_rows):
+        rows.append(
+            {
+                "source_file": requirement.get("file"),
+                "source_line": requirement.get("line"),
+                "signal_kind": requirement.get("kind"),
+                "signal_name": requirement.get("name"),
+                "approved": False,
+                "status": "draft",
+                "approval_reference": "REPLACE_WITH_OPERATOR_APPROVAL_OR_TICKET",
+                "evidence_kind": (
+                    "REPLACE_WITH_ONE_OF_image_history_config_cache_log_registry_artifact_builder_attestation_operator_statement"
+                ),
+                "redacted_retention_or_disclosure_summary": (
+                    "REPLACE_WITH_REDACTED_SUMMARY_TIED_TO_THIS_BUILD_STEP"
+                ),
+                "impact_summary": "REPLACE_WITH_REDACTED_PACKAGE_REGISTRY_DEPLOYMENT_ACCOUNT_OR_SERVICE_IMPACT",
+                "raw_secret_included": False,
+                "redaction_notes": "Do not include raw token values, full .npmrc contents, or unredacted CI logs.",
+                "required_proof": requirement.get("required_proof"),
+                "reject_if": requirement.get("reject_if"),
+            }
+        )
+    return {
+        "generated_at": utc_now(),
+        "schema": "inferforge-build-provenance-evidence-template-v1",
+        "status": "template-present" if rows else "no-build-provenance-template-rows",
+        "target": target,
+        "artifact_dir": repo_relative_or_absolute(artifact_dir),
+        "draft_only": True,
+        "approved": False,
+        "target_official_evidence": "redacted build provenance supplied outside official sidecar files",
+        "accepted_evidence_kinds": [
+            "redacted docker image history or config",
+            "redacted build cache or layer metadata",
+            "redacted CI/build log excerpt",
+            "registry artifact metadata",
+            "builder attestation",
+            "operator statement tied to the build step",
+        ],
+        "template_rows": rows,
+        "redaction_gate": [
+            "Do not include raw secret values, full tokens, full .npmrc contents, bearer tokens, cookies, private keys, seed phrases, or unredacted CI logs.",
+            "Use approval references, source lines, artifact metadata, hashes, timestamps, and short redacted summaries instead of raw sensitive content.",
+            "Keep approved=false until a reviewer/operator has approved the redacted provenance for this exact build step.",
+            "Run build-provenance-readiness and bounty-evidence-intake after approved provenance exists.",
+        ],
+        "safety": (
+            "Draft handoff template only. It is not evidence, not a finding, writes no official sidecar, sends no traffic, "
+            "starts no browser, signs no wallet, submits no transaction, and changes no infrastructure."
+        ),
+    }
+
+
 def build_provenance_readiness_from_reviews(
     *,
     target: str,
@@ -28375,6 +28436,11 @@ def build_provenance_readiness_from_reviews(
             "raw unredacted CI logs",
         ],
     }
+    evidence_template = build_provenance_evidence_template(
+        target=target,
+        artifact_dir=artifact_dir,
+        actionable_rows=actionable_rows,
+    )
     commands = [
         validation_command_for_artifact_dir(
             artifact_dir,
@@ -28415,9 +28481,12 @@ def build_provenance_readiness_from_reviews(
                 if isinstance(bounty_invalidity_review, dict)
                 else "missing"
             ),
+            "template_status": evidence_template.get("status"),
+            "template_rows": len(evidence_template.get("template_rows", []) or []),
         },
         "static_signal_summary": static_summary,
         "minimum_official_evidence_package": minimum_package,
+        "build_provenance_template": evidence_template,
         "checks": checks,
         "first_blocker": failed_or_waiting[0] if failed_or_waiting else None,
         "commands": commands,
@@ -78737,6 +78806,7 @@ def run_build_provenance_readiness(args: argparse.Namespace) -> int:
         f"passed={summary.get('passed', 0)} "
         f"waiting={summary.get('waiting_or_blocked', 0)} "
         f"static_signals={summary.get('static_signals', 0)} "
+        f"template_rows={summary.get('template_rows', 0)} "
         f"official_ready={summary.get('official_evidence_ready')} "
         f"invalid_now={summary.get('invalid_if_reported_now')}"
     )
@@ -78786,6 +78856,14 @@ def run_build_provenance_readiness(args: argparse.Namespace) -> int:
         print("Commands:")
         for command_text in normalize_string_list(readiness.get("commands"))[:top_count]:
             print(f"- {inline_summary_text(command_text, max_chars=420)}")
+    if getattr(args, "show_template_json", False):
+        template_doc = (
+            readiness.get("build_provenance_template")
+            if isinstance(readiness.get("build_provenance_template"), dict)
+            else {}
+        )
+        print("Build provenance template JSON:")
+        print(json.dumps(sanitize_artifact_samples(template_doc), indent=2, sort_keys=True))
     first_blocker = (
         readiness.get("first_blocker")
         if isinstance(readiness.get("first_blocker"), dict)
@@ -83827,6 +83905,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-commands",
         action="store_true",
         help="Print safe offline follow-up commands.",
+    )
+    build_provenance_readiness.add_argument(
+        "--show-template-json",
+        action="store_true",
+        help="Print a draft-only redacted build provenance evidence template.",
     )
     build_provenance_readiness.add_argument(
         "--no-write",
