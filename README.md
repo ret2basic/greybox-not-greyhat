@@ -489,6 +489,11 @@ commands. It also prints the offline `transaction-payload-preflight` and
 or one approved quote request plus its matching response, before any official
 sidecar is created. The contract and preflight result are still not evidence and
 do not authorize traffic.
+Each request also carries `handoff_command_refs`,
+`verification_command_refs`, and after-ready validation refs with command-safety
+summaries. `claim-evidence-requests --show-requests` prints those labels so
+placeholder handoff commands show as `manual-template` and missing-evidence
+verifiers remain `review-gated` instead of appearing as runnable shell snippets.
 `evidence-sidecar-drafts` carries the same transaction pair binding metadata in
 its non-evidence draft workbook: `approval_reference`, `request_text_sha256`,
 `payload_text_sha256`, and `paired_payload_text_sha256`. The draft CLI prints
