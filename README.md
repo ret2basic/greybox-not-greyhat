@@ -1601,7 +1601,10 @@ approved import also requires a real `--approval-reference`.
 When an approved HAR, Burp XML export, JSON-wrapped exchange, or raw HTTP
 exchange is staged directly under `.greybox/discover-check/operator-inputs`,
 `evidence-sidecar-drafts` and `bounty-shortest-path` surface the importable
-candidate and its exact no-write preview command.
+candidate and its exact no-write preview command. The staged-file scanner also
+checks approved export files in subdirectories up to two levels deep, such as
+`operator-inputs/exports/burp/*.xml`, while keeping the same candidate-count and
+per-file byte caps.
 `approved-quote-exchange-candidates --show-commands` runs the same staged-file
 scanner directly and is read-only; with `--strict`, it exits non-zero unless at
 least one importable staged exchange is present.
