@@ -24939,6 +24939,7 @@ def bounty_action_rows_have_current_evidence_gate_schema(rows: Any) -> bool:
             "collect-approved-evidence",
             "fix-evidence-intake",
             "validate-ready-evidence",
+            "run-evidence-intake",
             "park-until-official-evidence",
             "refresh-bounty-artifacts",
         }:
@@ -26641,13 +26642,19 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
 BOUNTY_ACTION_KIND_RANK = {
     "fix-evidence-intake": 0,
     "validate-ready-evidence": 1,
+    "run-evidence-intake": 1,
     "collect-approved-evidence": 2,
     "park-until-official-evidence": 6,
     "refresh-bounty-artifacts": 9,
 }
 
 
-def bounty_action_kind_for_request(authorization: dict[str, Any], intake: dict[str, Any]) -> str:
+def bounty_action_kind_for_request(
+    authorization: dict[str, Any],
+    intake: dict[str, Any],
+    *,
+    evidence_gate_status: str = "",
+) -> str:
     intake_status = str(intake.get("status") or "")
     decision = str(authorization.get("priority_decision") or "")
     if intake_status.startswith("blocked"):
@@ -26656,6 +26663,8 @@ def bounty_action_kind_for_request(authorization: dict[str, Any], intake: dict[s
         return "validate-ready-evidence"
     if decision.startswith("park"):
         return "park-until-official-evidence"
+    if evidence_gate_status == "evidence-files-present-needs-intake":
+        return "run-evidence-intake"
     if intake_status.startswith("waiting") or not intake_status:
         return "collect-approved-evidence"
     return "collect-approved-evidence"
@@ -26663,6 +26672,8 @@ def bounty_action_kind_for_request(authorization: dict[str, Any], intake: dict[s
 
 def bounty_action_actor(kind: str) -> str:
     if kind == "validate-ready-evidence":
+        return "agent-offline"
+    if kind == "run-evidence-intake":
         return "agent-offline"
     if kind == "fix-evidence-intake":
         return "operator-or-reviewer"
@@ -26683,6 +26694,8 @@ def bounty_action_next_step(
             str(intake.get("next_step") or "")
             or "Run the lane-specific after-evidence validation command."
         )
+    if kind == "run-evidence-intake":
+        return "Official evidence file(s) are present; run offline evidence intake before lane validation."
     if kind == "fix-evidence-intake":
         return str(intake.get("next_step") or "Fix evidence format or redaction blockers before validation.")
     if kind == "park-until-official-evidence":
@@ -26717,6 +26730,12 @@ def bounty_action_safe_command(
             intake.get("recommended_after_evidence_command")
             or authorization.get("recommended_after_evidence_command")
             or ""
+        )
+    if kind == "run-evidence-intake":
+        return validation_command_for_artifact_dir(
+            artifact_dir,
+            "bounty-evidence-intake --no-write --show-requests --show-files --show-risks --top 8",
+            profile=profile,
         )
     if kind == "fix-evidence-intake":
         return validation_command_for_artifact_dir(
@@ -26815,7 +26834,17 @@ def bounty_action_for_authorization_request(
     artifact_dir: Path,
     profile: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    kind = bounty_action_kind_for_request(authorization, intake)
+    requested_evidence = bounty_prep_order_required_artifacts(
+        str(authorization.get("lane") or ""),
+        normalize_string_list(authorization.get("requested_official_evidence_labels")),
+    )
+    evidence_status_rows = bounty_requested_evidence_status_rows(requested_evidence, artifact_dir=artifact_dir)
+    evidence_gate_status = bounty_evidence_gate_status(evidence_status_rows)
+    kind = bounty_action_kind_for_request(
+        authorization,
+        intake,
+        evidence_gate_status=evidence_gate_status,
+    )
     safe_command = bounty_action_safe_command(
         kind,
         authorization,
@@ -26833,11 +26862,6 @@ def bounty_action_for_authorization_request(
         for profile in authorization.get("api_authorization_profiles", []) or []
         if isinstance(profile, dict)
     ]
-    requested_evidence = bounty_prep_order_required_artifacts(
-        str(authorization.get("lane") or ""),
-        normalize_string_list(authorization.get("requested_official_evidence_labels")),
-    )
-    evidence_status_rows = bounty_requested_evidence_status_rows(requested_evidence, artifact_dir=artifact_dir)
     missing_evidence = [
         str(row.get("label") or "")
         for row in evidence_status_rows
@@ -26859,13 +26883,13 @@ def bounty_action_for_authorization_request(
         "readiness_status": rollup.get("readiness_status"),
         "gate_status": rollup.get("gate_status"),
         "requires_human_evidence": requires_human,
-        "agent_can_continue_without_new_evidence": kind == "validate-ready-evidence",
+        "agent_can_continue_without_new_evidence": kind in {"validate-ready-evidence", "run-evidence-intake"},
         "blocked_by_official_evidence": kind in {"collect-approved-evidence", "park-until-official-evidence"},
         "safe_offline_command": safe_command,
         "next_step": bounty_action_next_step(kind, authorization, intake),
         "requested_evidence": requested_evidence,
         "requested_evidence_status": evidence_status_rows,
-        "evidence_gate_status": bounty_evidence_gate_status(evidence_status_rows),
+        "evidence_gate_status": evidence_gate_status,
         "missing_official_evidence": missing_evidence,
         "present_official_evidence": [
             str(row.get("label") or "")
@@ -27313,6 +27337,8 @@ def build_bounty_prep_sync(
         status = "blocked-prep-sync-mismatch"
     elif top_kind in {"collect-approved-evidence", "fix-evidence-intake", "park-until-official-evidence"}:
         status = "prep-sync-aligned-waiting-evidence"
+    elif top_kind == "run-evidence-intake":
+        status = "prep-sync-aligned-ready-for-intake"
     elif top_kind == "validate-ready-evidence":
         status = "prep-sync-aligned-ready-for-validation"
     else:
@@ -27534,7 +27560,12 @@ def build_bounty_prep_package(
         row
         for row in (queue.get("actions", []) or [])
         if isinstance(row, dict)
-        and str(row.get("kind") or "") in {"collect-approved-evidence", "fix-evidence-intake", "validate-ready-evidence"}
+        and str(row.get("kind") or "") in {
+            "collect-approved-evidence",
+            "fix-evidence-intake",
+            "run-evidence-intake",
+            "validate-ready-evidence",
+        }
     ][: max(1, int(top))]
     if not actions:
         top_action = bounty_prep_top_action(queue)
@@ -27850,6 +27881,38 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             artifact_dir=artifact_dir,
             profile=None,
         )
+        present_artifact_dir = Path(temp_dir) / "present-artifacts"
+        present_artifact_dir.mkdir(parents=True)
+        (present_artifact_dir / "transaction-payloads.jsonl").write_text(
+            json.dumps(
+                {
+                    "approval_reference": "self-test-approved-redacted-payload",
+                    "payloads": [{"data": {"type": "svm", "transaction": "QUJDREVGRw=="}}],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (present_artifact_dir / "transaction-intent-policy.json").write_text(
+            json.dumps(
+                {
+                    "approval_reference": "self-test-approved-redacted-policy",
+                    "direction": "self-test",
+                    "manual_program_review_required": True,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        evidence_present_action_case = bounty_action_for_authorization_request(
+            authorization_case,
+            intake={"status": "waiting-approved-evidence-files"},
+            rollup={"readiness_status": "waiting-minimal-transaction-evidence"},
+            artifact_dir=present_artifact_dir,
+            profile=None,
+        )
         template_case = build_bounty_evidence_templates(
             target=target,
             profile=None,
@@ -27930,6 +27993,7 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
     workorder_api_profile_ids = set(normalize_string_list(workorder_case.get("api_authorization_profile_ids")))
     authorization_api_profile_ids = set(normalize_string_list(authorization_case.get("api_authorization_profile_ids")))
     action_api_profile_ids = set(normalize_string_list(action_case.get("api_authorization_profile_ids")))
+    evidence_present_action_kind = str(evidence_present_action_case.get("kind") or "")
     template_api_profile_ids = {
         profile_id
         for template in template_case.get("templates", []) or []
@@ -28198,6 +28262,25 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "present-evidence-routes-to-intake",
+            "passed": (
+                evidence_present_action_kind == "run-evidence-intake"
+                and evidence_present_action_case.get("agent_can_continue_without_new_evidence") is True
+                and evidence_present_action_case.get("evidence_gate_status") == "evidence-files-present-needs-intake"
+            ),
+            "expected": {
+                "kind": "run-evidence-intake",
+                "agent_ready": True,
+                "gate": "evidence-files-present-needs-intake",
+            },
+            "actual": {
+                "kind": evidence_present_action_kind,
+                "agent_ready": evidence_present_action_case.get("agent_can_continue_without_new_evidence"),
+                "gate": evidence_present_action_case.get("evidence_gate_status"),
+                "command": evidence_present_action_case.get("safe_offline_command"),
+            },
+        },
+        {
             "id": "request-brief-renders-api-oracle-profiles",
             "passed": (
                 "Evidence oracle profiles:" in request_markdown_case
@@ -28262,6 +28345,7 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             "authorization_case": authorization_case,
             "action_case": action_case,
             "template_case": template_case,
+            "evidence_present_action_case": evidence_present_action_case,
         },
         "assertions": assertions,
         "safety": (
@@ -28311,7 +28395,12 @@ def bounty_evidence_request_markdown(
     active_actions = [
         row
         for row in actions
-        if str(row.get("kind") or "") in {"collect-approved-evidence", "fix-evidence-intake", "validate-ready-evidence"}
+        if str(row.get("kind") or "") in {
+            "collect-approved-evidence",
+            "fix-evidence-intake",
+            "run-evidence-intake",
+            "validate-ready-evidence",
+        }
     ][:top]
     parked_actions = [
         row
@@ -28717,7 +28806,12 @@ def build_bounty_evidence_templates(
         row
         for row in actions
         if isinstance(row, dict)
-        and str(row.get("kind") or "") in {"collect-approved-evidence", "fix-evidence-intake", "validate-ready-evidence"}
+        and str(row.get("kind") or "") in {
+            "collect-approved-evidence",
+            "fix-evidence-intake",
+            "run-evidence-intake",
+            "validate-ready-evidence",
+        }
     ][:top]
     templates = []
     for action in active_actions:
