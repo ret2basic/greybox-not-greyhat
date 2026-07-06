@@ -399,6 +399,11 @@ climbing a witness ladder, assembling the minimal PoC/report package, and
 keeping feedback/resource gates closed. This is stricter than broad audit
 coverage: a lead is still blocked until the validation oracle, witness ladder,
 finding gate, and adjudication prove concrete impact.
+The same alignment now includes a `validation_funnel` for unattended loops:
+system context, lead selection, impact oracle, witness ladder, and
+finding-gate/adjudication are counted as separate stages with survival rates and
+the first blocking stage. The funnel is accounting only; it does not collect
+evidence or promote a static candidate into a bounty finding.
 
 Use `lead-dossier` when you want the same evidence closure in a tighter
 bug-bounty style lead file. It applies the “read code, constrain by
