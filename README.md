@@ -1533,26 +1533,34 @@ result means the input shape is compatible with the official sidecar; it is stil
 not evidence and does not satisfy finding gates until the official sidecar,
 matching intent policy, decode review, finding gate, and adjudication all agree.
 
-`transaction-corpus-preflight --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --no-write --show-policy-json --show-checks --show-commands`
+`transaction-corpus-preflight --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --intent-input ./approved-quote-intent.json --no-write --show-policy-json --show-checks --show-commands`
 is the paired offline intake check for one approved quote request body and the
-matching approved quote response or extracted payload. It derives the intent
-policy preview from the request's configured sender, amount, source mint, and
-destination mint fields, verifies that the response/payload has exactly one
-compatible transaction candidate, prints the exact policy and decode follow-up
-commands, and still writes no official sidecars. Stdin is supported for only one
-side at a time; the other side must be a file so the tool never tries to read the
-same stream twice. A `ready-for-approved-corpus-sidecars` result only means the
-operator-reviewed request/response pair is ready to be copied into the official
-payload and intent-policy sidecars after approval.
+matching approved quote response or extracted payload. The optional
+`--intent-input` file lets the reviewer bind a separate approved intent document
+to the request before official sidecar prep. When present, the intent JSON must
+match the request's wallet, source mint, destination mint, raw amount, optional
+recipient, chain, direction, and `maxNumQuotes` fields; mismatches stop the
+preflight at `intent-needs-review`. It derives the intent policy preview from the
+request's configured sender, amount, source mint, and destination mint fields,
+verifies that the response/payload has exactly one compatible transaction
+candidate, prints the exact policy and decode follow-up commands, and still
+writes no official sidecars. Stdin is supported for only one side at a time; the
+other sides must be files so the tool never tries to read the same stream twice.
+A `ready-for-approved-corpus-sidecars` result only means the operator-reviewed
+request/response/intent set is ready to be copied into the official payload and
+intent-policy sidecars after approval.
 
-`prepare-transaction-corpus-sidecars --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --approval-reference APPROVED-QUOTE-001 --no-write --show-policy-json --show-checks --show-commands`
+`prepare-transaction-corpus-sidecars --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --intent-input ./approved-quote-intent.json --approval-reference APPROVED-QUOTE-001 --no-write --show-policy-json --show-checks --show-commands`
 previews that final offline assembly step. It reuses the paired corpus preflight,
 builds the exact `transaction-payloads.jsonl` JSONL line and
 `transaction-intent-policy.json` object that would be written, and prints the
 sidecar review, decode, and finding-gate follow-up commands. It writes no
 official sidecars unless `--write-official-sidecars` is also supplied, the
 preflight is ready, an approval reference is present, and existing sidecars are
-not being overwritten. Use `--replace` only after reviewing the existing official
+not being overwritten. If `--approval-reference` is omitted, a matching
+`--intent-input` with `approval_reference` and
+`approved_for_offline_validation=true` can seed the approval reference for the
+preview/write gate. Use `--replace` only after reviewing the existing official
 evidence files. `self-test-transactions` exercises this write path inside a
 temporary artifact directory, requires `transaction-sidecar-review` to return
 `ready-for-decode`, then runs `decode-transactions --no-write` and confirms no
