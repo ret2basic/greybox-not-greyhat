@@ -28454,6 +28454,13 @@ def bounty_action_validation_commands(
     return ordered_unique_strings(commands)
 
 
+def bounty_action_validation_command_refs(action_id: str, commands: list[str]) -> list[dict[str, Any]]:
+    return [
+        validation_command_ref(command, source=f"{action_id}:validation[{index}]", item_status="ready")
+        for index, command in enumerate(normalize_string_list(commands), start=1)
+    ]
+
+
 def bounty_requested_evidence_path(value: Any, *, artifact_dir: Path) -> Path | None:
     text = str(value or "").strip()
     if not text:
@@ -28704,6 +28711,7 @@ def bounty_action_for_authorization_request(
         str(authorization.get("lane") or ""),
         normalize_string_list(authorization.get("requested_official_evidence_labels")),
     )
+    action_id = f"ACTION-{safe_probe_id(str(authorization.get('id') or authorization.get('lane') or 'bounty-action'))}"
     evidence_status_rows = bounty_requested_evidence_status_rows(requested_evidence, artifact_dir=artifact_dir)
     evidence_gate_status = bounty_evidence_gate_status(evidence_status_rows)
     kind = bounty_action_kind_for_request(
@@ -28726,6 +28734,8 @@ def bounty_action_for_authorization_request(
         artifact_dir=artifact_dir,
         profile=profile,
     )
+    validation_command_refs = bounty_action_validation_command_refs(action_id, validation_commands)
+    validation_command_safety = command_safety_summary(validation_command_refs)
     requires_human = kind in {
         "collect-approved-evidence",
         "fix-evidence-intake",
@@ -28742,7 +28752,7 @@ def bounty_action_for_authorization_request(
         if isinstance(row, dict) and str(row.get("status") or "").startswith(("missing", "operator-handoff"))
     ]
     action = {
-        "id": f"ACTION-{safe_probe_id(str(authorization.get('id') or authorization.get('lane') or kind))}",
+        "id": action_id,
         "kind": kind,
         "actor": bounty_action_actor(kind),
         "lane": authorization.get("lane"),
@@ -28762,6 +28772,8 @@ def bounty_action_for_authorization_request(
         "safe_offline_command": safe_command,
         "validation_commands": validation_commands,
         "validation_command_count": len(validation_commands),
+        "validation_command_refs": validation_command_refs,
+        "validation_command_safety": validation_command_safety,
         "next_step": bounty_action_next_step(kind, authorization, intake),
         "requested_evidence": requested_evidence,
         "requested_evidence_status": evidence_status_rows,
@@ -28876,9 +28888,11 @@ def build_bounty_action_queue(
             "bounty-evidence-authorization --no-write --show-questions --show-commands --top 8",
             profile=profile,
         )
+        refresh_action_id = "ACTION-refresh-bounty-artifacts"
+        refresh_command_refs = bounty_action_validation_command_refs(refresh_action_id, [refresh_command])
         actions.append(
             {
-                "id": "ACTION-refresh-bounty-artifacts",
+                "id": refresh_action_id,
                 "kind": "refresh-bounty-artifacts",
                 "actor": "agent-offline",
                 "lane": None,
@@ -28898,6 +28912,8 @@ def build_bounty_action_queue(
                 "safe_offline_command": refresh_command,
                 "validation_commands": [refresh_command],
                 "validation_command_count": 1,
+                "validation_command_refs": refresh_command_refs,
+                "validation_command_safety": command_safety_summary(refresh_command_refs),
                 "next_step": "Refresh bounty evidence authorization and intake artifacts.",
                 "requested_evidence": [],
                 "requested_evidence_status": [],
@@ -28980,6 +28996,17 @@ def build_bounty_action_queue(
             if command
         ]
     )
+    validation_command_refs = [
+        ref
+        for row in actions
+        for ref in (
+            row.get("validation_command_refs")
+            if isinstance(row.get("validation_command_refs"), list)
+            else []
+        )
+        if isinstance(ref, dict)
+    ]
+    command_safety = command_safety_summary(validation_command_refs)
     cache_validation = bounty_action_queue_cache_validation(
         bounty_readiness_rollup=bounty_readiness_rollup,
         bounty_evidence_authorization=bounty_evidence_authorization,
@@ -29023,6 +29050,7 @@ def build_bounty_action_queue(
             "adjudication_status": artifact_summary_status(adjudication),
             "claim_evidence_requests_status": artifact_summary_status(claim_evidence_requests),
             "cache_dependency_count": len(cache_validation.get("dependencies", {}) or {}),
+            "command_safety": command_safety,
         },
         "cache_validation": cache_validation,
         "actions": actions,
@@ -30445,7 +30473,37 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
     )
     rebuilt_ready_validation_commands = normalize_string_list(rebuilt_ready_action.get("validation_commands"))
     rebuilt_ready_validation_text = "\n".join(rebuilt_ready_validation_commands)
+    rebuilt_ready_validation_refs = [
+        row
+        for row in rebuilt_ready_action.get("validation_command_refs", []) or []
+        if isinstance(row, dict)
+    ]
+    rebuilt_ready_action_safety = (
+        rebuilt_ready_action.get("validation_command_safety")
+        if isinstance(rebuilt_ready_action.get("validation_command_safety"), dict)
+        else {}
+    )
+    rebuilt_ready_action_safety_counts = (
+        rebuilt_ready_action_safety.get("classification_counts", {})
+        if isinstance(rebuilt_ready_action_safety.get("classification_counts"), dict)
+        else {}
+    )
     rebuilt_ready_queue_commands_text = "\n".join(normalize_string_list(rebuilt_ready_queue_case.get("commands")))
+    rebuilt_ready_queue_summary = (
+        rebuilt_ready_queue_case.get("summary")
+        if isinstance(rebuilt_ready_queue_case.get("summary"), dict)
+        else {}
+    )
+    rebuilt_ready_queue_safety = (
+        rebuilt_ready_queue_summary.get("command_safety")
+        if isinstance(rebuilt_ready_queue_summary.get("command_safety"), dict)
+        else {}
+    )
+    rebuilt_ready_queue_safety_counts = (
+        rebuilt_ready_queue_safety.get("classification_counts", {})
+        if isinstance(rebuilt_ready_queue_safety.get("classification_counts"), dict)
+        else {}
+    )
     stale_template_cache = (
         stale_templates_case.get("cache_validation")
         if isinstance(stale_templates_case.get("cache_validation"), dict)
@@ -30943,6 +31001,34 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
                 "validation_command_count": rebuilt_ready_action.get("validation_command_count"),
                 "validation_commands": rebuilt_ready_validation_commands,
                 "queue_commands": normalize_string_list(rebuilt_ready_queue_case.get("commands")),
+            },
+        },
+        {
+            "id": "ready-transaction-action-classifies-validation-chain-safe",
+            "passed": (
+                len(rebuilt_ready_validation_refs) == 4
+                and rebuilt_ready_action_safety.get("commands") == 4
+                and rebuilt_ready_action_safety.get("runnable") == 4
+                and rebuilt_ready_action_safety.get("requires_manual_input") == 0
+                and rebuilt_ready_action_safety.get("blocked_external") == 0
+                and rebuilt_ready_action_safety.get("unsafe_template_count") == 0
+                and rebuilt_ready_action_safety_counts.get("ready") == 4
+                and rebuilt_ready_queue_safety.get("commands") == 4
+                and rebuilt_ready_queue_safety.get("runnable") == 4
+                and rebuilt_ready_queue_safety.get("requires_manual_input") == 0
+                and rebuilt_ready_queue_safety.get("blocked_external") == 0
+                and rebuilt_ready_queue_safety.get("unsafe_template_count") == 0
+                and rebuilt_ready_queue_safety_counts.get("ready") == 4
+            ),
+            "expected": {
+                "refs": 4,
+                "action": {"commands": 4, "runnable": 4, "ready": 4, "manual": 0, "external": 0, "unsafe": 0},
+                "queue": {"commands": 4, "runnable": 4, "ready": 4, "manual": 0, "external": 0, "unsafe": 0},
+            },
+            "actual": {
+                "refs": rebuilt_ready_validation_refs,
+                "action_safety": rebuilt_ready_action_safety,
+                "queue_safety": rebuilt_ready_queue_safety,
             },
         },
         {
@@ -86987,6 +87073,9 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
     )
     print(f"Kinds: {json.dumps(summary.get('kind_counts', {}), sort_keys=True)}")
     print(f"Evidence gates: {json.dumps(summary.get('evidence_gate_counts', {}), sort_keys=True)}")
+    command_safety = summary.get("command_safety", {}) if isinstance(summary.get("command_safety"), dict) else {}
+    if command_safety:
+        print(f"Command safety: {format_command_safety_summary(command_safety)}")
     if summary.get("claim_evidence_request_count"):
         claim_request_summary_bits = [
             f"requests={summary.get('claim_evidence_request_count', 0)}",
@@ -87024,6 +87113,13 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
                 print(f"  needs={inline_summary_text(evidence, max_chars=300)}")
             if row.get("evidence_gate_status"):
                 print(f"  evidence_gate={row.get('evidence_gate_status')}")
+            validation_command_safety = (
+                row.get("validation_command_safety")
+                if isinstance(row.get("validation_command_safety"), dict)
+                else {}
+            )
+            if validation_command_safety:
+                print(f"  validation_safety={format_command_safety_summary(validation_command_safety)}")
             claim_summary = (
                 row.get("claim_evidence_request_summary")
                 if isinstance(row.get("claim_evidence_request_summary"), dict)

@@ -349,7 +349,11 @@ When intake does mark a request ready, `bounty-action-queue` keeps the action
 agent-offline and attaches an ordered `validation_commands` chain. For
 transaction-integrity this runs transaction evidence readiness, offline decode,
 finding gate, and adjudication in order; the chain is workflow control only and
-does not make the evidence reportable by itself.
+does not make the evidence reportable by itself. Each queued action and the
+queue summary also record command-safety totals for that validation chain, so an
+agent can distinguish runnable no-write validators from manual templates,
+external probes, resource-gated commands, or unsafe shell templates before any
+automatic execution.
 
 `claim-evidence-requests` also uses that queue context for its default ordering:
 in bounty mode, evidence for the highest-ranked action comes before a broader
