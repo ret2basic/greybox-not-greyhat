@@ -24929,12 +24929,58 @@ def bounty_authorization_has_current_api_authorization_schema(doc: Any) -> bool:
     return bounty_artifact_has_current_api_authorization_schema(doc, "authorization_requests")
 
 
+def bounty_action_rows_have_current_evidence_gate_schema(rows: Any) -> bool:
+    if not isinstance(rows, list):
+        return False
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("kind") or "") not in {
+            "collect-approved-evidence",
+            "fix-evidence-intake",
+            "validate-ready-evidence",
+            "park-until-official-evidence",
+            "refresh-bounty-artifacts",
+        }:
+            continue
+        if "evidence_gate_status" not in row:
+            return False
+        if not isinstance(row.get("requested_evidence_status"), list):
+            return False
+        if not isinstance(row.get("missing_official_evidence"), list):
+            return False
+    return True
+
+
+def bounty_template_rows_have_current_evidence_gate_schema(rows: Any) -> bool:
+    if not isinstance(rows, list):
+        return False
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("lane") or "") not in BOUNTY_LANE_API_AUTHORIZATION_IMPACTS:
+            continue
+        if "evidence_gate_status" not in row:
+            return False
+        if not isinstance(row.get("requested_evidence_status"), list):
+            return False
+        if not isinstance(row.get("missing_official_evidence"), list):
+            return False
+    return True
+
+
 def bounty_action_queue_has_current_api_authorization_schema(doc: Any) -> bool:
-    return bounty_artifact_has_current_api_authorization_schema(doc, "actions")
+    return (
+        bounty_artifact_has_current_api_authorization_schema(doc, "actions")
+        and bounty_action_rows_have_current_evidence_gate_schema(doc.get("actions") if isinstance(doc, dict) else None)
+    )
 
 
 def bounty_templates_have_current_api_authorization_schema(doc: Any) -> bool:
-    return bounty_artifact_has_current_api_authorization_schema(doc, "templates")
+    return (
+        bounty_artifact_has_current_api_authorization_schema(doc, "templates")
+        and bounty_template_rows_have_current_evidence_gate_schema(doc.get("templates") if isinstance(doc, dict) else None)
+    )
 
 
 def bounded_source_refs_from_rows(rows: Any, *, limit: int = 10) -> list[dict[str, Any]]:
@@ -26683,6 +26729,72 @@ def bounty_action_safe_command(
     return str(authorization.get("recommended_preview_command") or "")
 
 
+def bounty_requested_evidence_path(value: Any, *, artifact_dir: Path) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    path = Path(text)
+    name = path.name
+    suffix = path.suffix.lower()
+    if name in {
+        REWRITE_RESPONSE_SIDECAR_ARTIFACT,
+        "transaction-payloads.jsonl",
+        "transaction-intent-policy.json",
+        OPERATOR_EVIDENCE_ARTIFACT,
+    }:
+        return artifact_dir / name
+    if ":" in text or "," in text or " " in text:
+        return None
+    if path.is_absolute() or "/" in text or text.startswith("."):
+        return resolve_repo_path(text)
+    if suffix in {".json", ".jsonl", ".txt", ".log", ".md"} and ":" not in text:
+        return artifact_dir / name
+    return None
+
+
+def bounty_requested_evidence_status_rows(requested_evidence: Any, *, artifact_dir: Path) -> list[dict[str, Any]]:
+    rows = []
+    for item in normalize_string_list(requested_evidence):
+        path = bounty_requested_evidence_path(item, artifact_dir=artifact_dir)
+        if path is None:
+            rows.append(
+                {
+                    "label": item,
+                    "kind": "operator-handoff",
+                    "path": None,
+                    "status": "operator-handoff-required",
+                }
+            )
+            continue
+        exists = path.exists() and path.is_file()
+        rows.append(
+            {
+                "label": item,
+                "kind": "official-evidence-file",
+                "path": repo_relative_or_absolute(path),
+                "status": "present" if exists else "missing-official-evidence-file",
+            }
+        )
+    return rows
+
+
+def bounty_evidence_gate_status(rows: Any) -> str:
+    if not isinstance(rows, list) or not rows:
+        return "no-requested-evidence"
+    statuses = {
+        str(row.get("status") or "")
+        for row in rows
+        if isinstance(row, dict)
+    }
+    if "missing-official-evidence-file" in statuses:
+        return "blocked-missing-official-evidence-file"
+    if "operator-handoff-required" in statuses:
+        return "waiting-operator-evidence-handoff"
+    if statuses == {"present"}:
+        return "evidence-files-present-needs-intake"
+    return "evidence-status-review-required"
+
+
 def bounty_action_score(action: dict[str, Any]) -> int:
     severity_rank = BOUNTY_FRONTIER_SEVERITY_RANK.get(str(action.get("expected_severity") or "info"), 9)
     severity_score = max(0, 48 - severity_rank * 8)
@@ -26721,6 +26833,16 @@ def bounty_action_for_authorization_request(
         for profile in authorization.get("api_authorization_profiles", []) or []
         if isinstance(profile, dict)
     ]
+    requested_evidence = bounty_prep_order_required_artifacts(
+        str(authorization.get("lane") or ""),
+        normalize_string_list(authorization.get("requested_official_evidence_labels")),
+    )
+    evidence_status_rows = bounty_requested_evidence_status_rows(requested_evidence, artifact_dir=artifact_dir)
+    missing_evidence = [
+        str(row.get("label") or "")
+        for row in evidence_status_rows
+        if isinstance(row, dict) and str(row.get("status") or "").startswith(("missing", "operator-handoff"))
+    ]
     action = {
         "id": f"ACTION-{safe_probe_id(str(authorization.get('id') or authorization.get('lane') or kind))}",
         "kind": kind,
@@ -26741,10 +26863,20 @@ def bounty_action_for_authorization_request(
         "blocked_by_official_evidence": kind in {"collect-approved-evidence", "park-until-official-evidence"},
         "safe_offline_command": safe_command,
         "next_step": bounty_action_next_step(kind, authorization, intake),
-        "requested_evidence": bounty_prep_order_required_artifacts(
-            str(authorization.get("lane") or ""),
-            normalize_string_list(authorization.get("requested_official_evidence_labels")),
-        ),
+        "requested_evidence": requested_evidence,
+        "requested_evidence_status": evidence_status_rows,
+        "evidence_gate_status": bounty_evidence_gate_status(evidence_status_rows),
+        "missing_official_evidence": missing_evidence,
+        "present_official_evidence": [
+            str(row.get("label") or "")
+            for row in evidence_status_rows
+            if isinstance(row, dict) and row.get("status") == "present"
+        ],
+        "operator_handoff_evidence": [
+            str(row.get("label") or "")
+            for row in evidence_status_rows
+            if isinstance(row, dict) and row.get("status") == "operator-handoff-required"
+        ],
         "acceptance_checklist": normalize_string_list(authorization.get("acceptance_checklist")),
         "reject_if": normalize_string_list(authorization.get("reject_if")),
         "api_authorization_profiles": api_profiles,
@@ -26853,6 +26985,11 @@ def build_bounty_action_queue(
                 "safe_offline_command": refresh_command,
                 "next_step": "Refresh bounty evidence authorization and intake artifacts.",
                 "requested_evidence": [],
+                "requested_evidence_status": [],
+                "evidence_gate_status": "no-requested-evidence",
+                "missing_official_evidence": [],
+                "present_official_evidence": [],
+                "operator_handoff_evidence": [],
                 "file_refs": [],
                 "redaction_risks": [],
                 "reportability_boundary": "This action queue is not evidence.",
@@ -26870,9 +27007,11 @@ def build_bounty_action_queue(
     )
     kind_counts: dict[str, int] = {}
     actor_counts: dict[str, int] = {}
+    evidence_gate_counts: dict[str, int] = {}
     for row in actions:
         increment_count(kind_counts, str(row.get("kind") or "unknown"))
         increment_count(actor_counts, str(row.get("actor") or "unknown"))
+        increment_count(evidence_gate_counts, str(row.get("evidence_gate_status") or "unknown"))
     api_authorization_counts: dict[str, int] = {}
     for row in actions:
         for profile_id in normalize_string_list(row.get("api_authorization_profile_ids")):
@@ -26916,6 +27055,7 @@ def build_bounty_action_queue(
             "top_actor": top.get("actor"),
             "kind_counts": dict(sorted(kind_counts.items())),
             "actor_counts": dict(sorted(actor_counts.items())),
+            "evidence_gate_counts": dict(sorted(evidence_gate_counts.items())),
             "api_authorization_counts": dict(sorted(api_authorization_counts.items())),
             "bounty_readiness_rollup_status": artifact_summary_status(bounty_readiness_rollup),
             "bounty_evidence_authorization_status": artifact_summary_status(bounty_evidence_authorization),
@@ -27769,6 +27909,13 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             for check in normalize_string_list(template.get("api_authorization_reject_if"))
         ]
     )
+    action_missing_evidence = set(normalize_string_list(action_case.get("missing_official_evidence")))
+    template_missing_evidence = {
+        item
+        for template in template_case.get("templates", []) or []
+        if isinstance(template, dict)
+        for item in normalize_string_list(template.get("missing_official_evidence"))
+    }
     fresh_api_schema_cases = {
         "workorders": bounty_workorders_have_current_api_authorization_schema(
             {
@@ -27966,6 +28113,23 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
                 "action_reject_if": action_api_reject_if[:6],
                 "template_acceptance": template_api_acceptance_checks[:6],
                 "template_reject_if": template_api_reject_if[:6],
+            },
+        },
+        {
+            "id": "action-evidence-gate-status-propagates",
+            "passed": (
+                action_case.get("evidence_gate_status") == "blocked-missing-official-evidence-file"
+                and {"transaction-payloads.jsonl", "transaction-intent-policy.json"} <= action_missing_evidence
+                and {"transaction-payloads.jsonl", "transaction-intent-policy.json"} <= template_missing_evidence
+            ),
+            "expected": {
+                "gate": "blocked-missing-official-evidence-file",
+                "missing": ["transaction-payloads.jsonl", "transaction-intent-policy.json"],
+            },
+            "actual": {
+                "action_gate": action_case.get("evidence_gate_status"),
+                "action_missing": sorted(action_missing_evidence),
+                "template_missing": sorted(template_missing_evidence),
             },
         },
         {
@@ -28481,6 +28645,14 @@ def build_bounty_evidence_templates(
             )
             template["acceptance_checklist"] = normalize_string_list(action.get("acceptance_checklist"))
             template["reject_if"] = normalize_string_list(action.get("reject_if"))
+            template["requested_evidence"] = normalize_string_list(action.get("requested_evidence"))
+            template["requested_evidence_status"] = [
+                row
+                for row in action.get("requested_evidence_status", []) or []
+                if isinstance(row, dict)
+            ]
+            template["evidence_gate_status"] = action.get("evidence_gate_status")
+            template["missing_official_evidence"] = normalize_string_list(action.get("missing_official_evidence"))
             template["after_filling_commands"] = ordered_unique_strings(
                 [
                     validation_command_for_artifact_dir(
@@ -81178,6 +81350,7 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
         f"adjudication={summary.get('adjudication_status') or '-'}"
     )
     print(f"Kinds: {json.dumps(summary.get('kind_counts', {}), sort_keys=True)}")
+    print(f"Evidence gates: {json.dumps(summary.get('evidence_gate_counts', {}), sort_keys=True)}")
     print(f"API profiles: {json.dumps(summary.get('api_authorization_counts', {}), sort_keys=True)}")
     display_limit = max(0, int(args.top))
     if getattr(args, "show_actions", False):
@@ -81194,6 +81367,8 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
             evidence = ", ".join(normalize_string_list(row.get("requested_evidence"))[:4])
             if evidence:
                 print(f"  needs={inline_summary_text(evidence, max_chars=300)}")
+            if row.get("evidence_gate_status"):
+                print(f"  evidence_gate={row.get('evidence_gate_status')}")
             api_profiles = ", ".join(normalize_string_list(row.get("api_authorization_profile_ids"))[:4])
             if api_profiles:
                 print(f"  api_profiles={inline_summary_text(api_profiles, max_chars=260)}")
@@ -81211,6 +81386,9 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
                 rejects = normalize_string_list(row.get("api_authorization_reject_if"))
                 if rejects:
                     print(f"  api_reject={inline_summary_text(rejects[0], max_chars=280)}")
+                missing = ", ".join(normalize_string_list(row.get("missing_official_evidence"))[:4])
+                if missing:
+                    print(f"  missing_evidence={inline_summary_text(missing, max_chars=300)}")
                 if row.get("blocked_by_official_evidence"):
                     print("  blocker=official-evidence-required")
         remaining = len(queue.get("actions", []) or []) - display_limit
@@ -81638,6 +81816,11 @@ def run_bounty_evidence_templates(args: argparse.Namespace) -> int:
                 f"- {row.get('id')}: lane={row.get('lane')} kind={row.get('template_kind')} "
                 f"target={row.get('target_evidence_path')}"
             )
+            if row.get("evidence_gate_status"):
+                print(f"  evidence_gate={row.get('evidence_gate_status')}")
+            missing = ", ".join(normalize_string_list(row.get("missing_official_evidence"))[:4])
+            if missing:
+                print(f"  missing_evidence={inline_summary_text(missing, max_chars=300)}")
             for instruction in normalize_string_list(row.get("instructions"))[:3]:
                 print(f"  instruction={inline_summary_text(instruction, max_chars=260)}")
             api_profiles = ", ".join(normalize_string_list(row.get("api_authorization_profile_ids"))[:4])
