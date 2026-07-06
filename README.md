@@ -408,6 +408,21 @@ every required sidecar contract is ready for no-write validation. Use
 `bounty-action-queue --show-contracts` to print the packet's required fields,
 reject conditions, paired sidecars, and copy policy without opening the JSON.
 
+Use `bounty-shortest-path` when the loop needs the shortest current path to one
+valid Medium/High/Critical bounty report instead of a broad coverage queue:
+
+```bash
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  bounty-shortest-path --no-write --show-contract --show-intake-manifest --show-commands --top 4
+```
+
+This command is still an offline workflow-control view. With
+`--show-intake-manifest`, each closure action expands the evidence intake
+manifest into artifact counts, artifact formats, required pair-binding fields,
+copy policy, and reject rules. That makes the next handoff explicit without
+copying drafts, creating official sidecars, authorizing traffic, or promoting a
+lead past finding-gate/adjudication.
+
 `claim-evidence-requests` also uses that queue context for its default ordering:
 in bounty mode, evidence for the highest-ranked action comes before a broader
 coverage request that merely unblocks more lower-value claims. Each request now
