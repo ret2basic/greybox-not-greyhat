@@ -379,6 +379,9 @@ missing evidence names, source-boundary rendering, non-promotion while official
 evidence is absent, redaction/reportability text, no-write validation commands,
 and placeholder/template boundaries. `--strict` fails if this quality gate is
 not passed.
+`adjudicate` links that same queue/brief context as `next_evidence_unblocker`,
+so a no-finding run can distinguish `waiting-official-evidence` from
+`blocked-brief-quality` without promoting the candidate.
 Each contract also has a `validator_execution_gate`, so missing sidecars remain
 `waiting-official-evidence` even when their no-write validator commands are
 safe to preview. The packet-level `official_evidence_contract_gate` aggregates
