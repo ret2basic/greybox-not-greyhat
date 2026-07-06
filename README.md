@@ -381,8 +381,9 @@ external probes, resource-gated commands, or unsafe shell templates before any
 automatic execution. `validation_execution_gate` is the final automation guard:
 only actions with `ready-offline-validation` expose
 `autorunnable_validation_commands`; actions waiting for official evidence,
-manual input, external probes, or unsafe templates remain visible as workflow
-items but are not presented as agent-runnable validation chains.
+manual input, external probes, or unsafe templates classify their validation
+commands as gated workflow items and are not presented as agent-runnable
+validation chains.
 Each action also carries a `harness_phase` model. This records the current
 finder/evidence/intake/triager/adjudication phase, the phase gate blocking
 promotion, and whether agent autorun is allowed. Source-positive leads stay in
