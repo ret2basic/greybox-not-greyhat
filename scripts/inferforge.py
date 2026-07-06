@@ -22821,12 +22821,13 @@ def build_bounty_frontier(
         item["missing_or_invalid_evidence_count"] = len(missing_requests)
         item["draft_ready_count"] = len(draft_ready)
         item["evidence_distance"] = len(missing_requests)
-        item["required_artifacts"] = ordered_unique_strings(
+        item["required_artifacts"] = bounty_prep_order_required_artifacts(
+            str(item.get("bounty_lane") or ""),
             [
                 str(request.get("artifact") or "")
                 for request in request_summaries
                 if request.get("artifact")
-            ]
+            ],
         )
         item["draft_paths"] = ordered_unique_strings(
             [
@@ -22839,10 +22840,23 @@ def build_bounty_frontier(
         item["acceptance_criteria"] = ordered_unique_strings(normalize_string_list(item.get("acceptance_criteria")))[:12]
         item["reject_if"] = ordered_unique_strings(normalize_string_list(item.get("reject_if")))[:12]
         if missing_requests:
+            missing_artifacts = bounty_prep_order_required_artifacts(
+                str(item.get("bounty_lane") or ""),
+                [
+                    str(request.get("artifact") or "")
+                    for request in missing_requests
+                    if request.get("artifact")
+                ],
+            )
+            missing_labels = [
+                bounty_validation_evidence_label(artifact)
+                for artifact in missing_artifacts
+                if bounty_validation_evidence_label(artifact)
+            ]
             item["status"] = "blocked-missing-official-evidence"
             item["next_step"] = (
                 f"Fill and validate {len(missing_requests)} official evidence artifact(s): "
-                f"{', '.join(Path(str(request.get('artifact'))).name for request in missing_requests if request.get('artifact'))}."
+                f"{', '.join(missing_labels)}."
             )
         else:
             item["status"] = "ready-for-evidence-verification"
@@ -23285,10 +23299,11 @@ def bounty_validation_evidence_label(value: Any) -> str:
     return Path(text).name if path_like else text
 
 
-def bounty_validation_evidence_labels(values: Any, *, limit: int = 4) -> list[str]:
-    return ordered_unique_strings(
+def bounty_validation_evidence_labels(values: Any, *, limit: int = 4, lane: str = "") -> list[str]:
+    labels = ordered_unique_strings(
         [bounty_validation_evidence_label(value) for value in normalize_string_list(values)]
-    )[:limit]
+    )
+    return bounty_prep_order_required_artifacts(lane, labels)[:limit]
 
 
 def build_bounty_validation_gates(
@@ -23317,11 +23332,12 @@ def build_bounty_validation_gates(
         lane = str(frontier.get("bounty_lane") or "evidence-closed-impact")
         lane_spec = bounty_validation_lane_spec(lane, artifact_dir, profile)
         gate_status = bounty_validation_gate_status(frontier)
-        required_artifacts = ordered_unique_strings(
+        required_artifacts = bounty_prep_order_required_artifacts(
+            lane,
             [
                 *normalize_string_list(frontier.get("required_artifacts")),
                 *normalize_string_list(lane_spec.get("required_official_evidence")),
-            ]
+            ],
         )
         validation_commands = ordered_unique_strings(
             [
@@ -23489,7 +23505,7 @@ def bounty_invalidity_reason_category(text: str) -> str:
 
 def bounty_invalidity_minimum_fix(gate: dict[str, Any]) -> str:
     lane = str(gate.get("bounty_lane") or "")
-    evidence = bounty_validation_evidence_labels(gate.get("required_official_evidence"), limit=3)
+    evidence = bounty_validation_evidence_labels(gate.get("required_official_evidence"), limit=3, lane=lane)
     evidence_text = ", ".join(evidence) if evidence else "the lane-specific official evidence"
     if lane == "transaction-integrity":
         return (
@@ -23540,7 +23556,11 @@ def bounty_invalidity_gate_review(gate: dict[str, Any]) -> dict[str, Any]:
 
     gate_status = str(gate.get("gate_status") or "unknown")
     invalid_now = not bool(gate.get("reportable_now")) or gate_status != "reportable-needs-final-adjudication"
-    missing_evidence = bounty_validation_evidence_labels(gate.get("required_official_evidence"), limit=6)
+    missing_evidence = bounty_validation_evidence_labels(
+        gate.get("required_official_evidence"),
+        limit=6,
+        lane=str(gate.get("bounty_lane") or ""),
+    )
     missing_count = int(gate.get("missing_or_invalid_evidence_count") or 0)
     if gate_status.startswith("blocked") or missing_count > 0:
         evidence_text = ", ".join(missing_evidence) if missing_evidence else "official evidence"
@@ -23903,7 +23923,11 @@ def bounty_readiness_gate_row(
             validation_command_for_artifact_dir(artifact_dir, "adjudicate --no-write", profile=profile),
         ]
     )
-    evidence_labels = bounty_validation_evidence_labels(gate.get("required_official_evidence"), limit=16)
+    evidence_labels = bounty_validation_evidence_labels(
+        gate.get("required_official_evidence"),
+        limit=16,
+        lane=lane,
+    )
     official_missing = int(gate.get("missing_or_invalid_evidence_count") or 0)
     if evidence_labels and official_missing <= 0:
         official_missing = len(evidence_labels)
@@ -24342,17 +24366,19 @@ def bounty_evidence_workorder_for_rollup_row(
 ) -> dict[str, Any]:
     lane = str(row.get("lane") or "unknown")
     lane_spec = bounty_evidence_workorder_lane_spec(lane, artifact_dir=artifact_dir, profile=profile)
-    required_evidence = ordered_unique_strings(
+    required_evidence = bounty_prep_order_required_artifacts(
+        lane,
         [
             *normalize_string_list(row.get("required_official_evidence")),
             *normalize_string_list(lane_spec.get("official_artifacts")),
-        ]
+        ],
     )
-    required_labels = ordered_unique_strings(
+    required_labels = bounty_prep_order_required_artifacts(
+        lane,
         [
             *normalize_string_list(row.get("required_official_evidence_labels")),
             *[bounty_validation_evidence_label(value) for value in normalize_string_list(required_evidence)],
-        ]
+        ],
     )
     template_commands = normalize_string_list(lane_spec.get("template_commands"))
     after_evidence_commands = ordered_unique_strings(
@@ -27125,12 +27151,28 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
         for row in (status_doc.get("required_evidence_artifacts", []) or [])
         if isinstance(row, dict)
     ]
+    path_order = [
+        Path(value).name
+        for value in bounty_prep_order_required_artifacts(
+            "transaction-integrity",
+            [
+                repo_relative_or_absolute(artifact_dir / "transaction-intent-policy.json"),
+                repo_relative_or_absolute(artifact_dir / "transaction-payloads.jsonl"),
+            ],
+        )
+    ]
     assertions = [
         {
             "id": "transaction-payload-precedes-policy",
             "passed": required_artifacts[:2] == ["transaction-payloads.jsonl", "transaction-intent-policy.json"],
             "expected": ["transaction-payloads.jsonl", "transaction-intent-policy.json"],
             "actual": required_artifacts[:2],
+        },
+        {
+            "id": "transaction-path-payload-precedes-policy",
+            "passed": path_order[:2] == ["transaction-payloads.jsonl", "transaction-intent-policy.json"],
+            "expected": ["transaction-payloads.jsonl", "transaction-intent-policy.json"],
+            "actual": path_order[:2],
         },
         {
             "id": "top-unblocker-uses-payload-first-missing",
@@ -78935,7 +78977,12 @@ def run_bounty_validation_gates(args: argparse.Namespace) -> int:
                 f"{gate.get('gate_status')} type={gate.get('gate_type')} "
                 f"lane={gate.get('bounty_lane')} witness={gate.get('minimum_witness_level')}"
             )
-            evidence = ", ".join(bounty_validation_evidence_labels(gate.get("required_official_evidence")))
+            evidence = ", ".join(
+                bounty_validation_evidence_labels(
+                    gate.get("required_official_evidence"),
+                    lane=str(gate.get("bounty_lane") or ""),
+                )
+            )
             if evidence:
                 print(f"  needs={inline_summary_text(evidence, max_chars=300)}")
             print(f"  method={inline_summary_text(gate.get('validation_method'), max_chars=320)}")
