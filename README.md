@@ -1516,6 +1516,7 @@ python3 scripts/inferforge.py audit --ws-resource-probes
 python3 scripts/inferforge.py lead-dossier --no-write --show-commands --show-evidence --skip-current-resource-check
 python3 scripts/inferforge.py rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract --show-sidecar-template-json
 python3 scripts/inferforge.py transaction-payload-preflight --input ./approved-payloads.jsonl --no-write --show-records --show-commands
+python3 scripts/inferforge.py prepare-approved-quote-operator-inputs --request-input ./approved-quote-request.http --payload-input ./approved-quote-response.http --approval-reference APPROVED-QUOTE-001 --no-write --show-preflight --show-commands
 python3 scripts/inferforge.py transaction-corpus-preflight --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --intent-input ./approved-quote-intent.json --no-write --show-policy-json --show-checks --show-commands
 python3 scripts/inferforge.py prepare-transaction-corpus-sidecars --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --intent-input ./approved-quote-intent.json --approval-reference APPROVED-QUOTE-001 --no-write --show-policy-json --show-checks --show-commands
 python3 scripts/inferforge.py transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract
@@ -1564,6 +1565,18 @@ hits, and never writes the official sidecar. A `ready-for-approved-sidecar-copy`
 result means the input shape is compatible with the official sidecar; it is still
 not evidence and does not satisfy finding gates until the official sidecar,
 matching intent policy, decode review, finding gate, and adjudication all agree.
+
+`prepare-approved-quote-operator-inputs --request-input ./approved-quote-request.http --payload-input ./approved-quote-response.http --approval-reference APPROVED-QUOTE-001 --no-write --show-preflight --show-commands`
+is the offline helper for Burp/raw-HTTP handoff. It strips raw HTTP headers from
+an approved quote request/response pair, keeps only the JSON bodies as candidate
+supporting operator inputs, and generates an approved quote intent draft from the
+derived wallet, recipient, mints, raw amount, optional minimum destination amount,
+chain, direction, and payload type. By default it previews only. With
+`--write-operator-inputs`, it writes the three supporting files under
+`.greybox/discover-check/operator-inputs`; this still does not create official
+evidence sidecars. Generated intent remains `approved_for_offline_validation=false`
+unless `--approve-offline-validation` is supplied after operator review, and an
+approved import also requires a real `--approval-reference`.
 
 `transaction-corpus-preflight --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --intent-input ./approved-quote-intent.json --no-write --show-policy-json --show-checks --show-commands`
 is the paired offline intake check for one approved quote request body and the
