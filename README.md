@@ -423,6 +423,12 @@ commands. It also prints the offline `transaction-payload-preflight` and
 or one approved quote request plus its matching response, before any official
 sidecar is created. The contract and preflight result are still not evidence and
 do not authorize traffic.
+`evidence-sidecar-drafts` carries the same transaction pair binding metadata in
+its non-evidence draft workbook: `approval_reference`, `request_text_sha256`,
+`payload_text_sha256`, and `paired_payload_text_sha256`. The draft CLI prints
+the required binding fields with `--show-drafts`; placeholders still have to be
+replaced from one approved quote request/response pair before anything is copied
+into official sidecars.
 
 `methodology-review` also emits `bounty_harness_alignment`, a compact
 bug-bounty readiness check derived from the harness pattern of building system
