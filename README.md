@@ -587,7 +587,9 @@ places `evidence-sidecar-drafts --no-write --show-drafts` at the front of the
 handoff commands as a review-gated workbook view before the placeholder
 preflight/prepare commands. With `--show-requests`, the same shortest-path view
 prints the approved quote operator-input file status so the top bounty lane
-shows whether the request, response, and intent files are still missing.
+shows whether the request, response, and intent files are still missing. With
+`--show-requests --show-commands`, it also prints the fixed-path no-write corpus
+preflight and sidecar-prepare previews for those operator-input files.
 When the pair reaches `ready-for-decode`, the same contract exposes the gated
 no-write validation chain: `transaction-sidecar-review`, `decode-transactions`,
 `gate`, and `adjudicate`. Blocked pairs keep that command list empty.
