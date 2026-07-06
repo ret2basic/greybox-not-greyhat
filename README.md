@@ -1440,6 +1440,11 @@ belong to the expected wallet/recipient and mint. Missing token-account metadata
 does not create a finding; a concrete owner or mint mismatch is only a candidate
 transaction-integrity signal that still has to pass finding-gate and
 adjudication.
+By default, decoded top-level SPL token transfer instructions must stay within
+the expected source and destination mints/accounts. A policy can set
+`allowExtraTokenTransfers: true` only after the route's extra token movement is
+reviewed; otherwise unexpected transfer mints or unexpected explicit token
+account boundaries are treated as candidate transaction-integrity impact.
 `transaction-intent.json.reportability_review` summarizes whether decoded
 checks are merely waiting for corpus/policy, passed for the current corpus, or
 contain signer, wallet, mint, or program mismatches that are ready for a
