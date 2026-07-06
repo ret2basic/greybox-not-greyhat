@@ -404,6 +404,11 @@ system context, lead selection, impact oracle, witness ladder, and
 finding-gate/adjudication are counted as separate stages with survival rates and
 the first blocking stage. The funnel is accounting only; it does not collect
 evidence or promote a static candidate into a bounty finding.
+It also emits `assessment_mode_comparison`, which scores the same candidates as
+both `greybox` and `blackbox` without changing the profile. This makes it clear
+when coverage-first and bounty-first modes would pursue different top leads, and
+how many secondary candidates blackbox mode would park behind the dominant
+bounty path.
 
 Use `lead-dossier` when you want the same evidence closure in a tighter
 bug-bounty style lead file. It applies the “read code, constrain by
