@@ -330,6 +330,13 @@ offline verifier commands, and a finding-gate/adjudication path. A witness
 ladder is proof-work bookkeeping only: it does not create evidence sidecars and
 does not make a finding reportable.
 
+`bounty-evidence-workorders` turns blocked bounty lanes into bounded official
+evidence requests. Its summary and CLI include the top workorder's required
+evidence count, preview command count, after-evidence validation count, and
+command-safety totals. This lets unattended loops verify that workorders are
+still waiting on approved evidence while the post-evidence commands remain
+classified as safe no-write validators gated behind evidence arrival.
+
 `bounty-action-queue` consumes the same claim evidence request pack and attaches
 matching witness requests to each queued bounty action. The queue shows the
 missing official evidence file, claim count, draft-assist path, first offline
