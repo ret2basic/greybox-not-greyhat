@@ -406,7 +406,11 @@ the first blocking stage. The funnel is accounting only; it does not collect
 evidence or promote a static candidate into a bounty finding. When the first
 gap is an impact oracle or witness ladder, the alignment also links it to the
 current `next_evidence_packet` from `bounty-action-queue`, including the first
-missing sidecar and official evidence contract blocker.
+missing sidecar and official evidence contract blocker. The same first-gap
+packet now carries `source_invariant_context`, so `--show-funnel` can print the
+source invariant, source signal, and negative controls that explain why a
+source-positive path is still not promotable without approved official
+evidence.
 It also emits `assessment_mode_comparison`, which scores the same candidates as
 both `greybox` and `blackbox` without changing the profile. This makes it clear
 when coverage-first and bounty-first modes would pursue different top leads, and
