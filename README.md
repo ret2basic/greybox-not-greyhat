@@ -834,6 +834,9 @@ Use `rewrite-validation-checklist --no-write --show-candidates --show-commands`
 to turn those review items into a one-path validation checklist. It prints
 client-derived read-only candidates, blocked dynamic templates, and no-write
 `promote-observation-candidate` previews for exactly one approved local path.
+Those preview commands carry item-level and top-level command-safety summaries
+and `ready` labels because they are local no-write promotion previews, not
+traffic or Burp observation steps.
 The checklist is still offline: it does not invoke Burp, start a browser, send
 HTTP traffic, or enumerate catch-all paths.
 After the reviewed profile has produced a normalized observation, use
