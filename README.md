@@ -372,7 +372,9 @@ contract also has a `validator_execution_gate`, so missing sidecars remain
 `waiting-official-evidence` even when their no-write validator commands are
 safe to preview. The packet-level `official_evidence_contract_gate` aggregates
 those contracts and only exposes `autorunnable_contract_validator_commands` when
-every required sidecar contract is ready for no-write validation.
+every required sidecar contract is ready for no-write validation. Use
+`bounty-action-queue --show-contracts` to print the packet's required fields,
+reject conditions, paired sidecars, and copy policy without opening the JSON.
 
 `claim-evidence-requests` also uses that queue context for its default ordering:
 in bounty mode, evidence for the highest-ranked action comes before a broader
