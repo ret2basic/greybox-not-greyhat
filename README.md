@@ -358,6 +358,11 @@ only actions with `ready-offline-validation` expose
 `autorunnable_validation_commands`; actions waiting for official evidence,
 manual input, external probes, or unsafe templates remain visible as workflow
 items but are not presented as agent-runnable validation chains.
+The queue also emits `next_evidence_packet`, a compact view of the current
+highest-value action's minimum official evidence set, first missing artifact,
+claim-witness request, manual handoff/preflight commands, and after-evidence
+validation chain. It is an offline handoff summary only: it does not create
+sidecars, authorize traffic, or make a candidate reportable.
 
 `claim-evidence-requests` also uses that queue context for its default ordering:
 in bounty mode, evidence for the highest-ranked action comes before a broader

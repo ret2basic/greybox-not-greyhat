@@ -28726,6 +28726,127 @@ def bounty_action_claim_request_summary(rows: list[dict[str, Any]]) -> dict[str,
     }
 
 
+def bounty_action_evidence_handoff_commands(action: dict[str, Any]) -> list[str]:
+    commands: list[str] = []
+    for request in action.get("claim_evidence_requests", []) or []:
+        if not isinstance(request, dict):
+            continue
+        source = request.get("source_readiness") if isinstance(request.get("source_readiness"), dict) else {}
+        for key in ["preflight_command", "corpus_preflight_command", "sidecar_prepare_command"]:
+            if source.get(key):
+                commands.append(str(source.get(key)))
+        handoff = source.get("handoff_contract") if isinstance(source.get("handoff_contract"), dict) else {}
+        for key in ["preflight_command", "corpus_preflight_command", "sidecar_prepare_command"]:
+            if handoff.get(key):
+                commands.append(str(handoff.get(key)))
+        commands.extend(normalize_string_list(handoff.get("offline_commands")))
+    return ordered_unique_strings(commands)
+
+
+def bounty_action_next_evidence_packet(action: dict[str, Any]) -> dict[str, Any]:
+    if not action:
+        return {
+            "id": "NEXT-EVIDENCE-none",
+            "status": "no-action",
+            "next_step": "Refresh bounty-action-queue before preparing evidence.",
+        }
+    action_id = str(action.get("id") or "ACTION-unknown")
+    packet_id = f"NEXT-EVIDENCE-{safe_probe_id(action_id)}"
+    missing_evidence = normalize_string_list(action.get("missing_official_evidence"))
+    requested_evidence = normalize_string_list(action.get("requested_evidence"))
+    first_missing = missing_evidence[0] if missing_evidence else None
+    validation_gate = str(action.get("validation_execution_gate") or "")
+    if validation_gate == "ready-offline-validation":
+        status = "ready-offline-validation"
+    elif missing_evidence:
+        status = "waiting-official-evidence"
+    elif str(action.get("kind") or "") == "run-evidence-intake":
+        status = "evidence-present-needs-intake"
+    elif action.get("requires_human_evidence"):
+        status = "waiting-human-evidence"
+    else:
+        status = "review-required"
+
+    claim_rows = []
+    for request in action.get("claim_evidence_requests", []) or []:
+        if not isinstance(request, dict):
+            continue
+        official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
+        source = request.get("source_readiness") if isinstance(request.get("source_readiness"), dict) else {}
+        handoff = source.get("handoff_contract") if isinstance(source.get("handoff_contract"), dict) else {}
+        recommended_quote = handoff.get("recommended_quote") if isinstance(handoff.get("recommended_quote"), dict) else {}
+        claim_rows.append(
+            {
+                "id": request.get("id"),
+                "request_status": request.get("request_status"),
+                "official_evidence": {
+                    "name": official.get("name"),
+                    "path": official.get("path"),
+                    "category": official.get("category"),
+                    "status": official.get("status"),
+                    "validator_status": official.get("validator_status"),
+                },
+                "claim_count": int(request.get("claim_count") or 0),
+                "draft_path": request.get("draft_path"),
+                "source_readiness_status": source.get("status"),
+                "local_candidate_count": source.get("local_candidate_count", 0),
+                "official_evidence_still_required": source.get("official_evidence_still_required", True),
+                "handoff_status": handoff.get("status"),
+                "recommended_quote": {
+                    key: recommended_quote.get(key)
+                    for key in ["method", "path", "direction", "expectedPayloadType"]
+                    if recommended_quote.get(key) is not None
+                },
+                "next_step": request.get("next_step") or source.get("next_step"),
+            }
+        )
+
+    handoff_commands = bounty_action_evidence_handoff_commands(action)
+    handoff_command_refs = [
+        validation_command_ref(command, source=f"{packet_id}:handoff[{index}]", item_status="manual-review")
+        for index, command in enumerate(handoff_commands, start=1)
+    ]
+    after_evidence_commands = normalize_string_list(action.get("validation_commands"))
+    return {
+        "id": packet_id,
+        "status": status,
+        "action_id": action_id,
+        "lane": action.get("lane"),
+        "kind": action.get("kind"),
+        "entrypoint": action.get("entrypoint"),
+        "expected_severity": action.get("expected_severity"),
+        "score": action.get("score"),
+        "priority_decision": action.get("priority_decision"),
+        "evidence_gate_status": action.get("evidence_gate_status"),
+        "validation_execution_gate": validation_gate,
+        "minimum_official_evidence": requested_evidence,
+        "missing_official_evidence": missing_evidence,
+        "first_missing_artifact": first_missing,
+        "present_official_evidence": normalize_string_list(action.get("present_official_evidence")),
+        "claim_evidence_request_count": len(claim_rows),
+        "claim_evidence_claim_count": int(action.get("claim_evidence_claim_count") or 0),
+        "claim_evidence_requests": claim_rows[:6],
+        "handoff_commands": handoff_commands[:8],
+        "handoff_command_safety": command_safety_summary(handoff_command_refs),
+        "after_evidence_validation_commands": after_evidence_commands[:8],
+        "after_evidence_validation_command_safety": (
+            action.get("validation_command_safety")
+            if isinstance(action.get("validation_command_safety"), dict)
+            else command_safety_summary([])
+        ),
+        "autorunnable_validation_commands": normalize_string_list(action.get("autorunnable_validation_commands"))[:8],
+        "acceptance_checklist": normalize_string_list(action.get("api_authorization_acceptance_checks"))[:6],
+        "reject_if": normalize_string_list(action.get("api_authorization_reject_if"))[:6],
+        "operator_question": action.get("next_step"),
+        "next_step": action.get("next_step"),
+        "reportability_boundary": action.get("reportability_boundary"),
+        "safety": (
+            "Evidence packet is an offline handoff summary only. It creates no official evidence, sends no traffic, "
+            "starts no browser, calls no Burp tool, signs no wallet, submits no transaction, and changes no infrastructure."
+        ),
+    }
+
+
 def bounty_action_for_authorization_request(
     authorization: dict[str, Any],
     *,
@@ -29070,6 +29191,7 @@ def build_bounty_action_queue(
         if isinstance(ref, dict)
     ]
     command_safety = command_safety_summary(validation_command_refs)
+    next_evidence_packet = bounty_action_next_evidence_packet(top)
     cache_validation = bounty_action_queue_cache_validation(
         bounty_readiness_rollup=bounty_readiness_rollup,
         bounty_evidence_authorization=bounty_evidence_authorization,
@@ -29117,8 +29239,11 @@ def build_bounty_action_queue(
             "claim_evidence_requests_status": artifact_summary_status(claim_evidence_requests),
             "cache_dependency_count": len(cache_validation.get("dependencies", {}) or {}),
             "command_safety": command_safety,
+            "next_evidence_packet_status": next_evidence_packet.get("status"),
+            "next_evidence_packet_first_missing": next_evidence_packet.get("first_missing_artifact"),
         },
         "cache_validation": cache_validation,
+        "next_evidence_packet": next_evidence_packet,
         "actions": actions,
         "agent_ready_actions": ready_agent[:8],
         "human_required_actions": human_required[:8],
@@ -30031,6 +30156,7 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             claim_evidence_requests_case["requests"][0],
             artifact_dir=artifact_dir,
         )
+        claim_evidence_requests_case["requests"][0]["source_readiness"] = transaction_source_readiness_case
         preflight_profile = default_target_profile()
         preflight_payload = base64.b64encode(b"A" * 64).decode("ascii")
 
@@ -30617,6 +30743,29 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
         if isinstance(rebuilt_claim_queue_case.get("actions"), list) and rebuilt_claim_queue_case.get("actions")
         else {}
     )
+    rebuilt_claim_next_packet = (
+        rebuilt_claim_queue_case.get("next_evidence_packet")
+        if isinstance(rebuilt_claim_queue_case.get("next_evidence_packet"), dict)
+        else {}
+    )
+    rebuilt_claim_next_packet_handoff_safety = (
+        rebuilt_claim_next_packet.get("handoff_command_safety")
+        if isinstance(rebuilt_claim_next_packet.get("handoff_command_safety"), dict)
+        else {}
+    )
+    rebuilt_claim_next_packet_handoff_counts = (
+        rebuilt_claim_next_packet_handoff_safety.get("classification_counts", {})
+        if isinstance(rebuilt_claim_next_packet_handoff_safety.get("classification_counts"), dict)
+        else {}
+    )
+    rebuilt_claim_next_packet_handoff_text = "\n".join(
+        normalize_string_list(rebuilt_claim_next_packet.get("handoff_commands"))
+    )
+    rebuilt_ready_next_packet = (
+        rebuilt_ready_queue_case.get("next_evidence_packet")
+        if isinstance(rebuilt_ready_queue_case.get("next_evidence_packet"), dict)
+        else {}
+    )
     stale_queue_claim_cache = (
         stale_queue_case.get("cache_validation")
         if isinstance(stale_queue_case.get("cache_validation"), dict)
@@ -31126,6 +31275,47 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
                 "queue_summary": rebuilt_ready_queue_summary,
                 "queue_autorunnable": rebuilt_ready_queue_autorunnable_commands,
                 "waiting_action_autorunnable": normalize_string_list(action_case.get("autorunnable_validation_commands")),
+            },
+        },
+        {
+            "id": "next-evidence-packet-focuses-highest-value-official-evidence",
+            "passed": (
+                rebuilt_claim_next_packet.get("status") == "waiting-official-evidence"
+                and rebuilt_claim_next_packet.get("action_id") == rebuilt_claim_action.get("id")
+                and rebuilt_claim_next_packet.get("lane") == "transaction-integrity"
+                and rebuilt_claim_next_packet.get("first_missing_artifact") == "transaction-payloads.jsonl"
+                and {"transaction-payloads.jsonl", "transaction-intent-policy.json"}
+                <= set(normalize_string_list(rebuilt_claim_next_packet.get("minimum_official_evidence")))
+                and rebuilt_claim_next_packet.get("claim_evidence_request_count") == 1
+                and rebuilt_claim_next_packet.get("claim_evidence_claim_count") == 2
+                and "transaction-payload-preflight" in rebuilt_claim_next_packet_handoff_text
+                and "prepare-transaction-corpus-sidecars" in rebuilt_claim_next_packet_handoff_text
+                and rebuilt_claim_next_packet_handoff_safety.get("requires_manual_input", 0) >= 2
+                and rebuilt_claim_next_packet_handoff_counts.get("manual-template", 0) >= 2
+                and not normalize_string_list(rebuilt_claim_next_packet.get("autorunnable_validation_commands"))
+            ),
+            "expected": "waiting next evidence packet names the top bounty evidence pair without exposing autorun commands",
+            "actual": {
+                "packet": rebuilt_claim_next_packet,
+                "handoff_safety": rebuilt_claim_next_packet_handoff_safety,
+                "handoff_text": rebuilt_claim_next_packet_handoff_text,
+            },
+        },
+        {
+            "id": "next-evidence-packet-switches-to-ready-validation-after-intake",
+            "passed": (
+                rebuilt_ready_next_packet.get("status") == "ready-offline-validation"
+                and rebuilt_ready_next_packet.get("validation_execution_gate") == "ready-offline-validation"
+                and rebuilt_ready_next_packet.get("action_id") == rebuilt_ready_action.get("id")
+                and rebuilt_ready_next_packet.get("autorunnable_validation_commands")
+                == rebuilt_ready_autorunnable_commands
+                and "decode-transactions --no-write"
+                in "\n".join(normalize_string_list(rebuilt_ready_next_packet.get("after_evidence_validation_commands")))
+            ),
+            "expected": "ready next evidence packet exposes only the safe offline validation chain",
+            "actual": {
+                "packet": rebuilt_ready_next_packet,
+                "ready_autorunnable": rebuilt_ready_autorunnable_commands,
             },
         },
         {
@@ -87175,6 +87365,26 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
     command_safety = summary.get("command_safety", {}) if isinstance(summary.get("command_safety"), dict) else {}
     if command_safety:
         print(f"Command safety: {format_command_safety_summary(command_safety)}")
+    next_packet = (
+        queue.get("next_evidence_packet")
+        if isinstance(queue.get("next_evidence_packet"), dict)
+        else {}
+    )
+    if next_packet:
+        print(
+            "Next evidence packet: "
+            f"status={next_packet.get('status') or '-'} "
+            f"lane={next_packet.get('lane') or '-'} "
+            f"first_missing={next_packet.get('first_missing_artifact') or '-'} "
+            f"validation_gate={next_packet.get('validation_execution_gate') or '-'}"
+        )
+        packet_handoff_safety = (
+            next_packet.get("handoff_command_safety")
+            if isinstance(next_packet.get("handoff_command_safety"), dict)
+            else {}
+        )
+        if packet_handoff_safety and packet_handoff_safety.get("commands"):
+            print(f"Packet handoff safety: {format_command_safety_summary(packet_handoff_safety)}")
     if summary.get("claim_evidence_request_count"):
         claim_request_summary_bits = [
             f"requests={summary.get('claim_evidence_request_count', 0)}",
@@ -87332,6 +87542,17 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
             print("Autorunnable validation commands:")
             for command_text in autorunnable[:display_limit]:
                 print(f"- {inline_summary_text(command_text, max_chars=420)}")
+        if next_packet:
+            handoff_commands = normalize_string_list(next_packet.get("handoff_commands"))
+            if handoff_commands:
+                print("Next evidence packet handoff commands:")
+                for command_text in handoff_commands[:display_limit]:
+                    print(f"- {inline_summary_text(command_text, max_chars=420)}")
+            after_commands = normalize_string_list(next_packet.get("after_evidence_validation_commands"))
+            if after_commands:
+                print("Next evidence packet after-evidence commands:")
+                for command_text in after_commands[:display_limit]:
+                    print(f"- {inline_summary_text(command_text, max_chars=420)}")
     print(f"Rule: {inline_summary_text(queue.get('reportability_rule'), max_chars=360)}")
     print(f"Next: {inline_summary_text(queue.get('next_step'), max_chars=360)}")
     if no_write:
