@@ -589,7 +589,11 @@ preflight/prepare commands. With `--show-requests`, the same shortest-path view
 prints the approved quote operator-input file status so the top bounty lane
 shows whether the request, response, and intent files are still missing. With
 `--show-requests --show-commands`, it also prints the fixed-path no-write corpus
-preflight and sidecar-prepare previews for those operator-input files.
+preflight and sidecar-prepare previews for those operator-input files. The
+preflight command remains review-gated while any input file is missing and
+becomes ready only after all three local input files are present; the
+sidecar-prepare preview remains a manual template until the approval reference
+placeholder is replaced.
 When the pair reaches `ready-for-decode`, the same contract exposes the gated
 no-write validation chain: `transaction-sidecar-review`, `decode-transactions`,
 `gate`, and `adjudicate`. Blocked pairs keep that command list empty.
