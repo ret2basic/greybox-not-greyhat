@@ -66227,6 +66227,11 @@ def build_transaction_decoder_selftest(
     prepared_decode_return_code = 1
     prepared_decode_stdout: list[str] = []
     prepared_decode_wrote_transaction_intent = True
+    prepared_mismatch_decode_return_code = 1
+    prepared_mismatch_decode_stdout: list[str] = []
+    prepared_mismatch_wrote_transaction_intent = False
+    prepared_mismatch_transaction_intent: dict[str, Any] = {}
+    prepared_mismatch_finding_gate: dict[str, Any] = {}
     with tempfile.TemporaryDirectory() as temp_dir:
         guard_artifact_dir = Path(temp_dir) / "transaction-sidecar-guard"
         guard_artifact_dir.mkdir()
@@ -66480,6 +66485,30 @@ def build_transaction_decoder_selftest(
             )
         prepared_decode_stdout = prepared_decode_stdout_buffer.getvalue().splitlines()
         prepared_decode_wrote_transaction_intent = (prepared_artifact_dir / "transaction-intent.json").exists()
+        prepared_mismatch_stdout_buffer = io.StringIO()
+        with contextlib.redirect_stdout(prepared_mismatch_stdout_buffer):
+            prepared_mismatch_decode_return_code = run_decode_transactions(
+                argparse.Namespace(
+                    profile=str(prepared_profile_path),
+                    artifact_dir=str(prepared_artifact_dir),
+                    target=DEFAULT_TARGET,
+                    source_root=str(source_root),
+                    node=node,
+                    input=None,
+                    max_input_bytes=DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+                    intent_policy=None,
+                    intent_direction=None,
+                    intent_wallet="So11111111111111111111111111111111111111112",
+                    intent_amount_in=None,
+                    intent_allowed_program=None,
+                    no_write=False,
+                )
+            )
+        prepared_mismatch_decode_stdout = prepared_mismatch_stdout_buffer.getvalue().splitlines()
+        prepared_mismatch_transaction_intent_path = prepared_artifact_dir / "transaction-intent.json"
+        prepared_mismatch_wrote_transaction_intent = prepared_mismatch_transaction_intent_path.exists()
+        prepared_mismatch_transaction_intent = load_optional_json(prepared_mismatch_transaction_intent_path) or {}
+        prepared_mismatch_finding_gate = build_finding_gate([], [], prepared_mismatch_transaction_intent, {}, None)
     sidecar_guard_passed = (
         sidecar_guard_intent.get("candidates_seen") == 0
         and sidecar_guard_intent.get("resource_limits", {}).get("max_transaction_candidate_input_bytes") == 32
@@ -66625,6 +66654,55 @@ def build_transaction_decoder_selftest(
         and "No files written (--no-write)." in prepared_decode_stdout
         and prepared_decode_wrote_transaction_intent is False
     )
+    prepared_mismatch_review = (
+        prepared_mismatch_transaction_intent.get("reportability_review")
+        if isinstance(prepared_mismatch_transaction_intent.get("reportability_review"), dict)
+        else {}
+    )
+    prepared_mismatch_gate_item = next(
+        (
+            item
+            for item in prepared_mismatch_finding_gate.get("gates", []) or []
+            if isinstance(item, dict) and item.get("suspicion_id") == "TXINTENT-transaction-integrity"
+        ),
+        {},
+    )
+    prepared_mismatch_gate_checks = [
+        check
+        for check in prepared_mismatch_gate_item.get("checks", []) or []
+        if isinstance(check, dict)
+    ]
+    prepared_mismatch_manual_review_check = next(
+        (
+            check
+            for check in prepared_mismatch_gate_checks
+            if check.get("id") == "manual-impact-review"
+        ),
+        {},
+    )
+    prepared_mismatch_stdout_text = "\n".join(prepared_mismatch_decode_stdout)
+    prepared_mismatch_gate_text = json.dumps(prepared_mismatch_finding_gate, sort_keys=True)
+    prepared_sidecar_finding_gate_passed = (
+        prepared_mismatch_decode_return_code == 0
+        and prepared_mismatch_wrote_transaction_intent is True
+        and "Transactions: 1 candidates, 1 decoded" in prepared_mismatch_stdout_text
+        and "Intent gate: status=candidate-transaction-integrity-impact severity=high ready_for_finding_gate=True"
+        in prepared_mismatch_stdout_text
+        and prepared_mismatch_transaction_intent.get("candidates_seen") == 1
+        and prepared_mismatch_transaction_intent.get("decoded_transactions") == 1
+        and prepared_mismatch_review.get("status") == "candidate-transaction-integrity-impact"
+        and prepared_mismatch_review.get("candidate_severity") == "high"
+        and prepared_mismatch_review.get("ready_for_finding_gate") is True
+        and prepared_mismatch_review.get("reportable_now") is False
+        and int(prepared_mismatch_review.get("high_impact_failure_count") or 0) >= 2
+        and prepared_mismatch_finding_gate.get("summary", {}).get("gates") == 1
+        and prepared_mismatch_gate_item.get("classification") == "candidate-transaction-integrity-impact"
+        and prepared_mismatch_gate_item.get("gate_status") == "manual-review"
+        and prepared_mismatch_gate_item.get("severity") == "high"
+        and prepared_mismatch_manual_review_check.get("passed") is False
+        and payload["base64"] not in prepared_mismatch_gate_text
+        and payload["base64"] not in prepared_mismatch_stdout_text
+    )
     sidecar_contracts = [
         item
         for item in sidecar_empty_review.get("evidence_contracts", []) or []
@@ -66747,6 +66825,7 @@ def build_transaction_decoder_selftest(
         and sidecar_evm_passed
         and prepared_sidecar_passed
         and prepared_decode_no_write_passed
+        and prepared_sidecar_finding_gate_passed
         and sidecar_contract_passed
         and sidecar_empty_approval_packet_passed
         and sidecar_empty_closure_plan_passed
@@ -66850,6 +66929,19 @@ def build_transaction_decoder_selftest(
             "return_code": prepared_decode_return_code,
             "wrote_transaction_intent": prepared_decode_wrote_transaction_intent,
             "stdout": prepared_decode_stdout,
+        },
+        "prepared_sidecar_finding_gate": {
+            "status": "passed" if prepared_sidecar_finding_gate_passed else "failed",
+            "decode_return_code": prepared_mismatch_decode_return_code,
+            "wrote_transaction_intent": prepared_mismatch_wrote_transaction_intent,
+            "reportability_status": prepared_mismatch_review.get("status"),
+            "candidate_severity": prepared_mismatch_review.get("candidate_severity"),
+            "ready_for_finding_gate": prepared_mismatch_review.get("ready_for_finding_gate"),
+            "reportable_now": prepared_mismatch_review.get("reportable_now"),
+            "high_impact_failure_count": prepared_mismatch_review.get("high_impact_failure_count"),
+            "gate_summary": prepared_mismatch_finding_gate.get("summary", {}),
+            "gate_item": prepared_mismatch_gate_item,
+            "stdout": prepared_mismatch_decode_stdout,
         },
         "sidecar_evidence_contract": {
             "status": "passed" if sidecar_contract_passed else "failed",

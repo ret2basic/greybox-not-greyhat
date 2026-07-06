@@ -1265,7 +1265,11 @@ not being overwritten. Use `--replace` only after reviewing the existing officia
 evidence files. `self-test-transactions` exercises this write path inside a
 temporary artifact directory, requires `transaction-sidecar-review` to return
 `ready-for-decode`, then runs `decode-transactions --no-write` and confirms no
-`transaction-intent.json` artifact is written.
+`transaction-intent.json` artifact is written. It also runs a synthetic
+high-impact intent mismatch through the same prepared sidecars, writes only a
+temporary `transaction-intent.json`, and confirms the finding gate produces a
+manual-review `candidate-transaction-integrity-impact` item without treating it
+as reportable evidence.
 
 `transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract` prints the
 accepted sidecar files, configured candidate paths, and compact JSON/JSONL/TXT
@@ -1392,7 +1396,10 @@ only when a quote cluster is active, then refreshes the managed artifact
 manifest. `self-test-transactions` writes
 `.greybox/transaction-decoder-selftest.json`; it generates a synthetic local
 Solana versioned transaction to prove the candidate extractor, decoder, and
-intent-policy checks work, but it is not a substitute for a real quote-provider corpus.
+intent-policy checks work. The same self-test also covers prepared sidecar
+write, sidecar review, no-write decode preview, and synthetic mismatch
+finding-gate handoff, but it is not a substitute for a real quote-provider
+corpus.
 
 `burp-sync` is the preferred automatic Burp loop. It can force Proxy Intercept
 off, optionally run the deterministic `burp-observe` flow, read matching Burp
