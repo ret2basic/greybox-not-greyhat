@@ -24780,6 +24780,8 @@ def bounty_evidence_workorder_for_rollup_row(
         "api_authorization_profiles": api_profiles,
         "api_authorization_profile_ids": api_authorization_profile_ids(api_profiles),
         "api_authorization_evidence_questions": api_authorization_profile_evidence_questions(api_profiles),
+        "api_authorization_acceptance_checks": api_authorization_profile_acceptance_checks(api_profiles),
+        "api_authorization_reject_if": api_authorization_profile_reject_if(api_profiles),
         "acceptance_checklist": ordered_unique_strings(
             [
                 *BOUNTY_WORKORDER_GLOBAL_ACCEPTANCE_CHECKS,
@@ -24895,6 +24897,10 @@ def bounty_rows_have_current_api_authorization_schema(rows: Any) -> bool:
         if str(row.get("lane") or "") not in BOUNTY_LANE_API_AUTHORIZATION_IMPACTS:
             continue
         if not normalize_string_list(row.get("api_authorization_profile_ids")):
+            return False
+        if not normalize_string_list(row.get("api_authorization_acceptance_checks")):
+            return False
+        if not normalize_string_list(row.get("api_authorization_reject_if")):
             return False
     return True
 
@@ -25699,6 +25705,11 @@ def bounty_authorization_request_for_workorder(
     )
     preview_commands = normalize_string_list(workorder.get("template_preview_commands"))
     after_commands = normalize_string_list(workorder.get("after_evidence_validation_commands"))
+    api_profiles = [
+        profile
+        for profile in workorder.get("api_authorization_profiles", []) or []
+        if isinstance(profile, dict)
+    ]
     return {
         "id": f"AUTHZ-{safe_probe_id(str(workorder.get('id') or priority.get('id') or lane))}",
         "rank": rank,
@@ -25741,14 +25752,22 @@ def bounty_authorization_request_for_workorder(
         ),
         "redaction_requirements": BOUNTY_AUTHORIZATION_REDACTION_REQUIREMENTS,
         "acceptance_checklist": normalize_string_list(workorder.get("acceptance_checklist")),
-        "api_authorization_profiles": [
-            profile
-            for profile in workorder.get("api_authorization_profiles", []) or []
-            if isinstance(profile, dict)
-        ],
+        "api_authorization_profiles": api_profiles,
         "api_authorization_profile_ids": normalize_string_list(workorder.get("api_authorization_profile_ids")),
         "api_authorization_evidence_questions": normalize_string_list(
             workorder.get("api_authorization_evidence_questions")
+        ),
+        "api_authorization_acceptance_checks": ordered_unique_strings(
+            [
+                *normalize_string_list(workorder.get("api_authorization_acceptance_checks")),
+                *api_authorization_profile_acceptance_checks(api_profiles),
+            ]
+        ),
+        "api_authorization_reject_if": ordered_unique_strings(
+            [
+                *normalize_string_list(workorder.get("api_authorization_reject_if")),
+                *api_authorization_profile_reject_if(api_profiles),
+            ]
         ),
         "reject_if": reject_if,
         "preview_commands": preview_commands[:4],
@@ -26697,6 +26716,11 @@ def bounty_action_for_authorization_request(
         "fix-evidence-intake",
         "park-until-official-evidence",
     }
+    api_profiles = [
+        profile
+        for profile in authorization.get("api_authorization_profiles", []) or []
+        if isinstance(profile, dict)
+    ]
     action = {
         "id": f"ACTION-{safe_probe_id(str(authorization.get('id') or authorization.get('lane') or kind))}",
         "kind": kind,
@@ -26721,14 +26745,24 @@ def bounty_action_for_authorization_request(
             str(authorization.get("lane") or ""),
             normalize_string_list(authorization.get("requested_official_evidence_labels")),
         ),
-        "api_authorization_profiles": [
-            profile
-            for profile in authorization.get("api_authorization_profiles", []) or []
-            if isinstance(profile, dict)
-        ],
+        "acceptance_checklist": normalize_string_list(authorization.get("acceptance_checklist")),
+        "reject_if": normalize_string_list(authorization.get("reject_if")),
+        "api_authorization_profiles": api_profiles,
         "api_authorization_profile_ids": normalize_string_list(authorization.get("api_authorization_profile_ids")),
         "api_authorization_evidence_questions": normalize_string_list(
             authorization.get("api_authorization_evidence_questions")
+        ),
+        "api_authorization_acceptance_checks": ordered_unique_strings(
+            [
+                *normalize_string_list(authorization.get("api_authorization_acceptance_checks")),
+                *api_authorization_profile_acceptance_checks(api_profiles),
+            ]
+        ),
+        "api_authorization_reject_if": ordered_unique_strings(
+            [
+                *normalize_string_list(authorization.get("api_authorization_reject_if")),
+                *api_authorization_profile_reject_if(api_profiles),
+            ]
         ),
         "file_refs": normalize_string_list(intake.get("file_refs")),
         "redaction_risks": normalize_string_list(intake.get("redaction_risks")),
@@ -27717,6 +27751,24 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
         if isinstance(template, dict)
         for profile_id in normalize_string_list(template.get("api_authorization_profile_ids"))
     }
+    action_api_acceptance_checks = normalize_string_list(action_case.get("api_authorization_acceptance_checks"))
+    action_api_reject_if = normalize_string_list(action_case.get("api_authorization_reject_if"))
+    template_api_acceptance_checks = ordered_unique_strings(
+        [
+            check
+            for template in template_case.get("templates", []) or []
+            if isinstance(template, dict)
+            for check in normalize_string_list(template.get("api_authorization_acceptance_checks"))
+        ]
+    )
+    template_api_reject_if = ordered_unique_strings(
+        [
+            check
+            for template in template_case.get("templates", []) or []
+            if isinstance(template, dict)
+            for check in normalize_string_list(template.get("api_authorization_reject_if"))
+        ]
+    )
     fresh_api_schema_cases = {
         "workorders": bounty_workorders_have_current_api_authorization_schema(
             {
@@ -27764,6 +27816,52 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
         ),
         "templates": bounty_templates_have_current_api_authorization_schema(
             {"summary": {}, "templates": template_case.get("templates", [])}
+        ),
+    }
+    stale_missing_oracle_schema_cases = {
+        "workorders": bounty_workorders_have_current_api_authorization_schema(
+            {
+                "summary": {"api_authorization_counts": {"transaction-intent-property-boundary": 1}},
+                "workorders": [
+                    {
+                        "lane": "transaction-integrity",
+                        "api_authorization_profile_ids": ["transaction-intent-property-boundary"],
+                    }
+                ],
+            }
+        ),
+        "authorization": bounty_authorization_has_current_api_authorization_schema(
+            {
+                "summary": {"api_authorization_counts": {"transaction-intent-property-boundary": 1}},
+                "authorization_requests": [
+                    {
+                        "lane": "transaction-integrity",
+                        "api_authorization_profile_ids": ["transaction-intent-property-boundary"],
+                    }
+                ],
+            }
+        ),
+        "action_queue": bounty_action_queue_has_current_api_authorization_schema(
+            {
+                "summary": {"api_authorization_counts": {"transaction-intent-property-boundary": 1}},
+                "actions": [
+                    {
+                        "lane": "transaction-integrity",
+                        "api_authorization_profile_ids": ["transaction-intent-property-boundary"],
+                    }
+                ],
+            }
+        ),
+        "templates": bounty_templates_have_current_api_authorization_schema(
+            {
+                "summary": {"api_authorization_counts": {"transaction-intent-property-boundary": 1}},
+                "templates": [
+                    {
+                        "lane": "transaction-integrity",
+                        "api_authorization_profile_ids": ["transaction-intent-property-boundary"],
+                    }
+                ],
+            }
         ),
     }
     assertions = [
@@ -27855,6 +27953,22 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             "actual": normalize_string_list(authorization_case.get("acceptance_checklist"))[:8],
         },
         {
+            "id": "api-authorization-oracle-conditions-propagate",
+            "passed": (
+                any("Offline decode shows" in str(check) for check in action_api_acceptance_checks)
+                and any("decoded payload matches" in str(reject) for reject in action_api_reject_if)
+                and any("Offline decode shows" in str(check) for check in template_api_acceptance_checks)
+                and any("decoded payload matches" in str(reject) for reject in template_api_reject_if)
+            ),
+            "expected": "action and template carry API oracle acceptance and reject conditions",
+            "actual": {
+                "action_acceptance": action_api_acceptance_checks[:6],
+                "action_reject_if": action_api_reject_if[:6],
+                "template_acceptance": template_api_acceptance_checks[:6],
+                "template_reject_if": template_api_reject_if[:6],
+            },
+        },
+        {
             "id": "request-brief-renders-api-oracle-profiles",
             "passed": (
                 "Evidence oracle profiles:" in request_markdown_case
@@ -27875,11 +27989,13 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             "passed": (
                 not any(stale_missing_profile_schema_cases.values())
                 and not any(stale_missing_summary_schema_cases.values())
+                and not any(stale_missing_oracle_schema_cases.values())
             ),
-            "expected": {"missing_profiles": False, "missing_summary_counts": False},
+            "expected": {"missing_profiles": False, "missing_summary_counts": False, "missing_oracle_conditions": False},
             "actual": {
                 "missing_profiles": stale_missing_profile_schema_cases,
                 "missing_summary_counts": stale_missing_summary_schema_cases,
+                "missing_oracle_conditions": stale_missing_oracle_schema_cases,
             },
         },
     ]
@@ -28357,6 +28473,14 @@ def build_bounty_evidence_templates(
             template["api_authorization_evidence_questions"] = normalize_string_list(
                 action.get("api_authorization_evidence_questions")
             )
+            template["api_authorization_acceptance_checks"] = normalize_string_list(
+                action.get("api_authorization_acceptance_checks")
+            )
+            template["api_authorization_reject_if"] = normalize_string_list(
+                action.get("api_authorization_reject_if")
+            )
+            template["acceptance_checklist"] = normalize_string_list(action.get("acceptance_checklist"))
+            template["reject_if"] = normalize_string_list(action.get("reject_if"))
             template["after_filling_commands"] = ordered_unique_strings(
                 [
                     validation_command_for_artifact_dir(
@@ -80296,6 +80420,8 @@ def run_bounty_evidence_workorders(args: argparse.Namespace) -> int:
             if getattr(args, "show_checklist", False):
                 for capture in normalize_string_list(item.get("must_capture"))[:3]:
                     print(f"  capture={inline_summary_text(capture, max_chars=260)}")
+                for accept in normalize_string_list(item.get("api_authorization_acceptance_checks"))[:2]:
+                    print(f"  api_accept={inline_summary_text(accept, max_chars=280)}")
                 for reject in normalize_string_list(item.get("lane_reject_if"))[:2]:
                     print(f"  reject_if={inline_summary_text(reject, max_chars=260)}")
             if getattr(args, "show_commands", False):
@@ -80732,6 +80858,10 @@ def run_bounty_evidence_authorization(args: argparse.Namespace) -> int:
                     print(f"  allowed={inline_summary_text(allowed, max_chars=280)}")
                 for forbidden in normalize_string_list(row.get("forbidden_actions"))[: max(1, min(3, int(args.contract_items)))]:
                     print(f"  forbidden={inline_summary_text(forbidden, max_chars=280)}")
+                for accept in normalize_string_list(row.get("api_authorization_acceptance_checks"))[: max(1, min(2, int(args.contract_items)))]:
+                    print(f"  api_accept={inline_summary_text(accept, max_chars=280)}")
+                for reject in normalize_string_list(row.get("api_authorization_reject_if"))[: max(1, min(2, int(args.contract_items)))]:
+                    print(f"  api_reject={inline_summary_text(reject, max_chars=280)}")
                 for field in normalize_string_list(row.get("handoff_fields"))[: max(1, min(8, int(args.contract_items) * 2))]:
                     print(f"  field={inline_summary_text(field, max_chars=120)}")
             if getattr(args, "show_commands", False):
@@ -81075,6 +81205,12 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
                 risks = ", ".join(normalize_string_list(row.get("redaction_risks"))[:4])
                 if risks:
                     print(f"  redaction_risks={inline_summary_text(risks, max_chars=260)}")
+                accepts = normalize_string_list(row.get("api_authorization_acceptance_checks"))
+                if accepts:
+                    print(f"  api_accept={inline_summary_text(accepts[0], max_chars=280)}")
+                rejects = normalize_string_list(row.get("api_authorization_reject_if"))
+                if rejects:
+                    print(f"  api_reject={inline_summary_text(rejects[0], max_chars=280)}")
                 if row.get("blocked_by_official_evidence"):
                     print("  blocker=official-evidence-required")
         remaining = len(queue.get("actions", []) or []) - display_limit
@@ -81507,6 +81643,12 @@ def run_bounty_evidence_templates(args: argparse.Namespace) -> int:
             api_profiles = ", ".join(normalize_string_list(row.get("api_authorization_profile_ids"))[:4])
             if api_profiles:
                 print(f"  api_profiles={inline_summary_text(api_profiles, max_chars=260)}")
+            accepts = normalize_string_list(row.get("api_authorization_acceptance_checks"))
+            if accepts:
+                print(f"  api_accept={inline_summary_text(accepts[0], max_chars=280)}")
+            rejects = normalize_string_list(row.get("api_authorization_reject_if"))
+            if rejects:
+                print(f"  api_reject={inline_summary_text(rejects[0], max_chars=280)}")
             commands = normalize_string_list(row.get("after_filling_commands"))
             if commands:
                 print(f"  validate={inline_summary_text(commands[0], max_chars=420)}")
