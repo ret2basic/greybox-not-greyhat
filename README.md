@@ -1580,6 +1580,10 @@ direction, and payload type. By default it previews only. With
 evidence sidecars. Generated intent remains `approved_for_offline_validation=false`
 unless `--approve-offline-validation` is supplied after operator review, and an
 approved import also requires a real `--approval-reference`.
+When an approved HAR, Burp XML export, JSON-wrapped exchange, or raw HTTP
+exchange is staged directly under `.greybox/discover-check/operator-inputs`,
+`evidence-sidecar-drafts` and `bounty-shortest-path` surface the importable
+candidate and its exact no-write preview command.
 
 `transaction-corpus-preflight --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --intent-input ./approved-quote-intent.json --no-write --show-policy-json --show-checks --show-commands`
 is the paired offline intake check for one approved quote request body and the
