@@ -594,6 +594,13 @@ evidence. It also carries the `evidence_intake_manifest` summary, including
 artifact counts, pair-binding status, required binding fields, copy policy, and
 reject rules, so the methodology funnel shows exactly what the next approved
 evidence handoff must contain.
+`bounty_harness_alignment` also emits `iteration_strategy`, a compact routing
+decision for unattended work. It separates the human/operator official-evidence
+lane from agent-safe offline deepening, names the first missing artifact, tells
+whether the agent can continue offline, and records the explicit
+`do_not_promote_reason` while Medium+ evidence is absent. This strategy is
+workflow control only; it does not create sidecars, collect traffic, or bypass
+intake, finding-gate, or adjudication.
 It also emits `assessment_mode_comparison`, which scores the same candidates as
 both `greybox` and `blackbox` without changing the profile. This makes it clear
 when coverage-first and bounty-first modes would pursue different top leads, and
