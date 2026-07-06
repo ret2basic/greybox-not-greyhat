@@ -1560,6 +1560,13 @@ the evidence path focused on the shortest valid high-impact bounty candidate.
 When the resource gate is degraded or critical, it keeps capture steps marked as
 blocked and only prints sidecar formats plus decode commands:
 
+With `--show-commands`, the corpus checklist uses the same command-safety
+labels as frontier, gate, and evidence-contract views. Policy preparation and
+decode previews that still contain wallet or amount placeholders are printed as
+`[manual-template]`; sidecar review remains `[review-gated]` until a reviewable
+approved corpus exists; only fully local ready commands are eligible for
+autorun metadata.
+
 ```bash
 python3 scripts/inferforge.py transaction-corpus-checklist --no-write --show-commands --show-steps --skip-current-resource-check
 ```
