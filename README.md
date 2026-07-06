@@ -489,6 +489,10 @@ preview commands document the exact post-evidence chain, but they remain
 `review-gated`, `after_ready_autorun=false`, and blocked on the official
 evidence bundle until every required contract is
 `ready-no-write-contract-validation`.
+The bundle plan keeps both views in JSON: `after_ready_validation_command_safety`
+describes the intrinsic no-write commands, while
+`after_ready_validation_gated_command_safety` and
+`autorunnable_after_ready_validation_commands` reflect the current evidence gate.
 Stage commands printed by `bounty-shortest-path --show-stages --show-commands`
 carry the same command-safety classifications. Commands in blocked stages remain
 `review-gated` or `manual-template`, and only stages whose local no-write
