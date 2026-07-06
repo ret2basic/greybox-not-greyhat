@@ -593,8 +593,15 @@ It also emits `assessment_mode_comparison`, which scores the same candidates as
 both `greybox` and `blackbox` without changing the profile. This makes it clear
 when coverage-first and bounty-first modes would pursue different top leads, and
 how many secondary candidates blackbox mode would park behind the dominant
-bounty path. Add `--show-funnel --show-mode-comparison` to print those stage
-blockers and per-mode scores directly in the no-write CLI output.
+bounty path. `assessment_strategy_reconciliation` then compares the validation
+plan, methodology high-value queue, and bounty reportability funnel as separate
+selection sources. It records the active source, the recommended follow source,
+the reportability source, and split reasons such as
+`validation-vs-methodology-source`, so unattended loops can follow the active
+mode without confusing a greybox coverage target with a bounty-valid evidence
+blocker. Add `--show-funnel --show-mode-comparison` to print those stage
+blockers, per-mode scores, and reconciliation status directly in the no-write
+CLI output.
 
 Use `lead-dossier` when you want the same evidence closure in a tighter
 bug-bounty style lead file. It applies the “read code, constrain by
