@@ -66221,6 +66221,9 @@ def build_transaction_decoder_selftest(
     sidecar_mismatch_review: dict[str, Any] = {}
     sidecar_empty_review: dict[str, Any] = {}
     sidecar_empty_transaction_closure: dict[str, Any] = {}
+    prepared_sidecar_return_code = 1
+    prepared_sidecar_review: dict[str, Any] = {}
+    prepared_sidecar_prep_doc: dict[str, Any] = {}
     with tempfile.TemporaryDirectory() as temp_dir:
         guard_artifact_dir = Path(temp_dir) / "transaction-sidecar-guard"
         guard_artifact_dir.mkdir()
@@ -66380,6 +66383,71 @@ def build_transaction_decoder_selftest(
             profile=profile,
             artifact_dir=evm_artifact_dir,
         )
+        prepared_artifact_dir = Path(temp_dir) / "transaction-sidecar-prepared"
+        prepared_artifact_dir.mkdir()
+        prepared_profile_path = Path(temp_dir) / "prepared-profile.json"
+        write_json(prepared_profile_path, profile or default_target_profile())
+        prepared_request_input = Path(temp_dir) / "approved-quote-request.json"
+        write_json(
+            prepared_request_input,
+            build_quote_request_body(
+                profile,
+                direction,
+                payload["wallet"],
+                amount_in,
+                recipient=payload["wallet"],
+                source_mint=payload["sourceMint"],
+                destination_mint=payload["destinationMint"],
+            ),
+        )
+        prepared_payload_input = Path(temp_dir) / "approved-quote-response.json"
+        write_json(
+            prepared_payload_input,
+            {
+                "payloads": [
+                    {
+                        "data": {
+                            "type": "svm",
+                            "transaction": payload["base64"],
+                        }
+                    }
+                ]
+            },
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            prepared_sidecar_return_code = run_prepare_transaction_corpus_sidecars(
+                argparse.Namespace(
+                    profile=str(prepared_profile_path),
+                    artifact_dir=str(prepared_artifact_dir),
+                    target=DEFAULT_TARGET,
+                    source_root=str(source_root),
+                    request_input=str(prepared_request_input),
+                    payload_input=str(prepared_payload_input),
+                    approval_reference="SELFTEST-APPROVED-TX-CORPUS",
+                    redaction_note=["Synthetic transaction decoder self-test corpus."],
+                    direction=direction,
+                    output=None,
+                    max_input_bytes=DEFAULT_TRANSACTION_CANDIDATE_INPUT_BYTES,
+                    top=8,
+                    show_policy_json=False,
+                    show_payload_summary_json=False,
+                    show_checks=False,
+                    show_commands=False,
+                    show_json=False,
+                    write_official_sidecars=True,
+                    replace=False,
+                    no_write=False,
+                    strict=True,
+                )
+            )
+        prepared_sidecar_prep_doc = load_optional_json(
+            prepared_artifact_dir / TRANSACTION_CORPUS_SIDECAR_PREP_ARTIFACT
+        ) or {}
+        prepared_sidecar_review = build_transaction_sidecar_review(
+            target=DEFAULT_TARGET,
+            profile=profile,
+            artifact_dir=prepared_artifact_dir,
+        )
     sidecar_guard_passed = (
         sidecar_guard_intent.get("candidates_seen") == 0
         and sidecar_guard_intent.get("resource_limits", {}).get("max_transaction_candidate_input_bytes") == 32
@@ -66501,6 +66569,20 @@ def build_transaction_decoder_selftest(
         and (sidecar_evm_shape_review.get("summary", {}).get("kind_counts") or {}).get("evm-executable-payload") == 1
         and "EVM executable payloads" in str(sidecar_evm_review.get("next_step") or "")
     )
+    prepared_sidecar_text = json.dumps(prepared_sidecar_review, sort_keys=True)
+    prepared_sidecar_passed = (
+        prepared_sidecar_return_code == 0
+        and prepared_sidecar_prep_doc.get("status") == "ready-to-write-official-sidecars"
+        and prepared_sidecar_prep_doc.get("official_sidecars_written") is True
+        and prepared_sidecar_review.get("status") == "ready-for-decode"
+        and prepared_sidecar_review.get("summary", {}).get("candidate_count") == 1
+        and prepared_sidecar_review.get("summary", {}).get("intent_policy_valid") is True
+        and prepared_sidecar_review.get("summary", {}).get("ready_for_decode") is True
+        and prepared_sidecar_review.get("payload_contract_review", {}).get("status") == "payload-type-matched"
+        and prepared_sidecar_review.get("payload_contract_review", {}).get("allows_decode") is True
+        and prepared_sidecar_review.get("decode_commands")
+        and payload["base64"] not in prepared_sidecar_text
+    )
     sidecar_contracts = [
         item
         for item in sidecar_empty_review.get("evidence_contracts", []) or []
@@ -66621,6 +66703,7 @@ def build_transaction_decoder_selftest(
         and sidecar_mismatch_passed
         and sidecar_empty_passed
         and sidecar_evm_passed
+        and prepared_sidecar_passed
         and sidecar_contract_passed
         and sidecar_empty_approval_packet_passed
         and sidecar_empty_closure_plan_passed
@@ -66707,6 +66790,17 @@ def build_transaction_decoder_selftest(
             "summary": sidecar_evm_review.get("summary", {}),
             "shape_review": sidecar_evm_shape_review,
             "next_step": sidecar_evm_review.get("next_step"),
+        },
+        "prepared_sidecar_write_review": {
+            "status": "passed" if prepared_sidecar_passed else "failed",
+            "prepare_return_code": prepared_sidecar_return_code,
+            "prepare_status": prepared_sidecar_prep_doc.get("status"),
+            "official_sidecars_written": prepared_sidecar_prep_doc.get("official_sidecars_written"),
+            "review_status": prepared_sidecar_review.get("status"),
+            "summary": prepared_sidecar_review.get("summary", {}),
+            "payload_contract_review": prepared_sidecar_review.get("payload_contract_review", {}),
+            "candidate_summaries": prepared_sidecar_review.get("candidate_summaries", []),
+            "decode_commands": prepared_sidecar_review.get("decode_commands", []),
         },
         "sidecar_evidence_contract": {
             "status": "passed" if sidecar_contract_passed else "failed",
