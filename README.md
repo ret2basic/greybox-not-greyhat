@@ -438,6 +438,11 @@ human handoff brief as well as in `bounty-shortest-path`.
 The brief summary and CLI now expose the same top intake manifest counts, so
 automation can verify artifact coverage and pair-binding requirements without
 parsing Markdown.
+The same brief also renders a compact handoff/unblocker summary: whether the
+agent can keep working offline, whether a human/operator evidence bundle is
+required for Medium+ promotion, the first missing official artifact, and the
+current promotion gate. This is status routing only; it does not create evidence
+or bypass intake, finding-gate, or adjudication.
 This keeps source-positive leads useful for targeting evidence while preventing
 them from being treated as bounty-valid findings. The brief also carries a
 machine-readable `brief_quality_gate` that checks active requests, required and
