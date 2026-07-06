@@ -289,8 +289,13 @@ use it after `resource-snapshot --strict` to decide whether to deepen an
 existing lead, regenerate passive leads, refresh adjudication, or stop because
 there is no reportable evidence yet. If the finding gate only has
 `blocked_gate_previews`, the issue-validation stage reports `gate-blockers` and
-prints offline gate/adjudication follow-ups first; those previews are the
-nearest evidence blockers, not reportable findings.
+checks the current `bounty-action-queue` `next_evidence_packet` before selecting
+focus commands. When the top packet is still `waiting-official-evidence`, the
+focus switches to `official-evidence-first`: ready commands refresh the action
+queue, evidence request brief, and evidence intake, while after-evidence lane
+validators stay in `gated_followup_commands` until the required sidecars pass
+intake. Those previews are the nearest evidence blockers, not reportable
+findings. `--top` is accepted as an alias for `--top-steps`.
 
 Use `methodology-review` to align the harness with business-logic testing
 methodology before broadening. It maps high-value threads to offline-safe
