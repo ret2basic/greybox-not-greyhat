@@ -26308,6 +26308,39 @@ def bounty_action_queue_cache_current(
     return cached == current
 
 
+def bounty_evidence_templates_cache_validation(
+    *,
+    bounty_action_queue: dict[str, Any] | None,
+    top: int,
+) -> dict[str, Any]:
+    return {
+        "schema": "inferforge-bounty-evidence-templates-cache-v1",
+        "top": max(1, int(top)),
+        "bounty_action_queue_status": artifact_summary_status(bounty_action_queue),
+        "bounty_action_queue_fingerprint": bounty_cache_fingerprint(
+            bounty_action_queue if isinstance(bounty_action_queue, dict) else {}
+        ),
+    }
+
+
+def bounty_evidence_templates_cache_current(
+    templates: dict[str, Any] | None,
+    *,
+    bounty_action_queue: dict[str, Any] | None,
+    top: int,
+) -> bool:
+    if not bounty_templates_have_current_api_authorization_schema(templates):
+        return False
+    cached = templates.get("cache_validation") if isinstance(templates, dict) else None
+    if not isinstance(cached, dict):
+        return False
+    current = bounty_evidence_templates_cache_validation(
+        bounty_action_queue=bounty_action_queue,
+        top=top,
+    )
+    return cached == current
+
+
 def bounty_intake_parse_jsonl(text: str) -> tuple[list[Any], list[str]]:
     rows = []
     errors = []
@@ -28753,6 +28786,30 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             adjudication=adjudication_doc,
             max_file_bytes=262144,
         )
+        stale_templates_case = build_bounty_evidence_templates(
+            target=target,
+            profile=None,
+            artifact_dir=artifact_dir,
+            bounty_action_queue=stale_queue_case,
+            top=1,
+        )
+        stale_templates_current_with_waiting = bounty_evidence_templates_cache_current(
+            stale_templates_case,
+            bounty_action_queue=stale_queue_case,
+            top=1,
+        )
+        stale_templates_current_with_ready = bounty_evidence_templates_cache_current(
+            stale_templates_case,
+            bounty_action_queue=rebuilt_ready_queue_case,
+            top=1,
+        )
+        rebuilt_ready_templates_case = build_bounty_evidence_templates(
+            target=target,
+            profile=None,
+            artifact_dir=artifact_dir,
+            bounty_action_queue=rebuilt_ready_queue_case,
+            top=1,
+        )
         template_case = build_bounty_evidence_templates(
             target=target,
             profile=None,
@@ -28841,6 +28898,16 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
     rebuilt_ready_action = (
         rebuilt_ready_queue_case.get("actions", [])[0]
         if isinstance(rebuilt_ready_queue_case.get("actions"), list) and rebuilt_ready_queue_case.get("actions")
+        else {}
+    )
+    stale_template_cache = (
+        stale_templates_case.get("cache_validation")
+        if isinstance(stale_templates_case.get("cache_validation"), dict)
+        else {}
+    )
+    rebuilt_template_cache = (
+        rebuilt_ready_templates_case.get("cache_validation")
+        if isinstance(rebuilt_ready_templates_case.get("cache_validation"), dict)
         else {}
     )
     template_api_profile_ids = {
@@ -29150,6 +29217,22 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "template-cache-invalidates-when-queue-changes",
+            "passed": stale_templates_current_with_waiting is True
+            and stale_templates_current_with_ready is False
+            and rebuilt_ready_templates_case.get("status") == "bounty-evidence-templates-ready"
+            and stale_template_cache.get("bounty_action_queue_fingerprint")
+            != rebuilt_template_cache.get("bounty_action_queue_fingerprint"),
+            "expected": "stale template package invalidates when action queue changes",
+            "actual": {
+                "stale_current_with_waiting": stale_templates_current_with_waiting,
+                "stale_current_with_ready": stale_templates_current_with_ready,
+                "rebuilt_status": rebuilt_ready_templates_case.get("status"),
+                "stale_queue_fingerprint": stale_template_cache.get("bounty_action_queue_fingerprint"),
+                "rebuilt_queue_fingerprint": rebuilt_template_cache.get("bounty_action_queue_fingerprint"),
+            },
+        },
+        {
             "id": "request-brief-renders-api-oracle-profiles",
             "passed": (
                 "Evidence oracle profiles:" in request_markdown_case
@@ -29218,6 +29301,8 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             "evidence_present_action_case": evidence_present_action_case,
             "stale_queue_case": stale_queue_case,
             "rebuilt_ready_queue_case": rebuilt_ready_queue_case,
+            "stale_templates_case": stale_templates_case,
+            "rebuilt_ready_templates_case": rebuilt_ready_templates_case,
         },
         "assertions": assertions,
         "safety": (
@@ -29748,6 +29833,10 @@ def build_bounty_evidence_templates(
         for profile_id in normalize_string_list(template.get("api_authorization_profile_ids")):
             increment_count(api_authorization_counts, profile_id)
     status = "bounty-evidence-templates-ready" if templates else "no-bounty-evidence-templates"
+    cache_validation = bounty_evidence_templates_cache_validation(
+        bounty_action_queue=bounty_action_queue,
+        top=top,
+    )
     return {
         "generated_at": utc_now(),
         "schema": "inferforge-bounty-evidence-templates-v1",
@@ -29763,7 +29852,9 @@ def build_bounty_evidence_templates(
             "template_kind_counts": dict(sorted(kind_counts.items())),
             "api_authorization_counts": dict(sorted(api_authorization_counts.items())),
             "bounty_action_queue_status": artifact_summary_status(bounty_action_queue),
+            "cache_top": cache_validation.get("top"),
         },
+        "cache_validation": cache_validation,
         "templates": templates,
         "target_evidence_paths": target_paths,
         "write_policy": (
@@ -83436,9 +83527,6 @@ def build_or_load_bounty_evidence_templates_for_run(
     max_file_bytes: int,
     top: int,
 ) -> dict[str, Any]:
-    templates = load_optional_json(artifact_dir / BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT)
-    if bounty_templates_have_current_api_authorization_schema(templates):
-        return templates
     queue = build_or_load_bounty_action_queue_for_run(
         target=target,
         profile=profile,
@@ -83446,6 +83534,13 @@ def build_or_load_bounty_evidence_templates_for_run(
         source_root=source_root,
         max_file_bytes=max_file_bytes,
     )
+    templates = load_optional_json(artifact_dir / BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT)
+    if bounty_evidence_templates_cache_current(
+        templates,
+        bounty_action_queue=queue,
+        top=top,
+    ):
+        return templates
     return build_bounty_evidence_templates(
         target=target,
         profile=profile,
