@@ -367,6 +367,13 @@ does not make the evidence reportable by itself. Intake rows also carry
 `autorunnable_after_evidence_validation_commands`: missing or blocked evidence
 keeps after-evidence validators `review-gated`, while only
 `ready-for-lane-validation` rows can expose autorunnable no-write validators.
+`bounty-readiness-rollup` applies the same guard one layer upstream: each lane
+row records `validation_execution_gate`, `validation_command_safety`, and
+`autorunnable_validation_commands`. Rows still missing official evidence, lane
+readiness, or reportability closure keep validation chains such as decode,
+finding gate, and adjudication classified as `review-gated`; only rows that
+clear official evidence, readiness, invalidity, and safe no-write command checks
+can expose autorunnable validation commands.
 Each queued action and the
 queue summary also record command-safety totals for that validation chain, so an
 agent can distinguish runnable no-write validators from manual templates,
