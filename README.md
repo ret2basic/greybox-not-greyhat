@@ -390,7 +390,10 @@ and placeholder/template boundaries. `--strict` fails if this quality gate is
 not passed.
 `adjudicate` links that same queue/brief context as `next_evidence_unblocker`,
 so a no-finding run can distinguish `waiting-official-evidence` from
-`blocked-brief-quality` without promoting the candidate.
+`blocked-brief-quality` without promoting the candidate. The unblocker also
+carries the harness active phase and phase gate, such as `official-evidence`
+and `triager-blocked-waiting-official-evidence`, so downstream automation can
+see why the triager is stopped.
 `iteration-decision` prints that unblocker next to the active assessment
 objective and labels `assessment-mode-split` when the greybox coverage focus and
 bounty/adjudication unblocker point at different lanes.
