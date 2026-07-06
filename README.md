@@ -1558,6 +1558,10 @@ those simple JSON paths are applied before the generic recursive/base64 scan so
 candidate summaries retain the provider-specific response location.
 When `quote_response.expected_payload_type` is set, JSON sidecars must also show
 that payload type before the sidecar is marked ready for decode.
+Responses that mix the expected transaction candidate with incompatible sibling
+payload shapes, such as EVM executable payloads, alternate transaction-shaped
+fields, or Solana payload records without `data.transaction`, are held for review
+before any official sidecar is prepared.
 `transaction-payload-preflight --input ./approved-payloads.jsonl --no-write --show-records --show-commands`
 is the offline intake check for a single approved local quote response or extracted
 payload before it is copied into `transaction-payloads.jsonl`. It accepts JSON,
