@@ -559,7 +559,8 @@ that handoff: `transaction-payloads.jsonl`, `transaction-intent-policy.json`,
 and an `approved-quote-intent.draft.json` operator-input template for
 `--intent-input`. The approved quote intent template is not an official evidence
 sidecar; it exists to bind the reviewer-approved wallet, mints, raw amount,
-chain, direction, payload type, approval reference, and `maxNumQuotes` before
+optional minimum destination amount, chain, direction, payload type, approval
+reference, and `maxNumQuotes` before
 `prepare-transaction-corpus-sidecars` writes official sidecars.
 `evidence-sidecar-drafts` carries the same transaction pair binding metadata in
 its non-evidence draft workbook: `approval_reference`, `request_text_sha256`,
@@ -1570,7 +1571,7 @@ matching approved quote response or extracted payload. The optional
 `--intent-input` file lets the reviewer bind a separate approved intent document
 to the request before official sidecar prep. When present, the intent JSON must
 match the request's wallet, source mint, destination mint, raw amount, optional
-recipient, chain, direction, and `maxNumQuotes` fields; mismatches stop the
+minimum destination amount, optional recipient, chain, direction, and `maxNumQuotes` fields; mismatches stop the
 preflight at `intent-needs-review`. It derives the intent policy preview from the
 request's configured sender, amount, source mint, and destination mint fields,
 verifies that the response/payload has exactly one compatible transaction
@@ -1768,8 +1769,10 @@ transaction-integrity impact; missing metadata remains non-finding context.
 For paired corpus preparation, `prepare-transaction-corpus-sidecars` can derive
 `minDestinationAmount` from a unique positive-integer `amountOut` in the same
 approved quote response/payload that supplies `transaction-payloads.jsonl`.
-Ambiguous or non-integer `amountOut` values stay in review and must be approved
-manually before they are used as the output-amount policy.
+If the approved quote intent input also declares `expected.min_destination_amount`
+or a supported alias such as `minDestinationAmount`, it must match that same
+derived value. Ambiguous, non-integer, or mismatched output amounts stay in review
+and must be approved manually before they are used as the output-amount policy.
 `transaction-intent.json.reportability_review` summarizes whether decoded
 checks are merely waiting for corpus/policy, passed for the current corpus, or
 contain signer, wallet, mint, or program mismatches that are ready for a
