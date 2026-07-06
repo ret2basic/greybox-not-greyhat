@@ -27457,6 +27457,28 @@ def bounty_prep_approval_packet_for_action(
             "transaction-intent-policy.json for the same quote request? Provide one approved quote transaction "
             "payload and one matching explicit intent policy."
         )
+    evidence_status_rows = [
+        row
+        for row in action.get("requested_evidence_status", []) or []
+        if isinstance(row, dict)
+    ]
+    if not evidence_status_rows:
+        evidence_status_rows = bounty_requested_evidence_status_rows(required, artifact_dir=artifact_dir)
+    missing_evidence = normalize_string_list(action.get("missing_official_evidence")) or [
+        str(row.get("label") or "")
+        for row in evidence_status_rows
+        if isinstance(row, dict) and str(row.get("status") or "").startswith(("missing", "operator-handoff"))
+    ]
+    present_evidence = normalize_string_list(action.get("present_official_evidence")) or [
+        str(row.get("label") or "")
+        for row in evidence_status_rows
+        if isinstance(row, dict) and row.get("status") == "present"
+    ]
+    operator_handoff = normalize_string_list(action.get("operator_handoff_evidence")) or [
+        str(row.get("label") or "")
+        for row in evidence_status_rows
+        if isinstance(row, dict) and row.get("status") == "operator-handoff-required"
+    ]
     packet = {
         "id": f"BOUNTY-PREP-{safe_probe_id(str(action.get('id') or lane))}",
         "status": "waiting-approved-evidence",
@@ -27467,9 +27489,20 @@ def bounty_prep_approval_packet_for_action(
         "gate_id": action.get("gate_id"),
         "expected_severity": action.get("expected_severity"),
         "required_artifacts": required,
+        "evidence_gate_status": action.get("evidence_gate_status") or bounty_evidence_gate_status(evidence_status_rows),
+        "requested_evidence_status": evidence_status_rows,
+        "missing_official_evidence": missing_evidence,
+        "present_official_evidence": present_evidence,
+        "operator_handoff_evidence": operator_handoff,
+        "api_authorization_profile_ids": normalize_string_list(action.get("api_authorization_profile_ids")),
+        "api_authorization_acceptance_checks": normalize_string_list(action.get("api_authorization_acceptance_checks")),
+        "api_authorization_reject_if": normalize_string_list(action.get("api_authorization_reject_if")),
         "redacted_sidecar_required_fields": normalize_string_list(authorization.get("handoff_fields"))[:16],
         "allowed_actions": normalize_string_list(authorization.get("allowed_actions"))[:8],
         "forbidden_actions": normalize_string_list(authorization.get("forbidden_actions"))[:12],
+        "after_evidence_validation_commands": normalize_string_list(
+            authorization.get("after_evidence_validation_commands")
+        )[:8],
         "approval_question": approval_question,
         "reportability_boundary": action.get("reportability_boundary") or authorization.get("reportability_boundary"),
     }
@@ -27531,6 +27564,10 @@ def build_bounty_prep_package(
         for action in actions
         if action
     ]
+    top_packet = approval_packets[0] if approval_packets else {}
+    evidence_gate_counts: dict[str, int] = {}
+    for packet in approval_packets:
+        increment_count(evidence_gate_counts, str(packet.get("evidence_gate_status") or "unknown"))
     template_command = bounty_prep_command_row(
         artifact_dir=artifact_dir,
         profile=profile,
@@ -27622,8 +27659,12 @@ def build_bounty_prep_package(
             "package_status": "waiting-approved-official-evidence" if required_artifacts else "no-required-artifacts",
             "oracle_type": top_lane or None,
             "first_missing_artifact": first_missing,
+            "evidence_gate_status": top_packet.get("evidence_gate_status"),
+            "missing_official_evidence": normalize_string_list(top_packet.get("missing_official_evidence")),
+            "operator_handoff_evidence": normalize_string_list(top_packet.get("operator_handoff_evidence")),
         },
         "required_artifacts": required_artifacts,
+        "evidence_gate_counts": dict(sorted(evidence_gate_counts.items())),
         "template_packages": [
             {
                 "action_id": "bounty-evidence-templates",
@@ -27866,6 +27907,10 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
         if isinstance(row, dict)
     ]
     approval_question = str(approval_packets[0].get("approval_question") or "") if approval_packets else ""
+    approval_packet_gate = approval_packets[0].get("evidence_gate_status") if approval_packets else None
+    approval_packet_missing_evidence = set(
+        normalize_string_list(approval_packets[0].get("missing_official_evidence")) if approval_packets else []
+    )
     status_rows = [
         row
         for row in (status_doc.get("required_evidence_artifacts", []) or [])
@@ -28029,8 +28074,13 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             "passed": (
                 (package.get("top_unblocker") or {}).get("lane") == "transaction-integrity"
                 and (package.get("top_unblocker") or {}).get("first_missing_artifact") == "transaction-payloads.jsonl"
+                and (package.get("top_unblocker") or {}).get("evidence_gate_status") == "blocked-missing-official-evidence-file"
             ),
-            "expected": {"lane": "transaction-integrity", "first_missing_artifact": "transaction-payloads.jsonl"},
+            "expected": {
+                "lane": "transaction-integrity",
+                "first_missing_artifact": "transaction-payloads.jsonl",
+                "evidence_gate_status": "blocked-missing-official-evidence-file",
+            },
             "actual": package.get("top_unblocker"),
         },
         {
@@ -28050,6 +28100,21 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             ),
             "expected": "transaction-payloads.jsonl appears before transaction-intent-policy.json",
             "actual": approval_question,
+        },
+        {
+            "id": "approval-packet-carries-evidence-gate",
+            "passed": (
+                approval_packet_gate == "blocked-missing-official-evidence-file"
+                and {"transaction-payloads.jsonl", "transaction-intent-policy.json"} <= approval_packet_missing_evidence
+            ),
+            "expected": {
+                "gate": "blocked-missing-official-evidence-file",
+                "missing": ["transaction-payloads.jsonl", "transaction-intent-policy.json"],
+            },
+            "actual": {
+                "gate": approval_packet_gate,
+                "missing": sorted(approval_packet_missing_evidence),
+            },
         },
         {
             "id": "prep-sync-aligned-waiting-evidence",
@@ -81500,10 +81565,12 @@ def run_bounty_prep_package(args: argparse.Namespace) -> int:
         f"lane={top_unblocker.get('lane') or '-'} "
         f"action={top_unblocker.get('actionability') or '-'} "
         f"first_missing={top_unblocker.get('first_missing_artifact') or '-'} "
+        f"gate={top_unblocker.get('evidence_gate_status') or '-'} "
         f"required={len(package.get('required_artifacts', []) or [])} "
         f"templates={command_plan.get('template_package_count', 0)} "
         f"approval_packets={len(package.get('approval_packets', []) or [])}"
     )
+    print(f"Evidence gates: {json.dumps(package.get('evidence_gate_counts', {}), sort_keys=True)}")
     required = ", ".join(normalize_string_list(package.get("required_artifacts"))[:8])
     if required:
         print(f"Required evidence: {inline_summary_text(required, max_chars=420)}")
@@ -81516,6 +81583,11 @@ def run_bounty_prep_package(args: argparse.Namespace) -> int:
                 f"- {packet.get('id')}: lane={packet.get('lane')} status={packet.get('status')} "
                 f"needs={inline_summary_text(packet.get('required_artifacts'), max_chars=260)}"
             )
+            if packet.get("evidence_gate_status"):
+                print(f"  evidence_gate={packet.get('evidence_gate_status')}")
+            missing = ", ".join(normalize_string_list(packet.get("missing_official_evidence"))[:4])
+            if missing:
+                print(f"  missing_evidence={inline_summary_text(missing, max_chars=300)}")
             question = packet.get("approval_question")
             if question:
                 print(f"  question={inline_summary_text(question, max_chars=360)}")
