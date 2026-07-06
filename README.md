@@ -475,7 +475,10 @@ missing sidecar and official evidence contract blocker. The same first-gap
 packet now carries `source_invariant_context`, so `--show-funnel` can print the
 source invariant, source signal, and negative controls that explain why a
 source-positive path is still not promotable without approved official
-evidence.
+evidence. It also carries the `evidence_intake_manifest` summary, including
+artifact counts, pair-binding status, required binding fields, copy policy, and
+reject rules, so the methodology funnel shows exactly what the next approved
+evidence handoff must contain.
 It also emits `assessment_mode_comparison`, which scores the same candidates as
 both `greybox` and `blackbox` without changing the profile. This makes it clear
 when coverage-first and bounty-first modes would pursue different top leads, and
