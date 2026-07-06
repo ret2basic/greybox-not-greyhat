@@ -1456,6 +1456,10 @@ destination-mint transfers and gates a concrete shortfall as candidate
 transaction-integrity impact; if the output amount is not visible in the
 unsigned transaction payload, the check stays in manual review instead of
 claiming a finding.
+When token-account metadata is available, the destination amount must also be
+credited to the expected recipient/wallet owner. A concrete owner or mint
+mismatch on the credited destination output is treated as candidate
+transaction-integrity impact; missing metadata remains non-finding context.
 For paired corpus preparation, `prepare-transaction-corpus-sidecars` can derive
 `minDestinationAmount` from a unique positive-integer `amountOut` in the same
 approved quote response/payload that supplies `transaction-payloads.jsonl`.
