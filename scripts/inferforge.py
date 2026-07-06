@@ -26302,10 +26302,174 @@ def bounty_intake_scan_file(path: Path, *, max_file_bytes: int) -> dict[str, Any
     }
 
 
+def bounty_intake_operator_evidence_requested(path_refs: list[Path]) -> bool:
+    return any(path.name == OPERATOR_EVIDENCE_ARTIFACT for path in path_refs)
+
+
+def bounty_intake_build_provenance_decision_ids(
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    source_root: Path | None,
+) -> list[str]:
+    secret_review = load_optional_json(artifact_dir / SECRET_EXPOSURE_REVIEW_ARTIFACT)
+    if not isinstance(secret_review, dict) and source_root is not None:
+        secret_review = build_secret_exposure_review(
+            source_root=source_root,
+            profile=profile,
+            max_file_bytes=DEFAULT_DEPLOYMENT_REVIEW_MAX_FILE_BYTES,
+            max_files=64,
+        )
+    actionable_rows = (
+        secret_review.get("actionable_review_items", [])
+        if isinstance(secret_review, dict)
+        and isinstance(secret_review.get("actionable_review_items"), list)
+        else []
+    )
+    build_provenance_rows = [
+        row
+        for row in actionable_rows
+        if isinstance(row, dict)
+        and str(row.get("status") or "") == "needs-build-provenance-review"
+    ]
+    return ordered_unique_strings(
+        [
+            str(row.get("id") or "")
+            for row in build_provenance_operator_decisions(build_provenance_rows)
+            if isinstance(row, dict) and row.get("id")
+        ]
+    )
+
+
+def bounty_intake_required_operator_decision_ids(
+    request: dict[str, Any],
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    source_root: Path | None,
+) -> list[str]:
+    lane = str(request.get("lane") or "")
+    if lane == "build-secret-exposure":
+        return bounty_intake_build_provenance_decision_ids(
+            artifact_dir=artifact_dir,
+            profile=profile,
+            source_root=source_root,
+        )
+    if lane == "credentialed-provider-impact":
+        return sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS)
+    if lane == "resource-control":
+        return sorted(OPERATOR_RESOURCE_CONTROL_DECISION_IDS)
+    if lane == "websocket-header-trust":
+        return sorted(OPERATOR_WEBSOCKET_HEADER_DECISION_IDS)
+    return []
+
+
+def bounty_intake_operator_evidence_scope_review(
+    request: dict[str, Any],
+    *,
+    artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    source_root: Path | None,
+    path_refs: list[Path],
+) -> dict[str, Any]:
+    if not bounty_intake_operator_evidence_requested(path_refs):
+        return {
+            "status": "not-requested",
+            "required_operator_decision_ids": [],
+            "present_operator_decision_ids": [],
+            "missing_operator_decision_ids": [],
+        }
+
+    required_ids = bounty_intake_required_operator_decision_ids(
+        request,
+        artifact_dir=artifact_dir,
+        profile=profile,
+        source_root=source_root,
+    )
+    required_set = {decision_id for decision_id in required_ids if decision_id}
+    operator_evidence, sidecar_file = load_operator_evidence_sidecar(artifact_dir)
+    accepted_statuses = sorted(OPERATOR_EVIDENCE_PRESENT_STATUSES)
+    sidecar_validation = operator_evidence_sidecar_validation_review(
+        operator_evidence=operator_evidence,
+        sidecar_file=sidecar_file,
+        required_decision_ids=required_ids,
+        accepted_present_statuses=accepted_statuses,
+    )
+    present_required = normalize_string_list(sidecar_validation.get("present_required_decisions"))
+    missing_required = normalize_string_list(sidecar_validation.get("missing_required_decisions"))
+    scoped_reviews = [
+        operator_evidence_sidecar_item_validation(
+            item,
+            index=index,
+            required_decision_ids=required_set,
+            accepted_present_statuses=set(accepted_statuses),
+        )
+        for index, item in enumerate(operator_evidence_items(operator_evidence), start=1)
+        if operator_evidence_item_id(item) in required_set
+    ]
+    invalid_required = [
+        row
+        for row in scoped_reviews
+        if row.get("status") in {"invalid", "missing-fields"}
+        or row.get("invalid_fields")
+        or row.get("missing_fields")
+    ]
+    warning_required = [row for row in scoped_reviews if row.get("warnings")]
+    pending_required = [row for row in scoped_reviews if row.get("status") == "pending"]
+    file_status = str(sidecar_file.get("status") or "missing")
+    if not required_ids:
+        status = "waiting-operator-decision-scope"
+    elif file_status not in {"present", "provided-in-memory"}:
+        status = "missing-operator-evidence-file"
+    elif invalid_required:
+        status = "blocked-invalid-operator-evidence"
+    elif warning_required:
+        status = "blocked-operator-evidence-redaction-review"
+    elif missing_required:
+        status = "waiting-lane-operator-evidence"
+    else:
+        status = "ready"
+
+    next_step = "Run the after-evidence validation commands for this lane."
+    if status == "waiting-operator-decision-scope":
+        next_step = "Refresh the lane readiness command to derive required operator evidence decision ids before intake can pass."
+    elif status == "missing-operator-evidence-file":
+        next_step = f"Provide {OPERATOR_EVIDENCE_ARTIFACT} with approved redacted rows for this lane."
+    elif status == "waiting-lane-operator-evidence":
+        next_step = (
+            f"Add approved redacted {OPERATOR_EVIDENCE_ARTIFACT} row(s) for required decision id(s): "
+            f"{', '.join(missing_required[:6])}."
+        )
+    elif status == "blocked-invalid-operator-evidence":
+        next_step = f"Fix malformed required {OPERATOR_EVIDENCE_ARTIFACT} row(s) before lane validation."
+    elif status == "blocked-operator-evidence-redaction-review":
+        next_step = f"Fix required {OPERATOR_EVIDENCE_ARTIFACT} row warning(s) or redaction/source_ref gaps before lane validation."
+
+    return {
+        "status": status,
+        "lane": request.get("lane"),
+        "path": sidecar_file.get("path") or repo_relative_or_absolute(artifact_dir / OPERATOR_EVIDENCE_ARTIFACT),
+        "sidecar_file_status": file_status,
+        "sidecar_validation_status": sidecar_validation.get("status"),
+        "required_operator_decision_ids": required_ids,
+        "present_operator_decision_ids": present_required,
+        "missing_operator_decision_ids": missing_required,
+        "invalid_required_rows": len(invalid_required),
+        "warning_required_rows": len(warning_required),
+        "pending_required_rows": len(pending_required),
+        "first_missing_field": sidecar_validation.get("first_missing_field"),
+        "first_invalid_field": sidecar_validation.get("first_invalid_field"),
+        "required_row_reviews": scoped_reviews[:12],
+        "next_step": next_step,
+    }
+
+
 def bounty_intake_request_review(
     request: dict[str, Any],
     *,
     artifact_dir: Path,
+    profile: dict[str, Any] | None,
+    source_root: Path | None,
     max_file_bytes: int,
 ) -> dict[str, Any]:
     raw_evidence = normalize_string_list(request.get("requested_official_evidence"))
@@ -26323,6 +26487,14 @@ def bounty_intake_request_review(
         seen_paths.add(key)
         path_refs.append(path)
     files = [bounty_intake_scan_file(path, max_file_bytes=max_file_bytes) for path in path_refs]
+    operator_scope = bounty_intake_operator_evidence_scope_review(
+        request,
+        artifact_dir=artifact_dir,
+        profile=profile,
+        source_root=source_root,
+        path_refs=path_refs,
+    )
+    operator_status = str(operator_scope.get("status") or "not-requested")
     missing = [row for row in files if row.get("status") in {"missing", "empty", "not-a-file"}]
     invalid = [row for row in files if row.get("status") == "invalid-format"]
     unapproved = [
@@ -26344,6 +26516,14 @@ def bounty_intake_request_review(
         status = "blocked-template-or-unapproved-evidence"
     elif redaction:
         status = "blocked-redaction-review"
+    elif operator_status == "waiting-operator-decision-scope":
+        status = "waiting-lane-operator-evidence"
+    elif operator_status == "waiting-lane-operator-evidence":
+        status = "waiting-lane-operator-evidence"
+    elif operator_status == "blocked-invalid-operator-evidence":
+        status = "blocked-invalid-operator-evidence"
+    elif operator_status == "blocked-operator-evidence-redaction-review":
+        status = "blocked-operator-evidence-redaction-review"
     elif path_refs and len(clean) == len(path_refs):
         status = "ready-for-lane-validation"
     elif descriptive_refs and not path_refs:
@@ -26369,6 +26549,11 @@ def bounty_intake_request_review(
         "invalid_format_files": len(invalid),
         "unapproved_or_template_files": len(unapproved),
         "redaction_review_files": len(redaction),
+        "operator_evidence_scope": operator_scope,
+        "operator_evidence_status": operator_status,
+        "required_operator_decision_ids": normalize_string_list(operator_scope.get("required_operator_decision_ids")),
+        "present_operator_decision_ids": normalize_string_list(operator_scope.get("present_operator_decision_ids")),
+        "missing_operator_decision_ids": normalize_string_list(operator_scope.get("missing_operator_decision_ids")),
         "redaction_risks": ordered_unique_strings(
             [
                 risk
@@ -26392,6 +26577,13 @@ def bounty_intake_request_review(
             if unapproved
             else "Remove raw secret-like data or forbidden fields before lane validation."
             if redaction
+            else operator_scope.get("next_step")
+            if operator_status in {
+                "waiting-operator-decision-scope",
+                "waiting-lane-operator-evidence",
+                "blocked-invalid-operator-evidence",
+                "blocked-operator-evidence-redaction-review",
+            }
             else "Run the after-evidence validation commands for this lane."
             if path_refs and len(clean) == len(path_refs)
             else "Attach a redacted operator/build provenance summary and approval reference."
@@ -26409,6 +26601,7 @@ def build_bounty_evidence_intake(
     artifact_dir: Path,
     bounty_evidence_authorization: dict[str, Any] | None,
     max_file_bytes: int,
+    source_root: Path | None = None,
 ) -> dict[str, Any]:
     requests = (
         bounty_evidence_authorization.get("authorization_requests", [])
@@ -26420,6 +26613,8 @@ def build_bounty_evidence_intake(
         bounty_intake_request_review(
             request,
             artifact_dir=artifact_dir,
+            profile=profile,
+            source_root=source_root,
             max_file_bytes=max_file_bytes,
         )
         for request in requests
@@ -26427,9 +26622,13 @@ def build_bounty_evidence_intake(
     ]
     status_counts: dict[str, int] = {}
     lane_counts: dict[str, int] = {}
+    operator_status_counts: dict[str, int] = {}
     for row in reviews:
         increment_count(status_counts, str(row.get("status") or "unknown"))
         increment_count(lane_counts, str(row.get("lane") or "unknown"))
+        operator_status = str(row.get("operator_evidence_status") or "not-requested")
+        if operator_status != "not-requested":
+            increment_count(operator_status_counts, operator_status)
     ready = [row for row in reviews if row.get("status") == "ready-for-lane-validation"]
     blocked = [
         row
@@ -26490,6 +26689,7 @@ def build_bounty_evidence_intake(
             "top_status": top.get("status"),
             "status_counts": dict(sorted(status_counts.items())),
             "lane_counts": dict(sorted(lane_counts.items())),
+            "operator_evidence_status_counts": dict(sorted(operator_status_counts.items())),
             "bounty_evidence_authorization_status": artifact_summary_status(bounty_evidence_authorization),
             "max_file_bytes": max_file_bytes,
         },
@@ -26501,8 +26701,9 @@ def build_bounty_evidence_intake(
         "approval_risk_kinds": approval_risks,
         "commands": commands[:12],
         "reportability_rule": (
-            "Intake only checks file presence, shape, approval/template markers, and redaction risk. It is not evidence validation "
-            "and cannot promote a finding. Medium+ still requires lane readiness, finding-gate acceptance, and adjudication."
+            "Intake checks file presence, shape, approval/template markers, redaction risk, and lane-scoped operator decision "
+            "coverage for operator-evidence.json. It is not evidence validation and cannot promote a finding. Medium+ still "
+            "requires lane readiness, finding-gate acceptance, and adjudication."
         ),
         "next_step": (
             top.get("next_step")
@@ -26557,6 +26758,74 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
             artifact_dir=case_root,
             bounty_evidence_authorization=authorization_for(sidecar, request_id=f"AUTHZ-{case_name}"),
             max_file_bytes=262144,
+            source_root=case_root,
+        )
+
+    def operator_authorization_for(path: Path, *, lane: str, request_id: str) -> dict[str, Any]:
+        return {
+            "generated_at": utc_now(),
+            "schema": "inferforge-bounty-evidence-authorization-v1",
+            "status": "authorization-required-before-evidence-collection",
+            "target": target,
+            "authorization_requests": [
+                {
+                    "id": request_id,
+                    "lane": lane,
+                    "entrypoint": "operator evidence self-test",
+                    "expected_severity": "medium-candidate",
+                    "priority_decision": "pursue-high-value",
+                    "requested_official_evidence": [str(path)],
+                    "requested_official_evidence_labels": [path.name],
+                    "after_evidence_validation_commands": ["operator-evidence-review --no-write"],
+                    "recommended_after_evidence_command": "operator-evidence-review --no-write",
+                    "reportability_boundary": "Synthetic operator evidence intake self-test request only.",
+                }
+            ],
+        }
+
+    def operator_row(decision_id: str, *, status: str = "confirmed", source_ref: str = "self-test-approved-redacted-fixture") -> dict[str, Any]:
+        return {
+            "id": decision_id,
+            "status": status,
+            "evidence_type": "operator-statement",
+            "summary": f"Redacted self-test evidence confirms decision {decision_id}.",
+            "source_ref": source_ref,
+        }
+
+    def operator_sidecar(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "schema": "inferforge-operator-evidence-v1",
+            "evidence_items": rows,
+        }
+
+    def run_operator_case(
+        case_name: str,
+        *,
+        lane: str,
+        rows: list[dict[str, Any]],
+        secret_actionable_rows: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        case_root = root / case_name
+        case_root.mkdir(parents=True, exist_ok=True)
+        sidecar = case_root / OPERATOR_EVIDENCE_ARTIFACT
+        write_json(sidecar, operator_sidecar(rows))
+        if secret_actionable_rows is not None:
+            write_json(
+                case_root / SECRET_EXPOSURE_REVIEW_ARTIFACT,
+                {
+                    "generated_at": utc_now(),
+                    "schema": "inferforge-secret-exposure-review-v1",
+                    "status": "needs-build-secret-review",
+                    "actionable_review_items": secret_actionable_rows,
+                },
+            )
+        return build_bounty_evidence_intake(
+            target=target,
+            profile=None,
+            artifact_dir=case_root,
+            bounty_evidence_authorization=operator_authorization_for(sidecar, lane=lane, request_id=f"AUTHZ-{case_name}"),
+            max_file_bytes=262144,
+            source_root=case_root,
         )
 
     with tempfile.TemporaryDirectory(prefix="inferforge-bounty-evidence-intake-selftest-") as temp_dir:
@@ -26606,6 +26875,69 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
                 ],
             },
         )
+        build_actionable_rows = [
+            {
+                "id": "secret-dockerfile-13-docker-secret-arg",
+                "status": "needs-build-provenance-review",
+                "kind": "docker-build-secret",
+                "file": "Dockerfile",
+                "line": 13,
+                "name": "NODE_AUTH_TOKEN",
+                "severity": "medium-candidate",
+            },
+            {
+                "id": "secret-dockerfile-14-docker-secret-env",
+                "status": "needs-build-provenance-review",
+                "kind": "docker-build-secret",
+                "file": "Dockerfile",
+                "line": 14,
+                "name": "NODE_AUTH_TOKEN",
+                "severity": "medium-candidate",
+            },
+        ]
+        build_decision_ids = [
+            str(row.get("id"))
+            for row in build_provenance_operator_decisions(build_actionable_rows)
+            if isinstance(row, dict) and row.get("id")
+        ]
+        build_operator_case = run_operator_case(
+            "operator_build_ready",
+            lane="build-secret-exposure",
+            rows=[operator_row(decision_id) for decision_id in build_decision_ids],
+            secret_actionable_rows=build_actionable_rows,
+        )
+        provider_from_build_case = run_operator_case(
+            "operator_provider_from_build_only",
+            lane="credentialed-provider-impact",
+            rows=[operator_row(decision_id) for decision_id in build_decision_ids],
+        )
+        provider_ready_case = run_operator_case(
+            "operator_provider_ready",
+            lane="credentialed-provider-impact",
+            rows=[operator_row(decision_id) for decision_id in sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS)],
+        )
+        provider_warning_case = run_operator_case(
+            "operator_provider_warning",
+            lane="credentialed-provider-impact",
+            rows=[
+                operator_row(
+                    decision_id,
+                    source_ref="" if decision_id == "credentialed-upstream-billing-impact" else "self-test-approved-redacted-fixture",
+                )
+                for decision_id in sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS)
+            ],
+        )
+        provider_pending_case = run_operator_case(
+            "operator_provider_pending",
+            lane="credentialed-provider-impact",
+            rows=[
+                operator_row(
+                    decision_id,
+                    status="pending" if decision_id == "credentialed-upstream-billing-impact" else "confirmed",
+                )
+                for decision_id in sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS)
+            ],
+        )
 
     def first_review(case: dict[str, Any]) -> dict[str, Any]:
         rows = case.get("intake_reviews") if isinstance(case.get("intake_reviews"), list) else []
@@ -26613,6 +26945,11 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
 
     draft_review = first_review(draft_case)
     approved_false_review = first_review(approved_false_case)
+    build_operator_review = first_review(build_operator_case)
+    provider_from_build_review = first_review(provider_from_build_case)
+    provider_ready_review = first_review(provider_ready_case)
+    provider_warning_review = first_review(provider_warning_case)
+    provider_pending_review = first_review(provider_pending_case)
     assertions = [
         {
             "id": "missing-sidecar-waits-for-evidence",
@@ -26655,6 +26992,70 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
                 "approval_risks": approved_false_review.get("approval_risks"),
             },
         },
+        {
+            "id": "build-operator-evidence-ready-only-for-build-lane",
+            "passed": build_operator_case.get("status") == "ready-for-lane-validation"
+            and build_operator_review.get("status") == "ready-for-lane-validation"
+            and sorted(build_operator_review.get("present_operator_decision_ids") or []) == sorted(build_decision_ids),
+            "expected": ["ready-for-lane-validation", sorted(build_decision_ids)],
+            "actual": {
+                "artifact": build_operator_case.get("status"),
+                "request": build_operator_review.get("status"),
+                "present": build_operator_review.get("present_operator_decision_ids"),
+                "missing": build_operator_review.get("missing_operator_decision_ids"),
+            },
+        },
+        {
+            "id": "build-only-operator-evidence-does-not-ready-provider-lane",
+            "passed": provider_from_build_case.get("status") == "waiting-approved-evidence-files"
+            and provider_from_build_review.get("status") == "waiting-lane-operator-evidence"
+            and sorted(provider_from_build_review.get("missing_operator_decision_ids") or [])
+            == sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS),
+            "expected": ["waiting-lane-operator-evidence", sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS)],
+            "actual": {
+                "artifact": provider_from_build_case.get("status"),
+                "request": provider_from_build_review.get("status"),
+                "present": provider_from_build_review.get("present_operator_decision_ids"),
+                "missing": provider_from_build_review.get("missing_operator_decision_ids"),
+            },
+        },
+        {
+            "id": "provider-operator-evidence-ready-when-all-provider-decisions-present",
+            "passed": provider_ready_case.get("status") == "ready-for-lane-validation"
+            and provider_ready_review.get("status") == "ready-for-lane-validation"
+            and sorted(provider_ready_review.get("present_operator_decision_ids") or [])
+            == sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS),
+            "expected": ["ready-for-lane-validation", sorted(OPERATOR_CREDENTIAL_PROVIDER_DECISION_IDS)],
+            "actual": {
+                "artifact": provider_ready_case.get("status"),
+                "request": provider_ready_review.get("status"),
+                "present": provider_ready_review.get("present_operator_decision_ids"),
+                "missing": provider_ready_review.get("missing_operator_decision_ids"),
+            },
+        },
+        {
+            "id": "provider-operator-warning-blocks-lane-validation",
+            "passed": provider_warning_case.get("status") == "blocked-evidence-intake"
+            and provider_warning_review.get("status") == "blocked-operator-evidence-redaction-review",
+            "expected": "blocked-operator-evidence-redaction-review",
+            "actual": {
+                "artifact": provider_warning_case.get("status"),
+                "request": provider_warning_review.get("status"),
+                "operator_evidence_scope": provider_warning_review.get("operator_evidence_scope"),
+            },
+        },
+        {
+            "id": "provider-operator-pending-does-not-pass-intake",
+            "passed": provider_pending_case.get("status") == "blocked-evidence-intake"
+            and provider_pending_review.get("status") == "blocked-template-or-unapproved-evidence",
+            "expected": "blocked-template-or-unapproved-evidence",
+            "actual": {
+                "artifact": provider_pending_case.get("status"),
+                "request": provider_pending_review.get("status"),
+                "approval_risks": provider_pending_review.get("approval_risks"),
+                "operator_evidence_scope": provider_pending_review.get("operator_evidence_scope"),
+            },
+        },
     ]
     failed = [item for item in assertions if not item.get("passed")]
     return {
@@ -26663,7 +27064,7 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
         "status": "failed" if failed else "passed",
         "target": target,
         "summary": {
-            "cases": 4,
+            "cases": 9,
             "assertions": len(assertions),
             "failed": len(failed),
             "case_statuses": {
@@ -26671,6 +27072,11 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
                 "clean": clean_case.get("status"),
                 "draft": draft_case.get("status"),
                 "approved_false": approved_false_case.get("status"),
+                "operator_build_ready": build_operator_case.get("status"),
+                "operator_provider_from_build_only": provider_from_build_case.get("status"),
+                "operator_provider_ready": provider_ready_case.get("status"),
+                "operator_provider_warning": provider_warning_case.get("status"),
+                "operator_provider_pending": provider_pending_case.get("status"),
             },
         },
         "cases": {
@@ -26678,6 +27084,11 @@ def build_bounty_evidence_intake_selftest() -> dict[str, Any]:
             "clean": clean_case,
             "draft": draft_case,
             "approved_false": approved_false_case,
+            "operator_build_ready": build_operator_case,
+            "operator_provider_from_build_only": provider_from_build_case,
+            "operator_provider_ready": provider_ready_case,
+            "operator_provider_warning": provider_warning_case,
+            "operator_provider_pending": provider_pending_case,
         },
         "assertions": assertions,
         "safety": (
@@ -81833,6 +82244,7 @@ def run_bounty_evidence_intake(args: argparse.Namespace) -> int:
         artifact_dir=artifact_dir,
         bounty_evidence_authorization=authorization,
         max_file_bytes=int(args.max_file_bytes),
+        source_root=source_root,
     )
     output_path = (
         resolve_repo_path(args.output)
@@ -81883,6 +82295,19 @@ def run_bounty_evidence_intake(args: argparse.Namespace) -> int:
             labels = ", ".join(normalize_string_list(row.get("requested_labels"))[:4])
             if labels:
                 print(f"  needs={inline_summary_text(labels, max_chars=300)}")
+            operator_scope = row.get("operator_evidence_scope") if isinstance(row.get("operator_evidence_scope"), dict) else {}
+            if operator_scope and operator_scope.get("status") != "not-requested":
+                print(
+                    f"  operator={operator_scope.get('status')} "
+                    f"required={len(operator_scope.get('required_operator_decision_ids') or [])} "
+                    f"present={len(operator_scope.get('present_operator_decision_ids') or [])} "
+                    f"missing={len(operator_scope.get('missing_operator_decision_ids') or [])}"
+                )
+                missing_decisions = ", ".join(
+                    normalize_string_list(operator_scope.get("missing_operator_decision_ids"))[:3]
+                )
+                if missing_decisions:
+                    print(f"  operator_missing={inline_summary_text(missing_decisions, max_chars=260)}")
             print(f"  next={inline_summary_text(row.get('next_step'), max_chars=320)}")
             if getattr(args, "show_files", False):
                 for file_row in (row.get("files", []) or [])[: max(1, min(4, int(args.files_per_request)))]:
@@ -81990,6 +82415,7 @@ def build_or_load_bounty_evidence_intake_for_run(
         artifact_dir=artifact_dir,
         bounty_evidence_authorization=authorization,
         max_file_bytes=max_file_bytes,
+        source_root=source_root,
     )
 
 
