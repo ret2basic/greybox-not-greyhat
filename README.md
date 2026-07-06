@@ -559,7 +559,9 @@ its non-evidence draft workbook: `approval_reference`, `request_text_sha256`,
 `payload_text_sha256`, and `paired_payload_text_sha256`. The draft CLI prints
 the required binding fields with `--show-drafts`; placeholders still have to be
 replaced from one approved quote request/response pair before anything is copied
-into official sidecars.
+into official sidecars. SHA-256 binding fields must be real 64-character hex
+digests; placeholders, short labels, or other non-hex metadata block pair
+binding even when the same invalid value appears in both files.
 `evidence-prep-status --show-details` summarizes the paired sidecar contract
 with the first blocker, binding review status, and first pairing issue, so a
 bad `approval_reference` or SHA-256 mismatch is visible without opening the JSON.
