@@ -368,6 +368,12 @@ artifact name/path, category, format, required fields, reject conditions, paired
 evidence dependencies, and no-write validator commands. These contracts are
 acceptance criteria for approved evidence handoff; they are not evidence and do
 not bypass `bounty-evidence-intake`, finding-gate, or adjudication. Each
+`bounty-evidence-request` brief renders the same handoff for a human/operator
+and, when source invariants are available, includes a source-invariant boundary:
+the source signal, what the source path proves, negative controls, whether it is
+promotable without official evidence, and the official sidecars still required.
+This keeps source-positive leads useful for targeting evidence while preventing
+them from being treated as bounty-valid findings.
 contract also has a `validator_execution_gate`, so missing sidecars remain
 `waiting-official-evidence` even when their no-write validator commands are
 safe to preview. The packet-level `official_evidence_contract_gate` aggregates
