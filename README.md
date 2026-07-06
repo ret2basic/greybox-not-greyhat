@@ -462,9 +462,13 @@ without mistaking it for a valid Medium+ bounty report.
 assessment-mode split and first-gap evidence packet views.
 Each contract also has a `validator_execution_gate`, so missing sidecars remain
 `waiting-official-evidence` even when their no-write validator commands are
-safe to preview. The packet-level `official_evidence_contract_gate` aggregates
-those contracts and only exposes `autorunnable_contract_validator_commands` when
-every required sidecar contract is ready for no-write validation. Use
+safe to preview. Contract JSON keeps both `validator_command_safety` for the
+intrinsic no-write command and `validator_gated_command_safety` for the current
+evidence gate; `autorunnable_validator_commands` stays empty until that contract
+is `ready-no-write-contract-validation`. The packet-level
+`official_evidence_contract_gate` aggregates those contracts and only exposes
+`autorunnable_contract_validator_commands` when every required sidecar contract
+is ready for no-write validation. Use
 `bounty-action-queue --show-contracts --show-intake-manifest` to print the
 packet's required fields, reject conditions, paired sidecars, intake artifact
 counts, pair-binding fields, and copy policy without opening the JSON.
