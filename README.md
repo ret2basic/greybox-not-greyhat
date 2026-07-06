@@ -1560,6 +1560,16 @@ temporary `transaction-intent.json`, and confirms the finding gate produces a
 manual-review `candidate-transaction-integrity-impact` item without treating it
 as reportable evidence.
 
+`build-provenance-readiness` is the offline gate for Docker build-secret
+signals. It now parses Dockerfile stages and final-stage `COPY --from` edges so
+static `ARG`/`ENV`/`.npmrc` findings can be classified as final-image secret
+paths versus builder/cache/log/registry provenance risks. For multi-stage builds
+where the final runner does not copy a secret path, the readiness output shows
+`source_class=builder-stage-provenance-only` and keeps Medium+ promotion blocked
+until redacted build provenance proves actual retention or disclosure. This
+command sends no traffic, does not query Docker or registries, and does not
+create `operator-evidence.json`.
+
 `transaction-sidecar-review --no-write --show-files --show-commands --show-payload-template-json --show-evidence-contract` prints the
 accepted sidecar files, configured candidate paths, and compact JSON/JSONL/TXT
 payload-shape examples when a sidecar is present but no base64 transaction
