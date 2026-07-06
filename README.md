@@ -50,6 +50,10 @@ completion unit is `all-dangerous-source-derived-surfaces`, while blackbox's
 completion unit is `one-valid-medium-high-critical-report`. The same model also
 records `coverage_requirement` and `bounty_validity_policy`, so unattended runs
 can distinguish exhaustive audit closure from non-exhaustive bounty pursuit.
+Use the global `--assessment-mode greybox|blackbox` option to override the
+profile's mode for a single run without editing the profile JSON. Follow-up
+commands generated during that run preserve the override, so a blackbox bounty
+loop does not silently fall back to coverage-first greybox ordering.
 
 Target-specific routing, source references, Burp observation requests, enabled
 strategy sets, and cluster metadata are described by a target profile. The
