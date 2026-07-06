@@ -425,8 +425,9 @@ them from being treated as bounty-valid findings. The brief also carries a
 machine-readable `brief_quality_gate` that checks active requests, required and
 missing evidence names, source-boundary rendering, non-promotion while official
 evidence is absent, redaction/reportability text, no-write validation commands,
-and placeholder/template boundaries. `--strict` fails if this quality gate is
-not passed.
+command-safety labels next to InferForge bash blocks, and
+placeholder/template boundaries. `--strict` fails if this quality gate is not
+passed.
 `adjudicate` links that same queue/brief context as `next_evidence_unblocker`,
 so a no-finding run can distinguish `waiting-official-evidence` from
 `blocked-brief-quality` without promoting the candidate. The unblocker also
