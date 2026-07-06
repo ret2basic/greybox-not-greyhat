@@ -1535,6 +1535,10 @@ payload sidecar.
 Add `--show-evidence-contract` to print the single-corpus quote capture,
 resource gate, Burp history import, sidecar review, and no-write decode preview
 sequence without sending requests, signing wallets, or submitting transactions.
+The evidence-contract view prints a command-safety summary and labels every
+command step with the same `[ready]`, `[manual-template]`, or `[review-gated]`
+classification used by frontier and gate views, so approved-input templates and
+Burp history import cannot look like unattended runnable commands.
 `transaction-evidence-readiness --no-write --show-commands` summarizes the
 same proof path and carries command-safety totals. Sidecar review, corpus
 checklist, and transaction-boundary review stay ready offline;
