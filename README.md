@@ -418,6 +418,11 @@ Packet handoff commands also carry `handoff_command_refs`, so the same
 `manual-template`/`review-gated` classification shown in
 `bounty-action-queue --show-actions --show-commands` is available to automation
 without inferring command safety from shell text.
+When all bounty-valid report paths are waiting on official evidence, the queue
+also exposes an offline continuation section. Its local no-write continuation
+commands carry `command_refs` and render as `offline_continue=[ready] ...`, so
+automation can keep broadening greybox/source coverage while leaving evidence
+handoff and reportability gates blocked.
 Each packet includes `official_evidence_contracts` for the required sidecars:
 artifact name/path, category, format, required fields, reject conditions, paired
 evidence dependencies, and no-write validator commands. These contracts are
