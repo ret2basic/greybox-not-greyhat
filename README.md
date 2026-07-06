@@ -1424,9 +1424,10 @@ transaction intent policy supplies `sourceMint` and `destinationMint`.
 `allowedPrograms` can also live in `quote_intent` or in a specific direction,
 and explicit CLI or policy-file allowlists take precedence. The current checks
 verify that the decoded transaction has the expected wallet account, the wallet
-is a signer, both expected mints appear in static account keys when available,
-compiled instructions are present, decoded source-mint transfer amounts match
-`amountIn` when available, explicit `sourceTokenAccount` and
+is a signer, both expected mints appear in static account keys or can be
+inferred from token-account metadata when available, compiled instructions are
+present, decoded source-mint transfer amounts match `amountIn` when available,
+explicit `sourceTokenAccount` and
 `destinationTokenAccount` values match decoded SPL transfer accounts, and all
 compiled instruction program IDs are in `allowedPrograms` when that allowlist is
 configured. Address table lookups can require manual review unless
@@ -1437,7 +1438,8 @@ When an approved public token-account metadata sidecar is available,
 provide rows with `address`, `mint`, and `owner`. Those rows let
 `decode-transactions` verify that explicit source and destination token accounts
 belong to the expected wallet/recipient and mint. They also let InferForge bind
-the decoded source-mint debit to the expected wallet owner. Missing token-account
+unchecked SPL Token `transfer` instructions to an inferred mint, and bind the
+decoded source-mint debit to the expected wallet owner. Missing token-account
 metadata does not create a finding; a concrete owner or mint mismatch is only a
 candidate transaction-integrity signal that still has to pass finding-gate and
 adjudication.
