@@ -1136,6 +1136,10 @@ commands before writing profile artifacts. Use the reviewed profile with
 commands use a narrower Burp history count than the general default, and audit
 commands default to `audit --max-probes 6 --no-ws`; add broader external or
 WebSocket resource probes only after scope and runner capacity are reviewed.
+`promote-observation-candidate` labels those follow-up commands as well: the
+resource check is `resource-gated`, the Burp observe step is non-runnable with
+`blocked_external`, and post-observation review/audit commands remain
+`review-gated` until evidence exists.
 
 When a rewrite observation gap is present, `verification-queue` also emits the
 same promotion sequence as manual-review command templates:
