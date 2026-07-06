@@ -503,6 +503,10 @@ does not create evidence sidecars or bypass finding-gate/adjudication.
 `bounty-validation-gates --show-gates --show-commands` mirrors those labels at
 the Medium+ validation-gate layer so blocked gates do not expose their verifier
 commands as autorunnable.
+Both artifacts also carry the same command-safety data in JSON:
+`verification_command_refs` / `verification_command_safety` on frontier rows and
+`validation_command_refs` / `validation_command_safety` on gate rows, plus empty
+`autorunnable_*_commands` lists while official evidence is still missing.
 
 `claim-evidence-ledger` decomposes each claim into required evidence artifacts
 and verifier commands. Ledger rows now carry `verification_command_refs`,
