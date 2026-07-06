@@ -395,8 +395,11 @@ carries the harness active phase and phase gate, such as `official-evidence`
 and `triager-blocked-waiting-official-evidence`, so downstream automation can
 see why the triager is stopped.
 `iteration-decision` prints that unblocker next to the active assessment
-objective and labels `assessment-mode-split` when the greybox coverage focus and
-bounty/adjudication unblocker point at different lanes.
+objective, including the harness phase and phase gate, and labels
+`assessment-mode-split` when the greybox coverage focus and bounty/adjudication
+unblocker point at different lanes.
+`methodology-review` carries the same phase and phase-gate fields in its
+assessment-mode split and first-gap evidence packet views.
 Each contract also has a `validator_execution_gate`, so missing sidecars remain
 `waiting-official-evidence` even when their no-write validator commands are
 safe to preview. The packet-level `official_evidence_contract_gate` aggregates
