@@ -1450,6 +1450,12 @@ Compute budget instructions are decoded as well. Set `maxComputeUnitLimit`,
 policy to cap priority-fee exposure; when both unit limit and unit price are
 explicit, InferForge estimates the priority fee in lamports and gates values
 above policy as candidate user-funds impact.
+When an approved quote includes a minimum or expected destination amount, add
+`minDestinationAmount` to the intent policy. InferForge sums decoded
+destination-mint transfers and gates a concrete shortfall as candidate
+transaction-integrity impact; if the output amount is not visible in the
+unsigned transaction payload, the check stays in manual review instead of
+claiming a finding.
 `transaction-intent.json.reportability_review` summarizes whether decoded
 checks are merely waiting for corpus/policy, passed for the current corpus, or
 contain signer, wallet, mint, or program mismatches that are ready for a
