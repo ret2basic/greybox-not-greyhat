@@ -9363,6 +9363,20 @@ METHODOLOGY_RESEARCH_SOURCES = [
         "takeaway": "Keep repository state, feedback loops, and legible artifacts as the system of record while humans steer and agents execute.",
     },
     {
+        "id": "monad-bugfinder",
+        "title": "Monad Bugfinder: lessons from a month of AI-assisted bug hunting",
+        "url": "https://blog.monad.xyz/blog/monad-bugfinder",
+        "role": "security-harness-architecture-reference",
+        "takeaway": "Separate lead discovery from triage, use verifier-first review, climb an explicit witness ladder, and adjudicate only evidence-backed claims.",
+    },
+    {
+        "id": "monad-ultrafuzz",
+        "title": "Ultrafuzz: end-to-end agentic fuzzing for Solidity smart contracts",
+        "url": "https://blog.monad.xyz/blog/ultrafuzz",
+        "role": "workflow-variance-and-eval-reference",
+        "takeaway": "Keep workflows inspectable, preserve failing/evidence artifacts across iterations, and optimize against validated findings instead of speculative volume.",
+    },
+    {
         "id": "openai-codex-security",
         "title": "Codex Security: now in research preview",
         "url": "https://openai.com/index/codex-security-now-in-research-preview/",
@@ -13772,6 +13786,7 @@ def build_bounty_harness_alignment(
     high_value_threads: list[dict[str, Any]],
     evidence_closure_summary: dict[str, Any],
     resource_snapshot: dict[str, Any] | None,
+    claim_witness_ladder: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     assessment_policy = assessment_mode_policy(profile)
     objective_model = assessment_policy_objective_model(assessment_policy)
@@ -13780,6 +13795,12 @@ def build_bounty_harness_alignment(
     hypothesis_summary = hypothesis_matrix.get("summary", {}) if isinstance(hypothesis_matrix.get("summary"), dict) else {}
     validation_summary = validation_plan.get("summary", {}) if isinstance(validation_plan.get("summary"), dict) else {}
     business_summary = business_logic_map.get("summary", {}) if isinstance(business_logic_map.get("summary"), dict) else {}
+    claim_witness = claim_witness_ladder if isinstance(claim_witness_ladder, dict) else {}
+    claim_witness_summary = (
+        claim_witness.get("summary")
+        if isinstance(claim_witness.get("summary"), dict)
+        else {}
+    )
     focus = harness_loop.get("focus") if isinstance(harness_loop.get("focus"), dict) else {}
 
     candidate_leads = []
@@ -13853,6 +13874,14 @@ def build_bounty_harness_alignment(
     )
     reportable = str(harness_loop.get("status") or "") == "reportable-findings"
     resource_blocks_active = resource_status not in {"healthy", "not-run"}
+    claim_witness_ready = bool(claim_witness.get("finding_gate_ready"))
+    claim_ladder_count = int(claim_witness_summary.get("ladders", 0) or 0)
+    claim_ready_ladders = int(claim_witness_summary.get("ready_ladders", 0) or 0)
+    claim_blocked_ladders = int(claim_witness_summary.get("blocked_ladders", 0) or 0)
+    top_ladder = next(
+        (row for row in claim_witness.get("ladders", []) or [] if isinstance(row, dict)),
+        {},
+    )
 
     components = [
         component(
@@ -13940,6 +13969,41 @@ def build_bounty_harness_alignment(
             ],
         ),
         component(
+            "verifier-witness-ladder",
+            "Verifier and witness ladder",
+            "passed" if claim_witness_ready else "waiting",
+            "Keep each candidate as an atomic claim with official sidecars, offline verifiers, and adjudication before promotion.",
+            {
+                "claim_witness_ladder_status": claim_witness.get("status") or "missing",
+                "finding_gate_ready": claim_witness_ready,
+                "ladders": claim_ladder_count,
+                "ready_ladders": claim_ready_ladders,
+                "blocked_ladders": claim_blocked_ladders,
+                "next_stage_counts": claim_witness_summary.get("next_stage_counts", {}),
+                "top_ladder": {
+                    "claim_id": top_ladder.get("claim_id"),
+                    "oracle_type": top_ladder.get("oracle_type"),
+                    "next_stage": top_ladder.get("next_stage"),
+                    "claim_readiness": top_ladder.get("claim_readiness"),
+                    "top_blocker": top_ladder.get("top_blocker"),
+                }
+                if top_ladder
+                else {},
+            },
+            (
+                "Run claim-witness-ladder no-write and close official evidence sidecar blockers before finding-gate."
+                if not claim_ladder_count
+                else str(claim_witness.get("next_step") or "")
+                if not claim_witness_ready
+                else "Every claim ladder is ready; run finding-gate and adjudication no-write."
+            ),
+            [
+                command("claim-evidence-ledger --no-write --show-claims --top 8", source="bounty-harness:witness:ledger"),
+                command("claim-witness-ladder --no-write --show-ladders --top 8", source="bounty-harness:witness:ladder"),
+                command("claim-evidence-requests --no-write --show-requests --top 8", source="bounty-harness:witness:requests"),
+            ],
+        ),
+        component(
             "minimal-poc-report-package",
             "Minimal PoC and report package",
             "passed" if minimal_poc_ready or reportable else "waiting",
@@ -14008,6 +14072,11 @@ def build_bounty_harness_alignment(
             "lead_selection_strategy": ranking_strategy,
             "high_value_threads": len(high_value_threads),
             "gate_ready_threads": gate_ready_threads,
+            "claim_witness_ladder_status": claim_witness.get("status") or "missing",
+            "claim_witness_finding_gate_ready": claim_witness_ready,
+            "claim_witness_ladders": claim_ladder_count,
+            "claim_witness_ready_ladders": claim_ready_ladders,
+            "claim_witness_blocked_ladders": claim_blocked_ladders,
             "resource_status": resource_status,
             "top_candidate_id": top_candidate.get("id"),
             "top_candidate_decision": (top_candidate.get("assessment_rank") or {}).get("decision") if top_candidate else None,
@@ -14018,6 +14087,8 @@ def build_bounty_harness_alignment(
         "research_sources": [
             "pkqs91-codex-web3-bounty",
             "openai-harness-engineering",
+            "monad-bugfinder",
+            "monad-ultrafuzz",
             "openai-codex-security",
             "poco-agentic-poc-generation",
         ],
@@ -14140,6 +14211,11 @@ def build_methodology_review(
         high_value_threads,
         limit=max(1, int(limit)),
     )
+    claim_witness_ladder = build_claim_witness_ladder(
+        target=target,
+        profile=profile,
+        artifact_dir=artifact_dir,
+    )
     bounty_harness_alignment = build_bounty_harness_alignment(
         artifact_dir=artifact_dir,
         profile=profile,
@@ -14150,6 +14226,7 @@ def build_methodology_review(
         high_value_threads=high_value_threads,
         evidence_closure_summary=evidence_closure_summary,
         resource_snapshot=resource_snapshot,
+        claim_witness_ladder=claim_witness_ladder,
     )
 
     focus = harness_loop.get("focus") if isinstance(harness_loop.get("focus"), dict) else {}
@@ -14171,6 +14248,11 @@ def build_methodology_review(
         "minimal_poc_plans": len(high_value_threads),
         "evidence_closure_status_counts": evidence_closure_summary.get("status_counts", {}),
         "evidence_closure_gate_ready_threads": evidence_closure_summary.get("gate_ready_threads", 0),
+        "claim_witness_ladder": claim_witness_ladder.get("status"),
+        "claim_witness_ladders": (claim_witness_ladder.get("summary", {}) or {}).get("ladders", 0),
+        "claim_witness_ready_ladders": (claim_witness_ladder.get("summary", {}) or {}).get("ready_ladders", 0),
+        "claim_witness_blocked_ladders": (claim_witness_ladder.get("summary", {}) or {}).get("blocked_ladders", 0),
+        "claim_witness_finding_gate_ready": claim_witness_ladder.get("finding_gate_ready"),
         "bounty_harness_alignment": bounty_harness_alignment.get("status"),
         "bounty_harness_top_candidate": (bounty_harness_alignment.get("summary", {}) or {}).get("top_candidate_id"),
     }
@@ -14191,6 +14273,7 @@ def build_methodology_review(
         "bounty_harness_alignment": bounty_harness_alignment,
         "business_logic_map": business_logic_map,
         "evidence_closure": evidence_closure_summary,
+        "claim_witness_ladder": claim_witness_ladder,
         "supporting_review_statuses": {
             key: value.get("status")
             for key, value in supporting_reviews.items()
@@ -14204,6 +14287,7 @@ def build_methodology_review(
             "validation_plan": VALIDATION_PLAN_ARTIFACT,
             "transaction_flow_review": TRANSACTION_FLOW_REVIEW_ARTIFACT,
             "deployment_review": DEPLOYMENT_RESOURCE_REVIEW_ARTIFACT,
+            "claim_witness_ladder": CLAIM_WITNESS_LADDER_ARTIFACT,
         },
         "stop_conditions": [
             "Do not run active target traffic until resource-snapshot --strict is healthy.",
@@ -59428,6 +59512,9 @@ def build_no_write_selftest() -> dict[str, Any]:
                 and "Methodology review:" in methodology_review_stdout_text
                 and "resource=not-run" in methodology_review_stdout_text
                 and "Evidence closure:" in methodology_review_stdout_text
+                and "Witness ladder:" in methodology_review_stdout_text
+                and "ladders=" in methodology_review_stdout_text
+                and "next_stages=" in methodology_review_stdout_text
                 and "Bounty harness:" in methodology_review_stdout_text
                 and "selection=greybox-coverage-first" in methodology_review_stdout_text
                 and "objective=" in methodology_review_stdout_text
@@ -77853,6 +77940,25 @@ def run_methodology_review(args: argparse.Namespace) -> int:
             f"closures={evidence_closure.get('closures', 0)} "
             f"gate_ready={evidence_closure.get('gate_ready_threads', 0)} "
             f"statuses={json.dumps(evidence_closure.get('status_counts', {}), sort_keys=True)}"
+        )
+    claim_witness = (
+        review.get("claim_witness_ladder")
+        if isinstance(review.get("claim_witness_ladder"), dict)
+        else {}
+    )
+    if claim_witness:
+        claim_witness_summary = (
+            claim_witness.get("summary")
+            if isinstance(claim_witness.get("summary"), dict)
+            else {}
+        )
+        print(
+            "Witness ladder: "
+            f"{claim_witness.get('status') or '-'} "
+            f"ladders={claim_witness_summary.get('ladders', 0)} "
+            f"ready={claim_witness_summary.get('ready_ladders', 0)} "
+            f"blocked={claim_witness_summary.get('blocked_ladders', 0)} "
+            f"next_stages={json.dumps(claim_witness_summary.get('next_stage_counts', {}), sort_keys=True)}"
         )
     bounty_alignment = (
         review.get("bounty_harness_alignment")
