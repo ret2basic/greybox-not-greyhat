@@ -27968,8 +27968,9 @@ def build_bounty_template_safety_selftest() -> dict[str, Any]:
         safe_dir = root / "safe"
         polluted_dir = root / "polluted"
         approved_dir = root / "approved"
+        build_provenance_dir = root / "build-provenance"
         empty_dir = root / "empty"
-        for path in [safe_dir, polluted_dir, approved_dir, empty_dir]:
+        for path in [safe_dir, polluted_dir, approved_dir, build_provenance_dir, empty_dir]:
             path.mkdir(parents=True, exist_ok=True)
 
         safe_template = template(
@@ -28055,6 +28056,31 @@ def build_bounty_template_safety_selftest() -> dict[str, Any]:
             max_file_bytes=max_file_bytes,
         )
 
+        build_provenance_template = template(
+            "selftest-build-provenance-template",
+            target_evidence_path="redacted build provenance supplied outside official sidecar files",
+            draft_content=build_provenance_evidence_template(
+                target=target,
+                artifact_dir=build_provenance_dir,
+                actionable_rows=[
+                    {
+                        "id": "selftest-docker-build-secret",
+                        "kind": "docker-build-secret-arg",
+                        "file": "Dockerfile",
+                        "line": 13,
+                        "name": "NODE_AUTH_TOKEN",
+                    }
+                ],
+            ),
+        )
+        build_provenance_case = build_bounty_template_safety(
+            target=target,
+            profile=None,
+            artifact_dir=build_provenance_dir,
+            bounty_evidence_templates=template_doc([build_provenance_template]),
+            max_file_bytes=max_file_bytes,
+        )
+
         empty_case = build_bounty_template_safety(
             target=target,
             profile=None,
@@ -28070,6 +28096,11 @@ def build_bounty_template_safety_selftest() -> dict[str, Any]:
     safe_summary = safe_case.get("summary") if isinstance(safe_case.get("summary"), dict) else {}
     polluted_summary = polluted_case.get("summary") if isinstance(polluted_case.get("summary"), dict) else {}
     approved_summary = approved_case.get("summary") if isinstance(approved_case.get("summary"), dict) else {}
+    build_provenance_summary = (
+        build_provenance_case.get("summary")
+        if isinstance(build_provenance_case.get("summary"), dict)
+        else {}
+    )
 
     assertions = [
         {
@@ -28113,6 +28144,23 @@ def build_bounty_template_safety_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "build-provenance-nonfile-template-passes",
+            "passed": (
+                build_provenance_case.get("status") == "template-safety-passed"
+                and build_provenance_summary.get("templates") == 1
+                and build_provenance_summary.get("passed") == 1
+                and build_provenance_summary.get("blocked") == 0
+                and (build_provenance_case.get("template_reviews", [{}])[0].get("target_file") or {}).get("status")
+                == "non-file-handoff"
+            ),
+            "expected": "draft-only build provenance handoff templates pass as non-file templates, not official sidecars",
+            "actual": {
+                "status": build_provenance_case.get("status"),
+                "summary": build_provenance_summary,
+                "review": (build_provenance_case.get("template_reviews", [{}]) or [{}])[0],
+            },
+        },
+        {
             "id": "missing-official-evidence-is-not-finding-evidence",
             "passed": (
                 safe_case.get("status") == "template-safety-passed"
@@ -28141,13 +28189,14 @@ def build_bounty_template_safety_selftest() -> dict[str, Any]:
         "status": "failed" if failed else "passed",
         "target": target,
         "summary": {
-            "cases": 4,
+            "cases": 5,
             "assertions": len(assertions),
             "failed": len(failed),
             "case_statuses": {
                 "safe": safe_case.get("status"),
                 "polluted_sidecar": polluted_case.get("status"),
                 "approved_true": approved_case.get("status"),
+                "build_provenance": build_provenance_case.get("status"),
                 "empty": empty_case.get("status"),
             },
         },
@@ -28155,6 +28204,7 @@ def build_bounty_template_safety_selftest() -> dict[str, Any]:
             "safe": safe_case,
             "polluted_sidecar": polluted_case,
             "approved_true": approved_case,
+            "build_provenance": build_provenance_case,
             "empty": empty_case,
         },
         "assertions": assertions,
