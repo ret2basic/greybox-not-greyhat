@@ -22635,6 +22635,10 @@ def build_claim_evidence_requests(
             if request.get("draft_assist")
             else "Create a reviewed official evidence sidecar manually, then run the first verification command."
         )
+        request["source_readiness"] = claim_evidence_request_source_readiness(
+            request,
+            artifact_dir=artifact_dir,
+        )
         requests.append(request)
     requests.sort(
         key=lambda item: (
@@ -22720,6 +22724,176 @@ def claim_evidence_request_status_rank(status: Any) -> int:
     if text == "official-evidence-ready":
         return 2
     return 3
+
+
+def int_from_nested(doc: dict[str, Any] | None, path: list[str], default: int = 0) -> int:
+    node: Any = doc if isinstance(doc, dict) else {}
+    for key in path:
+        if not isinstance(node, dict):
+            return default
+        node = node.get(key)
+    try:
+        return int(node or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def claim_evidence_request_source_readiness(
+    request: dict[str, Any],
+    *,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    name = claim_evidence_request_official_name(request)
+    draft = request.get("draft_assist") if isinstance(request.get("draft_assist"), dict) else {}
+    base = {
+        "official_evidence": name,
+        "status": "not-modeled",
+        "local_candidate_count": 0,
+        "sources": [],
+        "approval_required": True,
+        "official_evidence_still_required": True,
+        "draft_status": draft.get("draft_status"),
+        "draft_path": draft.get("draft_path"),
+        "next_step": "Provide reviewed official evidence, then rerun evidence intake.",
+        "finding_gate_boundary": "Source readiness is not evidence and does not satisfy finding gates.",
+    }
+    if name == "transaction-payloads.jsonl":
+        burp_candidates = load_optional_json(artifact_dir / "burp-transaction-candidates.json") or {}
+        quote_collection = load_optional_json(artifact_dir / "quote-collection.json") or {}
+        sidecar_review = load_optional_json(artifact_dir / TRANSACTION_SIDECAR_REVIEW_ARTIFACT) or {}
+        burp_count = int(burp_candidates.get("candidate_count") or 0)
+        quote_count = int(
+            quote_collection.get("candidate_count")
+            or quote_collection.get("transaction_candidate_count")
+            or 0
+        )
+        review_count = int_from_nested(sidecar_review, ["summary", "candidate_count"])
+        local_count = max(burp_count, quote_count, review_count)
+        status = "local-candidates-need-approval" if local_count else "waiting-approved-quote-capture"
+        return {
+            **base,
+            "status": status,
+            "local_candidate_count": local_count,
+            "sources": [
+                {
+                    "artifact": "burp-transaction-candidates.json",
+                    "status": burp_candidates.get("source") or artifact_summary_status(burp_candidates),
+                    "candidate_count": burp_count,
+                    "quote_response_count": burp_candidates.get("quote_response_count", 0),
+                },
+                {
+                    "artifact": "quote-collection.json",
+                    "status": quote_collection.get("status") or artifact_summary_status(quote_collection),
+                    "success": quote_collection.get("success"),
+                    "candidate_count": quote_count,
+                },
+                {
+                    "artifact": TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
+                    "status": sidecar_review.get("status") or artifact_summary_status(sidecar_review),
+                    "candidate_count": review_count,
+                    "ready_for_decode": int_from_nested(sidecar_review, ["summary", "ready_for_decode"]),
+                },
+            ],
+            "next_step": (
+                "Review the local transaction candidate source, then copy exactly one approved/redacted payload into the official sidecar."
+                if local_count
+                else "No local transaction payload candidate is available; collect or import exactly one approved quote response before creating the official sidecar."
+            ),
+        }
+    if name == "transaction-intent-policy.json":
+        templates = load_optional_json(artifact_dir / TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT) or {}
+        sidecar_review = load_optional_json(artifact_dir / TRANSACTION_SIDECAR_REVIEW_ARTIFACT) or {}
+        template_count = int(templates.get("template_count") or 0)
+        policy_valid = bool(int_from_nested(sidecar_review, ["intent_policy_sidecar", "policy", "valid"]))
+        return {
+            **base,
+            "status": "manual-template-ready" if template_count else "waiting-manual-intent-policy",
+            "local_candidate_count": template_count,
+            "sources": [
+                {
+                    "artifact": TRANSACTION_INTENT_POLICY_TEMPLATES_ARTIFACT,
+                    "status": templates.get("status") or artifact_summary_status(templates),
+                    "template_count": template_count,
+                    "target_policy_sidecar": templates.get("target_policy_sidecar"),
+                },
+                {
+                    "artifact": TRANSACTION_SIDECAR_REVIEW_ARTIFACT,
+                    "status": sidecar_review.get("status") or artifact_summary_status(sidecar_review),
+                    "policy_valid": policy_valid,
+                    "policy_issues": normalize_string_list(
+                        ((sidecar_review.get("intent_policy_sidecar") or {}).get("policy") or {}).get("issues")
+                        if isinstance(sidecar_review.get("intent_policy_sidecar"), dict)
+                        else []
+                    )[:4],
+                },
+            ],
+            "next_step": (
+                "Use the template only after the matching transaction payload is approved; replace placeholders with the approved public wallet and raw amount."
+                if template_count
+                else "Prepare a transaction intent policy template after the matching approved payload is selected."
+            ),
+        }
+    if name == REWRITE_RESPONSE_SIDECAR_ARTIFACT:
+        review = load_optional_json(artifact_dir / REWRITE_RESPONSE_REVIEW_ARTIFACT) or {}
+        observed_count = int_from_nested(review, ["summary", "observed_approved_responses"])
+        candidate_count = int_from_nested(review, ["summary", "candidate_impact_observations"])
+        contract_count = int_from_nested(review, ["summary", "observation_contracts"])
+        local_count = max(observed_count, candidate_count)
+        status = (
+            "local-observations-need-sidecar-approval"
+            if local_count
+            else "approved-observation-plan-ready"
+            if contract_count
+            else "waiting-approved-response-observation"
+        )
+        return {
+            **base,
+            "status": status,
+            "local_candidate_count": local_count,
+            "sources": [
+                {
+                    "artifact": REWRITE_RESPONSE_REVIEW_ARTIFACT,
+                    "status": review.get("status") or artifact_summary_status(review),
+                    "observed_approved_responses": observed_count,
+                    "candidate_impact_observations": candidate_count,
+                    "observation_contracts": contract_count,
+                    "recommended_single_request_path": (
+                        review.get("summary", {}).get("recommended_single_request_path")
+                        if isinstance(review.get("summary"), dict)
+                        else None
+                    ),
+                }
+            ],
+            "next_step": (
+                "Review the local approved response observation, then copy one redacted row into the official sidecar."
+                if local_count
+                else "Use the single-observation plan only after approval; collect one read-only response and keep raw history out of official evidence."
+                if contract_count
+                else "Select one approved read-only response path before creating the official rewrite response sidecar."
+            ),
+        }
+    if name == OPERATOR_EVIDENCE_ARTIFACT:
+        review = load_optional_json(artifact_dir / OPERATOR_EVIDENCE_REVIEW_ARTIFACT) or {}
+        summary = review.get("summary") if isinstance(review.get("summary"), dict) else {}
+        missing_decisions = normalize_string_list(summary.get("missing_decisions"))
+        return {
+            **base,
+            "status": "waiting-operator-evidence",
+            "local_candidate_count": 0,
+            "sources": [
+                {
+                    "artifact": OPERATOR_EVIDENCE_REVIEW_ARTIFACT,
+                    "status": review.get("status") or artifact_summary_status(review),
+                    "sidecar_file_status": summary.get("sidecar_file_status"),
+                    "decision_coverage": summary.get("decision_coverage", 0),
+                    "missing_decision_count": len(missing_decisions),
+                    "critical_missing": normalize_string_list(summary.get("critical_missing"))[:4],
+                    "provider_missing": normalize_string_list(summary.get("provider_missing"))[:4],
+                }
+            ],
+            "next_step": "Operator/provider/deployment evidence must be supplied as approved redacted rows; source-only review cannot fill this request.",
+        }
+    return base
 
 
 def bounty_prioritize_claim_evidence_requests(
@@ -27964,6 +28138,7 @@ def bounty_action_claim_request_rows(
     for request in matches[:6]:
         official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
         draft = request.get("draft_assist") if isinstance(request.get("draft_assist"), dict) else {}
+        source = request.get("source_readiness") if isinstance(request.get("source_readiness"), dict) else {}
         verify_commands = normalize_string_list(request.get("verification_commands"))
         compact_rows.append(
             {
@@ -27981,6 +28156,12 @@ def bounty_action_claim_request_rows(
                 "entrypoints": normalize_string_list(request.get("entrypoints"))[:4],
                 "draft_status": draft.get("draft_status"),
                 "draft_path": draft.get("draft_path"),
+                "source_readiness": {
+                    "status": source.get("status"),
+                    "local_candidate_count": source.get("local_candidate_count", 0),
+                    "official_evidence_still_required": source.get("official_evidence_still_required", True),
+                    "next_step": source.get("next_step"),
+                } if source else {},
                 "first_verification_command": verify_commands[0] if verify_commands else None,
                 "redaction_rules": normalize_string_list(request.get("redaction_rules"))[:4],
                 "next_step": request.get("next_step"),
@@ -29161,6 +29342,39 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
                 "category_counts": {"transaction-payload-sidecar": 1},
             },
         }
+        (artifact_dir / "burp-transaction-candidates.json").write_text(
+            json.dumps(
+                {
+                    "generated_at": utc_now(),
+                    "source": "selftest-approved-candidate-source",
+                    "quote_response_count": 1,
+                    "candidate_count": 1,
+                    "candidates": [{"id": "candidate-redacted", "source_path": "$.payloads[0].data.transaction"}],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (artifact_dir / TRANSACTION_SIDECAR_REVIEW_ARTIFACT).write_text(
+            json.dumps(
+                {
+                    "generated_at": utc_now(),
+                    "status": "payload-sidecar-has-candidates",
+                    "summary": {
+                        "candidate_count": 1,
+                        "ready_for_decode": False,
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        transaction_source_readiness_case = claim_evidence_request_source_readiness(
+            claim_evidence_requests_case["requests"][0],
+            artifact_dir=artifact_dir,
+        )
         operator_claim_evidence_requests_case = {
             "generated_at": utc_now(),
             "schema": "inferforge-claim-evidence-requests-v1",
@@ -29938,6 +30152,18 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "claim-evidence-source-readiness-keeps-local-candidates-non-evidence",
+            "passed": (
+                transaction_source_readiness_case.get("status") == "local-candidates-need-approval"
+                and transaction_source_readiness_case.get("local_candidate_count") == 1
+                and transaction_source_readiness_case.get("official_evidence_still_required") is True
+                and transaction_source_readiness_case.get("approval_required") is True
+                and "official sidecar" in str(transaction_source_readiness_case.get("next_step") or "")
+            ),
+            "expected": "local transaction candidates are surfaced but still require approved official sidecar evidence",
+            "actual": transaction_source_readiness_case,
+        },
+        {
             "id": "operator-evidence-claim-requests-stay-lane-scoped",
             "passed": (
                 len(build_secret_operator_matches) == 0
@@ -30290,6 +30516,15 @@ def bounty_evidence_request_markdown(
                 )
                 if request.get("draft_path"):
                     lines.append(f"  - Draft assist: `{bounty_brief_line(request.get('draft_path'), max_chars=240)}`")
+                source = request.get("source_readiness") if isinstance(request.get("source_readiness"), dict) else {}
+                if source:
+                    lines.append(
+                        "  - Source readiness: "
+                        f"`{bounty_brief_line(source.get('status') or '-', max_chars=120)}` "
+                        f"local_candidates=`{source.get('local_candidate_count', 0)}`"
+                    )
+                    if source.get("next_step"):
+                        lines.append(f"  - Source next: {bounty_brief_line(source.get('next_step'), max_chars=360)}")
                 if request.get("first_verification_command"):
                     lines.extend(
                         [
@@ -82230,6 +82465,7 @@ def run_claim_evidence_requests(args: argparse.Namespace) -> int:
             official = request.get("official_evidence") if isinstance(request.get("official_evidence"), dict) else {}
             draft = request.get("draft_assist") if isinstance(request.get("draft_assist"), dict) else {}
             priority = request.get("bounty_priority") if isinstance(request.get("bounty_priority"), dict) else {}
+            source = request.get("source_readiness") if isinstance(request.get("source_readiness"), dict) else {}
             print(
                 f"- {request.get('id')}: {request.get('request_status')} "
                 f"name={official.get('name') or '-'} "
@@ -82246,12 +82482,21 @@ def run_claim_evidence_requests(args: argparse.Namespace) -> int:
                     f"score={priority.get('score') or 0} "
                     f"severity={priority.get('expected_severity') or '-'}"
                 )
+            if source:
+                print(
+                    "  source="
+                    f"{source.get('status') or '-'} "
+                    f"local_candidates={source.get('local_candidate_count', 0)} "
+                    f"official_required={source.get('official_evidence_still_required')}"
+                )
             if draft.get("draft_path"):
                 print(f"  draft_path={draft.get('draft_path')}")
             if request.get("entrypoints"):
                 print(f"  entrypoints={inline_summary_text(', '.join(request.get('entrypoints', [])[:4]), max_chars=260)}")
             if request.get("missing_or_invalid_details"):
                 print(f"  detail={inline_summary_text(request.get('missing_or_invalid_details')[0], max_chars=260)}")
+            if source.get("next_step"):
+                print(f"  source_next={inline_summary_text(source.get('next_step'), max_chars=360)}")
             commands = normalize_string_list(request.get("verification_commands"))
             if commands:
                 print(f"  verify={inline_summary_text(commands[0], max_chars=420)}")
@@ -83992,6 +84237,23 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
                 draft_paths = normalize_string_list(claim_summary.get("draft_paths"))
                 if draft_paths:
                     print(f"  claim_draft={inline_summary_text(draft_paths[0], max_chars=260)}")
+                claim_requests = [
+                    request
+                    for request in row.get("claim_evidence_requests", []) or []
+                    if isinstance(request, dict)
+                ]
+                first_source = (
+                    claim_requests[0].get("source_readiness")
+                    if claim_requests
+                    and isinstance(claim_requests[0].get("source_readiness"), dict)
+                    else {}
+                )
+                if first_source:
+                    print(
+                        "  claim_source="
+                        f"{first_source.get('status') or '-'} "
+                        f"local_candidates={first_source.get('local_candidate_count', 0)}"
+                    )
                 if row.get("claim_evidence_first_verification_command") and getattr(args, "show_commands", False):
                     print(
                         "  claim_verify="
