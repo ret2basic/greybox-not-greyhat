@@ -394,9 +394,11 @@ not passed.
 `adjudicate` links that same queue/brief context as `next_evidence_unblocker`,
 so a no-finding run can distinguish `waiting-official-evidence` from
 `blocked-brief-quality` without promoting the candidate. The unblocker also
-carries the harness active phase and phase gate, such as `official-evidence`
-and `triager-blocked-waiting-official-evidence`, so downstream automation can
-see why the triager is stopped.
+carries the evidence intake manifest summary and the harness active phase/phase
+gate, such as `official-evidence` and
+`triager-blocked-waiting-official-evidence`, so downstream automation can see
+which artifacts and pair-binding gates are missing and why the triager is
+stopped.
 `iteration-decision` prints that unblocker next to the active assessment
 objective, including the harness phase and phase gate, and labels
 `assessment-mode-split` when the greybox coverage focus and bounty/adjudication
