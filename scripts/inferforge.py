@@ -24653,6 +24653,69 @@ def bounty_evidence_workorder_lane_spec(
     }
 
 
+BOUNTY_LANE_API_AUTHORIZATION_IMPACTS = {
+    "transaction-integrity": "transaction-integrity",
+    "sensitive-response-impact": "fixed-upstream-proxy-confusion",
+    "credentialed-provider-impact": "credentialed-upstream-cost-abuse",
+    "resource-control": "resource-exhaustion",
+    "websocket-header-trust": "method-authorization-boundary",
+}
+
+
+def api_authorization_profiles_for_bounty_lane(lane: str, row: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    impact = BOUNTY_LANE_API_AUTHORIZATION_IMPACTS.get(str(lane or ""))
+    if not impact:
+        return []
+    item = {
+        "impact": impact,
+        "type": f"bounty-lane:{lane}",
+        "entrypoint": (row or {}).get("entrypoint") if isinstance(row, dict) else None,
+    }
+    return api_authorization_profiles_for_hypothesis(item)
+
+
+def api_authorization_profile_ids(profiles: Any) -> list[str]:
+    return ordered_unique_strings(
+        [
+            str(profile.get("id") or "")
+            for profile in (profiles or [])
+            if isinstance(profile, dict) and profile.get("id")
+        ]
+    )
+
+
+def api_authorization_profile_evidence_questions(profiles: Any) -> list[str]:
+    return ordered_unique_strings(
+        [
+            str(profile.get("evidence_question") or "")
+            for profile in (profiles or [])
+            if isinstance(profile, dict) and profile.get("evidence_question")
+        ]
+    )
+
+
+def api_authorization_profile_acceptance_checks(profiles: Any) -> list[str]:
+    return ordered_unique_strings(
+        [
+            str(check)
+            for profile in (profiles or [])
+            if isinstance(profile, dict)
+            for check in normalize_string_list(profile.get("acceptance_checks"))
+        ]
+    )
+
+
+def api_authorization_profile_reject_if(profiles: Any) -> list[str]:
+    return ordered_unique_strings(
+        [
+            str(check)
+            for profile in (profiles or [])
+            if isinstance(profile, dict)
+            for check in normalize_string_list(profile.get("reject_if"))
+        ]
+    )
+
+
 def bounty_evidence_workorder_for_rollup_row(
     row: dict[str, Any],
     *,
@@ -24686,6 +24749,7 @@ def bounty_evidence_workorder_for_rollup_row(
     )
     official_evidence_missing = int(row.get("official_evidence_missing_count") or 0) > 0
     invalid_now = bool(row.get("invalid_if_reported_now"))
+    api_profiles = api_authorization_profiles_for_bounty_lane(lane, row)
     return {
         "id": f"WORKORDER-{safe_probe_id(str(row.get('gate_id') or row.get('lane') or rank))}",
         "rank": rank,
@@ -24713,8 +24777,21 @@ def bounty_evidence_workorder_for_rollup_row(
         "required_official_evidence_labels": required_labels,
         "must_capture": normalize_string_list(lane_spec.get("must_capture")),
         "must_not_capture": BOUNTY_WORKORDER_GLOBAL_FORBIDDEN_FIELDS,
-        "acceptance_checklist": BOUNTY_WORKORDER_GLOBAL_ACCEPTANCE_CHECKS,
-        "lane_reject_if": normalize_string_list(lane_spec.get("reject_if")),
+        "api_authorization_profiles": api_profiles,
+        "api_authorization_profile_ids": api_authorization_profile_ids(api_profiles),
+        "api_authorization_evidence_questions": api_authorization_profile_evidence_questions(api_profiles),
+        "acceptance_checklist": ordered_unique_strings(
+            [
+                *BOUNTY_WORKORDER_GLOBAL_ACCEPTANCE_CHECKS,
+                *api_authorization_profile_acceptance_checks(api_profiles),
+            ]
+        ),
+        "lane_reject_if": ordered_unique_strings(
+            [
+                *normalize_string_list(lane_spec.get("reject_if")),
+                *api_authorization_profile_reject_if(api_profiles),
+            ]
+        ),
         "invalidity_category": row.get("invalidity_category"),
         "invalidity_categories": normalize_string_list(row.get("invalidity_categories")),
         "minimum_fix": row.get("minimum_fix"),
@@ -24760,6 +24837,10 @@ def build_bounty_evidence_workorders(
     )
     operator_required = sum(1 for item in workorders if item.get("operator_input_required"))
     invalid_now = sum(1 for item in workorders if item.get("invalid_if_reported_now"))
+    api_authorization_counts: dict[str, int] = {}
+    for item in workorders:
+        for profile_id in normalize_string_list(item.get("api_authorization_profile_ids")):
+            increment_count(api_authorization_counts, profile_id)
     if not workorders:
         status = "no-bounty-evidence-workorders"
     elif operator_required:
@@ -24784,6 +24865,7 @@ def build_bounty_evidence_workorders(
             "top_workorder": top.get("id"),
             "top_lane": top.get("lane"),
             "top_first_blocker": (top.get("first_blocker") or {}).get("id") if isinstance(top.get("first_blocker"), dict) else None,
+            "api_authorization_counts": dict(sorted(api_authorization_counts.items())),
             "bounty_readiness_rollup_status": artifact_summary_status(bounty_readiness_rollup),
         },
         "workorders": workorders,
@@ -24802,6 +24884,51 @@ def build_bounty_evidence_workorders(
             "starts no browser, creates no official sidecars, signs no wallet, and submits no transaction."
         ),
     }
+
+
+def bounty_rows_have_current_api_authorization_schema(rows: Any) -> bool:
+    if not isinstance(rows, list):
+        return False
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("lane") or "") not in BOUNTY_LANE_API_AUTHORIZATION_IMPACTS:
+            continue
+        if not normalize_string_list(row.get("api_authorization_profile_ids")):
+            return False
+    return True
+
+
+def bounty_artifact_has_current_api_authorization_schema(doc: Any, rows_key: str) -> bool:
+    if not isinstance(doc, dict):
+        return False
+    rows = doc.get(rows_key)
+    if not bounty_rows_have_current_api_authorization_schema(rows):
+        return False
+    expects_profiles = any(
+        isinstance(row, dict) and str(row.get("lane") or "") in BOUNTY_LANE_API_AUTHORIZATION_IMPACTS
+        for row in (rows or [])
+    )
+    if not expects_profiles:
+        return True
+    summary = doc.get("summary")
+    return isinstance(summary, dict) and isinstance(summary.get("api_authorization_counts"), dict)
+
+
+def bounty_workorders_have_current_api_authorization_schema(doc: Any) -> bool:
+    return bounty_artifact_has_current_api_authorization_schema(doc, "workorders")
+
+
+def bounty_authorization_has_current_api_authorization_schema(doc: Any) -> bool:
+    return bounty_artifact_has_current_api_authorization_schema(doc, "authorization_requests")
+
+
+def bounty_action_queue_has_current_api_authorization_schema(doc: Any) -> bool:
+    return bounty_artifact_has_current_api_authorization_schema(doc, "actions")
+
+
+def bounty_templates_have_current_api_authorization_schema(doc: Any) -> bool:
+    return bounty_artifact_has_current_api_authorization_schema(doc, "templates")
 
 
 def bounded_source_refs_from_rows(rows: Any, *, limit: int = 10) -> list[dict[str, Any]]:
@@ -25614,6 +25741,15 @@ def bounty_authorization_request_for_workorder(
         ),
         "redaction_requirements": BOUNTY_AUTHORIZATION_REDACTION_REQUIREMENTS,
         "acceptance_checklist": normalize_string_list(workorder.get("acceptance_checklist")),
+        "api_authorization_profiles": [
+            profile
+            for profile in workorder.get("api_authorization_profiles", []) or []
+            if isinstance(profile, dict)
+        ],
+        "api_authorization_profile_ids": normalize_string_list(workorder.get("api_authorization_profile_ids")),
+        "api_authorization_evidence_questions": normalize_string_list(
+            workorder.get("api_authorization_evidence_questions")
+        ),
         "reject_if": reject_if,
         "preview_commands": preview_commands[:4],
         "after_evidence_validation_commands": after_commands[:8],
@@ -25711,6 +25847,10 @@ def build_bounty_evidence_authorization(
         if str(row.get("priority_decision") or "").startswith("park")
     ]
     invalid_now = sum(1 for row in requests if row.get("invalid_if_reported_now"))
+    api_authorization_counts: dict[str, int] = {}
+    for row in requests:
+        for profile_id in normalize_string_list(row.get("api_authorization_profile_ids")):
+            increment_count(api_authorization_counts, profile_id)
     status = (
         "authorization-required-before-evidence-collection"
         if requests and any(row.get("authorization_status") == "requires-human-approval" for row in requests)
@@ -25751,6 +25891,7 @@ def build_bounty_evidence_authorization(
             "top_lane": top.get("lane"),
             "top_priority_decision": top.get("priority_decision"),
             "top_requested_evidence": normalize_string_list(top.get("requested_official_evidence_labels")),
+            "api_authorization_counts": dict(sorted(api_authorization_counts.items())),
             "bounty_evidence_workorders_status": artifact_summary_status(bounty_evidence_workorders),
             "bounty_lane_priorities_status": artifact_summary_status(bounty_lane_priorities),
         },
@@ -26580,6 +26721,15 @@ def bounty_action_for_authorization_request(
             str(authorization.get("lane") or ""),
             normalize_string_list(authorization.get("requested_official_evidence_labels")),
         ),
+        "api_authorization_profiles": [
+            profile
+            for profile in authorization.get("api_authorization_profiles", []) or []
+            if isinstance(profile, dict)
+        ],
+        "api_authorization_profile_ids": normalize_string_list(authorization.get("api_authorization_profile_ids")),
+        "api_authorization_evidence_questions": normalize_string_list(
+            authorization.get("api_authorization_evidence_questions")
+        ),
         "file_refs": normalize_string_list(intake.get("file_refs")),
         "redaction_risks": normalize_string_list(intake.get("redaction_risks")),
         "reportability_boundary": authorization.get("reportability_boundary") or rollup.get("reportability_boundary"),
@@ -26689,6 +26839,10 @@ def build_bounty_action_queue(
     for row in actions:
         increment_count(kind_counts, str(row.get("kind") or "unknown"))
         increment_count(actor_counts, str(row.get("actor") or "unknown"))
+    api_authorization_counts: dict[str, int] = {}
+    for row in actions:
+        for profile_id in normalize_string_list(row.get("api_authorization_profile_ids")):
+            increment_count(api_authorization_counts, profile_id)
     ready_agent = [row for row in actions if row.get("agent_can_continue_without_new_evidence")]
     human_required = [row for row in actions if row.get("requires_human_evidence")]
     blocked = [row for row in actions if str(row.get("kind") or "") == "fix-evidence-intake"]
@@ -26728,6 +26882,7 @@ def build_bounty_action_queue(
             "top_actor": top.get("actor"),
             "kind_counts": dict(sorted(kind_counts.items())),
             "actor_counts": dict(sorted(actor_counts.items())),
+            "api_authorization_counts": dict(sorted(api_authorization_counts.items())),
             "bounty_readiness_rollup_status": artifact_summary_status(bounty_readiness_rollup),
             "bounty_evidence_authorization_status": artifact_summary_status(bounty_evidence_authorization),
             "bounty_evidence_intake_status": artifact_summary_status(bounty_evidence_intake),
@@ -27427,6 +27582,101 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             evidence_prep_status=status_doc,
             bounty_template_safety={"status": "no-templates-to-review"},
         )
+        workorder_case = bounty_evidence_workorder_for_rollup_row(
+            {
+                "gate_id": "GATE-selftest-transaction-integrity",
+                "frontier_id": "frontier-selftest",
+                "claim_id": "claim-selftest",
+                "entrypoint": "POST /api/quote",
+                "lane": "transaction-integrity",
+                "expected_severity": "high-candidate",
+                "gate_status": "blocked-missing-official-evidence",
+                "readiness_status": "waiting-minimal-transaction-evidence",
+                "first_blocker_id": "official-transaction-payload-sidecar",
+                "first_blocker_status": "missing",
+                "first_blocker_next_step": "Provide one approved quote transaction payload.",
+                "required_official_evidence": [
+                    str(artifact_dir / "transaction-payloads.jsonl"),
+                    str(artifact_dir / "transaction-intent-policy.json"),
+                ],
+                "required_official_evidence_labels": [
+                    "transaction-payloads.jsonl",
+                    "transaction-intent-policy.json",
+                ],
+                "official_evidence_missing_count": 2,
+                "evidence_distance": 8,
+                "invalid_if_reported_now": True,
+                "validation_commands": [],
+                "reportability_boundary": "Synthetic self-test workorder only.",
+            },
+            artifact_dir=artifact_dir,
+            profile=None,
+            rank=1,
+        )
+        priority_case = {
+            "id": "LANE-PRIORITY-selftest-transaction-integrity",
+            "workorder_id": workorder_case.get("id"),
+            "lane": "transaction-integrity",
+            "score": 99,
+            "decision": "pursue-first-if-approved-payload-can-be-collected",
+            "reason": "Synthetic transaction-integrity priority.",
+            "close_or_park_condition": "Close if no approved payload and matching policy can be collected.",
+            "reportability_boundary": "Synthetic self-test priority only.",
+        }
+        authorization_case = bounty_authorization_request_for_workorder(
+            workorder_case,
+            priority=priority_case,
+            rank=1,
+        )
+        action_case = bounty_action_for_authorization_request(
+            authorization_case,
+            intake={"status": "waiting-approved-evidence-files"},
+            rollup={"readiness_status": "waiting-minimal-transaction-evidence"},
+            artifact_dir=artifact_dir,
+            profile=None,
+        )
+        template_case = build_bounty_evidence_templates(
+            target=target,
+            profile=None,
+            artifact_dir=artifact_dir,
+            bounty_action_queue={
+                "generated_at": utc_now(),
+                "schema": "inferforge-bounty-action-queue-v1",
+                "status": "waiting-human-evidence-action",
+                "target": target,
+                "summary": {"actions": 1, "top_lane": "transaction-integrity"},
+                "actions": [action_case],
+            },
+            top=1,
+        )
+        request_markdown_case = bounty_evidence_request_markdown(
+            target=target,
+            action_queue={
+                "generated_at": utc_now(),
+                "schema": "inferforge-bounty-action-queue-v1",
+                "status": "waiting-human-evidence-action",
+                "target": target,
+                "summary": {
+                    "actions": 1,
+                    "agent_ready": 0,
+                    "human_required": 1,
+                    "blocked": 0,
+                    "parked": 0,
+                    "top_lane": "transaction-integrity",
+                    "top_kind": "collect-approved-evidence",
+                    "top_actor": "operator-or-user",
+                },
+                "actions": [action_case],
+            },
+            bounty_evidence_authorization={
+                "generated_at": utc_now(),
+                "schema": "inferforge-bounty-evidence-authorization-v1",
+                "status": "authorization-required-before-evidence-collection",
+                "target": target,
+                "authorization_requests": [authorization_case],
+            },
+            top=1,
+        )
         official_sidecars = [
             artifact_dir / "transaction-payloads.jsonl",
             artifact_dir / "transaction-intent-policy.json",
@@ -27457,6 +27707,65 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             ],
         )
     ]
+    expected_api_profile_ids = {"transaction-intent-property-boundary", "mass-assignment-property-boundary"}
+    workorder_api_profile_ids = set(normalize_string_list(workorder_case.get("api_authorization_profile_ids")))
+    authorization_api_profile_ids = set(normalize_string_list(authorization_case.get("api_authorization_profile_ids")))
+    action_api_profile_ids = set(normalize_string_list(action_case.get("api_authorization_profile_ids")))
+    template_api_profile_ids = {
+        profile_id
+        for template in template_case.get("templates", []) or []
+        if isinstance(template, dict)
+        for profile_id in normalize_string_list(template.get("api_authorization_profile_ids"))
+    }
+    fresh_api_schema_cases = {
+        "workorders": bounty_workorders_have_current_api_authorization_schema(
+            {
+                "summary": {"api_authorization_counts": {profile_id: 1 for profile_id in workorder_api_profile_ids}},
+                "workorders": [workorder_case],
+            }
+        ),
+        "authorization": bounty_authorization_has_current_api_authorization_schema(
+            {
+                "summary": {"api_authorization_counts": {profile_id: 1 for profile_id in authorization_api_profile_ids}},
+                "authorization_requests": [authorization_case],
+            }
+        ),
+        "action_queue": bounty_action_queue_has_current_api_authorization_schema(
+            {
+                "summary": {"api_authorization_counts": {profile_id: 1 for profile_id in action_api_profile_ids}},
+                "actions": [action_case],
+            }
+        ),
+        "templates": bounty_templates_have_current_api_authorization_schema(template_case),
+    }
+    stale_missing_profile_schema_cases = {
+        "workorders": bounty_workorders_have_current_api_authorization_schema(
+            {"summary": {"api_authorization_counts": {}}, "workorders": [{"lane": "transaction-integrity"}]}
+        ),
+        "authorization": bounty_authorization_has_current_api_authorization_schema(
+            {"summary": {"api_authorization_counts": {}}, "authorization_requests": [{"lane": "transaction-integrity"}]}
+        ),
+        "action_queue": bounty_action_queue_has_current_api_authorization_schema(
+            {"summary": {"api_authorization_counts": {}}, "actions": [{"lane": "transaction-integrity"}]}
+        ),
+        "templates": bounty_templates_have_current_api_authorization_schema(
+            {"summary": {"api_authorization_counts": {}}, "templates": [{"lane": "transaction-integrity"}]}
+        ),
+    }
+    stale_missing_summary_schema_cases = {
+        "workorders": bounty_workorders_have_current_api_authorization_schema(
+            {"summary": {}, "workorders": [workorder_case]}
+        ),
+        "authorization": bounty_authorization_has_current_api_authorization_schema(
+            {"summary": {}, "authorization_requests": [authorization_case]}
+        ),
+        "action_queue": bounty_action_queue_has_current_api_authorization_schema(
+            {"summary": {}, "actions": [action_case]}
+        ),
+        "templates": bounty_templates_have_current_api_authorization_schema(
+            {"summary": {}, "templates": template_case.get("templates", [])}
+        ),
+    }
     assertions = [
         {
             "id": "transaction-payload-precedes-policy",
@@ -27520,6 +27829,59 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             "expected": [],
             "actual": sidecar_exists,
         },
+        {
+            "id": "api-authorization-profiles-propagate",
+            "passed": (
+                expected_api_profile_ids <= workorder_api_profile_ids
+                and expected_api_profile_ids <= authorization_api_profile_ids
+                and expected_api_profile_ids <= action_api_profile_ids
+                and expected_api_profile_ids <= template_api_profile_ids
+            ),
+            "expected": sorted(expected_api_profile_ids),
+            "actual": {
+                "workorder": sorted(workorder_api_profile_ids),
+                "authorization": sorted(authorization_api_profile_ids),
+                "action": sorted(action_api_profile_ids),
+                "templates": sorted(template_api_profile_ids),
+            },
+        },
+        {
+            "id": "api-authorization-acceptance-checks-propagate",
+            "passed": any(
+                "Offline decode shows" in str(check)
+                for check in normalize_string_list(authorization_case.get("acceptance_checklist"))
+            ),
+            "expected": "transaction-intent acceptance checks copied into authorization checklist",
+            "actual": normalize_string_list(authorization_case.get("acceptance_checklist"))[:8],
+        },
+        {
+            "id": "request-brief-renders-api-oracle-profiles",
+            "passed": (
+                "Evidence oracle profiles:" in request_markdown_case
+                and "transaction-intent-property-boundary" in request_markdown_case
+                and "mass-assignment-property-boundary" in request_markdown_case
+            ),
+            "expected": "request brief contains API authorization profile ids",
+            "actual": request_markdown_case,
+        },
+        {
+            "id": "fresh-bounty-api-profile-artifacts-load",
+            "passed": all(fresh_api_schema_cases.values()),
+            "expected": {"all_fresh_cases": True},
+            "actual": fresh_api_schema_cases,
+        },
+        {
+            "id": "stale-bounty-api-profile-artifacts-rebuild",
+            "passed": (
+                not any(stale_missing_profile_schema_cases.values())
+                and not any(stale_missing_summary_schema_cases.values())
+            ),
+            "expected": {"missing_profiles": False, "missing_summary_counts": False},
+            "actual": {
+                "missing_profiles": stale_missing_profile_schema_cases,
+                "missing_summary_counts": stale_missing_summary_schema_cases,
+            },
+        },
     ]
     failed = [item for item in assertions if not item.get("passed")]
     return {
@@ -27539,6 +27901,10 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             "package": package,
             "evidence_prep_status": status_doc,
             "bounty_prep_sync": sync,
+            "workorder_case": workorder_case,
+            "authorization_case": authorization_case,
+            "action_case": action_case,
+            "template_case": template_case,
         },
         "assertions": assertions,
         "safety": (
@@ -27641,6 +28007,24 @@ def bounty_evidence_request_markdown(
             max_chars=260,
         )
         lines.extend(evidence_lines or ["- Approved, redacted official evidence for this lane."])
+        api_profiles = [
+            profile
+            for profile in auth.get("api_authorization_profiles", []) or action.get("api_authorization_profiles", []) or []
+            if isinstance(profile, dict)
+        ]
+        if api_profiles:
+            lines.extend(["", "Evidence oracle profiles:"])
+            for profile in api_profiles[:3]:
+                lines.append(
+                    f"- `{bounty_brief_line(profile.get('id'), max_chars=120)}`: "
+                    f"{bounty_brief_line(profile.get('evidence_question'), max_chars=300)}"
+                )
+                checks = bounty_brief_bullet_lines(profile.get("acceptance_checks"), max_items=2, max_chars=260)
+                if checks:
+                    lines.extend(["  Acceptance checks:", *[f"  {line}" for line in checks]])
+                rejects = bounty_brief_bullet_lines(profile.get("reject_if"), max_items=2, max_chars=260)
+                if rejects:
+                    lines.extend(["  Reject if:", *[f"  {line}" for line in rejects]])
         handoff = bounty_brief_bullet_lines(auth.get("handoff_fields"), max_items=10, max_chars=160)
         if handoff:
             lines.extend(["", "Handoff fields:", *handoff])
@@ -27962,6 +28346,17 @@ def build_bounty_evidence_templates(
             template["reportability_boundary"] = (
                 "Template-only. This is not evidence, not lane validation, not a finding, and not a bounty report."
             )
+            template["api_authorization_profiles"] = [
+                profile
+                for profile in action.get("api_authorization_profiles", []) or []
+                if isinstance(profile, dict)
+            ]
+            template["api_authorization_profile_ids"] = normalize_string_list(
+                action.get("api_authorization_profile_ids")
+            )
+            template["api_authorization_evidence_questions"] = normalize_string_list(
+                action.get("api_authorization_evidence_questions")
+            )
             template["after_filling_commands"] = ordered_unique_strings(
                 [
                     validation_command_for_artifact_dir(
@@ -27983,9 +28378,12 @@ def build_bounty_evidence_templates(
     )
     lane_counts: dict[str, int] = {}
     kind_counts: dict[str, int] = {}
+    api_authorization_counts: dict[str, int] = {}
     for template in templates:
         increment_count(lane_counts, str(template.get("lane") or "unknown"))
         increment_count(kind_counts, str(template.get("template_kind") or "unknown"))
+        for profile_id in normalize_string_list(template.get("api_authorization_profile_ids")):
+            increment_count(api_authorization_counts, profile_id)
     status = "bounty-evidence-templates-ready" if templates else "no-bounty-evidence-templates"
     return {
         "generated_at": utc_now(),
@@ -28000,6 +28398,7 @@ def build_bounty_evidence_templates(
             "target_evidence_paths": len(target_paths),
             "lane_counts": dict(sorted(lane_counts.items())),
             "template_kind_counts": dict(sorted(kind_counts.items())),
+            "api_authorization_counts": dict(sorted(api_authorization_counts.items())),
             "bounty_action_queue_status": artifact_summary_status(bounty_action_queue),
         },
         "templates": templates,
@@ -79874,6 +80273,7 @@ def run_bounty_evidence_workorders(args: argparse.Namespace) -> int:
         f"rollup={summary.get('bounty_readiness_rollup_status') or '-'} "
         f"top_blocker={summary.get('top_first_blocker') or '-'}"
     )
+    print(f"API profiles: {json.dumps(summary.get('api_authorization_counts', {}), sort_keys=True)}")
     display_limit = max(0, int(args.top))
     if getattr(args, "show_workorders", False):
         print("Workorders:")
@@ -79890,6 +80290,9 @@ def run_bounty_evidence_workorders(args: argparse.Namespace) -> int:
             evidence = ", ".join(normalize_string_list(item.get("required_official_evidence_labels"))[:4])
             if evidence:
                 print(f"  needs={inline_summary_text(evidence, max_chars=300)}")
+            api_profiles = ", ".join(normalize_string_list(item.get("api_authorization_profile_ids"))[:4])
+            if api_profiles:
+                print(f"  api_profiles={inline_summary_text(api_profiles, max_chars=260)}")
             if getattr(args, "show_checklist", False):
                 for capture in normalize_string_list(item.get("must_capture"))[:3]:
                     print(f"  capture={inline_summary_text(capture, max_chars=260)}")
@@ -79949,7 +80352,7 @@ def build_or_load_bounty_evidence_workorders_for_run(
     source_root: Path,
 ) -> dict[str, Any]:
     workorders = load_optional_json(artifact_dir / BOUNTY_EVIDENCE_WORKORDERS_ARTIFACT)
-    if isinstance(workorders, dict):
+    if bounty_workorders_have_current_api_authorization_schema(workorders):
         return workorders
     rollup = build_or_load_bounty_readiness_rollup_for_run(
         target=target,
@@ -80305,6 +80708,7 @@ def run_bounty_evidence_authorization(args: argparse.Namespace) -> int:
     top_evidence = normalize_string_list(summary.get("top_requested_evidence"))
     if top_evidence:
         print("Top requested evidence: " + ", ".join(top_evidence[: max(1, min(6, int(args.top)))]))
+    print(f"API profiles: {json.dumps(summary.get('api_authorization_counts', {}), sort_keys=True)}")
     display_limit = max(0, int(args.top))
     if getattr(args, "show_requests", False):
         print("Authorization requests:")
@@ -80320,6 +80724,9 @@ def run_bounty_evidence_authorization(args: argparse.Namespace) -> int:
             evidence = ", ".join(normalize_string_list(row.get("requested_official_evidence_labels"))[:4])
             if evidence:
                 print(f"  needs={inline_summary_text(evidence, max_chars=300)}")
+            api_profiles = ", ".join(normalize_string_list(row.get("api_authorization_profile_ids"))[:4])
+            if api_profiles:
+                print(f"  api_profiles={inline_summary_text(api_profiles, max_chars=260)}")
             if getattr(args, "show_contract", False):
                 for allowed in normalize_string_list(row.get("allowed_actions"))[: max(1, min(3, int(args.contract_items)))]:
                     print(f"  allowed={inline_summary_text(allowed, max_chars=280)}")
@@ -80368,7 +80775,7 @@ def build_or_load_bounty_evidence_authorization_for_run(
     source_root: Path,
 ) -> dict[str, Any]:
     authorization = load_optional_json(artifact_dir / BOUNTY_EVIDENCE_AUTHORIZATION_ARTIFACT)
-    if isinstance(authorization, dict):
+    if bounty_authorization_has_current_api_authorization_schema(authorization):
         return authorization
     workorders = build_or_load_bounty_evidence_workorders_for_run(
         target=target,
@@ -80641,6 +81048,7 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
         f"adjudication={summary.get('adjudication_status') or '-'}"
     )
     print(f"Kinds: {json.dumps(summary.get('kind_counts', {}), sort_keys=True)}")
+    print(f"API profiles: {json.dumps(summary.get('api_authorization_counts', {}), sort_keys=True)}")
     display_limit = max(0, int(args.top))
     if getattr(args, "show_actions", False):
         print("Actions:")
@@ -80656,6 +81064,9 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
             evidence = ", ".join(normalize_string_list(row.get("requested_evidence"))[:4])
             if evidence:
                 print(f"  needs={inline_summary_text(evidence, max_chars=300)}")
+            api_profiles = ", ".join(normalize_string_list(row.get("api_authorization_profile_ids"))[:4])
+            if api_profiles:
+                print(f"  api_profiles={inline_summary_text(api_profiles, max_chars=260)}")
             if getattr(args, "show_commands", False):
                 command_text = row.get("safe_offline_command")
                 if command_text:
@@ -80925,7 +81336,7 @@ def build_or_load_bounty_action_queue_for_run(
     max_file_bytes: int,
 ) -> dict[str, Any]:
     queue = load_optional_json(artifact_dir / BOUNTY_ACTION_QUEUE_ARTIFACT)
-    if isinstance(queue, dict):
+    if bounty_action_queue_has_current_api_authorization_schema(queue):
         return queue
     rollup = build_or_load_bounty_readiness_rollup_for_run(
         target=target,
@@ -81080,6 +81491,7 @@ def run_bounty_evidence_templates(args: argparse.Namespace) -> int:
         f"queue={summary.get('bounty_action_queue_status') or '-'}"
     )
     print(f"Kinds: {json.dumps(summary.get('template_kind_counts', {}), sort_keys=True)}")
+    print(f"API profiles: {json.dumps(summary.get('api_authorization_counts', {}), sort_keys=True)}")
     display_limit = max(0, int(args.top))
     if getattr(args, "show_templates", False):
         print("Templates:")
@@ -81092,6 +81504,9 @@ def run_bounty_evidence_templates(args: argparse.Namespace) -> int:
             )
             for instruction in normalize_string_list(row.get("instructions"))[:3]:
                 print(f"  instruction={inline_summary_text(instruction, max_chars=260)}")
+            api_profiles = ", ".join(normalize_string_list(row.get("api_authorization_profile_ids"))[:4])
+            if api_profiles:
+                print(f"  api_profiles={inline_summary_text(api_profiles, max_chars=260)}")
             commands = normalize_string_list(row.get("after_filling_commands"))
             if commands:
                 print(f"  validate={inline_summary_text(commands[0], max_chars=420)}")
@@ -81131,7 +81546,7 @@ def build_or_load_bounty_evidence_templates_for_run(
     top: int,
 ) -> dict[str, Any]:
     templates = load_optional_json(artifact_dir / BOUNTY_EVIDENCE_TEMPLATES_ARTIFACT)
-    if isinstance(templates, dict):
+    if bounty_templates_have_current_api_authorization_schema(templates):
         return templates
     queue = build_or_load_bounty_action_queue_for_run(
         target=target,
