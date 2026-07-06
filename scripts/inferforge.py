@@ -26241,6 +26241,73 @@ def bounty_evidence_intake_cache_current(
     return cached == current
 
 
+def bounty_cache_fingerprint(value: Any) -> str:
+    def stable(node: Any) -> Any:
+        if isinstance(node, dict):
+            return {
+                str(key): stable(child)
+                for key, child in sorted(node.items(), key=lambda item: str(item[0]))
+                if str(key) not in {"generated_at", "current_profile_context"}
+            }
+        if isinstance(node, list):
+            return [stable(child) for child in node]
+        return node
+
+    encoded = json.dumps(stable(value), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def bounty_action_queue_cache_validation(
+    *,
+    bounty_readiness_rollup: dict[str, Any] | None,
+    bounty_evidence_authorization: dict[str, Any] | None,
+    bounty_evidence_intake: dict[str, Any] | None,
+    adjudication: dict[str, Any] | None,
+    max_file_bytes: int,
+) -> dict[str, Any]:
+    dependencies = {
+        "bounty_readiness_rollup": bounty_readiness_rollup,
+        "bounty_evidence_authorization": bounty_evidence_authorization,
+        "bounty_evidence_intake": bounty_evidence_intake,
+        "adjudication": adjudication,
+    }
+    return {
+        "schema": "inferforge-bounty-action-queue-cache-v1",
+        "max_file_bytes": max_file_bytes,
+        "dependencies": {
+            name: {
+                "status": artifact_summary_status(doc),
+                "fingerprint": bounty_cache_fingerprint(doc if isinstance(doc, dict) else {}),
+            }
+            for name, doc in dependencies.items()
+        },
+    }
+
+
+def bounty_action_queue_cache_current(
+    queue: dict[str, Any] | None,
+    *,
+    bounty_readiness_rollup: dict[str, Any] | None,
+    bounty_evidence_authorization: dict[str, Any] | None,
+    bounty_evidence_intake: dict[str, Any] | None,
+    adjudication: dict[str, Any] | None,
+    max_file_bytes: int,
+) -> bool:
+    if not bounty_action_queue_has_current_api_authorization_schema(queue):
+        return False
+    cached = queue.get("cache_validation") if isinstance(queue, dict) else None
+    if not isinstance(cached, dict):
+        return False
+    current = bounty_action_queue_cache_validation(
+        bounty_readiness_rollup=bounty_readiness_rollup,
+        bounty_evidence_authorization=bounty_evidence_authorization,
+        bounty_evidence_intake=bounty_evidence_intake,
+        adjudication=adjudication,
+        max_file_bytes=max_file_bytes,
+    )
+    return cached == current
+
+
 def bounty_intake_parse_jsonl(text: str) -> tuple[list[Any], list[str]]:
     rows = []
     errors = []
@@ -27604,6 +27671,7 @@ def build_bounty_action_queue(
     bounty_evidence_authorization: dict[str, Any] | None,
     bounty_evidence_intake: dict[str, Any] | None,
     adjudication: dict[str, Any] | None,
+    max_file_bytes: int = 262144,
 ) -> dict[str, Any]:
     auth_requests = (
         bounty_evidence_authorization.get("authorization_requests", [])
@@ -27727,6 +27795,13 @@ def build_bounty_action_queue(
             if row.get("safe_offline_command")
         ]
     )
+    cache_validation = bounty_action_queue_cache_validation(
+        bounty_readiness_rollup=bounty_readiness_rollup,
+        bounty_evidence_authorization=bounty_evidence_authorization,
+        bounty_evidence_intake=bounty_evidence_intake,
+        adjudication=adjudication,
+        max_file_bytes=max_file_bytes,
+    )
     return {
         "generated_at": utc_now(),
         "schema": "inferforge-bounty-action-queue-v1",
@@ -27752,7 +27827,9 @@ def build_bounty_action_queue(
             "bounty_evidence_authorization_status": artifact_summary_status(bounty_evidence_authorization),
             "bounty_evidence_intake_status": artifact_summary_status(bounty_evidence_intake),
             "adjudication_status": artifact_summary_status(adjudication),
+            "cache_dependency_count": len(cache_validation.get("dependencies", {}) or {}),
         },
+        "cache_validation": cache_validation,
         "actions": actions,
         "agent_ready_actions": ready_agent[:8],
         "human_required_actions": human_required[:8],
@@ -28580,6 +28657,102 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             artifact_dir=present_artifact_dir,
             profile=None,
         )
+        authorization_doc = {
+            "generated_at": utc_now(),
+            "schema": "inferforge-bounty-evidence-authorization-v1",
+            "status": "authorization-required-before-evidence-collection",
+            "target": target,
+            "summary": {
+                "api_authorization_counts": {
+                    profile_id: 1
+                    for profile_id in normalize_string_list(authorization_case.get("api_authorization_profile_ids"))
+                }
+            },
+            "authorization_requests": [authorization_case],
+        }
+        rollup_doc = {
+            "generated_at": utc_now(),
+            "schema": "inferforge-bounty-readiness-rollup-v1",
+            "status": "blocked-missing-official-evidence",
+            "lane_rollups": [
+                {
+                    "gate_id": authorization_case.get("gate_id"),
+                    "lane": "transaction-integrity",
+                    "readiness_status": "waiting-minimal-transaction-evidence",
+                    "gate_status": "blocked-missing-official-evidence",
+                }
+            ],
+        }
+        waiting_intake_doc = {
+            "generated_at": utc_now(),
+            "schema": "inferforge-bounty-evidence-intake-v1",
+            "status": "waiting-approved-evidence-files",
+            "intake_reviews": [
+                {
+                    "authorization_request_id": authorization_case.get("id"),
+                    "status": "waiting-evidence-files",
+                    "recommended_after_evidence_command": validation_command_for_artifact_dir(
+                        artifact_dir,
+                        "transaction-evidence-readiness --no-write --show-checks",
+                        profile=None,
+                    ),
+                }
+            ],
+        }
+        ready_intake_doc = {
+            "generated_at": utc_now(),
+            "schema": "inferforge-bounty-evidence-intake-v1",
+            "status": "ready-for-lane-validation",
+            "intake_reviews": [
+                {
+                    "authorization_request_id": authorization_case.get("id"),
+                    "status": "ready-for-lane-validation",
+                    "next_step": "Run transaction evidence readiness after approved sidecars pass intake.",
+                    "recommended_after_evidence_command": validation_command_for_artifact_dir(
+                        artifact_dir,
+                        "transaction-evidence-readiness --no-write --show-checks",
+                        profile=None,
+                    ),
+                }
+            ],
+        }
+        adjudication_doc = {"generated_at": utc_now(), "schema": "inferforge-adjudication-v1", "status": "no-reportable-findings"}
+        stale_queue_case = build_bounty_action_queue(
+            target=target,
+            profile=None,
+            artifact_dir=artifact_dir,
+            bounty_readiness_rollup=rollup_doc,
+            bounty_evidence_authorization=authorization_doc,
+            bounty_evidence_intake=waiting_intake_doc,
+            adjudication=adjudication_doc,
+            max_file_bytes=262144,
+        )
+        stale_queue_current_with_waiting = bounty_action_queue_cache_current(
+            stale_queue_case,
+            bounty_readiness_rollup=rollup_doc,
+            bounty_evidence_authorization=authorization_doc,
+            bounty_evidence_intake=waiting_intake_doc,
+            adjudication=adjudication_doc,
+            max_file_bytes=262144,
+        )
+        stale_queue_current_with_ready = bounty_action_queue_cache_current(
+            stale_queue_case,
+            bounty_readiness_rollup=rollup_doc,
+            bounty_evidence_authorization=authorization_doc,
+            bounty_evidence_intake=ready_intake_doc,
+            adjudication=adjudication_doc,
+            max_file_bytes=262144,
+        )
+        rebuilt_ready_queue_case = build_bounty_action_queue(
+            target=target,
+            profile=None,
+            artifact_dir=artifact_dir,
+            bounty_readiness_rollup=rollup_doc,
+            bounty_evidence_authorization=authorization_doc,
+            bounty_evidence_intake=ready_intake_doc,
+            adjudication=adjudication_doc,
+            max_file_bytes=262144,
+        )
         template_case = build_bounty_evidence_templates(
             target=target,
             profile=None,
@@ -28665,6 +28838,11 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
     authorization_api_profile_ids = set(normalize_string_list(authorization_case.get("api_authorization_profile_ids")))
     action_api_profile_ids = set(normalize_string_list(action_case.get("api_authorization_profile_ids")))
     evidence_present_action_kind = str(evidence_present_action_case.get("kind") or "")
+    rebuilt_ready_action = (
+        rebuilt_ready_queue_case.get("actions", [])[0]
+        if isinstance(rebuilt_ready_queue_case.get("actions"), list) and rebuilt_ready_queue_case.get("actions")
+        else {}
+    )
     template_api_profile_ids = {
         profile_id
         for template in template_case.get("templates", []) or []
@@ -28956,6 +29134,22 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             },
         },
         {
+            "id": "action-queue-cache-invalidates-when-intake-changes",
+            "passed": stale_queue_current_with_waiting is True
+            and stale_queue_current_with_ready is False
+            and rebuilt_ready_queue_case.get("status") == "ready-for-offline-validation-action"
+            and rebuilt_ready_action.get("kind") == "validate-ready-evidence"
+            and rebuilt_ready_action.get("agent_can_continue_without_new_evidence") is True,
+            "expected": "stale queue cache invalidates when intake changes from waiting to ready",
+            "actual": {
+                "stale_current_with_waiting": stale_queue_current_with_waiting,
+                "stale_current_with_ready": stale_queue_current_with_ready,
+                "rebuilt_status": rebuilt_ready_queue_case.get("status"),
+                "rebuilt_kind": rebuilt_ready_action.get("kind"),
+                "rebuilt_agent_ready": rebuilt_ready_action.get("agent_can_continue_without_new_evidence"),
+            },
+        },
+        {
             "id": "request-brief-renders-api-oracle-profiles",
             "passed": (
                 "Evidence oracle profiles:" in request_markdown_case
@@ -29022,6 +29216,8 @@ def build_bounty_prep_package_selftest() -> dict[str, Any]:
             "action_case": action_case,
             "template_case": template_case,
             "evidence_present_action_case": evidence_present_action_case,
+            "stale_queue_case": stale_queue_case,
+            "rebuilt_ready_queue_case": rebuilt_ready_queue_case,
         },
         "assertions": assertions,
         "safety": (
@@ -82665,6 +82861,7 @@ def run_bounty_action_queue(args: argparse.Namespace) -> int:
         bounty_evidence_authorization=authorization,
         bounty_evidence_intake=intake,
         adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+        max_file_bytes=int(args.max_file_bytes),
     )
     output_path = (
         resolve_repo_path(args.output)
@@ -83008,9 +83205,6 @@ def build_or_load_bounty_action_queue_for_run(
     source_root: Path,
     max_file_bytes: int,
 ) -> dict[str, Any]:
-    queue = load_optional_json(artifact_dir / BOUNTY_ACTION_QUEUE_ARTIFACT)
-    if bounty_action_queue_has_current_api_authorization_schema(queue):
-        return queue
     rollup = build_or_load_bounty_readiness_rollup_for_run(
         target=target,
         profile=profile,
@@ -83030,6 +83224,17 @@ def build_or_load_bounty_action_queue_for_run(
         source_root=source_root,
         max_file_bytes=max_file_bytes,
     )
+    adjudication = load_optional_json(artifact_dir / "adjudication.json")
+    queue = load_optional_json(artifact_dir / BOUNTY_ACTION_QUEUE_ARTIFACT)
+    if bounty_action_queue_cache_current(
+        queue,
+        bounty_readiness_rollup=rollup,
+        bounty_evidence_authorization=authorization,
+        bounty_evidence_intake=intake,
+        adjudication=adjudication,
+        max_file_bytes=max_file_bytes,
+    ):
+        return queue
     return build_bounty_action_queue(
         target=target,
         profile=profile,
@@ -83037,7 +83242,8 @@ def build_or_load_bounty_action_queue_for_run(
         bounty_readiness_rollup=rollup,
         bounty_evidence_authorization=authorization,
         bounty_evidence_intake=intake,
-        adjudication=load_optional_json(artifact_dir / "adjudication.json"),
+        adjudication=adjudication,
+        max_file_bytes=max_file_bytes,
     )
 
 
