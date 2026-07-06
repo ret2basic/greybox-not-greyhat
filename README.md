@@ -806,6 +806,11 @@ a reportable issue.
 `rewrite-response-review --no-write --show-observation-contract --show-sidecar-template-json`
 prints the single approved-path promotion, resource-gate, Burp observe,
 response-review, and finding-gate preview sequence without sending requests.
+Observation-contract steps carry command-safety refs: only the no-write
+promotion preview is `ready`, profile writes and post-observation reviews remain
+`review-gated`, resource checks are `resource-gated`, and the single Burp
+observe step is non-runnable with `blocked_external` set until the preceding
+approval/resource gates are closed.
 It also prints a compact single-request approval packet with the recommended
 read-only path, sensitivity score, redacted sidecar fields, resource-gated active
 steps, and remaining finding-gate blockers. The same command prints a redacted
