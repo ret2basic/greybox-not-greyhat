@@ -576,6 +576,10 @@ value appears in both files.
 `evidence-prep-status --show-details` summarizes the paired sidecar contract
 with the first blocker, binding review status, and first pairing issue, so a
 bad `approval_reference` or SHA-256 mismatch is visible without opening the JSON.
+When official evidence is missing, `bounty-shortest-path --show-commands` also
+places `evidence-sidecar-drafts --no-write --show-drafts` at the front of the
+handoff commands as a review-gated workbook view before the placeholder
+preflight/prepare commands.
 When the pair reaches `ready-for-decode`, the same contract exposes the gated
 no-write validation chain: `transaction-sidecar-review`, `decode-transactions`,
 `gate`, and `adjudicate`. Blocked pairs keep that command list empty.
