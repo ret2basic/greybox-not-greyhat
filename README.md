@@ -381,6 +381,9 @@ not bypass `bounty-evidence-intake`, finding-gate, or adjudication.
 and, when source invariants are available, includes a source-invariant boundary:
 the source signal, what the source path proves, negative controls, whether it is
 promotable without official evidence, and the official sidecars still required.
+It also renders the packet evidence intake manifest: artifact counts, artifact
+formats, pair-binding fields, copy policy, and reject rules are visible in the
+human handoff brief as well as in `bounty-shortest-path`.
 This keeps source-positive leads useful for targeting evidence while preventing
 them from being treated as bounty-valid findings. The brief also carries a
 machine-readable `brief_quality_gate` that checks active requests, required and
