@@ -405,6 +405,11 @@ highest-value action's minimum official evidence set, first missing artifact,
 claim-witness request, manual handoff/preflight commands, and after-evidence
 validation chain. It is an offline handoff summary only: it does not create
 sidecars, authorize traffic, or make a candidate reportable.
+The same packet and human brief also carry a reviewer invalidity preflight:
+source-only context, missing official evidence, unproven pair binding, unchecked
+negative controls, blocked offline validation, and missing finding-gate
+acceptance are listed as explicit report blockers before any bounty report can
+be treated as valid.
 Packet handoff commands also carry `handoff_command_refs`, so the same
 `manual-template`/`review-gated` classification shown in
 `bounty-action-queue --show-actions --show-commands` is available to automation
