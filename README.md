@@ -1560,6 +1560,7 @@ python3 scripts/inferforge.py lead-dossier --no-write --show-commands --show-evi
 python3 scripts/inferforge.py rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract --show-sidecar-template-json
 python3 scripts/inferforge.py transaction-payload-preflight --input ./approved-payloads.jsonl --no-write --show-records --show-commands
 python3 scripts/inferforge.py approved-quote-capture-guide --show-commands
+python3 scripts/inferforge.py redact-approved-quote-capture --input ./approved-quote.har --show-commands
 python3 scripts/inferforge.py approved-quote-exchange-candidates --show-commands
 python3 scripts/inferforge.py approved-quote-exchange-candidates --input ./approved-quote.har --show-commands
 python3 scripts/inferforge.py prepare-approved-quote-operator-inputs --request-input ./approved-quote-request.http --payload-input ./approved-quote-response.http --approval-reference APPROVED-QUOTE-001 --no-write --show-preflight --show-commands
@@ -1626,6 +1627,19 @@ plus its matching response, and should remove raw auth, cookie, API-key,
 wallet-signature, submitted-transaction, and unrelated authenticated material.
 The guide is read-only and does not create operator inputs or official evidence
 sidecars.
+
+`redact-approved-quote-capture --input ./approved-quote.har --show-commands`
+is the local staging helper for an approved capture that parses but still carries
+raw auth or cookie headers. It accepts the same single-exchange formats as the
+staged-candidate scanner, extracts the unique `POST /api/quote` request and
+matching response, removes forbidden request/response headers such as
+`Cookie`, `Authorization`, `Set-Cookie`, API-key, token, secret, private-key,
+and seed-phrase style headers, then previews a redacted `.http` output path.
+With `--write-redacted-capture`, it writes only that supporting redacted capture
+under `.greybox/discover-check/operator-inputs/` by default; it still does not
+write operator input JSON files or official evidence sidecars. After writing,
+rerun `approved-quote-exchange-candidates --show-commands` and import only if
+the staged hygiene status is `passed`.
 
 `prepare-approved-quote-operator-inputs --request-input ./approved-quote-request.http --payload-input ./approved-quote-response.http --approval-reference APPROVED-QUOTE-001 --no-write --show-preflight --show-commands`
 is the offline helper for Burp/raw-HTTP handoff. It also accepts
