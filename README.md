@@ -1559,6 +1559,7 @@ python3 scripts/inferforge.py audit --ws-resource-probes
 python3 scripts/inferforge.py lead-dossier --no-write --show-commands --show-evidence --skip-current-resource-check
 python3 scripts/inferforge.py rewrite-response-review --no-write --show-observations --show-commands --show-observation-contract --show-sidecar-template-json
 python3 scripts/inferforge.py transaction-payload-preflight --input ./approved-payloads.jsonl --no-write --show-records --show-commands
+python3 scripts/inferforge.py approved-quote-capture-guide --show-commands
 python3 scripts/inferforge.py approved-quote-exchange-candidates --show-commands
 python3 scripts/inferforge.py approved-quote-exchange-candidates --input ./approved-quote.har --show-commands
 python3 scripts/inferforge.py prepare-approved-quote-operator-inputs --request-input ./approved-quote-request.http --payload-input ./approved-quote-response.http --approval-reference APPROVED-QUOTE-001 --no-write --show-preflight --show-commands
@@ -1614,6 +1615,17 @@ hits, and never writes the official sidecar. A `ready-for-approved-sidecar-copy`
 result means the input shape is compatible with the official sidecar; it is still
 not evidence and does not satisfy finding gates until the official sidecar,
 matching intent policy, decode review, finding gate, and adjudication all agree.
+
+`approved-quote-capture-guide --show-commands` prints the offline handoff recipe
+for the single approved `/api/quote` capture. It combines the current staging
+contract, accepted single-file formats, required context, redaction checklist,
+current staged-capture state, and the next local commands. Use it before asking
+an operator to export or restage evidence: it makes clear that the capture should
+stop at quote generation, should contain exactly one `POST /api/quote` request
+plus its matching response, and should remove raw auth, cookie, API-key,
+wallet-signature, submitted-transaction, and unrelated authenticated material.
+The guide is read-only and does not create operator inputs or official evidence
+sidecars.
 
 `prepare-approved-quote-operator-inputs --request-input ./approved-quote-request.http --payload-input ./approved-quote-response.http --approval-reference APPROVED-QUOTE-001 --no-write --show-preflight --show-commands`
 is the offline helper for Burp/raw-HTTP handoff. It also accepts
