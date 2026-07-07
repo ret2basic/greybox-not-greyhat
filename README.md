@@ -1660,6 +1660,11 @@ staged file contains raw `Cookie`, `Authorization`, `Set-Cookie`, API-key, or
 similar headers. In that case the one-capture closure stops at
 `staged-capture-hygiene-review` and asks for a minimal redacted restage before
 operator-input writes or official sidecars are considered.
+If an explicit input path is missing, skipped, or otherwise not a usable quote
+exchange, the hygiene summary now reports `hygiene=no-importable-staged-capture`
+with `hygiene_skipped` rather than implying the capture is clean. A clean hygiene
+status means at least one parser-importable staged exchange passed the staging
+hygiene review.
 After a staged exchange is discovered, the operator handoff's
 `one_capture_closure_plan` gives the exact local sequence from import preview to
 operator-input write, paired preflight, official sidecar preview/write,
