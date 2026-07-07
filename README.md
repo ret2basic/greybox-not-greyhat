@@ -1692,11 +1692,14 @@ with `hygiene_skipped` rather than implying the capture is clean. A clean hygien
 status means at least one parser-importable staged exchange passed the staging
 hygiene review.
 After a staged exchange is discovered, the operator handoff's
-`one_capture_closure_plan` gives the exact local sequence from import preview to
+`one_capture_closure_plan` gives the exact local sequence from staged-capture
+hygiene review, optional redacted-capture staging, import preview,
 operator-input write, paired preflight, official sidecar preview/write,
-readiness, decode, finding-gate, and adjudication. It intentionally keeps writes
-manual and marks post-evidence commands blocked until the required sidecars are
-real, paired, approved, and redacted.
+readiness, decode, finding-gate, and adjudication. If the top staged capture is
+parser-importable but carries sensitive headers, the active closure step points
+at `redact-approved-quote-capture` before any operator-input write. It
+intentionally keeps writes manual and marks post-evidence commands blocked until
+the required sidecars are real, paired, approved, and redacted.
 
 `transaction-corpus-preflight --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --intent-input ./approved-quote-intent.json --no-write --show-policy-json --show-checks --show-commands`
 is the paired offline intake check for one approved quote request body and the
