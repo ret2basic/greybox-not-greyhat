@@ -330,6 +330,10 @@ that impact stays reserved for routes without a more precise boundary model.
 evidence package: required sidecars or operator inputs, missing evidence,
 offline no-write commands, gate entry conditions, and forbidden actions. It is a
 planning view only, not an exploit script or approval to run active traffic.
+For transaction-integrity packages, the prep view carries the approved quote
+operator-input handoff and staging contract as well: target operator-input
+directory, present/missing file counts, preflight gate, byte caps, scan limits,
+and the same `do_not_stage` rules used by the shorter quote-specific views.
 With `--skip-current-resource-check`, `methodology-review` stays fully offline
 and reports resource status as `not-run` instead of reading current `/proc`
 resource state.
