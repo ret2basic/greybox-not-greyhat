@@ -523,6 +523,16 @@ The top-level `Handoff commands`, `Verify commands`, and `After-ready commands`
 sections also print command-safety summaries and per-command labels, so
 placeholder handoff templates show as `manual-template` and missing-evidence
 verifiers show as `review-gated` instead of bare runnable-looking shell lines.
+The same shortest-path artifact now embeds `platform_submission_gate`, a final
+offline quality gate for bounty-platform submission readiness. It keeps
+`submit_allowed=false` until official evidence is complete and bound, a safe
+no-write/offline PoC exists, finding-gate and adjudication both accept a concrete
+valid finding, invalidity review is clear, severity is supported by impact, and
+the package has redaction/secret hygiene. The CLI prints
+`Platform submission: status=... allowed=... first=...`; with
+`--show-requests` it also lists the first platform blockers. This is workflow
+control only: it does not create evidence, authorize traffic, sign wallets,
+submit transactions, or turn a draft/AI-generated allegation into a report.
 `bounty-lane-priorities --show-lanes --show-commands` prints the current
 lane-level workflow ranking before the frontier/action queue layers. Each row
 now includes a `scorecard` and `blackbox_value` block that separates expected
