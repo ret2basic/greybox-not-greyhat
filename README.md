@@ -609,6 +609,12 @@ sidecar-prepare preview remains a manual template until the approval reference
 placeholder is replaced. The shortest-path `Next:` line follows the same
 operator-input state, pointing to missing files first and to the ready no-write
 preflight once all three inputs exist.
+For transaction-integrity lanes, the shortest-path view also surfaces the same
+approved quote exchange staging contract as `approved-quote-exchange-candidates`:
+operator input directory, per-file byte cap, scan limits, preferred single-file
+formats, and `do_not_stage` rules. That keeps the top bounty path aligned with
+the bounded `/api/quote` handoff and avoids treating full Burp history exports or
+secret-bearing captures as acceptable input.
 When the pair reaches `ready-for-decode`, the same contract exposes the gated
 no-write validation chain: `transaction-sidecar-review`, `decode-transactions`,
 `gate`, and `adjudicate`. Blocked pairs keep that command list empty.
