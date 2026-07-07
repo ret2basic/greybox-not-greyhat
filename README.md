@@ -587,6 +587,10 @@ finding gate by itself. The draft CLI prints the required binding fields with
 no-write corpus preflight command that consumes those files. The handoff reports
 whether each local input file is missing or present, using path metadata only;
 it does not read or print request/response content in the workbook view.
+The same `--show-drafts` handoff prints the approved quote exchange staging
+contract, including byte caps, scan limits, and `do_not_stage` rules, so draft
+workbooks do not imply that full Burp history exports or secret-bearing captures
+are acceptable evidence inputs.
 Placeholders still have to be replaced from one approved quote request/response
 pair before anything is copied into official sidecars. SHA-256 binding fields
 must be real 64-character hex digests; placeholders, short labels, or other
