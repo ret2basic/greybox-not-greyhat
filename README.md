@@ -1616,6 +1616,12 @@ scanner directly and is read-only; with `--strict`, it exits non-zero unless at
 least one importable staged exchange is present.
 Use `--input PATH` to inspect a specific approved exchange file without moving it
 under the operator input directory first; repeat `--input` for multiple files.
+The candidate scanner also emits an approved-quote exchange staging contract:
+accepted suffixes, per-file byte caps, scan limits, preferred single-file formats,
+minimum capture contents, and material that must not be staged such as full Burp
+history exports, cookies, bearer tokens, private keys, wallet signatures, or
+unrelated authenticated traffic. This keeps the `/api/quote` evidence handoff
+small and bounded before any official sidecar is written.
 
 `transaction-corpus-preflight --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --intent-input ./approved-quote-intent.json --no-write --show-policy-json --show-checks --show-commands`
 is the paired offline intake check for one approved quote request body and the
