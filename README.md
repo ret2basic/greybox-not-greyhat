@@ -1653,6 +1653,13 @@ minimum capture contents, and material that must not be staged such as full Burp
 history exports, cookies, bearer tokens, private keys, wallet signatures, or
 unrelated authenticated traffic. This keeps the `/api/quote` evidence handoff
 small and bounded before any official sidecar is written.
+The scanner also separates parser importability from staging hygiene. A HAR,
+Burp XML, cURL+response, JSON-wrapped exchange, or raw HTTP exchange can be
+parser-importable while still showing `hygiene=needs-redaction-review` if the
+staged file contains raw `Cookie`, `Authorization`, `Set-Cookie`, API-key, or
+similar headers. In that case the one-capture closure stops at
+`staged-capture-hygiene-review` and asks for a minimal redacted restage before
+operator-input writes or official sidecars are considered.
 After a staged exchange is discovered, the operator handoff's
 `one_capture_closure_plan` gives the exact local sequence from import preview to
 operator-input write, paired preflight, official sidecar preview/write,
