@@ -623,6 +623,13 @@ operator input directory, per-file byte cap, scan limits, preferred single-file
 formats, and `do_not_stage` rules. That keeps the top bounty path aligned with
 the bounded `/api/quote` handoff and avoids treating full Burp history exports or
 secret-bearing captures as acceptable input.
+The same operator handoff now carries a one-capture closure plan. It shows the
+current active step from staged capture, import preview, local operator-input
+write, paired corpus preflight, official sidecar preview/write, readiness,
+decode, finding-gate, and adjudication. The plan is workflow control only:
+write steps stay manual/review-gated, and the capture still cannot promote a
+Medium+ finding until official sidecars, offline decode, gate, and adjudication
+all agree.
 When the pair reaches `ready-for-decode`, the same contract exposes the gated
 no-write validation chain: `transaction-sidecar-review`, `decode-transactions`,
 `gate`, and `adjudicate`. Blocked pairs keep that command list empty.
@@ -1636,6 +1643,12 @@ minimum capture contents, and material that must not be staged such as full Burp
 history exports, cookies, bearer tokens, private keys, wallet signatures, or
 unrelated authenticated traffic. This keeps the `/api/quote` evidence handoff
 small and bounded before any official sidecar is written.
+After a staged exchange is discovered, the operator handoff's
+`one_capture_closure_plan` gives the exact local sequence from import preview to
+operator-input write, paired preflight, official sidecar preview/write,
+readiness, decode, finding-gate, and adjudication. It intentionally keeps writes
+manual and marks post-evidence commands blocked until the required sidecars are
+real, paired, approved, and redacted.
 
 `transaction-corpus-preflight --request-input ./approved-quote-request.json --payload-input ./approved-quote-response.json --intent-input ./approved-quote-intent.json --no-write --show-policy-json --show-checks --show-commands`
 is the paired offline intake check for one approved quote request body and the
