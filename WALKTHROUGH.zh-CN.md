@@ -731,6 +731,8 @@ manual_input_recommended=true
 
 这样工具不会假装已经读完整个赏金范围。正确做法是用浏览器打开页面，点开 `Show all` 或分页后，把渲染后的 HTML/text 存成 `scope.html` 或 `scope.txt`，再用 `--input-dir --no-fetch` 重新导入。
 
+本地导入时优先保存 HTML，因为 HTML 里会保留资产 URL、文档链接和审计链接；纯文本适合保留正文、Impact 和 Out of scope，但不一定能保留链接。
+
 最关键的是 Impact 到攻击技术的逆向映射：
 
 - `Executing arbitrary system commands` 会映射到 command injection、unsafe template/render、upload/render pipeline 等 RCE 路径。
@@ -822,6 +824,7 @@ python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
 
 它离线合并：
 
+- bounty program profile 里的 in-scope impact 和 impact-to-technique matrix。
 - asset candidates。
 - WebSocket candidates。
 - runtime config hosts。
@@ -832,8 +835,21 @@ python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
 
 这是线索队列，不是 evidence。
 
+如果存在 `bounty-program-profile.json`，`lead-portfolio` 会优先生成 `bounty-program-impact` lane。每条 lane 保留：
+
+- 原始 Impact 文本。
+- severity 和赏金项目状态。
+- 候选 in-scope assets。
+- 逆向映射出的 attack techniques。
+- safe validation boundary。
+- reportability gate。
+
+这就是黑盒赏金策略从“覆盖尽量多 endpoint”改成“优先围绕项目愿意付钱的 impact 找 valid 高危”的连接点。如果当前是 blackbox profile，但 artifact 目录里没有 `bounty-program-profile.json`，`lead-portfolio` 会生成 `bounty-program-profile-missing` blocker，提示先运行 `immunefi-program-profile`。
+
 实现入口：
 
+- `bounty_program_profile_review_leads()`
+- `bounty_program_impact_leads()`
 - `build_lead_portfolio()`
 - `run_lead_portfolio()`
 

@@ -283,10 +283,20 @@ python3 scripts/inferforge.py --artifact-dir .greybox/edgex \
 ```
 
 The input directory can contain `information.html`, `scope.html`,
-`resources.html`, or the same names with `.txt`/`.md`. If Immunefi declares more
-impacts or assets than the parser can see, the artifact is marked
+`resources.html`, or the same names with `.txt`/`.md`. Prefer HTML exports when
+you need asset URLs and resource links preserved; plain text is enough for
+impact/out-of-scope parsing when links are not present. If Immunefi declares
+more impacts or assets than the parser can see, the artifact is marked
 `partial-needs-review` and `manual_input_recommended` so later strategy steps do
 not pretend the scope is complete.
+
+`lead-portfolio` consumes `bounty-program-profile.json` when it is present and
+creates `bounty-program-impact` lanes ahead of passive endpoint leads. These
+lanes preserve the original program impact, severity, candidate in-scope assets,
+mapped attack techniques, safe validation boundary, and reportability gates. In
+black-box mode, if the bounty profile is missing, `lead-portfolio` emits a
+`bounty-program-profile-missing` blocker so the run starts by ingesting program
+scope instead of spending effort on coverage-first endpoint work.
 
 Use `lead-portfolio` to turn the passive black-box leads into one prioritized
 local artifact before deciding what to validate next:
