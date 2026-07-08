@@ -72,6 +72,7 @@ resources.html
 https://bridge.berachain.com/
 https://nftbridge.berachain.com/
 https://hub.berachain.com/
+https://honey.berachain.com/
 ```
 
 请用正常浏览器打开这些页面，等待页面完整加载后保存 HTML：
@@ -80,6 +81,7 @@ https://hub.berachain.com/
 bridge.html
 nftbridge.html
 hub.html
+honey.html
 ```
 
 这些文件会让工具离线提取：
@@ -136,3 +138,19 @@ python3 scripts/inferforge.py --artifact-dir .greybox/berachain-webapps \
 ```
 
 Web App 页面可以继续用 `blackbox-asset-map --input-html` 做离线解析，不需要再请求目标站点。
+
+## 当前额外 scope-review 线索
+
+`https://safe.berachain.com/` 可以低量读取，工具离线解析到一个低风险页面 route：
+
+```text
+/welcome/accounts
+```
+
+同时 runtime config 里出现了：
+
+```text
+gateway.safe.berachain.com
+```
+
+它看起来像同父域 service host，但不在当前静态可见的 12 个 assets 里。因为 Immunefi 页面声明 `Total Assets in Scope 16`，它可能在 `Show all` 里，也可能不在 scope。请优先用完整 `scope.html` 确认这个 host 是否属于 in-scope asset。确认前工具会把它作为 out-of-scope-by-default，不会主动请求它。
