@@ -253,6 +253,41 @@ queues use this artifact to avoid turning passive runtime config or external
 script references into manual blockers when the explicit scope already excludes
 them.
 
+For Immunefi-style programs, ingest the public program pages before building a
+black-box bounty strategy:
+
+```bash
+python3 scripts/inferforge.py --artifact-dir .greybox/edgex \
+  immunefi-program-profile --program-slug edgex \
+  --show-assets --show-impacts --show-techniques --show-links
+```
+
+`immunefi-program-profile` reads the standard `information`, `scope`, and
+`resources` pages, extracts rewards/KYC/PoC/prohibited-activity sections,
+assets in scope, impacts in scope, out-of-scope rules, and documentation or
+audit links, then writes `bounty-program-profile.json`. The impact list is also
+reverse-mapped into safe planning techniques: for example, authenticated action
+impacts map to authorization and browser-mediated action paths, while direct
+fund-theft impacts map to transaction argument integrity and withdrawal/order
+authorization boundaries. This command fetches only public Immunefi pages; it
+does not probe in-scope assets and it does not authorize exploitation.
+
+If the static page fetch is incomplete or blocked, export the rendered pages
+from a browser and feed local files instead:
+
+```bash
+python3 scripts/inferforge.py --artifact-dir .greybox/edgex \
+  immunefi-program-profile --program-slug edgex \
+  --input-dir ./program-pages --no-fetch \
+  --show-impacts --show-techniques
+```
+
+The input directory can contain `information.html`, `scope.html`,
+`resources.html`, or the same names with `.txt`/`.md`. If Immunefi declares more
+impacts or assets than the parser can see, the artifact is marked
+`partial-needs-review` and `manual_input_recommended` so later strategy steps do
+not pretend the scope is complete.
+
 Use `lead-portfolio` to turn the passive black-box leads into one prioritized
 local artifact before deciding what to validate next:
 
