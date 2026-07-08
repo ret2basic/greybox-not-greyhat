@@ -649,9 +649,12 @@ python3 scripts/inferforge.py --target https://in-scope.example \
 
 它把赏金项目的 host scope 转成 local policy artifact。
 
+如果当前 artifact 目录里已经有 `bounty-program-profile.json`，`scope-policy` 会自动读取 `Assets in Scope` 里的 `target_host`，加入 allowlist。这样 Berachain 这类项目不需要手工把十几个 host 一个个传给 `--scope-host`。如果没有显式 `--target`，并且 bounty profile 里有资产 URL，工具会用第一个 in-scope asset 作为 policy target，避免把本地默认 target 放进赏金 scope。
+
 实现入口：
 
 - `normalize_scope_host()`
+- `bounty_program_profile_asset_hosts()`
 - `build_scope_policy()`
 - `scope_policy_decision_map()`
 - `run_scope_policy()`
@@ -834,6 +837,8 @@ python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
 - generated asset profile。
 
 这是线索队列，不是 evidence。
+
+如果 `blackbox-asset-map` 请求页面时遇到 `403`、`429` 这类非成功状态，artifact 会标记为 `page-fetch-non-success`，而不是 `no-candidates`。这表示应该停止扩大自动抓取，改用浏览器导出的 HTML 走 `--input-html` 离线解析，或者晚点再试。
 
 如果存在 `bounty-program-profile.json`，`lead-portfolio` 会优先生成 `bounty-program-impact` lane。每条 lane 保留：
 

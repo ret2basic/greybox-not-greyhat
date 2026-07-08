@@ -297,6 +297,10 @@ mapped attack techniques, safe validation boundary, and reportability gates. In
 black-box mode, if the bounty profile is missing, `lead-portfolio` emits a
 `bounty-program-profile-missing` blocker so the run starts by ingesting program
 scope instead of spending effort on coverage-first endpoint work.
+`scope-policy` also consumes `bounty-program-profile.json`: asset hosts parsed
+from the bounty page are automatically added to the explicit allowlist, and if
+no target was supplied the first bounty asset is used as the policy target
+instead of the local default target.
 
 Use `lead-portfolio` to turn the passive black-box leads into one prioritized
 local artifact before deciding what to validate next:
@@ -321,6 +325,12 @@ step, and no endpoint, host, or script is requested by this command. Use
 `--check-dir` repeatedly or `--discover-child-runs` to build a root-level rollup
 across multiple child runs that already contain `lead-portfolio.json`; this is
 also offline and prints per-run status counts plus the top actionable leads.
+
+When `blackbox-asset-map` receives a non-success page response such as 403 or
+429, it now writes `page-fetch-non-success` instead of pretending there were no
+endpoints. The safe next step is to use `--input-html` with a browser-exported
+page or retry later; do not broaden automated fetching after a rate-limit or
+block page.
 
 Use `harness-loop` as the high-level autonomous loop dashboard. It maps the
 current artifacts into discovery/recon, lead generation, finding identification,
