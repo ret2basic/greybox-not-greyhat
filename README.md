@@ -290,13 +290,1285 @@ more impacts or assets than the parser can see, the artifact is marked
 `partial-needs-review` and `manual_input_recommended` so later strategy steps do
 not pretend the scope is complete.
 
+For source-first local triage, run an offline source risk review before active
+testing:
+
+```bash
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --top 12 --show-signals --show-workbook
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --top 12 --show-signals --show-workbook
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --top 8 --surface shared-library --show-dependencies
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --top 8 --signal wallet-transaction-payload-boundary --dependency-status client-reachable-source
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --top 8 --surface nextjs-app-route --show-route-guards
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --top 8 --show-config-context --config-status public-secret-env-review
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus wallet --top 6 --show-packet --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus external-deps --top 8 --show-external-deps
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus imported-invocation --top 8 --show-imported-invocation --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus input-shape --top 8 --show-input-shape --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus object-key-trust --top 8 --show-object-key-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus csrf-origin --top 8 --show-csrf-origin --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus cors-origin-trust --top 8 --show-cors-origin-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus control-order --top 8 --show-control-order --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus control-effect --top 8 --show-control-effect --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus response-exposure --top 8 --show-response-exposure --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus download-response-trust --top 8 --show-download-response-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus cache-policy --top 8 --show-cache-policy --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus path-trust --top 8 --show-path-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus upload-trust --top 8 --show-upload-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus auth-token-trust --top 8 --show-auth-token-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus auth-flow-trust --top 8 --show-auth-flow-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus account-recovery-trust --top 8 --show-account-recovery-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus role-permission-trust --top 8 --show-role-permission-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus cookie-trust --top 8 --show-cookie-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus message-trust --top 8 --show-message-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus client-rendering-trust --top 8 --show-client-rendering-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus security-header-trust --top 8 --show-security-header-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus client-storage-trust --top 8 --show-client-storage-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus randomness-trust --top 8 --show-randomness-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus crypto-primitive-trust --top 8 --show-crypto-primitive-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus business-value-trust --top 8 --show-business-value-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus tenant-scope-trust --top 8 --show-tenant-scope-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus workflow-precondition-trust --top 8 --show-workflow-precondition-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus resource-fanout-trust --top 8 --show-resource-fanout-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus sensitive-logging-trust --top 8 --show-sensitive-logging-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus error-disclosure-trust --top 8 --show-error-disclosure-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus debug-surface-trust --top 8 --show-debug-surface-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus code-exec-trust --top 8 --show-code-exec-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus server-template-trust --top 8 --show-server-template-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus deserialization-trust --top 8 --show-deserialization-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus archive-extraction-trust --top 8 --show-archive-extraction-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus xml-parser-trust --top 8 --show-xml-parser-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus regex-complexity-trust --top 8 --show-regex-complexity-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus query-trust --top 8 --show-query-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus graphql-resolver-trust --top 8 --show-graphql-resolver-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus ssrf-trust --top 8 --show-ssrf-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus redirect-trust --top 8 --show-redirect-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus webhook-trust --top 8 --show-webhook-trust --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus identity --top 8 --show-identity-binding --show-triage
+python3 scripts/inferforge.py --artifact-dir .greybox/in-scope-example \
+  source-risk-review --no-write --focus client-exposure --top 8 --show-client-exposure --show-triage
+```
+
+`source-risk-review` reads bounded local source files only and writes
+`source-risk-review.json`. It looks for code boundaries that deserve manual
+review, including mutation routes, Server Actions, credential/header forwarding,
+fixed-upstream fetches, wallet transaction construction, GraphQL resolver maps,
+file write/upload sinks, dynamic HTML rendering, origin/CORS controls, resource
+fanout limits, sensitive logging or telemetry boundaries, account-recovery
+lifecycle trust, and error response disclosure boundaries.
+The output is a prioritized lead list, not a finding: each lead keeps source
+refs, signal ids, inferred source surface metadata such as Next.js route paths,
+HTTP methods, dynamic segments, source kind, review lanes, a structured offline
+review workbook, heuristic control context, reportability gates, stop
+conditions, evidence requests, and a safe next step. The control context indexes
+same-file auth/session guards, authorization or ownership checks, request
+validation, method/content-type checks, origin/CSRF hints, rate limits, and error
+boundaries so mutation leads can be separated into `no-obvious-controls`,
+`validation-controls-only`, or `access-control-context-indexed` buckets.
+It also indexes direct local imported helper controls for each lead. If a route
+or helper imports a checked-in guard module, `source-risk-review` can show
+`imported-access-control-context-indexed`,
+`imported-validation-controls-only`, or `no-imported-controls-indexed` without
+executing the import. Imported controls are context only: they do not prove the
+guard is called before the sensitive operation or that the policy is correct.
+The review also indexes static imported guard invocation context for direct
+local imports. It resolves imported callable names from local import syntax,
+looks for same-file calls, and compares call lines to sensitive sink lines so
+statuses such as `imported-invoked-control-before-sink-indexed`,
+`imported-invoked-control-after-sink-review`,
+`imported-control-not-invoked-review`, and
+`imported-control-invocation-unresolved` can separate likely useful context
+from stale imports or late guard calls. Imported callable names are also
+filtered before line-order promotion: ordinary helper or SDK-like calls such as
+store accessors, transaction classes, and derivation helpers are kept as
+`imported-control-callables-not-control-like` context instead of being treated
+as guard-order evidence. This is source triage only: it does not execute
+imports, prove branch reachability, prove authorization semantics, invoke
+routes, send requests, or prove exploitability.
+The review also indexes request-shape context for mutation boundaries. It looks
+for `await req.json()`, schema parsing, strict or permissive schema handling,
+explicit field allowlists, request-body object spread such as `{ ...body }`,
+direct body writes such as `data: body`, dynamic field keys, and local
+database/service mutation calls. Statuses such as
+`input-shape-mass-assignment-review`, `input-shape-spread-review`,
+`input-shape-unvalidated-mutation-review`,
+`input-shape-strict-validation-indexed`, and
+`input-shape-validation-context-indexed` help queue manual review of unknown
+field handling, mass-assignment-style writes, and request body allowlists. These
+are static hints only: they do not prove a mass assignment bug, validation
+correctness, runtime reachability, or reportability.
+The review also indexes static object-key trust context. It looks for
+caller-controlled request objects, URLSearchParams entries, form entries, object
+keys, and dynamic field names near `Object.assign`, object spread, deep merge,
+lodash merge/set, `defaultsDeep`, `Object.fromEntries`, and bracket property
+writes, then correlates them with key allowlists, schema strictness,
+own-property checks, reserved-key rejection, `Object.create(null)`, and `Map`
+safe-container controls. Statuses such as
+`object-key-untrusted-merge-review`, `object-key-dynamic-write-review`,
+`object-key-control-context-indexed`,
+`object-key-safe-container-context-indexed`, and
+`object-key-context-indexed` help queue manual review of broad merge/set and
+dynamic property-write assumptions. These are static source hints only: they do
+not construct prototype-mutation payloads, fuzz keys, execute merge behavior,
+invoke routes, prove exploitability, or prove reportability.
+The review also indexes static browser-session mutation origin and CSRF context.
+It correlates mutation routes and Server Actions with cookie/session identity
+refs, bearer/API-key/JWT refs, same-file origin/referer/CSRF controls,
+content-type/method controls, imported local guard context, and matched route
+middleware controls. Statuses such as `csrf-origin-cookie-mutation-review`,
+`csrf-origin-safe-method-mutation-review`,
+`csrf-origin-missing-origin-review`,
+`csrf-origin-contextual-control-indexed`,
+`csrf-origin-context-indexed`, and
+`csrf-origin-non-cookie-auth-context-indexed` help queue review of browser
+session mutation assumptions, including GET/HEAD/OPTIONS routes that appear to
+mutate state with cookie/session identity, without treating missing source keywords as proof
+of a CSRF issue. These are static source-review hints only: they do not issue
+cross-site requests, invoke Server Actions, prove browser reachability, prove
+origin policy correctness, prove exploitability, or prove reportability.
+The review also indexes static CORS origin response trust context. It looks for
+wildcard `Access-Control-Allow-Origin`, credentialed CORS material, request
+`Origin` reflection, literal `null` origins, allowed/dynamic origin checks,
+permissive substring or regex-like origin allowlists, `Vary: Origin`, preflight
+and response-header context, and nearby auth/session/private route material.
+Statuses such as `cors-origin-wildcard-credentials-review`,
+`cors-origin-null-credentials-review`,
+`cors-origin-permissive-allowlist-review`,
+`cors-origin-reflection-review`, `cors-origin-missing-vary-review`,
+`cors-origin-sensitive-credentials-review`, and
+`cors-origin-controlled-context-indexed` help queue manual review of CORS origin
+and credential assumptions. These are static source-review hints only: they do
+not send cross-origin requests, run browser CORS checks, probe endpoints, replay
+traffic, collect or replay cookies/credentials, attempt cache poisoning, prove
+runtime headers, prove exploitability, or prove reportability.
+The review also indexes same-file control-order context for sensitive sinks. It
+compares static line positions for auth/session, authorization, ownership,
+request validation, content-type/origin checks, rate-limit hints, and sinks such
+as database/service mutations, persistent writes, transaction material, header
+forwarding, upstream requests, broad body writes, and resource fanout. Statuses
+such as `control-order-access-after-sink-review`,
+`control-order-validation-after-sink-review`,
+`control-order-rate-limit-after-fanout-review`,
+`pre-sink-access-and-validation-indexed`, and
+`pre-sink-access-control-indexed` help queue review of code where a control-like
+ref appears after a sink or where pre-sink controls may reduce noise. These are
+line-order hints only: they do not prove branch execution, call order,
+authorization correctness, validation correctness, exploitability, or
+reportability.
+The review also indexes same-file control-effect context for obvious guard
+effect mistakes. It looks for denial response lines such as
+`Response.json(..., { status: 401 })` that are not returned or thrown, guard-like
+results assigned before sensitive sinks without an obvious branch/assertion,
+and guard-like calls before sinks without obvious `await`, `return`, `throw`,
+`if`, or assignment context. Statuses such as
+`control-effect-denial-fallthrough-review`,
+`control-effect-ignored-result-review`,
+`control-effect-floating-call-review`, and
+`control-effect-enforced-context-indexed` help queue review of controls that may
+look present but not actually stop execution. These are static source hints only:
+they do not prove framework semantics, branch reachability, runtime behavior,
+authorization bypass, exploitability, or reportability.
+The review also indexes static JSON response exposure context. It looks for
+`Response.json`, `NextResponse.json`, `res.json`, object-return patterns, and
+nearby sensitive-looking fields such as user/session identifiers, account or
+tenant data, owner fields, email, credential names, wallet/transaction data,
+balances, and internal error details. Enriched statuses such as
+`response-exposure-sensitive-unguarded-review`,
+`response-exposure-cors-sensitive-review`,
+`response-exposure-identity-binding-review`,
+`response-exposure-sensitive-context-indexed`, and
+`response-exposure-context-indexed` combine response shape hints with route
+guard, imported control, identity binding, and config/CORS context. These are
+static source-review hints only: they do not prove actual response content,
+branch reachability, authorization correctness, data exposure, exploitability,
+or reportability.
+The review also indexes static cache and response-header policy context for
+sensitive JSON responses. It looks for `Cache-Control` headers, public/shared
+cache directives such as `public`, `s-maxage`, and positive `max-age`, private
+or no-store directives, Next.js `revalidate`, `dynamic`, and `cache` settings,
+`unstable_cache`, `noStore`, and matching Next.js route headers from checked-in
+config. Statuses such as `cache-policy-sensitive-public-cache-review`,
+`cache-policy-sensitive-missing-no-store-review`,
+`cache-policy-sensitive-private-context-indexed`, and
+`cache-policy-context-indexed` help queue review of sensitive response caching
+and static rendering assumptions. These are static source/config hints only:
+they do not fetch responses, inspect browser or CDN caches, prove runtime
+headers, prove cacheability, prove data exposure, or prove reportability.
+The review also indexes static download response trust context. It looks for
+checked-in `Content-Disposition` and filename response material, framework
+download helpers, CSV/spreadsheet export builders, download `Content-Type`
+headers such as `text/csv`, spreadsheet MIME types, `text/html`, and
+`application/octet-stream`, and correlates those sinks with caller-controlled
+filename and export-content sources from query, body, form data, and route
+params. It indexes filename sanitization, basename/path stripping, extension or
+MIME allowlists, attachment/content-type context, `nosniff` hints, and
+CSV/spreadsheet formula escaping helpers. Statuses such as
+`download-response-dynamic-filename-review`,
+`download-response-csv-formula-review`,
+`download-response-html-inline-review`,
+`download-response-controlled-context-indexed`, and
+`download-response-context-indexed` help queue manual review of export
+filenames, disposition/MIME policy, and spreadsheet handling assumptions. These
+are static source hints only: they do not request downloads, open exported
+files, execute spreadsheet or browser payloads, fetch runtime headers, prove
+download behavior, prove exploitability, or prove reportability.
+The review also indexes static file path and storage object-key trust context.
+It looks for filesystem sinks such as `readFile`, `createReadStream`,
+`writeFile`, `unlink`, and `rm`, plus object storage key sinks such as
+`PutObjectCommand`, `GetObjectCommand`, `putObject`, `upload`, `download`, and
+signed URL helpers. It correlates those sinks with caller-controlled filename,
+path, and object-key sources from query, body, form data, and route params, then
+indexes normalization, base-directory containment, traversal or absolute-path
+checks, extension/content-type allowlists, and tenant/user/project object-key
+prefix controls. Statuses such as
+`path-trust-user-controlled-path-review`,
+`path-trust-traversal-control-context-indexed`,
+`path-trust-extension-allowlist-context-indexed`,
+`path-trust-literal-context-indexed`, and `path-trust-context-indexed` help
+queue manual review of path traversal, arbitrary file access, upload/write, and
+object-key trust assumptions. These are static source hints only: they do not
+read, write, delete, upload, download, execute routes, prove traversal behavior,
+prove exploitability, or prove reportability.
+The review also indexes static file upload persistence trust context. It looks
+for multipart/form-data, request array buffers, body upload fields, `File`,
+`Blob`, and `Buffer.from` upload sources, then correlates them with filesystem
+write sinks and object-storage upload sinks such as `writeFile`,
+`createWriteStream`, `PutObjectCommand`, `putObject`, storage `upload`, and
+Vercel Blob `put`. It indexes MIME/content-type and extension allowlists, byte
+limits, private ACL or signed-access controls, tenant/user/project key binding,
+and public-serving or cache hints. Statuses such as
+`upload-trust-public-write-review`,
+`upload-trust-unvalidated-content-review`,
+`upload-trust-type-size-controls-indexed`,
+`upload-trust-access-control-context-indexed`,
+`upload-trust-literal-context-indexed`, and
+`upload-trust-context-indexed` help queue manual review of unbounded uploads,
+public object writes, type/size validation, ACLs, overwrite, retention, and
+serving policy assumptions. These are static source hints only: they do not
+upload, read, write, delete, fetch public objects, execute routes, prove upload
+behavior, prove exploitability, or prove reportability.
+The review also indexes static auth token trust context. It looks for bearer
+headers, cookie tokens, API keys, signatures, JWTs, and session-token sources,
+then correlates them with decode-only operations such as `jwt.decode`,
+`decodeJwt`, `jwtDecode`, `atob`, and token payload parsing, verification
+helpers such as `jwt.verify`, `jwtVerify`, `verifyJwt`, `verifyIdToken`, and
+`getToken`, unsafe verification options such as disabled expiry/not-before checks
+or allowing the JWT `none` algorithm, hardcoded verification-secret literals,
+issuer/audience/algorithm/expiry/nonce claim checks, and constant-time
+comparison helpers such as `timingSafeEqual` or `safeCompare`.
+Statuses such as `auth-token-decode-without-verify-review`,
+`auth-token-unsafe-verification-options-review`,
+`auth-token-hardcoded-secret-review`,
+`auth-token-secret-compare-review`,
+`auth-token-missing-claim-controls-review`,
+`auth-token-query-source-review`,
+`auth-token-claim-controls-context-indexed`,
+`auth-token-verification-context-indexed`,
+`auth-token-source-context-indexed`, and `auth-token-context-indexed` help queue
+manual review of decode-only token trust, API-key comparison, JWT verification
+key sourcing, JWT claim validation, URL/query token transport, missing
+issuer/audience/algorithm/expiry claim controls, unsafe verification options,
+expiry/revocation, and caller/object binding assumptions.
+These are static source hints only: they do not mint, forge,
+replay, brute-force, submit, or validate authentication tokens at runtime,
+execute routes, prove auth bypass, prove exploitability, or prove reportability.
+The review also indexes static OAuth/OIDC/SAML/SSO auth-flow trust context. It
+looks for callback sources such as `code`, `state`, `nonce`, `provider`,
+`redirect_uri`, `callbackUrl`, `returnTo`, `id_token`, `SAMLResponse`, and
+`RelayState`, then correlates them with token exchange, callback/session
+creation, cookie, redirect, and assertion sinks. It indexes state, nonce, PKCE
+or `codeVerifier`, provider/IdP allowlists or expected-provider binding,
+redirect allowlist or same-origin checks, issuer/audience, JWKS, id-token
+verification, and SAML signature/assertion validation controls.
+Statuses such as `auth-flow-missing-state-review`,
+`auth-flow-unvalidated-redirect-review`,
+`auth-flow-provider-binding-review`, `auth-flow-token-claim-review`,
+`auth-flow-pkce-review`, `auth-flow-controlled-context-indexed`, and
+`auth-flow-context-indexed` help queue manual review of callback CSRF, open
+redirect, provider/IdP mix-up, id-token/assertion claim validation, missing
+PKCE/code_verifier handling, provider binding, and session creation
+assumptions. These are
+static source hints only: they do not invoke login or callback routes, generate,
+collect, replay, or validate OAuth/OIDC/SAML tokens or assertions, switch
+accounts, submit SSO forms, replay authorization codes, prove auth bypass, prove
+exploitability, or prove reportability.
+The review also indexes static account-recovery, magic-link, invite, OTP, MFA,
+two-factor, verification-code, and recovery-code lifecycle trust context. It
+correlates reset tokens, magic tokens, invite tokens, OTP/TOTP/code values,
+recovery codes, new passwords, and password fields with password update/reset,
+OTP verification, MFA enable/disable, account verification, session creation,
+and token consumption sinks. It indexes expiry/TTL/max-age controls,
+single-use/revocation/consumption controls, token hashing or constant-time
+comparison, account/email/user binding, and attempts/rate-limit/lockout
+controls, and can separately queue review when token lifecycle controls are
+present but reset, magic-link, invite, or recovery-code material lacks obvious
+token-hash or safe-compare context or is transported through URL query or route
+parameter context near recovery sinks.
+Statuses such as `account-recovery-lifecycle-review`,
+`account-recovery-otp-attempt-review`,
+`account-recovery-reauth-review`,
+`account-recovery-token-hash-review`,
+`account-recovery-query-token-review`,
+`account-recovery-controlled-context-indexed`, and
+`account-recovery-context-indexed` help queue manual review of reset-token
+lifecycle, magic-link consumption, invite acceptance, OTP/MFA attempt limits,
+recovery-code handling, current-password or step-up re-authentication for
+password/MFA changes, token storage or comparison, URL/query token transport,
+password update binding, and session creation assumptions. These are static
+source hints only: they do not generate, guess, brute-force, replay, submit, or
+validate real reset tokens, magic links, invite codes, OTPs, MFA codes, recovery codes, passwords,
+or sessions, prove auth bypass, prove exploitability, or prove reportability.
+The review also indexes static role, permission, admin flag, invite, and
+membership mutation trust context. It correlates caller-controlled `role`,
+`roles`, `permission`, `permissions`, `scope`, `isAdmin`, invite role,
+membership role, target user, member, organization, and tenant material with
+role assignment, permission grant/revoke, membership update, invite creation or
+acceptance, and admin-state mutation sinks. It indexes admin policy checks, role
+and permission allowlists, role hierarchy, self-escalation protections,
+target-subject binding, and same-tenant or same-organization scope controls.
+Statuses such as `role-permission-admin-flag-review`,
+`role-permission-self-assignment-review`,
+`role-permission-role-allowlist-review`,
+`role-permission-assignment-review`,
+`role-permission-controlled-context-indexed`, and
+`role-permission-context-indexed` help queue manual review of privilege grants,
+admin flag writes, role changes, grantable-role allowlists, membership updates,
+and invite authority assumptions. These are static source hints only: they do not create users, send
+invites, change roles, grant permissions, replay membership flows, validate live
+privilege changes, prove auth bypass, prove exploitability, or prove
+reportability.
+The review also indexes static session cookie trust context. It looks for
+`Set-Cookie`, `cookies().set`, `res.cookie`, `setCookie`,
+`cookie.serialize`, and `document.cookie` writes, classifies cookie names as
+session/auth/JWT/CSRF/API-key sensitive, preference-like, or unknown, then
+correlates them with `HttpOnly`, `Secure`, `SameSite`, `Max-Age`/`Expires`,
+`Path`, `Domain`, `__Host-`, and `__Secure-` controls, including static
+`__Host-` requirements for `Secure`, `Path=/`, and no `Domain`, plus
+`__Secure-` requirements for `Secure`. Statuses such as
+`cookie-trust-client-readable-session-review`,
+`cookie-trust-missing-flags-review`,
+`cookie-trust-prefix-scope-review`,
+`cookie-trust-samesite-none-without-secure-review`,
+`cookie-trust-domain-scope-review`,
+`cookie-trust-long-lifetime-review`,
+`cookie-trust-cross-site-context-indexed`,
+`cookie-trust-secure-flags-context-indexed`,
+`cookie-trust-non-sensitive-cookie-context-indexed`, and
+`cookie-trust-context-indexed` help queue manual review of client-readable
+session cookies, missing security flags, prefix-scope gaps, `SameSite=None`
+without `Secure`, sensitive cookies scoped with `Domain`, cross-site cookie
+intent, long static `Max-Age` lifetimes, scope, and prefix assumptions. These
+are static source hints only: they do not
+collect, replay, forge, brute-force, submit, or validate real cookies or
+sessions at runtime, execute routes, prove session bypass, prove exploitability,
+or prove reportability.
+The review also indexes static browser message trust context. It looks for
+`addEventListener('message', ...)`, `window.onmessage`, `postMessage`,
+`MessageChannel`, and `BroadcastChannel` boundaries, then correlates them with
+`event.origin`, `event.source`, allowed-origin sets, non-wildcard target
+origins, and message schema/type controls. Statuses such as
+`message-trust-wildcard-target-review`,
+`message-trust-missing-origin-review`,
+`message-trust-dynamic-target-review`,
+`message-trust-origin-control-context-indexed`,
+`message-trust-target-origin-context-indexed`, and
+`message-trust-context-indexed` help queue manual review of wildcard
+`targetOrigin`, dynamic target-origin derivation without obvious allowlist
+context, missing sender-origin checks, message schema assumptions,
+iframe/parent contracts, and cross-window trust boundaries. These are static
+source hints only: they do not create, send, replay, fuzz, or validate browser
+messages at runtime, execute routes, prove message-origin bypass, prove
+exploitability, or prove reportability.
+The review also indexes static client rendering trust context. It looks for raw
+HTML/DOM sinks such as `dangerouslySetInnerHTML`, `__html`, `innerHTML`,
+`outerHTML`, `insertAdjacentHTML`, `document.write`, `DOMParser`, markdown
+renderers, and HTML parser helpers, then correlates them with props, URL/search
+params, browser storage, API/CMS/rich-text/markdown sources, DOMPurify,
+`sanitize-html`, output encoding, Trusted Types, and markdown sanitization
+controls. Statuses such as `client-rendering-unsanitized-html-review`,
+`client-rendering-markdown-html-review`,
+`client-rendering-sanitized-context-indexed`, and
+`client-rendering-static-literal-context-indexed` help queue manual review of
+content provenance, sanitizer policy, allowed tags/attributes, URL protocols,
+and output context. These are static source hints only: they do not generate XSS
+payloads, run a browser, invoke pages or routes, replay content, prove XSS,
+prove exploitability, or prove reportability.
+The review also indexes static client-side storage trust context. It looks for
+`localStorage`, `sessionStorage`, IndexedDB, `document.cookie`, and
+storage-persistence helpers such as `localForage`, idb-keyval-style helper
+calls, `createJSONStorage`, and `persist`, then classifies storage keys and
+value variables as auth/session/API-key/JWT
+sensitive, wallet-secret-like, personal/account data, preference-only, or
+unknown. Statuses such as `client-storage-wallet-secret-review`,
+`client-storage-sensitive-no-lifecycle-review`,
+`client-storage-sensitive-material-review`,
+`client-storage-sensitive-read-context-indexed`,
+`client-storage-personal-data-context-indexed`,
+`client-storage-non-sensitive-context-indexed`, and
+`client-storage-context-indexed` help queue manual review of browser-readable
+tokens, session state, API keys, wallet private keys or seed phrases, storage
+retention, cleanup, validation, and whether stored values are later trusted as
+authority. These are static source hints only: they do not open a browser, read
+real storage, collect cookies or tokens, forge, replay, submit, exfiltrate, or
+validate stored material at runtime, execute routes, prove exploitability, or
+prove reportability.
+The review also indexes static security-material randomness trust context. It
+looks for `Math.random`, time-derived values such as `Date.now`, and
+cryptographic sources such as `crypto.randomUUID`, `getRandomValues`,
+`randomBytes`, `randomInt`, `nanoid`, and UUID helpers near token, session,
+API-key, nonce, CSRF/OAuth state, OTP, reset, magic-link, and invite material.
+Statuses such as `randomness-trust-weak-security-material-review`,
+`randomness-trust-time-based-material-review`,
+`randomness-trust-strong-random-context-indexed`,
+`randomness-trust-non-security-context-indexed`, and
+`randomness-trust-context-indexed` help queue manual review of predictable
+security material generation while keeping ordinary UI/game/animation
+randomness out of high-priority findings. These are static source hints only:
+they do not generate, guess, brute-force, replay, submit, or validate real
+tokens, OTPs, reset links, invite codes, CSRF values, OAuth state values,
+sessions, or API keys at runtime, execute routes, prove exploitability, or
+prove reportability.
+The review also indexes static crypto primitive trust context. It looks for
+caller-controlled algorithm, hash, cipher, key, secret, IV, nonce, salt,
+signature, MAC, plaintext, and ciphertext material near `createHash`,
+`createHmac`, `createCipheriv`, `createDecipheriv`, WebCrypto, CryptoJS,
+deprecated Node `createCipher`/`createDecipher`, hash/HMAC/cipher/sign/verify
+sinks, non-AEAD modes such as AES-CBC, AES-CTR, AES-CFB, and AES-OFB, weak
+primitives such as MD5, SHA-1, DES, RC4, and ECB, static IV or nonce hints, and
+literal key, secret, signing/encryption key, or passphrase material near crypto
+primitive sinks. It also records same-file AEAD, HMAC/MAC/auth tag, random IV/nonce, KDF,
+key-management, algorithm allowlist, and constant-time compare controls.
+Statuses such as
+`crypto-user-controlled-algorithm-review`,
+`crypto-deprecated-cipher-review`,
+`crypto-weak-algorithm-review`, `crypto-static-iv-review`,
+`crypto-hardcoded-key-review`, `crypto-unauthenticated-cipher-review`,
+`crypto-controlled-context-indexed`, `crypto-literal-context-indexed`, and
+`crypto-context-indexed` help queue manual review of primitive selection,
+deprecated password-derived cipher helpers, unauthenticated encryption modes,
+IV/nonce uniqueness, key origin, hardcoded secret handling, signature/MAC
+verification, and compare behavior. Literal secret-like samples are redacted in
+the review output. These are static source hints only: they do not print raw
+secrets, validate keys, compute hashes, encrypt, decrypt, forge tokens or
+signatures, brute-force keys, generate chosen-ciphertext or chosen-plaintext
+payloads, invoke routes, replay requests, fuzz crypto inputs, run timing tests,
+prove exploitability, or prove reportability.
+The review also indexes static payment, order, balance, and entitlement
+business-value trust context. It looks for caller-controlled `amount`, `price`,
+`total`, `quantity`, `discount`, `coupon`, `currency`, `balance`, `credits`,
+`points`, and `fee` fields near checkout, payment, order, invoice,
+subscription, ledger, wallet, balance, credit, and entitlement writes, then
+correlates them with server-side product, plan, catalog, price-book, currency,
+quantity, coupon, and numeric-limit controls. Statuses such as
+`business-value-client-controlled-amount-review`,
+`business-value-client-controlled-discount-review`,
+`business-value-client-controlled-quantity-review`,
+`business-value-server-derived-context-indexed`,
+`business-value-validation-context-indexed`, and
+`business-value-context-indexed` help queue manual review of whether client
+values are authoritative or merely hints before payment and business-state
+writes. These are static source hints only: they do not create orders, charge,
+refund, transfer funds, alter balances, redeem coupons, mint credits, replay
+checkout sessions, submit payment flows, prove exploitability, or prove
+reportability.
+The review also indexes static tenant and object scope trust context. It looks
+for caller-controlled user, owner, tenant, account, organization, project,
+order, invoice, document, file, wallet, and object identifiers near database,
+repository, service, mutation, and JSON response boundaries, then correlates
+them with caller-to-object ownership, tenant, membership, wallet, imported
+policy, auth-only, and scoped-query controls. Statuses such as
+`tenant-scope-missing-review`, `tenant-scope-auth-only-review`,
+`tenant-scope-client-scope-review`,
+`tenant-scope-contextual-control-review`,
+`tenant-scope-controlled-context-indexed`, and
+`tenant-scope-context-indexed` help queue manual review of IDOR/BOLA and
+multi-tenant authorization assumptions, including client-supplied tenant,
+account, organization, user, owner, or wallet scope used as a query constraint,
+without pretending a source smell is a finding. These are static source hints only: they do not invoke routes,
+enumerate ids, switch or act as another user, collect cross-tenant data, replay
+requests, mutate tenant objects, prove exploitability, or prove reportability.
+The review also indexes static workflow-precondition trust context. It looks
+for caller-controlled workflow actions, object ids, amounts, coupons, roles,
+account fields, status, and state fields near order, payment, refund, coupon,
+balance, credit, role, account, password, and workflow-state mutation sinks,
+then correlates them with auth, ownership, role/tenant scope, state-machine,
+allowed-transition, transaction, lock/version, idempotency, nonce, and replay
+controls. Statuses such as `workflow-precondition-missing-review`,
+`workflow-state-transition-review`,
+`workflow-replay-idempotency-review`,
+`workflow-controlled-context-indexed`, and `workflow-context-indexed` help queue
+manual review of whether sensitive mutations have the expected access,
+transition, and replay preconditions. These are static source hints only: they
+do not invoke actions or routes, submit forms, create orders, payments,
+refunds, coupons, or balance changes, replay requests, run stress tests, run
+rate-limit tests, mutate state, prove exploitability, or prove reportability.
+The review also indexes static batch, pagination, retry, polling, and parallel
+resource-fanout trust context. It looks for caller-controlled ids/items arrays,
+URLs, recipients, batch sizes, limits, page sizes, cursors, offsets, and retry
+inputs near `Promise.all`, async map/forEach fanout, pagination/export/list
+queries, retry loops, polling, and interval work, then correlates them with
+schema `.max()` bounds, `Math.min` clamps, `slice`/`take` caps, rate-limit
+guards, queue/concurrency controls, and retry/time-bound controls. Statuses
+such as `resource-fanout-client-controlled-batch-review`,
+`resource-fanout-unbounded-pagination-review`,
+`resource-fanout-parallel-upstream-review`,
+`resource-fanout-loop-retry-review`,
+`resource-fanout-rate-limit-context-indexed`,
+`resource-fanout-bounded-context-indexed`, and
+`resource-fanout-context-indexed` help queue manual review of whether caller
+input can amplify backend, database, upstream, export, or messaging work. These
+are static source hints only: they do not issue requests, run stress tests,
+exhaust rate limits, open WebSocket connections, deplete quotas, broaden
+crawls/exports, prove availability impact, prove exploitability, or prove
+reportability.
+The review also indexes static sensitive logging, telemetry, analytics, and
+error-reporting trust context. It looks for auth headers, cookies, API keys,
+JWTs, sessions, secrets, wallet or payment material, request headers, request
+bodies, payloads, and personal data near `console`, logger, Sentry, analytics,
+PostHog, Mixpanel, telemetry, Datadog RUM, and New Relic sinks, then correlates
+them with same-file redaction, sanitization, scrubbing, masking, hashing,
+safe-logger wrappers, and field allowlist controls. Statuses such as
+`sensitive-logging-secret-material-review`,
+`sensitive-logging-wallet-payment-review`,
+`sensitive-logging-request-context-review`,
+`sensitive-logging-personal-data-review`,
+`sensitive-logging-redacted-context-indexed`, and
+`sensitive-logging-context-indexed` help queue manual review of whether
+sensitive material can reach logs or third-party telemetry without redaction and
+retention controls. These are static source hints only: they do not retrieve
+production logs, collect real tokens, cookies, secrets, or PII, query or
+exfiltrate telemetry, submit sensitive material, invoke routes, prove exposure,
+prove exploitability, or prove reportability.
+The review also indexes static error disclosure trust context. It looks for raw
+exceptions, stack traces, causes, debug fields, `rawError`, `rawResponse`,
+`response.data`, provider/RPC/upstream error bodies, and status text near
+`Response.json`, `NextResponse.json`, `res.json`, `reply.send`, and HTTP
+response constructors, then correlates them with same-file public-error shaping,
+sanitization, redaction, generic error messages, and allowlisted error-code
+controls. Statuses such as `error-disclosure-stack-trace-review`,
+`error-disclosure-upstream-error-review`,
+`error-disclosure-exception-message-review`,
+`error-disclosure-sanitized-context-indexed`, and
+`error-disclosure-context-indexed` help queue manual review of whether internal
+diagnostics or upstream/provider details can reach client-visible JSON/HTTP
+error responses. These are static source hints only: they do not trigger live
+errors, replay requests, send malformed traffic, invoke routes, retrieve
+production logs, query telemetry, collect raw upstream bodies, prove exposure,
+prove exploitability, or prove reportability.
+The review also indexes static debug, admin, internal, ops, diagnostic, cron,
+seed, backfill, maintenance, and devtools surface context. It looks for
+debug/internal route names, diagnostic JSON/HTTP response sinks, environment and
+header/cookie/config/build/process/stack material, cache revalidation and
+job/backfill/seed-style internal action sinks, then correlates them with
+same-file auth, admin/role checks, internal-only headers, cron secrets,
+environment gates, and denial responses. Statuses such as
+`debug-surface-diagnostics-review`,
+`debug-surface-internal-action-review`,
+`debug-surface-control-context-indexed`, and
+`debug-surface-context-indexed` help queue manual review of whether debug or
+internal surfaces are production-isolated and access-controlled. These are
+static source hints only: they do not request debug endpoints, trigger jobs,
+backfills, seeds, cache purges, or admin actions, read production diagnostics,
+prove exposure, prove exploitability, or prove reportability.
+The review also indexes static runtime command/code execution trust context. It
+looks for `child_process` `exec`, `execFile`, `spawn`, and `fork`, bare imported
+process execution helpers, `execa`, `shelljs.exec`, `Bun.spawn`, `Deno.Command`,
+`eval`, `Function`, and `vm` sinks, then correlates them with request body,
+query, params, form data, command/argv/script/code/template material, command or
+script allowlists, argv separation, `shell: false`, admin/internal controls, and
+environment gates. Statuses such as `code-exec-user-input-review`,
+`code-exec-dynamic-code-review`, `code-exec-shell-review`,
+`code-exec-controlled-context-indexed`,
+`code-exec-literal-context-indexed`, and `code-exec-context-indexed` help queue
+manual source review of command/code execution boundaries. These are static
+source hints only: they do not run commands, invoke routes, execute eval/vm
+code, fuzz command parameters, generate command-injection payloads, replay
+requests, prove exploitability, or prove reportability.
+The review also indexes static server-side template rendering trust context. It
+looks for render/view/compile sinks such as `res.render`, `reply.view`,
+`ejs.render`, `pug.render`, `Handlebars.compile`, `Mustache.render`,
+`nunjucks.renderString`, `render_template`, `render_template_string`,
+`Template(...).render`, `Environment.from_string`, and similar checked-in
+template engine calls. It correlates those sinks with caller-controlled template
+names, view names, layouts, partials, template strings, locals/render data,
+template allowlists, literal trusted templates, escaping/autoescape settings,
+sandbox controls, and raw/safe/no-escape contexts. Statuses such as
+`server-template-user-controlled-template-review`,
+`server-template-unescaped-data-review`,
+`server-template-controlled-context-indexed`,
+`server-template-literal-context-indexed`, and
+`server-template-context-indexed` help queue manual review of template trust
+boundaries. These are static source hints only: they do not render templates,
+invoke routes, execute helper code, fuzz template names, generate SSTI or XSS
+payloads, replay requests, prove exploitability, or prove reportability.
+The review also indexes static deserialization trust context. It looks for
+checked-in object restore, YAML load/parse, binary object decode, MessagePack,
+CBOR, BSON/EJSON, and v8 deserialization sinks such as `unserialize`,
+`deserialize`, `yaml.load`, `YAML.parse`, `v8.deserialize`, `BSON.deserialize`,
+`msgpack.decode`, and `CBOR.decode`. It correlates those sinks with
+caller-controlled serialized payload, state, object, YAML, base64, binary, body,
+query, params, and form-data sources, then indexes schema/type allowlists, safe
+loader settings, signature or MAC verification, content-type checks, and size
+limits. Statuses such as `deserialization-untrusted-input-review`,
+`deserialization-unsafe-format-review`,
+`deserialization-controlled-context-indexed`,
+`deserialization-literal-context-indexed`, and
+`deserialization-context-indexed` help queue manual review of parser and object
+restore boundaries. These are static source hints only: they do not deserialize
+samples, construct gadget chains, generate parser payloads, invoke routes, fuzz
+parser inputs, replay requests, execute restored objects, prove exploitability,
+or prove reportability.
+The review also indexes static archive extraction trust context. It looks for
+checked-in zip, tar, bundle, upload, decompression, archive parser, and entry
+write sinks such as `AdmZip`, `extractAllTo`, `unzipper.Extract`,
+`unzipper.Parse`, `yauzl.open`, `JSZip.loadAsync`, `decompress`, and
+`tar.extract`. It correlates those sinks with caller-controlled archive,
+upload, file, bytes, destination, and entry-path material, then indexes
+basename/safe-join helpers, destination containment checks, preserve-paths-off
+settings, strip/filter settings, preserve-paths-on or strip-zero options,
+allowed extensions, size limits, and entry-count limits. Statuses such as
+`archive-extraction-preserve-paths-review`,
+`archive-extraction-user-controlled-review`,
+`archive-extraction-entry-path-review`,
+`archive-extraction-controlled-context-indexed`,
+`archive-extraction-literal-context-indexed`, and
+`archive-extraction-context-indexed` help queue manual review of archive
+extraction options, path preservation, and entry path boundaries. These are
+static source hints only: they do not unzip or untar files, construct Zip Slip
+payloads, upload archives, invoke routes, fuzz archive entries, replay
+requests, write extracted files, prove exploitability, or prove reportability.
+The review also indexes static XML parser trust context. It looks for checked-in
+XML parser sinks such as `parseString`, `parseStringPromise`, `XMLParser.parse`,
+`DOMParser.parseFromString`, `libxmljs`, `xmldom`, `sax`, and `saxes`, then
+correlates those sinks with caller-controlled XML, SOAP, SAML, SVG, RSS, Atom,
+feed, document, body, and upload material. It also indexes same-file DOCTYPE and
+entity material, entity-processing settings such as `processEntities`, external
+resource handling, schema or content-type controls, and size limits. Statuses such as
+`xml-parser-untrusted-input-review`, `xml-parser-entity-expansion-review`,
+`xml-parser-controlled-context-indexed`,
+`xml-parser-literal-context-indexed`, and `xml-parser-context-indexed` help
+queue manual review of XML parsing, entity, and external-resource assumptions.
+These are static source hints only: they do not parse XML samples, construct XXE
+or entity payloads, fetch external entities, invoke routes, fuzz parser inputs,
+read local files, prove exploitability, or prove reportability.
+The review also indexes static regex complexity trust context. It looks for
+checked-in dynamic `RegExp` or `RE2` construction, regex literal `.test`/`.exec`
+usage, and string `match`, `replace`, `search`, and `split` regex sinks. It
+correlates those sinks with caller-controlled pattern, search, filter, query,
+text, body, route, and form material, then indexes same-file pattern allowlists,
+literal trusted patterns, escaping helpers, `RE2` or safe-regex review, input
+length bounds, truncation, and schema maximum constraints. Statuses such as
+`regex-dynamic-pattern-review`, `regex-complex-input-review`,
+`regex-controlled-context-indexed`, `regex-literal-context-indexed`, and
+`regex-context-indexed` help queue manual review of ReDoS-style availability
+assumptions without running regexes. These are static source hints only: they do
+not generate ReDoS payloads, run regex benchmarks, fuzz patterns or inputs,
+invoke routes, replay requests, stress-test matching, prove exploitability, or
+prove reportability.
+The `regex-complexity-trust` focus preset uses indexed regex context, so broad
+signal-only files remain visible in lane inventory but do not expand the focused
+triage list by themselves.
+The review also indexes static database query trust context. It looks for raw
+SQL and database client sinks such as `$queryRawUnsafe`, `$executeRawUnsafe`,
+`query`, `execute`, and `raw`, plus ORM query and mutation sinks such as
+`findMany`, `findFirst`, `findUnique`, `update`, `delete`, `upsert`,
+`aggregate`, and `count`. It correlates those sinks with caller-controlled
+query, search, filter, where, sort, order, identifier, body, query-string, and
+route-param sources, then indexes parameterized query APIs, prepared statement
+patterns, tagged SQL templates, field/sort/filter allowlists, and owner,
+tenant, account, or project scoping controls. Statuses such as
+`query-trust-raw-user-input-review`,
+`query-trust-client-filter-review`,
+`query-trust-parameterized-context-indexed`,
+`query-trust-scoped-orm-context-indexed`,
+`query-trust-literal-context-indexed`, and `query-trust-context-indexed` help
+queue manual review of raw query construction, dynamic filters, sort/field
+selection, and tenant/object scoping assumptions. These are static source hints
+only: they do not connect to databases, execute SQL, invoke routes, fuzz query
+parameters, prove injection, prove authorization bypass, or prove reportability.
+The review also indexes static GraphQL resolver trust context. It looks for
+GraphQL server/schema/resolver entrypoints such as `ApolloServer`, `createYoga`,
+`graphqlHTTP`, `gql`, `typeDefs`, `resolvers`, `Query`, and `Mutation`, then
+correlates resolver `args`/`input` and object, tenant, account, project, role, or
+state selector args with context auth, caller-to-object scope controls,
+validation or field allowlists, pagination/depth/complexity controls, and
+database/repository/service data or mutation sinks. Statuses such as
+`graphql-resolver-missing-auth-review`,
+`graphql-resolver-object-scope-review`,
+`graphql-resolver-unbounded-list-review`,
+`graphql-resolver-controlled-context-indexed`, and
+`graphql-resolver-context-indexed` help queue manual review of resolver
+authorization, object-scope, and list pagination or complexity assumptions.
+These are static source hints only: they do not execute GraphQL operations,
+introspect live schemas, fuzz fields, replay requests, switch accounts, mutate
+data, stress-test list fields, prove authorization bypass, prove exploitability,
+or prove reportability.
+The review also indexes static server-side outbound URL trust context. It looks
+for `fetch`, `axios`, `got`, `ky`, and similar outbound request sinks, query,
+body, and route fields that look like upstream URLs, URL parsing and hostname
+extraction, host allowlists, protocol checks, and private-network or metadata
+address blocking. Statuses such as `ssrf-trust-user-controlled-url-review`,
+`ssrf-trust-permissive-host-allowlist-review`,
+`ssrf-trust-private-fixed-upstream-review`,
+`ssrf-trust-allowlist-context-indexed`,
+`ssrf-trust-private-network-control-context-indexed`,
+`ssrf-trust-fixed-upstream-context-indexed`, and
+`ssrf-trust-context-indexed` help queue review of user-controlled full URL
+targets, checked-in private/loopback/link-local/metadata upstream URLs, fixed
+upstream hosts with dynamic path/query material, permissive host allowlists
+that appear to rely on substring/suffix/prefix/regex matching, and allowlist
+assumptions.
+These are static source hints only: they do not issue outbound requests, follow
+redirects, resolve DNS, probe private networks, prove SSRF, prove
+exploitability, or prove reportability.
+The review also indexes static redirect and navigation destination trust
+context. It looks for server redirect sinks such as `NextResponse.redirect`,
+`Response.redirect`, `redirect`, and `permanentRedirect`, client navigation
+sinks such as `router.push`, `router.replace`, and `location.href`, and
+redirect-like query/body/route fields such as `next`, `redirect`, `returnTo`,
+`callbackUrl`, `url`, `to`, and `destination`. It correlates those sources with
+same-file path-only, same-origin, and allowlist controls, plus checked-in
+Next.js redirect route policies, and labels literal `javascript:`, `data:`, or
+`vbscript:` redirect/navigation destinations for review. Statuses such as
+`redirect-trust-dangerous-scheme-review`,
+`redirect-trust-user-controlled-review`,
+`redirect-trust-missing-allowlist-review`,
+`redirect-trust-external-destination-review`,
+`redirect-trust-same-origin-context-indexed`,
+`redirect-trust-allowlist-context-indexed`,
+`redirect-trust-literal-context-indexed`, and
+`redirect-trust-config-context-indexed` help queue manual review of redirect
+trust boundaries. These are static source/config hints only: they do not execute
+routes, follow redirects, open browsers, prove redirect behavior,
+exploitability, or reportability.
+The review also indexes static webhook origin-authenticity context. It looks
+for webhook-like route paths, provider signature headers such as
+`stripe-signature`, `svix-signature`, `x-hub-signature-256`, and
+`x-signature`, raw-body reads such as `req.text()` or `arrayBuffer()`, parsed
+body reads such as `req.json()` or JSON body parsers, signature verification
+helpers such as `constructEvent`, `verifyWebhook`, `verifySignature`,
+`Webhook.verify`, HMAC checks, timing-safe comparisons, webhook secret config,
+provider event-id material such as `event.id`, same-file idempotency or replay
+controls such as event-log lookups, dedupe helpers, unique/upsert/skip-duplicate
+patterns, timestamp freshness or replay-window controls, and side-effect sinks
+such as database writes, queues, email, or notifications.
+Statuses such as `webhook-trust-missing-signature-review`,
+`webhook-trust-json-before-signature-review`,
+`webhook-trust-missing-secret-review`,
+`webhook-trust-missing-idempotency-review`,
+`webhook-trust-missing-replay-window-review`,
+`webhook-trust-idempotency-context-indexed`,
+`webhook-trust-raw-body-signature-context-indexed`,
+`webhook-trust-signature-context-indexed`, and
+`webhook-trust-context-indexed` help queue review of webhook signature, raw-body,
+secret loading, replay-window, timestamp freshness, event-id idempotency, and
+provider-trust assumptions. These are static source/config hints only: they do
+not deliver webhook requests, replay provider events, call live routes, forge
+signatures, prove signature bypass, prove exploitability, or prove
+reportability.
+The review also indexes static identity and ownership binding context. It looks
+for route, body, query, subject, and object identifiers such as `userId`,
+`ownerId`, `tenantId`, `accountId`, `projectId`, `invoiceId`, `walletAddress`,
+and `publicKey`, then checks the same file for owner/session comparisons, scoped
+queries, or guard calls such as `requireOwnership` or `canAccess`. Statuses such
+as `identity-binding-gap-review`, `identity-binding-context-indexed`,
+`identity-contextual-binding-review`, `identity-access-context-indexed`, and
+`identity-validation-only` help queue manual review of object binding near
+mutation routes. The contextual status is used when direct local imports or
+route-bound middleware contain ownership-like controls, but the lead itself still
+needs manual review for call order, caller/object/action binding, and route
+coverage. These are static source triage only: they do not execute routes, send
+requests, prove an authorization bug, or prove that a guard is sufficient.
+The review also indexes static client/server exposure context. It combines local
+surface inference, direct client importers, transitive client reachability
+chains, env-name context, external package categories, and sensitive boundary
+signals to queue cases where client-visible code contains or imports private env
+names, public env names that look secret-like, `server-only` or Node-only
+runtime imports, Server Action context, database/storage packages, wallet/web3
+packages, or transaction encoding boundaries. Statuses such as
+`client-secret-exposure-review`, `client-server-only-import-review`,
+`client-storage-database-exposure-review`,
+`client-wallet-boundary-context-indexed`, and
+`client-exposure-context-indexed` are static review hints only: they do not
+inspect built bundles, read runtime env values, execute imports, prove browser
+reachability, or prove exploitability.
+For Next.js route leads, the review also computes a static route-guard context.
+It matches checked-in `middleware.*` or `proxy.*` files against the inferred
+route path, indexes auth/session, authorization, ownership, origin/CSRF, rate,
+and content-type controls inside matched middleware, and assigns route-bound
+statuses such as `same-file-access-control-indexed`,
+`route-middleware-access-control-indexed`, `route-middleware-validation-controls-indexed`,
+or `no-route-middleware-indexed`. These are prioritization hints only: matched
+middleware does not prove authorization, and missing middleware does not prove a
+bug.
+The review also builds a local import graph for relative and `@/` imports, so
+shared libraries and route helpers can be marked as `client-reachable-source`,
+`route-reachable-source`, `entrypoint-surface`, or `no-local-importers-indexed`
+without executing code or resolving npm packages. The dependency context keeps
+direct importers plus bounded transitive reachability chains, so a transaction
+helper can show `lib -> hook -> component` or `helper -> route` paths for manual
+review while still avoiding runtime validation. When a lead is route-reachable,
+the review also summarizes the static guard status of the importer routes, so a
+shared helper can be prioritized by whether its route callers have same-file
+access control, matched middleware controls, validation-only controls, or guard
+gaps.
+The import graph also reports coverage gaps: `candidate_file_limit_reached`
+when `--max-files` truncates the scan, unresolved local imports, local imports
+that point outside the candidate set, and external package imports that were
+counted but intentionally not resolved. Treat these as triage quality signals,
+not findings. Increase `--max-files` or review unresolved aliases before relying
+on dependency reachability.
+External package imports are also classified as static context without resolving
+or executing packages. `source-risk-review` can label direct external imports and
+external imports in direct local helpers as wallet/web3, transaction encoding,
+HTML/markdown rendering, validation, auth/session, database, storage/upload,
+HTTP client, rate-limit, crypto, framework runtime, or generic external package
+context. Statuses such as `wallet-transaction-package-context`,
+`rendering-package-context`, `auth-validation-package-context`, and
+`mutation-storage-package-context` are review orientation only; server-only or
+Node-only imports can also be summarized as `server-runtime-package-context`.
+These statuses do not audit the package, prove reachability, or imply
+exploitability.
+The review also adds single-file source/sink flow hints. It indexes local
+caller-input, route/query params, headers/cookies, remote response data, and
+rendered content sources, then links them to nearby sinks such as upstream
+requests, header forwarding, transaction construction, persistent writes, HTML
+rendering, state mutations, and resource fanout. Flow statuses such as
+`critical-nearby-source-sink-hints` or `same-file-source-sink-hints` are only
+prioritization hints: they do not prove true data flow, runtime reachability,
+exploitability, or reportability.
+The review also builds a static config context. It indexes local source env
+variable names, checked-in env template keys, fixed upstream/RPC/quote URL
+literals, and Next.js `headers`, `redirects`, and `rewrites` route-policy hints.
+Per-lead statuses include `public-secret-env-review` for public client-exposed
+env names that look secret-like, `cors-credential-config-review` for route CORS
+policy context near credential/header forwarding, `upstream-config-context-indexed`,
+`route-policy-config-indexed`, and `env-config-context-indexed`. The config
+context never reads runtime env values, does not execute config files, and sends
+no requests; it is only a queueing aid for manual source review.
+Finally, each lead gets combined triage explainers. These merge signal severity,
+flow hints, request-shape context, same-file control-order context, identity
+binding context, response exposure context, client/server exposure context,
+route guard gaps, route-importer guard context, config context, dependency
+reachability, and import-coverage gaps into statuses such as
+`critical-multi-context-review`, `critical-review`, `high-context-review`, or
+`standard-review`, with explicit reason ids and review hints. These explainers
+are queueing aids only; they do not change the finding gate or prove impact.
+`--show-workbook` prints the highest-signal lanes, control refs, checks,
+local importer refs, evidence requests, and stop condition for the displayed
+leads. `--show-dependencies` prints direct imports, importers, reachability
+chains, and per-lead import coverage notes without the workbook checklist.
+`--show-imported-controls` prints direct local imported helper controls and
+their auth, validation, rate, origin, and ownership refs.
+`--show-imported-invocation` prints static imported callable names, same-file
+call refs, and line-order context between imported guard calls and sensitive
+sinks for displayed leads.
+`--show-external-deps` prints classified direct external package import context
+and external imports found in direct local helpers. It does not resolve npm
+packages or read `node_modules`.
+`--show-input-shape` prints request body parsing, schema strictness, explicit
+field-copy, request-body spread, direct body-write, dynamic key, and mutation
+call context for displayed leads.
+`--show-object-key-trust` prints static caller-controlled object/key source
+refs, merge/set/spread/dynamic-property-write sink refs, key allowlist,
+reserved-key rejection, own-property, schema, null-prototype, and Map safe
+container context for displayed leads.
+`--show-csrf-origin` prints static cookie/session mutation,
+GET/HEAD/OPTIONS state mutation, bearer/API-key/JWT, origin/referer/CSRF,
+content-type, imported guard, and route middleware context for displayed leads.
+`--show-cors-origin-trust` prints static CORS origin source, response-header
+sink, credentials, wildcard, literal `null` origin, request-Origin reflection,
+permissive allowlist/control, and `Vary: Origin` context for displayed leads.
+`--show-control-order` prints same-file static line-order context between
+control-like refs and sensitive sinks, including sink refs, control refs, and
+line deltas.
+`--show-control-effect` prints same-file static guard result, denial response,
+floating call, and sink-order context for displayed leads.
+`--show-response-exposure` prints static JSON response sinks, nearby
+sensitive-looking refs, response/sensitive pair distances, route access context,
+identity-binding context, and CORS/config context for displayed leads.
+`--show-download-response-trust` prints static download response sinks,
+`Content-Disposition` filename material, content-type context, CSV/spreadsheet
+export builders, caller-controlled filename/content sources, filename controls,
+extension or MIME allowlists, attachment policy, and spreadsheet formula
+escaping context for displayed leads.
+`--show-cache-policy` prints static Cache-Control, Next.js cache directive,
+route-config header, sensitive-response, and private/no-store/public cache
+context for displayed leads.
+`--show-path-trust` prints static filesystem/storage path sink refs,
+caller-controlled path or object-key source refs, normalization, base-directory
+containment, traversal/absolute-path controls, extension allowlists, object-key
+prefix controls, and source/sink/control pair categories for displayed leads.
+`--show-upload-trust` prints static upload source refs, filesystem/storage
+persistence sink refs, MIME/content-type and extension controls, size limits,
+private ACL or signed access controls, ownership-key controls, public-serving
+hints, and source/sink/control pair categories for displayed leads.
+`--show-auth-token-trust` prints static bearer, cookie, URL/query, API-key,
+JWT, signature, and session-token source refs, decode and comparison sink refs,
+verification helpers, unsafe verification-option hints such as disabled expiry
+checks or allowed `none` algorithms, issuer/audience/algorithm/expiry claim
+controls, hardcoded verification-secret review pairs, query-token review pairs,
+missing-claim-control review pairs,
+constant-time comparison controls, and source/sink/control pair categories for
+displayed leads.
+`--show-auth-flow-trust` prints static OAuth/OIDC/SAML/SSO callback source
+refs, token exchange, callback/session creation, cookie, redirect, and assertion
+sink refs, state/nonce/PKCE controls, missing PKCE/code_verifier review pairs,
+provider allowlist or expected-provider binding controls, redirect allowlist or
+same-origin controls,
+issuer/audience/JWKS/signature controls, and source/sink/control pair categories
+for displayed leads.
+`--show-account-recovery-trust` prints static reset, magic-link, invite,
+OTP/MFA, verification-code, recovery-code, password, session, expiry,
+single-use/revocation, token-hash/safe-compare, account/email/user binding,
+attempt-limit, rate-limit, lockout, URL/query token transport, missing
+re-auth/current-password review pairs, and missing token-hash review context for
+displayed leads.
+`--show-role-permission-trust` prints static role, permission, admin flag,
+invite, membership, target-subject, admin-policy, role-allowlist,
+self-assignment gap, missing grantable-role allowlist review pairs,
+self-protection, and tenant or organization scope context for displayed leads.
+`--show-cookie-trust` prints static cookie write sinks, inferred cookie-name
+sensitivity, `HttpOnly`, `Secure`, `SameSite`, lifetime, path, domain, and
+prefix controls, including prefix-scope gaps, sensitive `Domain` scope review,
+long static `Max-Age` lifetime review, and `SameSite=None` without `Secure`,
+plus source/sink/control pair categories for displayed leads.
+`--show-message-trust` prints static browser message handlers, `postMessage`
+senders, target-origin categories, dynamic target-origin review pairs,
+`event.origin`/`event.source` controls, message schema controls, channels, and
+source/sink/control pair categories for displayed leads.
+`--show-client-rendering-trust` prints static raw HTML/DOM/markdown/parser
+sink refs, props/URL/storage/API/CMS/content source refs, sanitizer/output
+encoding/Trusted Types controls, static-literal context, and source/sink/control
+pair categories for displayed leads.
+`--show-security-header-trust` prints static checked-in CSP,
+`Content-Security-Policy-Report-Only`, `X-Frame-Options`, HSTS,
+`X-Content-Type-Options`, referrer policy, permissions policy, and cross-origin
+isolation header context from same-file header construction and matched Next.js
+route header policies. It highlights weak configured values such as
+`unsafe-inline`, `unsafe-eval`, wildcard CSP sources, report-only CSP used
+without an enforcing CSP on rendering-risk pages, enforcing CSP policies that
+omit `base-uri` or `object-src` hardening on rendering-risk pages, weak frame
+policies, short HSTS max-age, non-`nosniff` `X-Content-Type-Options`,
+`unsafe-url` referrer policy, broad COOP/CORP/COEP isolation values such as
+`unsafe-none` or `cross-origin`, and permissions policy wildcards for sensitive
+browser features such as camera, microphone, geolocation, payment, USB, serial,
+Bluetooth, display-capture, and clipboard access. Statuses such as
+`security-header-weak-csp-review`,
+`security-header-csp-report-only-review`,
+`security-header-frame-policy-gap-review`,
+`security-header-csp-hardening-gap-review`,
+`security-header-hsts-weak-review`,
+`security-header-permissions-policy-wildcard-review`,
+`security-header-referrer-policy-leak-review`,
+`security-header-xcto-weak-review`,
+`security-header-cross-origin-isolation-weak-review`,
+`security-header-weak-browser-policy-review`, and
+`security-header-controlled-context-indexed` help queue static review. It only
+raises missing CSP/frame-policy, report-only CSP, or CSP hardening-gap review
+when correlated with a local rendering-risk page or route. It does not fetch
+runtime headers, run a browser, execute payloads, or prove exploitability.
+`--show-client-storage-trust` prints static localStorage, sessionStorage,
+IndexedDB, client cookie, localForage/idb-keyval-style helper, storage
+persistence helper, storage-key sensitivity, read/write, expiry, validation,
+redaction, encryption-hint, and sensitive-write lifecycle-gap context for
+displayed leads.
+`--show-randomness-trust` prints static weak, time-derived, and cryptographic
+randomness refs, token/session/nonce/OTP/reset/invite material categories,
+lifetime/uniqueness controls, and source/material/control pair categories for
+displayed leads.
+`--show-crypto-primitive-trust` prints static caller-controlled algorithm,
+hash, cipher, key, IV/nonce, signature, MAC, plaintext, and ciphertext refs,
+weak algorithm/static IV hints, deprecated `createCipher`/`createDecipher`
+hints, unauthenticated cipher mode hints, hardcoded key, secret, or passphrase
+hints with literal samples redacted, primitive sink refs, AEAD, HMAC/MAC/auth
+tag, random IV/nonce, KDF, key-management, allowlist, constant-time compare
+controls, and source/sink/control pair categories for displayed leads. It is a
+static source view only and does not print raw secrets, validate keys, decrypt
+data, brute-force material, invoke routes, or replay requests.
+`--show-business-value-trust` prints static caller-controlled amount, price,
+total, quantity, discount, coupon, currency, balance, credit, point, and fee
+refs, payment/order/ledger/balance/entitlement sink refs, server-side
+pricing/catalog controls, numeric and currency limits, and source/sink/control
+pair categories for displayed leads.
+`--show-tenant-scope-trust` prints static caller-controlled user, owner,
+tenant, account, organization, project, order, invoice, document, file, wallet,
+and object id source refs, data-access/mutation/response sink refs,
+client-supplied tenant/account/user scope review pairs,
+ownership/tenant/membership/auth/imported policy controls, and
+source/sink/control pair categories for displayed leads.
+`--show-workflow-precondition-trust` prints static workflow action, object id,
+amount, coupon, role, account, password, status, and state source refs,
+order/payment/refund/coupon/balance/role/account/workflow mutation sinks,
+auth/ownership/state-machine/idempotency/transaction controls, and
+source/sink/control pair categories for displayed leads.
+`--show-resource-fanout-trust` prints static caller-controlled ids/items,
+batch, limit, page-size, cursor, offset, retry, polling, parallel fanout,
+pagination/export sink, bound, rate-limit, and concurrency-control context for
+displayed leads.
+`--show-sensitive-logging-trust` prints static console/logger/telemetry/
+analytics/error-reporting sink refs, sensitive auth/cookie/API-key/JWT/session/
+secret/wallet/payment/request/header/body/PII source refs, redaction or
+scrubbing controls, and sink/source/control pair categories for displayed leads.
+`--show-error-disclosure-trust` prints static raw exception, stack, debug,
+upstream/provider/RPC diagnostic, response-body, status-text, JSON/HTTP error
+response sink, and public-error shaping/redaction context for displayed leads.
+`--show-debug-surface-trust` prints static debug, admin, internal, ops,
+diagnostic, cron, seed, backfill, maintenance, devtools, diagnostic response,
+internal action, access-control, internal-only header, and environment-gate
+context for displayed leads.
+`--show-code-exec-trust` prints static process execution, shell execution, eval,
+Function, vm, caller-source, allowlist, argv-separation, shell-disabled,
+admin/internal, environment-gate, and source/sink/control pair context for
+displayed leads.
+`--show-server-template-trust` prints static server-side template name/string
+source refs, render/view/compile sink refs, render data refs, template
+allowlists, escaping, sandbox, literal-template, unescaped-output, and
+source/sink/control pair context for displayed leads.
+`--show-deserialization-trust` prints static serialized payload source refs,
+unserialize/deserialize/YAML/binary parser sink refs, schema or type allowlist
+controls, safe-loader settings, signature/MAC checks, content-type and size
+controls, and source/sink/control pair context for displayed leads.
+`--show-archive-extraction-trust` prints static archive upload/source refs,
+unzip/tar/decompress/parser sink refs, archive entry path write refs,
+destination containment, preserve-paths/strip-zero option refs, strip/filter
+settings, allowlists, size/count controls, and source/sink/control pair context
+for displayed leads.
+`--show-xml-parser-trust` prints static XML/SOAP/SAML/SVG source refs, XML
+parser sink refs, DOCTYPE/entity refs, external-resource or entity-processing
+settings, schema/content-type/size controls, and source/sink/control pair
+context for displayed leads.
+`--show-regex-complexity-trust` prints static dynamic `RegExp`/`RE2`, regex
+literal, caller-controlled pattern/input, complex regex, `RE2`/safe-regex,
+allowlist, escaping, and length-bound context for displayed leads.
+`--show-query-trust` prints static database/ORM query sink refs,
+caller-controlled query/filter/sort/where source refs, parameterization
+controls, client-controlled ORM filter review context, field allowlists,
+ownership/tenant scope controls, and source/sink/control pair categories for
+displayed leads.
+`--show-graphql-resolver-trust` prints static GraphQL resolver entrypoint,
+Query/Mutation, args/input, object selector, context auth, caller-to-object
+scope, validation, unbounded list review, pagination/depth/complexity, and
+data/mutation sink context for displayed leads.
+`--show-ssrf-trust` prints static outbound request sink refs, caller-controlled
+URL source refs, URL parser refs, host allowlist controls, protocol controls,
+private-network controls, permissive host allowlist review pairs, fixed
+private/metadata upstream URL categories, and source/sink/control pair
+categories for displayed leads. It is a static source view only and does not
+request those URLs, resolve DNS, follow redirects, or probe private networks.
+`--show-redirect-trust` prints static redirect/navigation sink refs,
+redirect-like source refs, same-origin/path controls, allowlist controls,
+dynamic missing-allowlist review pairs, dangerous-scheme literal destinations,
+Next.js redirect route-policy context, and source/sink/control pair categories
+for displayed leads.
+`--show-webhook-trust` prints static webhook entrypoint refs, signature header
+reads, raw/parsed body reads, verification refs, secret refs, event-id refs,
+idempotency refs, replay-window or timestamp-freshness refs, side-effect refs,
+missing-secret context, and signature/body/control-order/idempotency/replay-window
+categories for displayed leads. It is a static source view only and does not
+deliver or replay webhook events, call routes, or forge provider signatures.
+`--show-identity-binding` prints static object/subject identifiers, same-file
+binding refs, imported or middleware contextual-control refs, ownership-control
+counts, and mutation-like context for displayed leads.
+`--show-client-exposure` prints static client reachability, client importer or
+transitive chain hints, and client-reachable private env, server-only runtime,
+database/storage, wallet, and transaction-boundary refs for displayed leads.
+`--show-route-guards` prints matched middleware, static matcher status, and
+route-bound control refs for displayed route leads. It also prints importer
+route guard summaries for route-reachable helper or library leads.
+`--show-flow` prints the static source/sink links, nearest source and sink refs,
+line distance, and review question for displayed leads.
+`--show-config-context` prints static env/upstream/Next.js config context,
+including env variable names, URL categories, direct imported config refs, and
+matched route policies for displayed leads.
+`--show-packet` prints a compact offline review packet per displayed lead. The
+packet combines source refs, surface metadata, context statuses, top triage
+reasons, source/sink links, config refs, importer/reachability refs, offline
+checks, evidence requests, promotion gates, reportability gates, and stop
+conditions. Packets are designed for manual source review and do not authorize
+active validation.
+`--show-triage` prints the combined triage status, score, reason ids, weights,
+and safe review hints for displayed leads.
+`--focus` applies display-only presets without changing `source-risk-review.json`.
+Available presets include `wallet`, `mutation`, `route-guard-gap`, `flow`,
+`config`, `public-env`, `imported-controls`, `imported-invocation`,
+`external-deps`, `input-shape`, `object-key-trust`, `csrf-origin`,
+`cors-origin-trust`, `control-order`, `control-effect`,
+`response-exposure`, `download-response-trust`, `cache-policy`, `path-trust`, `upload-trust`,
+`auth-token-trust`, `auth-flow-trust`, `account-recovery-trust`,
+`role-permission-trust`, `cookie-trust`, `message-trust`, `client-rendering-trust`, `security-header-trust`, `client-storage-trust`,
+`randomness-trust`, `crypto-primitive-trust`, `business-value-trust`, `tenant-scope-trust`, `workflow-precondition-trust`,
+`resource-fanout-trust`,
+`sensitive-logging-trust`, `error-disclosure-trust`, `debug-surface-trust`,
+`code-exec-trust`, `server-template-trust`, `deserialization-trust`,
+`archive-extraction-trust`, `xml-parser-trust`, `regex-complexity-trust`, `query-trust`,
+`graphql-resolver-trust`, `ssrf-trust`, `redirect-trust`, `webhook-trust`,
+`identity`, `client-exposure`, `coverage`, `client`, and `route`.
+Display-only filters include `--priority`, `--signal`, `--lane`, `--surface`,
+`--control-status`, `--imported-control-status`,
+`--imported-invocation-status`, `--imported-invocation-category`,
+`--external-dep-status`, `--external-dep-category`, `--route-guard-status`,
+`--route-importer-guard-status`,
+`--input-shape-status`, `--input-shape-category`,
+`--object-key-trust-status`, `--object-key-trust-category`,
+`--csrf-origin-status`,
+`--csrf-origin-category`, `--cors-origin-trust-status`,
+`--cors-origin-trust-category`, `--control-order-status`, `--control-order-category`,
+`--control-effect-status`, `--control-effect-category`,
+`--response-exposure-status`,
+`--response-exposure-category`, `--download-response-trust-status`,
+`--download-response-trust-category`, `--cache-policy-status`,
+`--cache-policy-category`, `--path-trust-status`, `--path-trust-category`,
+`--upload-trust-status`, `--upload-trust-category`,
+`--auth-token-trust-status`, `--auth-token-trust-category`,
+`--auth-flow-trust-status`, `--auth-flow-trust-category`,
+`--account-recovery-trust-status`, `--account-recovery-trust-category`,
+`--role-permission-trust-status`, `--role-permission-trust-category`,
+`--cookie-trust-status`, `--cookie-trust-category`,
+`--message-trust-status`, `--message-trust-category`,
+`--client-rendering-trust-status`, `--client-rendering-trust-category`,
+`--security-header-trust-status`, `--security-header-trust-category`,
+`--client-storage-trust-status`, `--client-storage-trust-category`,
+`--randomness-trust-status`, `--randomness-trust-category`,
+`--crypto-primitive-trust-status`, `--crypto-primitive-trust-category`,
+`--business-value-trust-status`, `--business-value-trust-category`,
+`--tenant-scope-trust-status`, `--tenant-scope-trust-category`,
+`--workflow-precondition-trust-status`,
+`--workflow-precondition-trust-category`,
+`--resource-fanout-trust-status`, `--resource-fanout-trust-category`,
+`--sensitive-logging-trust-status`, `--sensitive-logging-trust-category`,
+`--error-disclosure-trust-status`, `--error-disclosure-trust-category`,
+`--debug-surface-trust-status`, `--debug-surface-trust-category`,
+`--code-exec-trust-status`, `--code-exec-trust-category`,
+`--server-template-trust-status`, `--server-template-trust-category`,
+`--deserialization-trust-status`, `--deserialization-trust-category`,
+`--archive-extraction-trust-status`,
+`--archive-extraction-trust-category`,
+`--xml-parser-trust-status`, `--xml-parser-trust-category`,
+`--regex-complexity-trust-status`, `--regex-complexity-trust-category`,
+`--query-trust-status`, `--query-trust-category`,
+`--graphql-resolver-trust-status`, `--graphql-resolver-trust-category`,
+`--ssrf-trust-status`,
+`--ssrf-trust-category`, `--redirect-trust-status`,
+`--redirect-trust-category`, `--webhook-trust-status`,
+`--webhook-trust-category`, `--identity-binding-status`,
+`--identity-binding-category`, `--client-exposure-status`,
+`--client-exposure-category`, `--flow-status`, `--flow-link`,
+`--config-status`, `--config-signal`, `--triage-status`, `--triage-reason`,
+`--dependency-status`, `--route`, and `--source-file`; they do not remove leads from
+`source-risk-review.json`. The command sends no HTTP requests, does not call
+Burp, does not sign wallets, does not submit transactions, does not retrieve
+production logs, does not collect tokens/cookies/PII, does not query or
+exfiltrate telemetry, does not trigger live errors, does not replay requests,
+does not execute GraphQL operations, does not introspect live schemas, does not
+fuzz GraphQL fields, does not switch accounts, does not send malformed traffic,
+does not collect raw upstream bodies, does not construct prototype-mutation
+payloads, does not fuzz keys, does not execute merge behavior, does not parse
+XML samples, does not construct XXE or entity payloads, does not fetch external
+entities, does not read local files from XML parser leads, does not generate
+ReDoS payloads, does not run regex benchmarks, does not fuzz regex patterns or
+inputs, does not stress-test regex matching, does not request debug
+endpoints, trigger jobs/backfills/seeds/cache purges/admin actions, read
+production diagnostics, run browser CORS checks, send cross-origin probes,
+collect/replay credentials, generate XSS payloads, invoke login or callback
+routes, generate or replay OAuth/OIDC/SAML tokens or assertions, submit SSO
+forms, replay authorization codes, generate, guess,
+brute-force, submit, replay, or validate account-recovery tokens, magic links,
+invite codes, OTPs, MFA codes, recovery codes, passwords, or sessions, run
+browser page validation, create users, send invites, change roles, grant
+permissions, replay membership flows, validate live privilege changes, replay
+rendered content, or attempt cache poisoning.
+
 `lead-portfolio` consumes `bounty-program-profile.json` when it is present and
-creates `bounty-program-impact` lanes ahead of passive endpoint leads. These
-lanes preserve the original program impact, severity, candidate in-scope assets,
-mapped attack techniques, safe validation boundary, and reportability gates. In
-black-box mode, if the bounty profile is missing, `lead-portfolio` emits a
-`bounty-program-profile-missing` blocker so the run starts by ingesting program
-scope instead of spending effort on coverage-first endpoint work.
+creates `bounty-program-impact` lanes ahead of passive endpoint leads. It also
+consumes `source-risk-review.json` when available, so high-value local source
+boundaries appear in the same queue as scope, endpoint, WebSocket, and takeover
+leads, with route/method/surface summaries when they can be inferred offline.
+Source-risk portfolio rows also include the control-context bucket so reviewers
+can prioritize unauthenticated-looking mutation boundaries without treating
+source heuristics as proof. Dependency buckets show whether a source-only lead is
+an entrypoint, imported by a route, imported by client code, or currently
+unreferenced in the local import graph; compact reachability counts show whether
+route or client chains were found. Config buckets show whether a lead has
+public-secret-like env names, upstream/RPC/quote config, CORS route-policy
+context, or only lower-signal env/url references. External dependency buckets
+show whether a source-risk lead imports wallet/web3, rendering/parser,
+validation/auth, storage/database, HTTP/upstream, or generic packages directly
+or through a direct local helper. Path-trust buckets show whether a source-risk
+lead has caller-controlled file path or object-key material, containment or
+traversal controls, extension allowlists, object-key prefix controls, or only
+literal path context. Upload-trust buckets show whether a source-risk lead has
+caller-controlled upload content, public-serving persistence sinks, missing
+MIME/type or size controls, private ACL or ownership-key context, or only
+literal upload/write context. Auth-token-trust buckets show whether a
+source-risk lead has decode-only token handling, unsafe API-key or signature
+comparison, verified JWT/session context, issuer/audience/expiry claim controls,
+URL/query token transport, missing claim-control review pairs, or token
+source-only context. XML-parser-trust buckets show whether a
+source-risk lead has caller-controlled XML/SOAP/SAML/SVG material near parser
+sinks, DOCTYPE/entity material, same-file parser controls, or only literal XML
+context. Regex-complexity-trust buckets show whether a source-risk lead has
+caller-controlled regex patterns, complex regexes over caller-controlled input,
+same-file RE2/safe-regex/length controls, or only literal regex context.
+Query-trust buckets show whether a source-risk lead has
+raw user-influenced database query material, parameterized query context,
+field/sort allowlists, scoped ORM ownership or tenant controls, or only literal
+query context.
+Bounty lanes preserve the original program impact, severity, candidate
+in-scope assets, mapped attack techniques, safe validation boundary, and
+reportability gates. In black-box mode, if the bounty profile is missing,
+`lead-portfolio` emits a `bounty-program-profile-missing` blocker so the run
+starts by ingesting program scope instead of spending effort on coverage-first
+endpoint work.
 `scope-policy` also consumes `bounty-program-profile.json`: asset hosts parsed
 from the bounty page are automatically added to the explicit allowlist, and if
 no target was supplied the first bounty asset is used as the policy target
@@ -316,12 +1588,13 @@ python3 scripts/inferforge.py --artifact-dir .greybox/target-set \
   lead-portfolio --discover-child-runs --no-write
 ```
 
-`lead-portfolio` reads existing local artifacts only. It combines static asset
-endpoint candidates, WebSocket handshake candidates, runtime configuration
-hosts, external script hosts, scope-policy decisions, generated asset profiles,
-handshake review results, and takeover baselines. The output is a triage queue,
-not evidence of impact: every entry keeps a reportability gate and a safe next
-step, and no endpoint, host, or script is requested by this command. Use
+`lead-portfolio` reads existing local artifacts only. It combines bounty impact
+lanes, source-risk leads, static asset endpoint candidates, WebSocket handshake
+candidates, runtime configuration hosts, external script hosts, scope-policy
+decisions, generated asset profiles, handshake review results, and takeover
+baselines. The output is a triage queue, not evidence of impact: every entry
+keeps a reportability gate and a safe next step, and no endpoint, host, source
+file, or script is requested by this command. Use
 `--check-dir` repeatedly or `--discover-child-runs` to build a root-level rollup
 across multiple child runs that already contain `lead-portfolio.json`; this is
 also offline and prints per-run status counts plus the top actionable leads.
@@ -1598,6 +2871,60 @@ python3 scripts/inferforge.py response-deltas
 python3 scripts/inferforge.py source-peek
 python3 scripts/inferforge.py source-peek --no-write
 python3 scripts/inferforge.py source-peek-requests
+python3 scripts/inferforge.py source-risk-review --no-write --top 12 --show-signals --show-workbook
+python3 scripts/inferforge.py source-risk-review --no-write --top 8 --show-dependencies --surface shared-library
+python3 scripts/inferforge.py source-risk-review --no-write --top 8 --show-imported-controls --imported-control-status imported-validation-controls-only
+python3 scripts/inferforge.py source-risk-review --no-write --top 8 --show-route-guards --surface nextjs-app-route
+python3 scripts/inferforge.py source-risk-review --no-write --top 8 --show-route-guards --route-importer-guard-status route-importer-guard-gaps-indexed
+python3 scripts/inferforge.py source-risk-review --no-write --top 8 --show-flow --flow-status critical-same-file-source-sink-hints
+python3 scripts/inferforge.py source-risk-review --no-write --top 8 --show-config-context --config-status public-secret-env-review
+python3 scripts/inferforge.py source-risk-review --no-write --focus wallet --top 6 --show-packet --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus external-deps --top 8 --show-external-deps
+python3 scripts/inferforge.py source-risk-review --no-write --focus imported-invocation --top 8 --show-imported-invocation --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus input-shape --top 8 --show-input-shape --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus object-key-trust --top 8 --show-object-key-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus csrf-origin --top 8 --show-csrf-origin --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus cors-origin-trust --top 8 --show-cors-origin-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus control-order --top 8 --show-control-order --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus control-effect --top 8 --show-control-effect --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus response-exposure --top 8 --show-response-exposure --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus download-response-trust --top 8 --show-download-response-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus cache-policy --top 8 --show-cache-policy --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus path-trust --top 8 --show-path-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus upload-trust --top 8 --show-upload-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus auth-token-trust --top 8 --show-auth-token-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus auth-flow-trust --top 8 --show-auth-flow-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus account-recovery-trust --top 8 --show-account-recovery-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus role-permission-trust --top 8 --show-role-permission-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus cookie-trust --top 8 --show-cookie-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus message-trust --top 8 --show-message-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus client-rendering-trust --top 8 --show-client-rendering-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus security-header-trust --top 8 --show-security-header-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus client-storage-trust --top 8 --show-client-storage-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus randomness-trust --top 8 --show-randomness-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus crypto-primitive-trust --top 8 --show-crypto-primitive-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus business-value-trust --top 8 --show-business-value-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus tenant-scope-trust --top 8 --show-tenant-scope-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus workflow-precondition-trust --top 8 --show-workflow-precondition-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus resource-fanout-trust --top 8 --show-resource-fanout-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus sensitive-logging-trust --top 8 --show-sensitive-logging-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus error-disclosure-trust --top 8 --show-error-disclosure-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus debug-surface-trust --top 8 --show-debug-surface-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus code-exec-trust --top 8 --show-code-exec-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus server-template-trust --top 8 --show-server-template-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus deserialization-trust --top 8 --show-deserialization-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus archive-extraction-trust --top 8 --show-archive-extraction-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus xml-parser-trust --top 8 --show-xml-parser-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus regex-complexity-trust --top 8 --show-regex-complexity-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus query-trust --top 8 --show-query-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus graphql-resolver-trust --top 8 --show-graphql-resolver-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus ssrf-trust --top 8 --show-ssrf-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus redirect-trust --top 8 --show-redirect-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus webhook-trust --top 8 --show-webhook-trust --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus identity --top 8 --show-identity-binding --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --focus client-exposure --top 8 --show-client-exposure --show-triage
+python3 scripts/inferforge.py source-risk-review --no-write --top 8 --show-triage --triage-status critical-multi-context-review
+python3 scripts/inferforge.py source-risk-review --no-write --top 8 --signal wallet-transaction-payload-boundary --dependency-status client-reachable-source
 python3 scripts/inferforge.py attack-strategy
 python3 scripts/inferforge.py attack-strategy --no-write
 python3 scripts/inferforge.py evidence-chain
@@ -1607,6 +2934,8 @@ python3 scripts/inferforge.py verification-queue --no-write
 python3 scripts/inferforge.py manifest
 python3 scripts/inferforge.py artifact-health --discover-child-runs
 python3 scripts/inferforge.py review-candidates --no-write
+python3 scripts/inferforge.py regression-suite --offline-only --plan-only
+python3 scripts/inferforge.py regression-suite --offline-only
 python3 scripts/inferforge.py regression-suite --include-external --ws-resource-probes
 python3 scripts/inferforge.py adjudicate
 python3 scripts/inferforge.py audit --no-ws
@@ -1634,6 +2963,9 @@ python3 scripts/inferforge.py self-test-manifest-refresh
 python3 scripts/inferforge.py self-test-no-write
 python3 scripts/inferforge.py self-test-rewrite-response-review
 python3 scripts/inferforge.py self-test-burp-sync-failures
+python3 scripts/inferforge.py self-test-bounty-program-profile
+python3 scripts/inferforge.py self-test-source-risk-review
+python3 scripts/inferforge.py self-test-regression-offline-safety
 python3 scripts/inferforge.py review-blockers
 python3 scripts/inferforge.py collect-quote --direction buy --wallet EzDmLUHTj53mSLN4BBrsuW8w3Gvc1iDGiYCXrkwm4vrR --amount-in 1000000
 python3 scripts/inferforge.py collect-orca-baseline
@@ -2355,8 +3687,9 @@ top-level artifacts, such as `profile`, `plan`, `collect`, `burp-observe`,
 `burp-sync`, `import-burp-history`, `coverage`, `burp-observation-coverage`,
 `discovery-coverage`, `response-deltas`, `source-peek`,
 `source-peek-requests`,
-`evidence-chain`, `evidence-appendix`, `verification-queue`, `review-blockers`,
-`oracle-plan`, `gate`, `adjudicate`, `artifact-health`, `review-candidates`,
+`source-risk-review`, `evidence-chain`, `evidence-appendix`,
+`verification-queue`, `review-blockers`, `oracle-plan`, `gate`, `adjudicate`,
+`artifact-health`, `review-candidates`,
 `promote-observation-candidate`, `discover-profile`, `capabilities`,
 `readiness`, `decode-transactions`, `collect-quote`, `collect-orca-baseline`,
 and the static `self-test-*` commands, also refresh the manifest when their
@@ -2412,15 +3745,17 @@ should also fail the job.
 
 `regression-suite` runs the repeatable local regression workflow that is used to
 develop the tool against `infrafi-web`: run static profile-routing, discovery
-coverage, command-safety, review-blocker, artifact-health, and
-manifest-refresh, no-write, Burp sync failure, and transaction-decoder
-self-tests, refresh static discovery, check that the discovered profile covers
-every static surface or review gate, run deterministic Burp observe/sync for
-the checked-in profile and discovered profile, collect one source-known Orca
-pool baseline, run both audits, write artifact health, and then generate a
-root-level review-blocker rollup, `regression-suite.json`, and a refreshed root
-`artifact-manifest.json`. The final log prints step counts, artifact-health
-gate counts including `security_issues`, review-blocker counts, and the top
+coverage, command-safety, review-blocker, artifact-health, source-risk,
+regression-offline-safety, and manifest-refresh, no-write, Burp sync failure,
+and transaction-decoder self-tests, refresh static discovery, run offline
+`source-risk-review` and a passive `lead-portfolio`, check that the discovered
+profile covers every static surface or review gate, run deterministic Burp
+observe/sync for the checked-in profile and discovered profile, collect one
+source-known Orca pool baseline, run both audits, write artifact health, and
+then generate a root-level review-blocker rollup, `regression-suite.json`, and a
+refreshed root `artifact-manifest.json`. The final log prints step counts,
+artifact-health gate counts including `security_issues`, review-blocker counts,
+and the top
 grouped review blockers so unattended runs surface both health gates and next
 actions directly. `regression-suite.json` stores step output as byte, hash, and
 line-count summaries rather than raw command stdout; step and preparation
@@ -2439,6 +3774,24 @@ On constrained VPS hosts, `regression-suite` now blocks at startup while the
 resource gate is warning unless `--allow-resource-warning` is passed. This avoids
 queuing self-tests, Burp observe/sync, Orca baselines, active audits, and report
 rollups when swap pressure is already high.
+
+During tool development, prefer the offline mode first:
+
+```bash
+python3 scripts/inferforge.py regression-suite --offline-only --plan-only
+python3 scripts/inferforge.py regression-suite --offline-only
+```
+
+`--plan-only` writes `regression-suite.json` with `planned` steps but does not
+execute subcommands or clear probe artifacts. `--offline-only` forces the suite
+to skip Burp observe/sync, active audit probes, Orca baseline collection,
+external probes, WebSocket resource probes, and non-local observation traffic.
+It still allows static self-tests, source/profile discovery, discovery coverage,
+offline source-risk review, passive lead portfolio generation, artifact health,
+review-blocker rollups, and local report rendering from existing artifacts. The
+generated suite artifact records `offline_only`,
+`plan_only`, and the disabled action list so unattended runs can verify the
+development-safe boundary before executing anything active.
 
 ```bash
 python3 scripts/inferforge.py regression-suite --include-external --ws-resource-probes
@@ -2574,6 +3927,10 @@ Key outputs:
 .greybox/verification-queue.json
 .greybox/reproduction-steps.md
 .greybox/source-peek-results.json
+.greybox/source-risk-review.json
+.greybox/source-risk-review-selftest.json
+.greybox/bounty-program-profile-selftest.json
+.greybox/regression-offline-safety-selftest.json
 .greybox/suspicions.json
 .greybox/findings.json
 .greybox/report.md
