@@ -1,81 +1,25 @@
-# Berachain Web/Apps 后续输入需求
+# Berachain Web/Apps 后续输入需求（历史状态已更新）
 
-生成时间：2026-07-08
+原始生成时间：2026-07-08
+
+状态更新时间：2026-07-10
 
 ## 当前状态
 
-我们已经用 `immunefi-program-profile` 读取了 Berachain Web/Apps 的 Immunefi 三个页面：
+本文最初记录的 Immunefi 静态页面缺口已经解决。更新后的解析器能够从页面序列化数据中恢复完整列表，本地权威画像现为：
 
-- Information: `https://immunefi.com/bug-bounty/berachain-webapps/information/`
-- Scope: `https://immunefi.com/bug-bounty/berachain-webapps/scope/`
-- Resources: `https://immunefi.com/bug-bounty/berachain-webapps/resources/`
+- Assets in Scope：`16/16`
+- Impacts in Scope：`20/20`
+- 状态：`ready`
+- Information、Scope、Resources：`3/3` 页面已读取
 
-当前静态页面可见结果：
+因此，不再需要为了补齐 scope 而手工展开 `Show all`。旧的 `12/16`、`12/20` 和 `partial-needs-review` 结论不得再作为当前状态引用。
 
-- Assets in Scope: 解析到 `12/16`
-- Impacts in Scope: 解析到 `12/20`
-- 状态：`partial-needs-review`
+公开、脱敏的阶段总结和换机说明见 [docs/BERACHAIN_HANDOFF_2026-07-10.zh-CN.md](docs/BERACHAIN_HANDOFF_2026-07-10.zh-CN.md)。完整研究证据仍在本地私密 artifact 中，不会进入公开 GitHub 仓库。
 
-这说明 Immunefi 静态 HTML 没有暴露完整的 `Show all` / 分页内容。工具已经保守处理，不会假装 scope 完整。
+## 仍有价值的可选输入
 
-## 我需要你提供的内容
-
-### 1. 渲染后的 Immunefi Scope 页面
-
-请用浏览器打开：
-
-```text
-https://immunefi.com/bug-bounty/berachain-webapps/scope/#top
-```
-
-操作：
-
-1. 展开 `Assets in Scope` 的 `Show all`。
-2. 展开 `Impacts in Scope` 的 `Show all`。
-3. 保存完整 HTML，命名为：
-
-```text
-scope.html
-```
-
-如果浏览器只能复制文本，也可以保存为：
-
-```text
-scope.txt
-```
-
-但优先 HTML，因为 HTML 能保留 asset URL。
-
-### 2. 渲染后的 Immunefi Information 和 Resources 页面
-
-请分别打开：
-
-```text
-https://immunefi.com/bug-bounty/berachain-webapps/information/#top
-https://immunefi.com/bug-bounty/berachain-webapps/resources/#top
-```
-
-保存为：
-
-```text
-information.html
-resources.html
-```
-
-这两个页面用于补齐奖励规则、KYC/PoC/禁止活动、文档和审计链接。
-
-### 3. 被 429 拦住的 Web App 页面 HTML
-
-自动低频请求以下页面时返回了 HTTP `429`，所以工具已经停止扩大抓取：
-
-```text
-https://bridge.berachain.com/
-https://nftbridge.berachain.com/
-https://hub.berachain.com/
-https://honey.berachain.com/
-```
-
-请用正常浏览器打开这些页面，等待页面完整加载后保存 HTML：
+以下页面的当前生产构建曾受 checkpoint 或限流影响。正常浏览器导出的 HTML 仍可用于“当前构建相关性”复核，但它们不再是补全 bounty scope 的前置条件：
 
 ```text
 bridge.html
@@ -84,51 +28,15 @@ hub.html
 honey.html
 ```
 
-这些文件会让工具离线提取：
-
-- JavaScript bundle URL
-- API endpoint 候选
-- WebSocket endpoint 候选
-- 钱包交易构造路径
-- NFT metadata / URI 相关路径
-
-### 4. 可选：测试账号和测试钱包材料
-
-如果后面要验证 authenticated action、fund/NFT theft、wallet transaction integrity 这类 impact，需要你提供明确授权的测试材料。
-
-最低需求：
-
-```text
-test-account-1
-test-account-2
-test-wallet-address-1
-test-wallet-address-2
-testnet-only private key or browser wallet profile
-```
-
-要求：
-
-- 只用测试账号。
-- 不使用真实用户数据。
-- 不使用主网资金。
-- 不提交真实交易。
-- 不做 DoS、压力测试、scanner-only 报告。
-
-## 建议目录结构
-
-把文件放到一个目录，例如：
+建议存放到：
 
 ```text
 manual-inputs/berachain-webapps/
-  information.html
-  scope.html
-  resources.html
-  bridge.html
-  nftbridge.html
-  hub.html
 ```
 
-然后我可以用：
+`manual-inputs/` 已加入 `.gitignore`。浏览器导出、HAR、认证会话、钱包 profile、签名和密钥只能通过私密带外渠道迁移，不能提交到当前公开仓库。
+
+离线解析示例：
 
 ```bash
 python3 scripts/inferforge.py --artifact-dir .greybox/berachain-webapps \
@@ -137,20 +45,18 @@ python3 scripts/inferforge.py --artifact-dir .greybox/berachain-webapps \
   --show-assets --show-impacts --show-techniques --show-links
 ```
 
-Web App 页面可以继续用 `blackbox-asset-map --input-html` 做离线解析，不需要再请求目标站点。
+Web App 页面可继续通过 `blackbox-asset-map --input-html` 离线提取候选，不需要扩大自动请求。
 
-## 当前额外 scope-review 线索
+## 测试账号与钱包材料
 
-`https://safe.berachain.com/` 可以低量读取，工具离线解析到一个低风险页面 route：
+只有在用户明确授权具体验证步骤后，才可使用专用测试账号或测试钱包材料。继续遵守：
 
-```text
-/welcome/accounts
-```
+- 不使用真实用户数据或主网资金。
+- 不提交真实交易、claim、approval 或签名。
+- 不测试第三方 OAuth、表单或其他第三方服务。
+- 不做 DoS、压力测试、高流量扫描或 scanner-only 报告。
+- 未在完整 16 项 scope 列表中的同父域 host，仍按 out-of-scope-by-default 处理。
 
-同时 runtime config 里出现了：
+## 换机时的注意事项
 
-```text
-gateway.safe.berachain.com
-```
-
-它看起来像同父域 service host，但不在当前静态可见的 12 个 assets 里。因为 Immunefi 页面声明 `Total Assets in Scope 16`，它可能在 `Show all` 里，也可能不在 scope。请优先用完整 `scope.html` 确认这个 host 是否属于 in-scope asset。确认前工具会把它作为 out-of-scope-by-default，不会主动请求它。
+本文件和公开 Git 历史只保存可公开内容。`.greybox/berachain-webapps/`、浏览器导出和未披露 finding 证据必须单独加密或通过安全带外方式复制；仅执行 `git clone` 无法恢复它们。

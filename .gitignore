@@ -13,6 +13,28 @@ coverage/
 !.env.template
 *.local
 
+# Private research inputs, captures, and handoff material
+manual-inputs/
+captures/
+operator-inputs/
+.handoff-private/
+*.har
+*.burp
+*.burp.xml
+*.pcap
+*.pcapng
+*.pem
+*.key
+*.p12
+*.pfx
+*.seed
+*.mnemonic
+.npmrc
+wallet-profile/
+wallet-profiles/
+browser-profile/
+browser-profiles/
+
 # Logs and transient runtime output
 *.log
 logs/
