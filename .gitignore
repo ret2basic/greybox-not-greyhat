@@ -53,10 +53,3 @@ __pycache__/
 
 # TypeScript incremental state
 *.tsbuildinfo
-
-# Large optional fixture assets and packaged deploy output
-infrafi-web/public/anim/
-infrafi-web/helm/*.tgz
-
-# Local fixture scratch files
-infrafi-web/.tmp-*

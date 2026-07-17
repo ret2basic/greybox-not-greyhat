@@ -145,12 +145,19 @@ python3 scripts/inferforge.py --target https://in-scope.example \
 and same-origin script assets. It does not request the candidate endpoints and
 does not persist raw HTML or JavaScript. The output
 `blackbox-asset-candidates.json` stores path candidates, query parameter names,
-source URLs, and source hashes; query values are stripped. Candidate endpoints
+source URLs, and source hashes; query values are stripped. When a fetched bundle
+places a 40-character Git commit beside an explicit build marker such as
+`getAppVersion` or `VITE_APP_VERSION`, the artifact also records a bounded
+`build_provenance_hints` entry. That value is only a lead: resolve it in the
+project's public repository and compare the reviewed files before claiming the
+source matches production. Candidate endpoints
 are added to verification/review blockers as leads, not as findings, until
 scope, authentication context, and business-operation risk are reviewed.
 Live page and asset fetches are blocked by the local resource gate while memory
 or swap pressure is warning; use `--input-html` for offline parsing, or pass
 `--allow-resource-warning` only after explicit review with narrow limits.
+Local `--input-html` parsing is bounded by the same `--max-bytes` value as live
+responses; oversized exports fail closed before being read into memory.
 If the page references script assets on other hosts, the tool records their
 hosts, counts, hashes, and stripped paths as scope-review leads without fetching
 those external scripts.
@@ -251,7 +258,12 @@ marked `in-scope-explicit-host`; every observed but unlisted host is
 `out-of-scope-by-default` unless `--allow-unlisted-review` is set. Verification
 queues use this artifact to avoid turning passive runtime config or external
 script references into manual blockers when the explicit scope already excludes
-them.
+them. When the artifact directory contains a `ready` Immunefi program profile
+whose declared asset list is complete, those program asset hosts become the
+authoritative allowlist: passing a different `--target` does not make that host
+in scope. Use `--scope-host` only for an explicit human-reviewed override; the
+resulting policy records both the manual override and whether the target host was
+auto-allowed.
 
 For Immunefi-style programs, ingest the public program pages before building a
 black-box bounty strategy:
@@ -270,7 +282,17 @@ reverse-mapped into safe planning techniques: for example, authenticated action
 impacts map to authorization and browser-mediated action paths, while direct
 fund-theft impacts map to transaction argument integrity and withdrawal/order
 authorization boundaries. This command fetches only public Immunefi pages; it
-does not probe in-scope assets and it does not authorize exploitation.
+does not probe in-scope assets and it does not authorize exploitation. Program
+intake is neutral scope context: it no longer writes the repository's default
+target profile/config artifacts into the program artifact directory.
+
+The profile includes a component-level `semantic_fingerprint` over the program
+header, assets, impacts, out-of-scope exclusions and clarifications, structured
+information/rule sections, and resource links. Raw and normalized page hashes
+remain available for provenance, but navigation-shell text and `utm_*` query
+parameters are excluded from the semantic digest. Compare the top-level and
+component hashes before treating an HTML/CDN/A-B rendering change as a bounty
+scope change.
 
 If the static page fetch is incomplete or blocked, export the rendered pages
 from a browser and feed local files instead:
@@ -289,6 +311,100 @@ impact/out-of-scope parsing when links are not present. If Immunefi declares
 more impacts or assets than the parser can see, the artifact is marked
 `partial-needs-review` and `manual_input_recommended` so later strategy steps do
 not pretend the scope is complete.
+
+### Monitor and rank Immunefi Web/Apps programs
+
+Use the catalog command to discover every current Immunefi program with an
+explicit `Websites and Applications` category, compare it with the previous
+snapshot, and produce an explainable Web2 research ranking:
+
+```bash
+python3 scripts/inferforge.py \
+  --artifact-dir .greybox/immunefi-webapps-catalog \
+  immunefi-webapps-catalog \
+  --top 20 --show-changes --strict
+```
+
+The default monitoring run makes one request to the public Immunefi directory.
+It writes:
+
+```text
+immunefi-webapps-catalog.json
+immunefi-webapps-catalog-diff.json
+immunefi-webapps-roi-ranking.json
+immunefi-webapps-snapshots/<semantic-sha256>.json
+```
+
+An unchanged program keeps its previously confirmed detail enrichment. Any
+catalog metadata change invalidates that carry-forward for the affected slug,
+so its explicit Web/App rewards, assets, and impacts can be fetched again. To
+confirm selected candidates, repeat `--enrich-slug` with a one-second default
+delay between public Information-page requests:
+
+```bash
+python3 scripts/inferforge.py \
+  --artifact-dir .greybox/immunefi-webapps-catalog \
+  immunefi-webapps-catalog \
+  --enrich-slug kiln-webapp \
+  --enrich-slug gmx \
+  --enrich-slug variational \
+  --top 20 --show-changes --strict
+```
+
+The directory `maxBounty` is never treated as the Web reward for a mixed
+program. Ranking uses the explicit `Websites and Applications` reward table
+when enrichment is available and otherwise labels the row provisional. Its
+score is ordinal triage metadata based on confirmed Web rewards, freshness,
+dynamic Web surface, reporting friction, and evidence cost; it is not expected
+payout or vulnerability evidence.
+
+This command is Web2-only. Wallets, transaction builders, and RPCs may be
+reviewed as Web application trust boundaries, but Smart Contract,
+Blockchain/DLT, consensus, execution-client, and protocol-economic scope is
+excluded. The command requests only public Immunefi pages and never probes a
+bounty asset. For offline parsing, supply a bounded catalog export with
+`--input-html --no-fetch`.
+
+Run its network-free regression test with:
+
+```bash
+python3 scripts/inferforge.py \
+  --artifact-dir .greybox/selftests-immunefi-webapps-catalog \
+  self-test-immunefi-webapps-catalog
+```
+
+For unattended monitoring, use the thin wrapper rather than duplicating the
+catalog arguments in cron or another scheduler:
+
+```bash
+scripts/watch-immunefi-webapps.sh
+```
+
+The first run creates a baseline and exits `0`. Later unchanged runs also exit
+`0`; an addition, removal, or catalog-metadata change is written to the normal
+diff/ranking artifacts and exits `3`, while parser or strict-readiness failures
+retain their ordinary non-zero failure codes. This makes the wrapper suitable
+for a scheduler that sends output only when the command returns `3`. The
+baseline lives under `.greybox/immunefi-webapps-catalog` by default; set
+`IMMUNEFI_WATCH_ARTIFACT_DIR` to keep it elsewhere and
+`IMMUNEFI_WATCH_TOP` to change the printed ranking size. Extra CLI arguments are
+forwarded, so selected candidates can be refreshed explicitly:
+
+```bash
+scripts/watch-immunefi-webapps.sh \
+  --enrich-slug gmx \
+  --enrich-slug stakewise
+```
+
+Example six-hour cron entry (install it manually only after reviewing the
+local output path):
+
+```cron
+17 */6 * * * cd /absolute/path/to/greybox-not-greyhat && scripts/watch-immunefi-webapps.sh >> .greybox/immunefi-webapps-watch.log 2>&1
+```
+
+The watcher requests only Immunefi's public directory and explicitly selected
+public program pages. It never probes bounty assets.
 
 For source-first local triage, run an offline source risk review before active
 testing:
@@ -405,6 +521,11 @@ fixed-upstream fetches, wallet transaction construction, GraphQL resolver maps,
 file write/upload sinks, dynamic HTML rendering, origin/CORS controls, resource
 fanout limits, sensitive logging or telemetry boundaries, account-recovery
 lifecycle trust, and error response disclosure boundaries.
+The candidate set includes `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, and `.cjs`.
+When a conventional `src/` tree exists, root-level runtime/config source files
+such as `server.cjs` and `next.config.mjs` are still indexed. Files skipped for
+size or read/stat errors make `scan_coverage_status` incomplete rather than
+silently reporting complete source coverage.
 The output is a prioritized lead list, not a finding: each lead keeps source
 refs, signal ids, inferred source surface metadata such as Next.js route paths,
 HTTP methods, dynamic segments, source kind, review lanes, a structured offline
@@ -1565,14 +1686,21 @@ field/sort allowlists, scoped ORM ownership or tenant controls, or only literal
 query context.
 Bounty lanes preserve the original program impact, severity, candidate
 in-scope assets, mapped attack techniques, safe validation boundary, and
-reportability gates. In black-box mode, if the bounty profile is missing,
+reportability gates. These taxonomy rows are marked `planning_only` and are
+reported separately from `actionable_leads`; an impact that the program is
+willing to pay for is not itself a vulnerability lead. In black-box mode, if the bounty profile is missing,
 `lead-portfolio` emits a `bounty-program-profile-missing` blocker so the run
 starts by ingesting program scope instead of spending effort on coverage-first
 endpoint work.
 `scope-policy` also consumes `bounty-program-profile.json`: asset hosts parsed
 from the bounty page are automatically added to the explicit allowlist, and if
 no target was supplied the first bounty asset is used as the policy target
-instead of the local default target.
+instead of the local default target. With a ready, complete program profile,
+both `scope-policy` and the root `lead-portfolio` avoid writing unrelated
+built-in target-profile artifacts into the program artifact directory.
+Each bounded impact row records the full candidate-asset count, display limit,
+and omitted count, so a program with more than eight assets cannot look like an
+eight-asset scope merely because the compact row is truncated.
 
 Use `lead-portfolio` to turn the passive black-box leads into one prioritized
 local artifact before deciding what to validate next:
@@ -2499,6 +2627,10 @@ application while keeping the same tool pipeline:
 python3 scripts/inferforge.py --profile profiles/infrafi-web.json profile
 python3 scripts/inferforge.py --profile profiles/infrafi-web.json audit --include-external
 ```
+
+An explicitly supplied `--profile` is fail-closed: a missing path exits with
+status 2 instead of silently loading the built-in InfraFi fixture. Omitting
+`--profile` retains the documented default-profile behavior.
 
 The profile's `strategy_sets` list controls which built-in bounded strategies
 are active for the run. The current registry includes:
@@ -3707,6 +3839,12 @@ error fields plus `burp-observation-run.json` top-level/nested errors for
 redacted error summaries, checks probe, warm-up, and Burp observation artifacts
 for raw bodies, unredacted body samples, and raw error strings, flags persisted
 default raw Burp MCP history files as security hygiene issues,
+compares the bounty program semantic fingerprint consumed by `scope-policy`
+and `lead-portfolio` with the current program profile, and fails stale or
+missing lineage before downstream scope decisions are trusted,
+carries explicit `corpus_integrity` declarations into the health gate so
+`summary-only`, `corpus-missing`, or non-reproducible evidence remains a visible
+evidence gap instead of being mistaken for a retained raw response corpus,
 carries forward key gate statuses such as black-box coverage, discovery
 coverage, verification queue, review blockers, response deltas,
 source-peek requests, and Burp observation coverage, and

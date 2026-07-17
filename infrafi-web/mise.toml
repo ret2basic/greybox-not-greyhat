@@ -1,5 +1,0 @@
-[tools]
-node = "22"
-
-[env]
-# NODE_ENV is set automatically by Next.js
