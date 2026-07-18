@@ -23,3 +23,21 @@ Hard rule:
 
 This rule was added after an accidental `kill -TERM` interrupted the user's
 AI/API load balancer on 2026-07-05.
+
+## InferForge v2 Product Invariants
+
+InferForge v2 is a source-required white-box Web security evidence engine.
+Changes in this repository must preserve these invariants:
+
+- Do not add a source-free, remote-target, bounty-discovery, or black-box mode.
+- Do not make Burp Suite, a browser, a proxy, MCP, or a running target a core
+  dependency.
+- Scanner commands must remain offline and must not execute target code,
+  package scripts, services, containers, or active probes.
+- Scanner alerts are candidates, not findings. Confirmation requires source
+  evidence, independent verification, explicit Impact and Likelihood, and
+  freshness checks.
+- Missing static signals are coverage gaps, not proof that a control is absent.
+- Preserve artifact integrity, source-root path confinement, secret redaction,
+  and evidence-digest invalidation.
+- Synthetic vulnerable fixtures must never be started or exposed as services.

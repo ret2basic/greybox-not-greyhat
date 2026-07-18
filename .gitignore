@@ -1,3 +1,7 @@
+# InferForge v2 local evidence workspace
+.inferforge/
+
+# Preserved legacy local research artifacts; v2 never reads this directory
 .greybox/
 
 # Local dependencies and build outputs
@@ -6,6 +10,7 @@ node_modules/
 dist/
 build/
 coverage/
+*.egg-info/
 
 # Local environment and secrets
 .env
@@ -44,6 +49,10 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.venv/
+.coverage
+htmlcov/
 
 # Editor/OS noise
 .DS_Store

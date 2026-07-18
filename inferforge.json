@@ -1,0 +1,30 @@
+{
+  "$schema": "./schemas/inferforge-config.schema.json",
+  "schema_version": 2,
+  "exclude": {
+    "directories": [],
+    "globs": [
+      "tests/**",
+      "src/inferforge/rules.py"
+    ]
+  },
+  "limits": {
+    "max_file_bytes": 1048576,
+    "max_files": 25000,
+    "max_total_bytes": 134217728
+  },
+  "rules": {
+    "disabled": [],
+    "severity_overrides": {}
+  },
+  "trust_boundaries": [
+    {
+      "name": "artifact write boundary",
+      "pattern": "src/inferforge/workspace.py"
+    },
+    {
+      "name": "source root path boundary",
+      "pattern": "src/inferforge/config.py"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "FixtureSAST",
+          "rules": [
+            {
+              "id": "fixture.rule",
+              "shortDescription": {"text": "Fixture external result"},
+              "fullDescription": {"text": "A deterministic SARIF fixture result."}
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "fixture.rule",
+          "level": "warning",
+          "message": {"text": "Review the fixture route."},
+          "partialFingerprints": {"primaryLocationLineHash": "fixture-1"},
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/app/api/users/%5Bid%5D/route.ts"
+                },
+                "region": {
+                  "startLine": 3,
+                  "startColumn": 3
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "inferforge-vulnerable-fixture",
+  "private": true,
+  "dependencies": {
+    "express": "4.21.0",
+    "next": "15.0.0"
+  }
+}

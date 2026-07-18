@@ -1,0 +1,31 @@
+{
+  "$schema": "./schemas/inferforge-config.schema.json",
+  "schema_version": 2,
+  "exclude": {
+    "directories": [
+      "generated"
+    ],
+    "globs": [
+      "examples/vendor/**"
+    ]
+  },
+  "limits": {
+    "max_file_bytes": 1048576,
+    "max_files": 25000,
+    "max_total_bytes": 134217728
+  },
+  "rules": {
+    "disabled": [],
+    "severity_overrides": {}
+  },
+  "trust_boundaries": [
+    {
+      "name": "privileged administration",
+      "pattern": "src/admin/"
+    },
+    {
+      "name": "transaction signing",
+      "pattern": "src/wallet/"
+    }
+  ]
+}
